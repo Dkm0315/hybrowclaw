@@ -179,6 +179,14 @@ test("built-in plugin catalog includes source-backed Hermes and OpenClaw breadth
   assert.doesNotMatch(serialized, new RegExp(`${11_434}`));
 });
 
+test("built-in catalog does not hardcode user-specific host connector availability", () => {
+  const serialized = JSON.stringify(listBuiltinPlugins());
+
+  assert.doesNotMatch(serialized, /hostConnectors|openai-curated-remote|claude-plugins-official|~\/\.codex|~\/\.claude/);
+  assert.match(serialized, /authenticated-app-reuse/);
+  assert.match(serialized, /provider plugin manifests/);
+});
+
 test("candidates are quarantined and invisible to injection until promoted", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-skills-"));
   await writeCandidateSkill({ name: "deploy-frappe", description: "Deploy a Frappe bench safely", body: "1. backup 2. migrate", sourceRunId: "run_1" }, cwd);

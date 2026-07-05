@@ -20,12 +20,15 @@
     "xlsx_workbook",
     "pptx_presentation",
     "pdf_document",
+    "validate_artifact_file",
+    "declare_artifact",
+    "document_generation_workflow",
     "artifact_capability_plan",
     "office_tool_integrations",
     "office_artifact_workflow",
     "artifact_goal_passes"
   ],
-  "status": "v0: deterministic artifact builders that return strings, JSON, or base64 file payloads for the caller to save, plus honest app-server handoff planning and gated multi-step Office workflows for polished document creation.",
+  "status": "v0: deterministic artifact builders return structured Markdown, OOXML, or PDF payloads for the caller to save; validation and declaration helpers register local/hosted files with provenance, token-ledger linkage, provider run ids, and channel delivery status; document_generation_workflow gives providers and users a direct invocation contract; higher-fidelity Codex/Claude app-server handoffs are only advertised when the host exposes those skills.",
   "readiness": {
     "level": "executable",
     "status": "beta",

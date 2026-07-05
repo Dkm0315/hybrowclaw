@@ -2,6 +2,8 @@ export {
   artifact_capability_plan,
   artifact_goal_passes,
   dashboard_manifest,
+  declare_artifact,
+  document_generation_workflow,
   docx_document,
   markdown_report,
   office_artifact_workflow,
@@ -10,5 +12,6 @@ export {
   pptx_presentation,
   rows_to_csv,
   tools,
+  validate_artifact_file,
   xlsx_workbook,
 } from "../../../packages/core/src/artifacts.js";

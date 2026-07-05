@@ -10,6 +10,7 @@ import {
   type BuiltinSkillCatalogEntry,
 } from "./builtin-catalog.js";
 import { ensureDefaultConfig, loadConfig } from "./config.js";
+import { buildRosterSupportMatrix } from "./roster.js";
 import type { RuntimeDoctorStatus } from "./runtime-doctor.js";
 
 export interface QaChannelPluginSetupCase {
@@ -41,9 +42,11 @@ export async function runChannelPluginSetupQa(input: {
 
   const plugins = listBuiltinPlugins();
   const mcps = listBuiltinMcpServers();
+  const rosterMatrix = buildRosterSupportMatrix();
   const cases: QaChannelPluginSetupCase[] = [];
 
   cases.push(caseCatalogCoverage(plugins, mcps));
+  cases.push(caseRosterSupportDepth(rosterMatrix));
   cases.push(caseCatalogActionabilityEvidence(plugins));
   cases.push(caseEverydayCapabilityBreadth(plugins));
   cases.push(caseSkillCatalogBreadth(listBuiltinSkills()));
@@ -57,26 +60,27 @@ export async function runChannelPluginSetupQa(input: {
   cases.push(await caseEnableDisablePolicy(cwd, "web-frameworks"));
   cases.push(caseMcpInstallGuidance(mcps));
 
-  const status: RuntimeDoctorStatus = cases.every((testCase) => testCase.status === "passed") ? "passed" : "failed";
-  const summary = status === "passed"
-    ? "Channel/plugin catalog depth, setup guidance, skill/MCP breadth, unsafe-plugin refusal, and enable/disable policy verified"
-    : "Channel/plugin setup QA found missing catalog depth, setup guidance, or policy regressions";
+	  const status: RuntimeDoctorStatus = cases.every((testCase) => testCase.status === "passed") ? "passed" : "failed";
+	  const summary = status === "passed"
+	    ? "Roster support depth, channel/plugin catalog depth, setup guidance, skill/MCP breadth, unsafe-plugin refusal, and enable/disable policy verified"
+	    : "Channel/plugin setup QA found missing roster support depth, catalog depth, setup guidance, or policy regressions";
   const manifestPath = join(artifactDir, "manifest.json");
   const casesPath = join(artifactDir, "cases.jsonl");
   const catalogPath = join(artifactDir, "catalog.json");
   await writeFile(casesPath, `${cases.map((testCase) => JSON.stringify(testCase)).join("\n")}\n`, "utf8");
-  await writeFile(catalogPath, `${JSON.stringify({
-    plugins: plugins.map((plugin) => catalogPluginSnapshot(plugin)),
-    mcpServers: mcps.map((mcp) => ({
+	  await writeFile(catalogPath, `${JSON.stringify({
+	    plugins: plugins.map((plugin) => catalogPluginSnapshot(plugin)),
+	    mcpServers: mcps.map((mcp) => ({
       id: mcp.id,
       category: mcp.category,
       auth: mcp.auth ?? "none",
       setupUrls: mcp.setupUrls ?? [],
       installable: Boolean(mcp.install),
-      requiresEnv: mcp.requiresEnv ?? [],
-      requiresAnyEnv: mcp.requiresAnyEnv ?? [],
-    })),
-  }, null, 2)}\n`, "utf8");
+	      requiresEnv: mcp.requiresEnv ?? [],
+	      requiresAnyEnv: mcp.requiresAnyEnv ?? [],
+	    })),
+	    rosterMatrix,
+	  }, null, 2)}\n`, "utf8");
   await writeFile(manifestPath, `${JSON.stringify({
     schemaVersion: 1,
     kind: "muster-qa",
@@ -121,6 +125,50 @@ function caseCatalogCoverage(
       ? "core web, channel, Frappe, Playwright, and MCP surfaces are discoverable"
       : "core integration catalog surfaces are missing",
     evidence: { pluginCount: plugins.length, mcpCount: mcps.length, missingPlugins, missingMcps },
+  };
+}
+
+function caseRosterSupportDepth(matrix: ReturnType<typeof buildRosterSupportMatrix>): QaChannelPluginSetupCase {
+  const summary = matrix.summary;
+  const entriesById = new Map(matrix.entries.map((entry) => [entry.id, entry]));
+  const requiredSupports = [
+    { id: "telegram", support: "owned_pack" },
+    { id: "telegram", support: "channel_adapter" },
+    { id: "slack", support: "owned_pack" },
+    { id: "slack", support: "channel_adapter" },
+    { id: "frappe-federated-bridge", support: "owned_pack" },
+    { id: "mcp:linear", support: "mcp_installable" },
+    { id: "mcp:notion", support: "mcp_installable" },
+    { id: "skill:systematic-debugging", support: "skill_guidance" },
+  ] as const;
+  const missingSupports = requiredSupports
+    .filter((requirement) => !entriesById.get(requirement.id)?.support.includes(requirement.support))
+    .map((requirement) => `${requirement.id}:${requirement.support}`);
+  const missingCounts = [
+    summary.ownedPacks > 0 ? undefined : "owned_packs",
+    summary.channelAdapters >= 2 ? undefined : "channel_adapters",
+    summary.mcpInstallable >= 4 ? undefined : "mcp_installable",
+    (summary.byKind.plugin ?? 0) > 0 ? undefined : "plugins",
+    (summary.byKind.mcp ?? 0) > 0 ? undefined : "mcps",
+    (summary.byKind.skill ?? 0) > 0 ? undefined : "skills",
+  ].filter((item): item is string => Boolean(item));
+  const hostReuseWithoutScan = summary.hostReuse;
+  const status: RuntimeDoctorStatus = missingSupports.length || missingCounts.length || hostReuseWithoutScan ? "failed" : "passed";
+  return {
+    id: "roster_support_depth",
+    status,
+    summary: status === "passed"
+      ? "roster support matrix exposes owned packs, channel adapters, MCP installs, and skill guidance without implicit host scans"
+      : "roster support matrix is shallow or mixed with implicit host evidence",
+    evidence: {
+      summary,
+      missingSupports,
+      missingCounts,
+      hostReuseWithoutScan,
+      sampleEntries: ["telegram", "slack", "frappe-federated-bridge", "mcp:linear", "mcp:notion", "skill:systematic-debugging"]
+        .map((id) => entriesById.get(id))
+        .filter(Boolean),
+    },
   };
 }
 

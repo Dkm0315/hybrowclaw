@@ -923,16 +923,26 @@ test("channel packs produce setup plans, readiness checks, and safe payload summ
   assert.deepEqual(googleSummary, { type: "MESSAGE", text: "hello", space: "spaces/AAA", user: "Ada", thread: "spaces/AAA/threads/BBB" });
 
   const slackPlan = await slack_setup_plan(
-    { publicUrl: "https://slack.example.test", gatewayConfig: { slack: { botToken: "xoxb", signingSecret: "secret" } } },
+    { publicUrl: "https://slack.example.test", gatewayConfig: { slack: { botToken: "xoxb", appToken: "xapp" } } },
     { config: {} },
   );
   assert.equal(slackPlan.ready, true);
-  assert.equal(slackPlan.webhookUrl, "https://slack.example.test/v1/adapters/slack");
+  assert.equal(slackPlan.mode, "socket");
+  assert.equal(slackPlan.webhookUrl, undefined);
 
   const slackCheck = await slack_gateway_check({ gatewayConfig: { slack: { botToken: "xoxb" } } }, { config: {} });
   assert.equal(slackCheck.ready, false);
-  assert.equal(slackCheck.checks[1].id, "signing_secret");
+  assert.equal(slackCheck.mode, "socket");
+  assert.equal(slackCheck.checks[1].id, "app_token");
   assert.equal(slackCheck.checks[1].ok, false);
+  assert.equal(slackCheck.checks[2].id, "file_upload_scope");
+  assert.equal(slackCheck.checks[2].ok, false);
+  assert.match(slackCheck.checks[2].detail, /doctor slack --live/);
+
+  const slackHttpCheck = await slack_gateway_check({ publicUrl: "https://slack.example.test", gatewayConfig: { slack: { botToken: "xoxb", mode: "http" } } }, { config: {} });
+  assert.equal(slackHttpCheck.ready, false);
+  assert.equal(slackHttpCheck.mode, "http");
+  assert.equal(slackHttpCheck.checks[1].id, "signing_secret");
 
   const slackSummary = await slack_event_summary({ event: { type: "message", channel: "C1", user: "U1", text: "hi", ts: "123.4" }, team_id: "T1" });
   assert.deepEqual(slackSummary, { type: "message", team: "T1", channel: "C1", user: "U1", text: "hi", threadTs: "123.4" });

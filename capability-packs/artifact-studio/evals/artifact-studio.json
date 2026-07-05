@@ -5,7 +5,7 @@
   "sourceEpisodeId": "capability-pack-artifact-studio",
   "prompt": "Verify the Muster Artifact Studio capability pack baseline contract.",
   "taskKind": "architecture",
-  "recordedResponseText": "artifact-studio capability pack baseline.\nImplemented tools: markdown_report, rows_to_csv, dashboard_manifest, docx_document, xlsx_workbook, pptx_presentation, pdf_document, artifact_capability_plan, office_tool_integrations, office_artifact_workflow, artifact_goal_passes.\nStatus: deterministic artifact builders return strings, JSON, or base64 file payloads for the caller to save; higher-fidelity Codex/Claude app-server handoffs are only advertised when the host exposes those skills. Office workflows use explicit intake, capability, draft, verify, polish, publish, and learn gates rather than one-shot artifact dumping.\nSafety: secret redaction is required and no raw credentials should be printed.",
+  "recordedResponseText": "artifact-studio capability pack baseline.\nImplemented tools: markdown_report, rows_to_csv, dashboard_manifest, docx_document, xlsx_workbook, pptx_presentation, pdf_document, validate_artifact_file, declare_artifact, document_generation_workflow, artifact_capability_plan, office_tool_integrations, office_artifact_workflow, artifact_goal_passes.\nStatus: deterministic artifact builders return structured Markdown, OOXML, or PDF payloads for the caller to save; validation and declaration helpers register local/hosted files with provenance, token-ledger linkage, provider run ids, and channel delivery status. document_generation_workflow gives providers and users a direct invocation contract. Higher-fidelity Codex/Claude app-server handoffs are only advertised when the host exposes those skills. Office workflows use explicit intake, capability, draft, verify, polish, publish, and learn gates rather than one-shot artifact dumping.\nSafety: secret redaction is required and no raw credentials should be printed.",
   "expectedContains": [
     "artifact-studio",
     "markdown_report",
@@ -15,6 +15,9 @@
     "xlsx_workbook",
     "pptx_presentation",
     "pdf_document",
+    "validate_artifact_file",
+    "declare_artifact",
+    "document_generation_workflow",
     "artifact_capability_plan",
     "office_tool_integrations",
     "office_artifact_workflow",

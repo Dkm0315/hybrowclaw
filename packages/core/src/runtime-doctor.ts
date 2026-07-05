@@ -74,11 +74,11 @@ export type RequiredQaSuiteId = typeof REQUIRED_QA_SUITES[number];
 const REQUIRED_QA_CASES: Readonly<Record<RequiredQaSuiteId, readonly string[]>> = {
   pty_tui: [
     "slash_overlay_stable",
-    "escape_closes_overlay",
+    "escape_closes_bare_completion",
     "history_navigation",
     "prompt_visible_after_output",
-    "agent_overlay",
-    "large_overlay_scroll",
+    "agent_overlay_navigation",
+    "large_overlay_scroll_window",
     "selected_row_contrast",
     "provider_model_speed_workflow",
     "cramped_transcript_receipts",

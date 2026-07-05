@@ -63,11 +63,13 @@ class StdioTransport {
   private dead = false;
   private deadReason?: Error;
 
-  constructor(command: string, args: string[], env?: Record<string, string>) {
-    this.child = spawn(command, args, {
+  constructor(command: string, args: string[], env: Record<string, string> | undefined, cwd: string) {
+    const resolvedArgs = args.map((arg) => resolveMcpRuntimeTemplate(arg, { cwd }));
+    const resolvedEnv = resolveMcpRuntimeEnv(env, cwd);
+    this.child = spawn(command, resolvedArgs, {
       stdio: ["pipe", "pipe", "ignore"],
       // filtered env: only what the server config declares, plus PATH — secrets never leak by default
-      env: { PATH: process.env.PATH ?? "", ...(env ?? {}) },
+      env: { PATH: process.env.PATH ?? "", ...resolvedEnv },
     });
     // An async spawn failure (ENOENT command-not-found, EACCES) emits 'error' on
     // the child; with NO listener Node rethrows it as an UNCAUGHT exception that
@@ -155,6 +157,54 @@ class StdioTransport {
   }
 }
 
+function resolveMcpRuntimeEnv(env: Record<string, string> | undefined, cwd: string): Record<string, string> {
+  if (!env) return {};
+  return Object.fromEntries(
+    Object.entries(env).map(([key, value]) => [key, resolveMcpRuntimeEnvValue(key, value, cwd)]),
+  );
+}
+
+function resolveMcpRuntimeEnvValue(key: string, value: string, cwd: string): string {
+  if (value === "${CWD}") return cwd;
+  if (isEnvChoiceTemplate(value)) return resolveMcpRuntimeEnvChoice(value);
+  if (isFullEnvTemplate(value)) return resolveRequiredRuntimeEnv(value.slice(2, -1));
+  if (value === key && isEnvName(value)) return resolveRequiredRuntimeEnv(value);
+  return resolveMcpRuntimeTemplate(value, { cwd });
+}
+
+function resolveMcpRuntimeTemplate(value: string, options: { readonly cwd: string }): string {
+  return value.replace(/\$\{([A-Z_][A-Z0-9_]*|CWD)\}/g, (_match, name: string) => {
+    if (name === "CWD") return options.cwd;
+    return resolveRequiredRuntimeEnv(name);
+  });
+}
+
+function resolveMcpRuntimeEnvChoice(value: string): string {
+  for (const name of value.split("|")) {
+    const candidate = process.env[name];
+    if (candidate) return candidate;
+  }
+  throw new Error(`Missing required MCP environment variable: ${value}`);
+}
+
+function resolveRequiredRuntimeEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing required MCP environment variable: ${name}`);
+  return value;
+}
+
+function isFullEnvTemplate(value: string): boolean {
+  return /^\$\{[A-Z_][A-Z0-9_]*\}$/.test(value);
+}
+
+function isEnvChoiceTemplate(value: string): boolean {
+  return /^[A-Z_][A-Z0-9_]*(?:\|[A-Z_][A-Z0-9_]*)+$/.test(value);
+}
+
+function isEnvName(value: string): boolean {
+  return /^[A-Z_][A-Z0-9_]*$/.test(value);
+}
+
 async function httpRequest(url: string, headers: Record<string, string>, method: string, params: unknown, timeoutMs: number): Promise<JsonRpcResponse> {
   const response = await fetch(url, {
     method: "POST",
@@ -182,7 +232,7 @@ export async function connectMcpServer(name: string, config: McpServerConfig, cw
   let transport: StdioTransport | undefined;
   const send = async (method: string, params: unknown): Promise<JsonRpcResponse> => {
     if (config.transport.kind === "stdio") {
-      transport ??= new StdioTransport(config.transport.command, config.transport.args ?? [], config.transport.env);
+      transport ??= new StdioTransport(config.transport.command, config.transport.args ?? [], config.transport.env, cwd);
       return transport.request(method, params, timeoutMs);
     }
     const headers = { ...(config.transport.headers ?? {}) };

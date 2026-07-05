@@ -38,6 +38,7 @@ interface FrappeCallOk {
 }
 
 type FrappeCallResult = FrappeCallOk | (FrappeError & { readonly ok?: undefined });
+type FrappeHttpMethod = "GET" | "POST" | "PUT";
 
 type FrappeAuth =
   | { readonly kind: "token"; readonly value: string }
@@ -55,6 +56,103 @@ interface FrappeModuleContext {
   readonly docs: FrappeDocSource[];
   readonly concepts: string[];
   readonly retrievalHints: string[];
+}
+
+type FrappeQueryClass =
+  | "schema"
+  | "field"
+  | "permission"
+  | "workflow"
+  | "report"
+  | "customization"
+  | "installed_app"
+  | "docs"
+  | "record_lookup"
+  | "record_creation"
+  | "record_update"
+  | "artifact_generation"
+  | "troubleshooting"
+  | "migration_custom_app_impact"
+  | "role_safe_management_summary";
+
+type FrappePermissionName = "read" | "write" | "create" | "delete" | "submit" | "cancel" | "amend" | "select" | "report" | "export" | "import" | "print" | "email" | "share";
+
+interface FrappeDocFieldIndex {
+  readonly fieldname: string;
+  readonly label?: string;
+  readonly fieldtype?: string;
+  readonly options?: string;
+  readonly reqd?: boolean;
+  readonly hidden?: boolean;
+  readonly permlevel?: number;
+}
+
+interface FrappePermissionIndex {
+  readonly role: string;
+  readonly read?: boolean;
+  readonly write?: boolean;
+  readonly create?: boolean;
+  readonly delete?: boolean;
+  readonly submit?: boolean;
+  readonly cancel?: boolean;
+  readonly amend?: boolean;
+  readonly select?: boolean;
+  readonly report?: boolean;
+  readonly export?: boolean;
+  readonly import?: boolean;
+  readonly print?: boolean;
+  readonly email?: boolean;
+  readonly share?: boolean;
+}
+
+interface FrappeDocTypeIndex {
+  readonly name: string;
+  readonly module?: string;
+  readonly custom?: boolean;
+  readonly istable?: boolean;
+  readonly autoname?: string;
+  readonly fields: FrappeDocFieldIndex[];
+  readonly links: Array<{ readonly fieldname: string; readonly target: string }>;
+  readonly childTables: Array<{ readonly fieldname: string; readonly target: string }>;
+  readonly namingSeries: string[];
+  readonly permissions: FrappePermissionIndex[];
+}
+
+interface FrappeGraph {
+  readonly nodes: Array<{ readonly id: string; readonly type: string; readonly label: string }>;
+  readonly edges: Array<{ readonly from: string; readonly to: string; readonly type: string; readonly label?: string }>;
+}
+
+interface FrappeSiteInduction {
+  readonly site: {
+    readonly url: string;
+    readonly authMode: "api_token" | "admin_login";
+    readonly identity: { readonly user?: string };
+    readonly versions: Record<string, string>;
+    readonly installedApps: string[];
+  };
+  readonly modules: string[];
+  readonly workspaces: string[];
+  readonly doctypes: FrappeDocTypeIndex[];
+  readonly roles: string[];
+  readonly permissions: Array<{ readonly doctype: string; readonly role: string; readonly permission: FrappePermissionName; readonly allowed: boolean }>;
+  readonly workflows: unknown[];
+  readonly reports: unknown[];
+  readonly printFormats: unknown[];
+  readonly dashboards: unknown[];
+  readonly webForms: unknown[];
+  readonly notificationRules: unknown[];
+  readonly assignmentRules: unknown[];
+  readonly customizations: {
+    readonly customFields: unknown[];
+    readonly propertySetters: unknown[];
+    readonly clientScripts: unknown[];
+    readonly serverScripts: unknown[];
+  };
+  readonly docs: FrappeDocSource[];
+  readonly graph: FrappeGraph;
+  readonly evidence: string[];
+  readonly warnings: string[];
 }
 
 const FRAPPE_DOCS: readonly FrappeDocSource[] = [
@@ -131,7 +229,7 @@ function extractFrappeMessage(body: unknown, rawText: string): string {
 
 async function frappeRequest(
   context: FrappeToolContext,
-  method: "GET" | "POST",
+  method: FrappeHttpMethod,
   path: string,
   body?: Record<string, unknown>,
 ): Promise<FrappeCallResult> {
@@ -183,7 +281,7 @@ async function frappeAuthedRequest(
   fetchFn: typeof globalThis.fetch,
   siteUrl: string,
   auth: FrappeAuth,
-  method: "GET" | "POST",
+  method: FrappeHttpMethod,
   path: string,
   body?: Record<string, unknown>,
 ): Promise<FrappeCallResult> {
@@ -315,6 +413,17 @@ export async function frappe_records_create(
   const doc = args.doc;
   if (typeof doc !== "object" || doc === null || Array.isArray(doc)) {
     return { error: 'frappe_records_create requires a "doc" object with the document fields.' };
+  }
+  if (!booleanArg(args.trustedFixture)) {
+    if (!booleanArg(args.approved)) {
+      return { error: "frappe_records_create requires approval for writes. Use frappe_safe_write to get a permission preflight, dry-run proposal, approval gate, execution, verification, and evidence log; trusted fixtures must pass trustedFixture=true explicitly." };
+    }
+    const safe = await frappe_safe_write({ ...args, operation: "create", approved: true }, context);
+    if ("error" in safe) return safe;
+    if (safe.status !== "executed" || !safe.result?.created) {
+      return { error: `frappe_records_create approved path did not create a document: ${safe.status}` };
+    }
+    return { created: safe.result.created };
   }
   const result = await frappeRequest(context, "POST", `/api/resource/${encodeURIComponent(doctype)}`, doc as Record<string, unknown>);
   if (!result.ok) return result;
@@ -509,6 +618,426 @@ export async function frappe_module_context(
   };
 }
 
+export async function frappe_site_induction(
+  args: Record<string, unknown>,
+  context: FrappeToolContext,
+): Promise<FrappeSiteInduction | FrappeError> {
+  const auth = await resolveRuntimeAuth(args, context);
+  if ("error" in auth) return auth;
+  const warnings: string[] = [];
+  const identity = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", "/api/method/frappe.auth.get_logged_user");
+  if (!identity.ok) warnings.push(`identity unavailable: ${identity.error}`);
+
+  const versionsResult = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", "/api/method/frappe.utils.change_log.get_versions");
+  const versions = versionsResult.ok ? extractAppVersions(versionsResult.data) : {};
+  if (!versionsResult.ok) warnings.push(`versions unavailable: ${versionsResult.error}`);
+
+  const workspaceResult = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", "/api/method/frappe.desk.desktop.get_workspace_sidebar_items");
+  const workspaces = workspaceResult.ok ? uniqueSorted(extractWorkspaceModules(workspaceResult.data)) : [];
+  if (!workspaceResult.ok) warnings.push(`workspaces unavailable: ${workspaceResult.error}`);
+
+  const requestedModules = stringList(args.modules);
+  const modules = uniqueSorted([...requestedModules, ...workspaces]);
+  const requestedDoctypes = stringList(args.doctypes);
+  const doctypeNames = requestedDoctypes.length ? requestedDoctypes : await discoverDoctypeNames(context, auth.siteUrl, auth.auth, modules, warnings);
+  const doctypes: FrappeDocTypeIndex[] = [];
+  const limit = positiveInteger(args.limit, 50);
+  for (const doctype of doctypeNames.slice(0, limit)) {
+    const resource = await frappeGetResource(context, auth.siteUrl, auth.auth, "DocType", doctype, warnings);
+    if (resource) doctypes.push(normalizeDoctype(resource));
+  }
+
+  const customFields = await frappeList(context, auth.siteUrl, auth.auth, "Custom Field", ["name", "dt", "fieldname", "fieldtype", "label", "options"], [], 500, warnings);
+  const propertySetters = await frappeList(context, auth.siteUrl, auth.auth, "Property Setter", ["name", "doc_type", "field_name", "property", "value"], [], 500, warnings);
+  const workflows = await frappeList(context, auth.siteUrl, auth.auth, "Workflow", ["name", "document_type", "is_active", "states", "transitions"], [], 200, warnings);
+  const reports = await frappeList(context, auth.siteUrl, auth.auth, "Report", ["name", "ref_doctype", "report_type", "module"], [], 200, warnings);
+  const printFormats = await frappeList(context, auth.siteUrl, auth.auth, "Print Format", ["name", "doc_type", "module"], [], 200, warnings);
+  const dashboards = await frappeList(context, auth.siteUrl, auth.auth, "Dashboard", ["name", "module"], [], 200, warnings);
+  const clientScripts = await frappeList(context, auth.siteUrl, auth.auth, "Client Script", ["name", "dt", "enabled"], [], 200, warnings);
+  const serverScripts = await frappeList(context, auth.siteUrl, auth.auth, "Server Script", ["name", "reference_doctype", "script_type", "disabled"], [], 200, warnings);
+  const webForms = await frappeList(context, auth.siteUrl, auth.auth, "Web Form", ["name", "doc_type", "module"], [], 200, warnings);
+  const notificationRules = await frappeList(context, auth.siteUrl, auth.auth, "Notification", ["name", "document_type", "enabled"], [], 200, warnings);
+  const assignmentRules = await frappeList(context, auth.siteUrl, auth.auth, "Assignment Rule", ["name", "document_type", "disabled"], [], 200, warnings);
+  const roleRows = await frappeList(context, auth.siteUrl, auth.auth, "Role", ["name"], [], 500, warnings);
+  const roles = uniqueSorted(roleRows.flatMap((role) => recordString(role, "name") ?? []));
+  const docs = await frappe_docs_context({ apps: Object.keys(versions), modules }, context);
+  const permissions = flattenPermissions(doctypes);
+
+  return {
+    site: {
+      url: auth.siteUrl,
+      authMode: auth.mode,
+      identity: { user: identity.ok && typeof identity.data.message === "string" ? identity.data.message : undefined },
+      versions,
+      installedApps: uniqueSorted(Object.keys(versions)),
+    },
+    modules,
+    workspaces,
+    doctypes,
+    roles,
+    permissions,
+    workflows,
+    reports,
+    printFormats,
+    dashboards,
+    webForms,
+    notificationRules,
+    assignmentRules,
+    customizations: {
+      customFields,
+      propertySetters,
+      clientScripts,
+      serverScripts,
+    },
+    docs: docs.docs,
+    graph: buildFrappeGraph({
+      site: auth.siteUrl,
+      apps: Object.keys(versions),
+      modules,
+      doctypes,
+      roles,
+      workflows,
+      reports,
+      customFields,
+      propertySetters,
+    }),
+    evidence: [
+      "identity:get_logged_user",
+      "versions:get_versions",
+      "workspaces:get_workspace_sidebar_items",
+      "metadata:DocType/Custom Field/Property Setter/Workflow/Report/Script",
+    ],
+    warnings,
+  };
+}
+
+export async function frappe_query_classify(
+  args: Record<string, unknown>,
+  _context: FrappeToolContext,
+): Promise<{
+  prompt: string;
+  primaryClass: FrappeQueryClass;
+  classes: Array<{ readonly class: FrappeQueryClass; readonly confidence: number; readonly reason: string }>;
+  retrievalStrategy: string[];
+  memoryPolicy: { readonly recall: boolean; readonly reason: string; readonly candidateScopes: string[] };
+  safeWriteRequired: boolean;
+}> {
+  const prompt = argString(args, "prompt") ?? argString(args, "query") ?? "";
+  const primaryClass = classifyFrappePrompt(prompt);
+  const classes = candidateClasses(prompt);
+  const retrievalStrategy = retrievalStrategyFor(primaryClass);
+  const memoryPolicy = memoryPolicyForPrompt(prompt, args);
+  return {
+    prompt,
+    primaryClass,
+    classes,
+    retrievalStrategy,
+    memoryPolicy,
+    safeWriteRequired: primaryClass === "record_creation" || primaryClass === "record_update",
+  };
+}
+
+export async function frappe_hybrid_retrieve(
+  args: Record<string, unknown>,
+  context: FrappeToolContext,
+): Promise<{
+  intent: FrappeQueryClass;
+  allowedSiteScope: { readonly site?: string; readonly user?: string; readonly roles: string[] };
+  candidateDocTypes: string[];
+  candidateFields: Array<{ readonly doctype: string; readonly fieldname: string; readonly label?: string; readonly fieldtype?: string; readonly options?: string }>;
+  relevantPermissions: Array<{ readonly doctype: string; readonly role: string; readonly permission: FrappePermissionName; readonly allowed: boolean }>;
+  relevantWorkflows: unknown[];
+  relevantReports: unknown[];
+  relevantCustomizations: unknown[];
+  docsReferences: FrappeDocSource[];
+  safeActionOptions: string[];
+  blockedPermissions: Array<{ readonly doctype: string; readonly permission: FrappePermissionName; readonly roles: string[] }>;
+  memory: { readonly searched: boolean; readonly reason: string; readonly scopes: string[]; readonly hits: unknown[] };
+  graphTrace: string[];
+}> {
+  const prompt = argString(args, "prompt") ?? argString(args, "query") ?? "";
+  const classification = await frappe_query_classify({ prompt }, context);
+  const induction = normalizeInductionArg(args.induction);
+  const roles = stringList(args.roles);
+  const candidateDoctypes = selectCandidateDoctypes(prompt, induction);
+  const blockedPermissions: Array<{ doctype: string; permission: FrappePermissionName; roles: string[] }> = [];
+  const allowedDoctypes = candidateDoctypes.filter((doctype) => {
+    const allowed = fixturePermissionDecision(induction, doctype.name, "read", roles.length ? roles : ["All"]);
+    if (!allowed.allowed) {
+      blockedPermissions.push({ doctype: doctype.name, permission: "read", roles: roles.length ? roles : ["All"] });
+      return false;
+    }
+    return true;
+  });
+  const allowedNames = new Set(allowedDoctypes.map((doctype) => doctype.name));
+  const relevantPermissions = induction.permissions.filter((permission) => allowedNames.has(permission.doctype) || candidateDoctypes.some((doctype) => doctype.name === permission.doctype));
+  const workflows = filterByDoctypeLike(induction.workflows, allowedNames, ["document_type", "doctype", "ref_doctype"]);
+  const reports = filterByDoctypeLike(induction.reports, allowedNames, ["ref_doctype", "doctype", "doc_type"]);
+  const customizations = [
+    ...filterByDoctypeLike(induction.customizations.customFields, allowedNames, ["dt", "doctype", "doc_type"]),
+    ...filterByDoctypeLike(induction.customizations.propertySetters, allowedNames, ["doc_type", "doctype", "dt"]),
+    ...filterByDoctypeLike(induction.customizations.clientScripts, allowedNames, ["dt", "doctype", "doc_type"]),
+    ...filterByDoctypeLike(induction.customizations.serverScripts, allowedNames, ["reference_doctype", "doctype", "doc_type"]),
+  ];
+  const memoryPolicy = memoryPolicyForPrompt(prompt, args);
+  const memoryRows = Array.isArray(args.memory) ? args.memory : [];
+  const memoryHits = memoryPolicy.recall ? memoryRows : [];
+  return {
+    intent: classification.primaryClass,
+    allowedSiteScope: {
+      site: induction.site.url,
+      user: induction.site.identity.user,
+      roles,
+    },
+    candidateDocTypes: allowedDoctypes.map((doctype) => doctype.name),
+    candidateFields: allowedDoctypes.flatMap((doctype) => doctype.fields.map((field) => ({
+      doctype: doctype.name,
+      fieldname: field.fieldname,
+      label: field.label,
+      fieldtype: field.fieldtype,
+      options: field.options,
+    }))),
+    relevantPermissions,
+    relevantWorkflows: workflows,
+    relevantReports: reports,
+    relevantCustomizations: customizations,
+    docsReferences: docsForIntent(classification.primaryClass, induction.docs),
+    safeActionOptions: safeActionOptionsFor(classification.primaryClass, allowedDoctypes.map((doctype) => doctype.name)),
+    blockedPermissions,
+    memory: {
+      searched: memoryPolicy.recall,
+      reason: memoryPolicy.reason,
+      scopes: memoryHits.flatMap((hit) => recordString(hit, "scope") ?? []),
+      hits: memoryHits,
+    },
+    graphTrace: allowedDoctypes.flatMap((doctype) => [
+      `site:${induction.site.url ?? "fixture"} -> doctype:${doctype.name}`,
+      ...doctype.links.map((link) => `doctype:${doctype.name} -> link:${link.target}`),
+      ...doctype.childTables.map((table) => `doctype:${doctype.name} -> child_table:${table.target}`),
+    ]),
+  };
+}
+
+export async function frappe_permission_check(
+  args: Record<string, unknown>,
+  context: FrappeToolContext,
+): Promise<{
+  doctype: string;
+  permission: FrappePermissionName;
+  allowed: boolean;
+  matchedRoles: string[];
+  deniedRoles: string[];
+  source: "fixture" | "live";
+  reason?: string;
+} | FrappeError> {
+  const doctype = argString(args, "doctype");
+  if (!doctype) return { error: 'frappe_permission_check requires a "doctype" argument.' };
+  const permission = permissionName(argString(args, "permission") ?? argString(args, "ptype") ?? "read");
+  const roles = stringList(args.roles);
+  if (args.induction !== undefined) {
+    const induction = normalizeInductionArg(args.induction);
+    const decision = fixturePermissionDecision(induction, doctype, permission, roles.length ? roles : ["All"]);
+    return {
+      doctype,
+      permission,
+      allowed: decision.allowed,
+      matchedRoles: decision.matchedRoles,
+      deniedRoles: decision.deniedRoles,
+      source: "fixture",
+    };
+  }
+
+  const auth = await resolveRuntimeAuth(args, context);
+  if ("error" in auth) return auth;
+  const preflight = await livePermissionPreflight(context, auth.siteUrl, auth.auth, doctype, permission, argString(args, "docname"));
+  return {
+    doctype,
+    permission,
+    allowed: preflight.allowed,
+    matchedRoles: [],
+    deniedRoles: preflight.allowed ? [] : roles,
+    source: "live",
+    reason: preflight.reason,
+  };
+}
+
+export async function frappe_safe_write(
+  args: Record<string, unknown>,
+  context: FrappeToolContext,
+): Promise<{
+  status: "approval_required" | "denied" | "executed";
+  operation: "create" | "update";
+  doctype: string;
+  preflight: { readonly allowed: boolean; readonly reason: string; readonly source: "frappe_api" };
+  proposedMutation: { readonly operation: "create" | "update"; readonly doctype: string; readonly docname?: string; readonly fields: string[]; readonly dryRun: boolean };
+  approvalGate: { readonly required: boolean; readonly approved: boolean; readonly approvalNote?: string; readonly instruction: string };
+  result?: { readonly created?: Record<string, unknown>; readonly updated?: Record<string, unknown> };
+  verification?: { readonly verified: boolean; readonly fetched?: Record<string, unknown>; readonly reason?: string };
+  evidenceLog: string[];
+} | FrappeError> {
+  const operation = argString(args, "operation") === "update" ? "update" : "create";
+  const doctype = argString(args, "doctype");
+  if (!doctype) return { error: 'frappe_safe_write requires a "doctype" argument.' };
+  const doc = args.doc;
+  if (typeof doc !== "object" || doc === null || Array.isArray(doc)) {
+    return { error: 'frappe_safe_write requires a "doc" object with proposed fields.' };
+  }
+  const docRecord = doc as Record<string, unknown>;
+  const auth = await resolveRuntimeAuth(args, context);
+  if ("error" in auth) return auth;
+  const permission = operation === "create" ? "create" : "write";
+  const evidenceLog = ["resolve_identity:ok"];
+  const preflightResult = await livePermissionPreflight(context, auth.siteUrl, auth.auth, doctype, permission, argString(args, "docname"));
+  const preflight = {
+    allowed: preflightResult.allowed,
+    reason: preflightResult.reason,
+    source: "frappe_api" as const,
+  };
+  evidenceLog.push(preflight.allowed ? "permission_preflight:allowed" : "permission_preflight:denied");
+  const proposedMutation = {
+    operation,
+    doctype,
+    docname: argString(args, "docname"),
+    fields: Object.keys(docRecord).sort(),
+    dryRun: !booleanArg(args.approved),
+  };
+  const approvalGate = {
+    required: true,
+    approved: booleanArg(args.approved),
+    approvalNote: argString(args, "approvalNote"),
+    instruction: "Re-run with approved=true only after the human user approves this exact mutation.",
+  };
+
+  if (!preflight.allowed) {
+    return {
+      status: "denied",
+      operation,
+      doctype,
+      preflight,
+      proposedMutation,
+      approvalGate,
+      evidenceLog,
+    };
+  }
+  if (!approvalGate.approved) {
+    evidenceLog.push("dry_run:proposal_only");
+    return {
+      status: "approval_required",
+      operation,
+      doctype,
+      preflight,
+      proposedMutation,
+      approvalGate,
+      evidenceLog,
+    };
+  }
+
+  const mutationPath = operation === "create"
+    ? `/api/resource/${encodeURIComponent(doctype)}`
+    : `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(proposedMutation.docname ?? "")}`;
+  if (operation === "update" && !proposedMutation.docname) {
+    return { error: 'frappe_safe_write update requires a "docname" argument.' };
+  }
+  const mutation = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, operation === "create" ? "POST" : "PUT", mutationPath, docRecord);
+  if (!mutation.ok) return mutation;
+  evidenceLog.push("execute_mutation:ok");
+  const returnedDoc = recordObject(mutation.data.data) ?? {};
+  const createdOrUpdatedName = recordString(returnedDoc, "name") ?? proposedMutation.docname;
+  let verification: { verified: boolean; fetched?: Record<string, unknown>; reason?: string };
+  if (createdOrUpdatedName) {
+    const fetched = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(createdOrUpdatedName)}`);
+    if (fetched.ok && recordObject(fetched.data.data)) {
+      verification = { verified: true, fetched: recordObject(fetched.data.data) };
+      evidenceLog.push("verify_result:ok");
+    } else {
+      verification = { verified: false, reason: fetched.ok ? "Frappe verification returned no document." : fetched.error };
+      evidenceLog.push("verify_result:failed");
+    }
+  } else {
+    verification = { verified: false, reason: "Frappe mutation returned no document name to verify." };
+    evidenceLog.push("verify_result:failed");
+  }
+
+  return {
+    status: "executed",
+    operation,
+    doctype,
+    preflight,
+    proposedMutation: { ...proposedMutation, dryRun: false },
+    approvalGate,
+    result: operation === "create" ? { created: returnedDoc } : { updated: returnedDoc },
+    verification,
+    evidenceLog,
+  };
+}
+
+export async function frappe_artifact_brief(
+  args: Record<string, unknown>,
+  context: FrappeToolContext,
+): Promise<{
+  id: string;
+  title: string;
+  format: string;
+  mimeType: string;
+  metadata: {
+    site: string;
+    user: string;
+    doctypes: string[];
+    permissionScope: unknown;
+    prompt: string;
+    dataQuery: unknown;
+    mode: "fixture" | "live";
+    generatedAt: string;
+  };
+  content: string;
+  evidence: string[];
+}> {
+  const mode = argString(args, "mode") === "live" ? "live" : "fixture";
+  const artifactType = argString(args, "artifactType") ?? "implementation_brief";
+  const format = argString(args, "format") ?? "markdown";
+  const site = argString(args, "site") ?? context.config.FRAPPE_SITE_URL ?? "fixture-site";
+  const user = argString(args, "user") ?? "fixture-user";
+  const prompt = argString(args, "prompt") ?? "";
+  const doctypes = stringList(args.doctypes);
+  const generatedAt = argString(args, "generatedAt") ?? new Date().toISOString();
+  const output = argString(args, "output") ?? "No output body was supplied.";
+  const metadata = {
+    site,
+    user,
+    doctypes,
+    permissionScope: args.permissionScope ?? {},
+    prompt,
+    dataQuery: args.dataQuery ?? {},
+    mode,
+    generatedAt,
+  };
+  return {
+    id: stableArtifactId(site, user, prompt, generatedAt),
+    title: `Frappe ${artifactType.replace(/_/g, " ")}`,
+    format,
+    mimeType: mimeTypeForArtifactFormat(format),
+    metadata,
+    content: [
+      `# Frappe ${artifactType.replace(/_/g, " ")}`,
+      "",
+      `Site: ${site}`,
+      `User: ${user}`,
+      `DocTypes: ${doctypes.length ? doctypes.join(", ") : "not specified"}`,
+      "",
+      output,
+    ].join("\n"),
+    evidence: [
+      `mode:${mode}`,
+      `site:${site}`,
+      `user:${user}`,
+      `doctypes:${doctypes.join(",")}`,
+      "permission_scope:attached",
+      "prompt:attached",
+      "output:attached",
+    ],
+  };
+}
+
 /** Loader entrypoint contract: tools record, registered as frappe-federated-bridge__<name>. */
 export const tools = {
   frappe_identity_resolve,
@@ -519,6 +1048,12 @@ export const tools = {
   frappe_context_build,
   frappe_installed_context,
   frappe_module_context,
+  frappe_site_induction,
+  frappe_query_classify,
+  frappe_hybrid_retrieve,
+  frappe_permission_check,
+  frappe_safe_write,
+  frappe_artifact_brief,
 };
 
 function modulePrior(module: string, apps: string[], doctypes: string[], concepts: string[]): FrappeModuleContext {
@@ -571,6 +1106,23 @@ function extractInstalledApps(data: Record<string, unknown>): string[] {
   return [];
 }
 
+function extractAppVersions(data: Record<string, unknown>): Record<string, string> {
+  const message = data.message;
+  if (typeof message !== "object" || message === null) return {};
+  const versions: Record<string, string> = {};
+  for (const [app, value] of Object.entries(message as Record<string, unknown>)) {
+    if (typeof value === "string") {
+      versions[app] = value;
+    } else if (typeof value === "object" && value !== null) {
+      const version = (value as Record<string, unknown>).version;
+      versions[app] = typeof version === "string" ? version : "installed";
+    } else {
+      versions[app] = "installed";
+    }
+  }
+  return versions;
+}
+
 function extractWorkspaceModules(data: Record<string, unknown>): string[] {
   const message = data.message;
   const source = Array.isArray(message) ? message : Array.isArray((message as Record<string, unknown> | undefined)?.pages) ? (message as { pages: unknown[] }).pages : [];
@@ -606,4 +1158,479 @@ async function frappeList(
     return [];
   }
   return Array.isArray(result.data.data) ? result.data.data : [];
+}
+
+async function frappeGetResource(
+  context: FrappeToolContext,
+  siteUrl: string,
+  auth: FrappeAuth,
+  doctype: string,
+  name: string,
+  warnings: string[],
+): Promise<Record<string, unknown> | undefined> {
+  if (typeof context.fetch !== "function") {
+    warnings.push(`${doctype} ${name} unavailable: network permission was not granted`);
+    return undefined;
+  }
+  const result = await frappeAuthedRequest(context.fetch, siteUrl, auth, "GET", `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(name)}`);
+  if (!result.ok) {
+    warnings.push(`${doctype} ${name} unavailable: ${result.error}`);
+    return undefined;
+  }
+  return recordObject(result.data.data);
+}
+
+async function discoverDoctypeNames(
+  context: FrappeToolContext,
+  siteUrl: string,
+  auth: FrappeAuth,
+  modules: readonly string[],
+  warnings: string[],
+): Promise<string[]> {
+  const filters = modules.length ? [["module", "in", modules]] : [];
+  const rows = await frappeList(context, siteUrl, auth, "DocType", ["name", "module", "custom", "istable"], filters, 200, warnings);
+  return uniqueSorted(rows.flatMap((row) => recordString(row, "name") ?? []));
+}
+
+function normalizeDoctype(raw: Record<string, unknown>): FrappeDocTypeIndex {
+  const fields = Array.isArray(raw.fields) ? raw.fields.map(normalizeField).filter((field): field is FrappeDocFieldIndex => Boolean(field.fieldname)) : [];
+  const permissions = Array.isArray(raw.permissions) ? raw.permissions.map(normalizePermission).filter((permission): permission is FrappePermissionIndex => Boolean(permission.role)) : [];
+  return {
+    name: recordString(raw, "name") ?? "Unknown DocType",
+    module: recordString(raw, "module"),
+    custom: booleanLike(raw.custom),
+    istable: booleanLike(raw.istable),
+    autoname: recordString(raw, "autoname"),
+    fields,
+    links: fields
+      .filter((field) => field.fieldtype === "Link" && field.options)
+      .map((field) => ({ fieldname: field.fieldname, target: field.options as string })),
+    childTables: fields
+      .filter((field) => ["Table", "Table MultiSelect"].includes(field.fieldtype ?? "") && field.options)
+      .map((field) => ({ fieldname: field.fieldname, target: field.options as string })),
+    namingSeries: extractNamingSeries(raw, fields),
+    permissions,
+  };
+}
+
+function normalizeField(raw: unknown): FrappeDocFieldIndex {
+  const record = recordObject(raw) ?? {};
+  return {
+    fieldname: recordString(record, "fieldname") ?? "",
+    label: recordString(record, "label"),
+    fieldtype: recordString(record, "fieldtype"),
+    options: recordString(record, "options"),
+    reqd: booleanLike(record.reqd),
+    hidden: booleanLike(record.hidden),
+    permlevel: numberLike(record.permlevel),
+  };
+}
+
+function normalizePermission(raw: unknown): FrappePermissionIndex {
+  const record = recordObject(raw) ?? {};
+  return {
+    role: recordString(record, "role") ?? "",
+    read: booleanLike(record.read),
+    write: booleanLike(record.write),
+    create: booleanLike(record.create),
+    delete: booleanLike(record.delete),
+    submit: booleanLike(record.submit),
+    cancel: booleanLike(record.cancel),
+    amend: booleanLike(record.amend),
+    select: booleanLike(record.select),
+    report: booleanLike(record.report),
+    export: booleanLike(record.export),
+    import: booleanLike(record.import),
+    print: booleanLike(record.print),
+    email: booleanLike(record.email),
+    share: booleanLike(record.share),
+  };
+}
+
+function extractNamingSeries(raw: Record<string, unknown>, fields: readonly FrappeDocFieldIndex[]): string[] {
+  const series = new Set<string>();
+  const namingField = fields.find((field) => field.fieldname === "naming_series");
+  if (namingField?.options) {
+    for (const option of namingField.options.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) series.add(option);
+  }
+  const autoname = recordString(raw, "autoname");
+  if (autoname && (autoname.includes("#") || autoname.includes(".YYYY."))) series.add(autoname);
+  return [...series];
+}
+
+function flattenPermissions(doctypes: readonly FrappeDocTypeIndex[]): Array<{ doctype: string; role: string; permission: FrappePermissionName; allowed: boolean }> {
+  return doctypes.flatMap((doctype) => doctype.permissions.flatMap((permission) => {
+    const role = permission.role;
+    return PERMISSION_NAMES.map((name) => ({
+      doctype: doctype.name,
+      role,
+      permission: name,
+      allowed: permission[name] === true,
+    }));
+  }));
+}
+
+function buildFrappeGraph(input: {
+  readonly site: string;
+  readonly apps: readonly string[];
+  readonly modules: readonly string[];
+  readonly doctypes: readonly FrappeDocTypeIndex[];
+  readonly roles: readonly string[];
+  readonly workflows: readonly unknown[];
+  readonly reports: readonly unknown[];
+  readonly customFields: readonly unknown[];
+  readonly propertySetters: readonly unknown[];
+}): FrappeGraph {
+  const nodes = new Map<string, { id: string; type: string; label: string }>();
+  const edges: Array<{ from: string; to: string; type: string; label?: string }> = [];
+  const addNode = (id: string, type: string, label = id) => nodes.set(id, { id, type, label });
+  addNode(`site:${input.site}`, "site", input.site);
+  for (const app of input.apps) {
+    addNode(`app:${app}`, "app", app);
+    edges.push({ from: `site:${input.site}`, to: `app:${app}`, type: "site_app" });
+  }
+  for (const module of input.modules) {
+    addNode(`module:${module}`, "module", module);
+    edges.push({ from: `site:${input.site}`, to: `module:${module}`, type: "site_module" });
+  }
+  for (const role of input.roles) addNode(`role:${role}`, "role", role);
+  for (const doctype of input.doctypes) {
+    addNode(`doctype:${doctype.name}`, "doctype", doctype.name);
+    if (doctype.module) {
+      addNode(`module:${doctype.module}`, "module", doctype.module);
+      edges.push({ from: `module:${doctype.module}`, to: `doctype:${doctype.name}`, type: "module_doctype" });
+    }
+    for (const field of doctype.fields) {
+      addNode(`field:${doctype.name}.${field.fieldname}`, "field", field.label ?? field.fieldname);
+      edges.push({ from: `doctype:${doctype.name}`, to: `field:${doctype.name}.${field.fieldname}`, type: "doctype_field", label: field.fieldtype });
+    }
+    for (const link of doctype.links) {
+      addNode(`doctype:${link.target}`, "doctype", link.target);
+      edges.push({ from: `doctype:${doctype.name}`, to: link.target, type: "doctype_link", label: link.fieldname });
+    }
+    for (const table of doctype.childTables) {
+      addNode(`doctype:${table.target}`, "doctype", table.target);
+      edges.push({ from: `doctype:${doctype.name}`, to: `doctype:${table.target}`, type: "doctype_child_table", label: table.fieldname });
+    }
+    for (const permission of doctype.permissions) {
+      addNode(`role:${permission.role}`, "role", permission.role);
+      edges.push({ from: `role:${permission.role}`, to: `doctype:${doctype.name}`, type: "role_permission" });
+    }
+  }
+  addCustomizationGraphNodes(input.customFields, "custom_field", "dt", nodes, edges);
+  addCustomizationGraphNodes(input.propertySetters, "property_setter", "doc_type", nodes, edges);
+  addDocumentTypeResourceNodes(input.workflows, "workflow", "document_type", nodes, edges);
+  addDocumentTypeResourceNodes(input.reports, "report", "ref_doctype", nodes, edges);
+  return { nodes: [...nodes.values()], edges };
+}
+
+function addCustomizationGraphNodes(
+  rows: readonly unknown[],
+  type: string,
+  doctypeKey: string,
+  nodes: Map<string, { id: string; type: string; label: string }>,
+  edges: Array<{ from: string; to: string; type: string; label?: string }>,
+): void {
+  for (const row of rows) {
+    const name = recordString(row, "name");
+    const doctype = recordString(row, doctypeKey);
+    if (!name || !doctype) continue;
+    nodes.set(`${type}:${name}`, { id: `${type}:${name}`, type, label: name });
+    edges.push({ from: `${type}:${name}`, to: `doctype:${doctype}`, type: `${type}_target` });
+  }
+}
+
+function addDocumentTypeResourceNodes(
+  rows: readonly unknown[],
+  type: string,
+  doctypeKey: string,
+  nodes: Map<string, { id: string; type: string; label: string }>,
+  edges: Array<{ from: string; to: string; type: string; label?: string }>,
+): void {
+  for (const row of rows) {
+    const name = recordString(row, "name");
+    const doctype = recordString(row, doctypeKey);
+    if (!name) continue;
+    nodes.set(`${type}:${name}`, { id: `${type}:${name}`, type, label: name });
+    if (doctype) edges.push({ from: `${type}:${name}`, to: `doctype:${doctype}`, type: `${type}_doctype` });
+  }
+}
+
+const PERMISSION_NAMES: readonly FrappePermissionName[] = ["read", "write", "create", "delete", "submit", "cancel", "amend", "select", "report", "export", "import", "print", "email", "share"];
+
+function classifyFrappePrompt(prompt: string): FrappeQueryClass {
+  const text = prompt.toLowerCase();
+  if (/\b(pdf|pptx?|deck|excel|xlsx|workbook|artifact|generate|export)\b/.test(text) && /\b(summary|brief|report|audit|matrix|dictionary|deck|pdf|excel|xlsx|pptx?)\b/.test(text)) return "artifact_generation";
+  if (/\b(role-safe|management summary|executive summary|cto|cfo|leadership)\b/.test(text)) return "role_safe_management_summary";
+  if (/\b(migration|migrate|upgrade|patch|custom app|custom_app|impact)\b/.test(text)) return "migration_custom_app_impact";
+  if (/\b(why|can't|cannot|error|failed|failing|blocked|not allowed|won't save|save)\b/.test(text)) return "troubleshooting";
+  if (/\b(?:docs?|documentation|manual|guide|how do i|api reference)\b/.test(text)) return "docs";
+  if (/\b(?:installed apps?|apps present|which apps|app versions?)\b/.test(text)) return "installed_app";
+  if (/\b(?:workflow|transition|state|approve|approval)\b/.test(text)) return "workflow";
+  if (/\b(?:permissions?|roles?|allowed|access|can .* read|can .* write|deny|denied)\b/.test(text)) return "permission";
+  if (/\b(?:report|dashboard|print format|number card|chart)\b/.test(text)) return "report";
+  if (/\b(?:custom fields?|property setters?|client scripts?|server scripts?|customizations?|customisations?|script)\b/.test(text)) return "customization";
+  if (/\b(?:create|add|new|draft|insert)\b/.test(text)) return "record_creation";
+  if (/\b(?:update|change|set|edit|modify|submit|cancel)\b/.test(text)) return "record_update";
+  if (/\b(?:find|list|lookup|look up|show|get|fetch|open)\b/.test(text)) return "record_lookup";
+  if (/\b(?:fields?|labels?|fieldtypes?|options|links?|child tables?|naming series)\b/.test(text)) return "field";
+  return "schema";
+}
+
+function candidateClasses(prompt: string): Array<{ class: FrappeQueryClass; confidence: number; reason: string }> {
+  const primary = classifyFrappePrompt(prompt);
+  const classes: Array<{ class: FrappeQueryClass; confidence: number; reason: string }> = [{ class: primary, confidence: 0.88, reason: "Matched Frappe-specific prompt terms." }];
+  const text = prompt.toLowerCase();
+  for (const candidate of QUERY_CLASS_ORDER) {
+    if (candidate === primary) continue;
+    const strategy = retrievalStrategyFor(candidate);
+    const token = candidate.replace(/_/g, " ");
+    if (text.includes(token.split(" ")[0] ?? token)) classes.push({ class: candidate, confidence: 0.45, reason: `Secondary hint for ${candidate}.` });
+    if (classes.length >= 3) break;
+    void strategy;
+  }
+  return classes;
+}
+
+const QUERY_CLASS_ORDER: readonly FrappeQueryClass[] = [
+  "schema",
+  "field",
+  "permission",
+  "workflow",
+  "report",
+  "customization",
+  "installed_app",
+  "docs",
+  "record_lookup",
+  "record_creation",
+  "record_update",
+  "artifact_generation",
+  "troubleshooting",
+  "migration_custom_app_impact",
+  "role_safe_management_summary",
+];
+
+function retrievalStrategyFor(queryClass: FrappeQueryClass): string[] {
+  switch (queryClass) {
+    case "schema":
+      return ["DocType metadata", "DocField list", "Link and child-table graph", "module priors"];
+    case "field":
+      return ["DocType metadata", "DocField exact/label search", "Custom Field overlay", "Property Setter overlay"];
+    case "permission":
+      return ["role permission table", "DocPerm rows", "workflow role transitions", "blocked permission summary"];
+    case "workflow":
+      return ["Workflow document", "states", "transitions", "allowed role filter", "DocType permission overlay"];
+    case "report":
+      return ["Report by name/module", "reference DocType graph", "dashboard/print-format siblings"];
+    case "customization":
+      return ["Custom Field", "Property Setter", "Client Script", "Server Script", "target DocType graph"];
+    case "installed_app":
+      return ["version metadata", "installed app list", "workspace modules", "installed app docs"];
+    case "docs":
+      return ["Frappe/ERPNext docs", "Frappe Suite docs", "installed app README/docs", "module docs"];
+    case "record_lookup":
+      return ["intent DocType", "permission preflight", "resource list filters", "bounded rows"];
+    case "record_creation":
+      return ["write intent classification", "create permission preflight", "dry-run mutation proposal", "approval gate"];
+    case "record_update":
+      return ["write intent classification", "write permission preflight", "record fetch", "dry-run mutation diff", "approval gate"];
+    case "artifact_generation":
+      return ["DocType graph", "permission-scoped dataset", "artifact metadata", "delivery evidence"];
+    case "troubleshooting":
+      return ["screen/context errors", "DocType validation fields", "workflow state", "permission boundary", "exact Frappe error"];
+    case "migration_custom_app_impact":
+      return ["installed apps", "custom app DocTypes", "customizations", "scripts", "migration risk graph"];
+    case "role_safe_management_summary":
+      return ["role permissions", "allowed DocType summaries", "blocked-sensitive data", "executive-safe artifact"];
+  }
+}
+
+function memoryPolicyForPrompt(prompt: string, args: Record<string, unknown>): { recall: boolean; reason: string; candidateScopes: string[] } {
+  const text = prompt.toLowerCase();
+  const recall = /\b(previous|remember|again|my preference|last time|handoff|prior|recurring)\b/.test(text);
+  const scopes = [
+    ...stringList(args.memoryScopes),
+    ...stringList(args.user).map((user) => `user:${user}`),
+    ...stringList(args.site).map((site) => `tenant:${site}`),
+  ];
+  return {
+    recall,
+    reason: recall ? "Prompt references prior/personal Frappe context." : "Prompt is answerable from live or fixture Frappe context without scoped memory.",
+    candidateScopes: scopes,
+  };
+}
+
+function normalizeInductionArg(value: unknown): FrappeSiteInduction {
+  const record = recordObject(value) ?? {};
+  const site = recordObject(record.site) ?? {};
+  const customizations = recordObject(record.customizations) ?? {};
+  const doctypes = Array.isArray(record.doctypes) ? record.doctypes.map((doctype) => normalizeDoctype(recordObject(doctype) ?? {})) : [];
+  return {
+    site: {
+      url: recordString(site, "url") ?? "",
+      authMode: recordString(site, "authMode") === "admin_login" ? "admin_login" : "api_token",
+      identity: { user: recordString(recordObject(site.identity) ?? {}, "user") },
+      versions: recordObject(site.versions) as Record<string, string> | undefined ?? {},
+      installedApps: Array.isArray(site.installedApps) ? site.installedApps.map(String) : [],
+    },
+    modules: Array.isArray(record.modules) ? record.modules.map(String) : [],
+    workspaces: Array.isArray(record.workspaces) ? record.workspaces.map(String) : [],
+    doctypes,
+    roles: Array.isArray(record.roles) ? record.roles.map(String) : [],
+    permissions: Array.isArray(record.permissions) ? record.permissions as Array<{ doctype: string; role: string; permission: FrappePermissionName; allowed: boolean }> : flattenPermissions(doctypes),
+    workflows: Array.isArray(record.workflows) ? record.workflows : [],
+    reports: Array.isArray(record.reports) ? record.reports : [],
+    printFormats: Array.isArray(record.printFormats) ? record.printFormats : [],
+    dashboards: Array.isArray(record.dashboards) ? record.dashboards : [],
+    webForms: Array.isArray(record.webForms) ? record.webForms : [],
+    notificationRules: Array.isArray(record.notificationRules) ? record.notificationRules : [],
+    assignmentRules: Array.isArray(record.assignmentRules) ? record.assignmentRules : [],
+    customizations: {
+      customFields: Array.isArray(customizations.customFields) ? customizations.customFields : [],
+      propertySetters: Array.isArray(customizations.propertySetters) ? customizations.propertySetters : [],
+      clientScripts: Array.isArray(customizations.clientScripts) ? customizations.clientScripts : [],
+      serverScripts: Array.isArray(customizations.serverScripts) ? customizations.serverScripts : [],
+    },
+    docs: Array.isArray(record.docs) ? record.docs as FrappeDocSource[] : [],
+    graph: recordObject(record.graph) as FrappeGraph | undefined ?? { nodes: [], edges: [] },
+    evidence: Array.isArray(record.evidence) ? record.evidence.map(String) : [],
+    warnings: Array.isArray(record.warnings) ? record.warnings.map(String) : [],
+  };
+}
+
+function selectCandidateDoctypes(prompt: string, induction: FrappeSiteInduction): FrappeDocTypeIndex[] {
+  const text = prompt.toLowerCase();
+  const selected = induction.doctypes.filter((doctype) => {
+    const haystack = [
+      doctype.name,
+      doctype.module ?? "",
+      ...doctype.fields.flatMap((field) => [field.fieldname, field.label ?? "", field.options ?? ""]),
+    ].join(" ").toLowerCase();
+    return haystack.split(/\s+/).some((word) => word.length > 2 && text.includes(word)) || text.includes(doctype.name.toLowerCase());
+  });
+  return selected.length ? selected : induction.doctypes.slice(0, 3);
+}
+
+function fixturePermissionDecision(
+  induction: FrappeSiteInduction,
+  doctypeName: string,
+  permission: FrappePermissionName,
+  roles: readonly string[],
+): { allowed: boolean; matchedRoles: string[]; deniedRoles: string[] } {
+  const doctype = induction.doctypes.find((item) => item.name === doctypeName);
+  if (!doctype) return { allowed: false, matchedRoles: [], deniedRoles: [...roles] };
+  const matchedRoles: string[] = [];
+  const deniedRoles: string[] = [];
+  for (const role of roles) {
+    const row = doctype.permissions.find((permissionRow) => permissionRow.role === role || role === "All");
+    if (row?.[permission] === true) matchedRoles.push(role);
+    else deniedRoles.push(role);
+  }
+  return { allowed: matchedRoles.length > 0, matchedRoles, deniedRoles };
+}
+
+function filterByDoctypeLike(rows: readonly unknown[], doctypes: ReadonlySet<string>, keys: readonly string[]): unknown[] {
+  if (!doctypes.size) return [];
+  return rows.filter((row) => keys.some((key) => {
+    const value = recordString(row, key);
+    return value ? doctypes.has(value) : false;
+  }));
+}
+
+function docsForIntent(intent: FrappeQueryClass, docs: readonly FrappeDocSource[]): FrappeDocSource[] {
+  if (intent === "docs") return docs.slice(0, 8);
+  if (intent === "workflow") return docs.filter((doc) => /workflow/i.test(doc.label) || /workflow/i.test(doc.url)).slice(0, 4);
+  if (intent === "customization") return docs.filter((doc) => /custom/i.test(doc.label) || /custom/i.test(doc.url)).slice(0, 4);
+  return docs.slice(0, 3);
+}
+
+function safeActionOptionsFor(intent: FrappeQueryClass, doctypes: readonly string[]): string[] {
+  if (intent === "record_creation") return doctypes.map((doctype) => `Propose create for ${doctype}, then require approval before POST.`);
+  if (intent === "record_update") return doctypes.map((doctype) => `Fetch ${doctype}, propose diff, then require approval before PUT.`);
+  if (intent === "artifact_generation") return doctypes.map((doctype) => `Build permission-scoped artifact data from ${doctype}.`);
+  return doctypes.map((doctype) => `Read-only context packet for ${doctype}.`);
+}
+
+async function livePermissionPreflight(
+  context: FrappeToolContext,
+  siteUrl: string,
+  auth: FrappeAuth,
+  doctype: string,
+  permission: FrappePermissionName,
+  docname?: string,
+): Promise<{ allowed: boolean; reason: string }> {
+  if (typeof context.fetch !== "function") return { allowed: false, reason: "No network access for Frappe permission preflight." };
+  const query = new URLSearchParams({ doctype, ptype: permission, perm_type: permission });
+  if (docname) query.set("docname", docname);
+  const result = await frappeAuthedRequest(context.fetch, siteUrl, auth, "GET", `/api/method/frappe.client.has_permission?${query.toString()}`);
+  if (!result.ok) return { allowed: false, reason: `Frappe permission preflight failed: ${result.error}` };
+  const message = result.data.message;
+  const allowed = message === true || message === 1 || message === "true" || (typeof message === "object" && message !== null && booleanLike((message as Record<string, unknown>).has_permission));
+  return {
+    allowed,
+    reason: allowed ? `Frappe allowed ${permission} on ${doctype}.` : `Frappe denied ${permission} on ${doctype}.`,
+  };
+}
+
+function permissionName(value: string): FrappePermissionName {
+  const normalized = value === "update" ? "write" : value;
+  return (PERMISSION_NAMES as readonly string[]).includes(normalized) ? normalized as FrappePermissionName : "read";
+}
+
+function mimeTypeForArtifactFormat(format: string): string {
+  switch (format.toLowerCase()) {
+    case "pdf":
+      return "application/pdf";
+    case "docx":
+      return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    case "pptx":
+      return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    case "xlsx":
+      return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    case "markdown":
+    case "md":
+    default:
+      return "text/markdown";
+  }
+}
+
+function stableArtifactId(site: string, user: string, prompt: string, generatedAt: string): string {
+  const seed = `${site}|${user}|${prompt}|${generatedAt}`;
+  let hash = 0;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash = (hash * 31 + seed.charCodeAt(index)) >>> 0;
+  }
+  return `frappe-artifact-${hash.toString(16).padStart(8, "0")}`;
+}
+
+function recordObject(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function recordString(value: unknown, key: string): string | undefined {
+  const record = recordObject(value);
+  const item = record?.[key];
+  return typeof item === "string" && item.trim() ? item.trim() : undefined;
+}
+
+function numberLike(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
+  return undefined;
+}
+
+function positiveInteger(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function booleanLike(value: unknown): boolean {
+  return value === true || value === 1 || value === "1" || value === "true" || value === "yes";
+}
+
+function booleanArg(value: unknown): boolean {
+  return value === true || value === "true" || value === 1 || value === "1";
+}
+
+function uniqueSorted(values: Iterable<string>): string[] {
+  return [...new Set([...values].map((value) => value.trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
 }

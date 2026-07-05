@@ -44,6 +44,62 @@ test("stdio handshake, tool listing with namespacing, include/exclude filters", 
   handle.close();
 });
 
+test("stdio env and arg templates resolve at process start without storing secrets in config", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-mcp-runtime-env-"));
+  const previous = {
+    MCP_TOKEN: process.env.MCP_TOKEN,
+    MCP_FALLBACK_TOKEN: process.env.MCP_FALLBACK_TOKEN,
+    MCP_ARG_SECRET: process.env.MCP_ARG_SECRET,
+  };
+  process.env.MCP_FALLBACK_TOKEN = "runtime-token";
+  process.env.MCP_ARG_SECRET = "runtime-arg-secret";
+  delete process.env.MCP_TOKEN;
+  const INSPECT_SERVER = `
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", serverInfo: { name: "inspect" } } });
+  else if (msg.method === "tools/list") send({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "inspect" }] } });
+  else if (msg.method === "tools/call") send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: JSON.stringify({ token: process.env.MCP_TOKEN, literal: process.env.MCP_LITERAL, cwd: process.env.MCP_CWD, args: process.argv.slice(1) }) }] } });
+});
+`;
+  const config = {
+    transport: {
+      kind: "stdio" as const,
+      command: process.execPath,
+      args: ["-e", INSPECT_SERVER, "${MCP_ARG_SECRET}", "${CWD}"],
+      env: {
+        MCP_TOKEN: "MCP_TOKEN|MCP_FALLBACK_TOKEN",
+        MCP_LITERAL: "literal-value",
+        MCP_CWD: "${CWD}",
+      },
+    },
+  };
+  assert.equal(JSON.stringify(config).includes("runtime-token"), false);
+  assert.equal(JSON.stringify(config).includes("runtime-arg-secret"), false);
+  try {
+    const handle = await connectMcpServer("inspect", config, cwd);
+    assert.equal(handle.status, "ready");
+    const result = await handle.call("inspect", {});
+    assert.equal(result.ok, true);
+    const inspected = JSON.parse(result.content) as { token: string; literal: string; cwd: string; args: string[] };
+    assert.equal(inspected.token, "runtime-token");
+    assert.equal(inspected.literal, "literal-value");
+    assert.equal(inspected.cwd, cwd);
+    assert.deepEqual(inspected.args.slice(-2), ["runtime-arg-secret", cwd]);
+    handle.close();
+  } finally {
+    if (previous.MCP_TOKEN === undefined) delete process.env.MCP_TOKEN;
+    else process.env.MCP_TOKEN = previous.MCP_TOKEN;
+    if (previous.MCP_FALLBACK_TOKEN === undefined) delete process.env.MCP_FALLBACK_TOKEN;
+    else process.env.MCP_FALLBACK_TOKEN = previous.MCP_FALLBACK_TOKEN;
+    if (previous.MCP_ARG_SECRET === undefined) delete process.env.MCP_ARG_SECRET;
+    else process.env.MCP_ARG_SECRET = previous.MCP_ARG_SECRET;
+  }
+});
+
 test("oversized results are capped through the persistence pipeline (stub + result_fetch)", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-mcp-cap-"));
   const handle = await connectMcpServer("fake", stdioConfig({ limits: { maxResultChars: 1000 } }), cwd);
