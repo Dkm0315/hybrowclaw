@@ -11,6 +11,7 @@ import {
   listBuiltinMcpServers,
   listBuiltinPlugins,
   loadConfig,
+  rosterMcpConfigFromCatalogEntry,
   saveConfig,
   setRuntimeProvider,
   type McpServerConfig,
@@ -154,7 +155,7 @@ const steps: readonly Step[] = [
     body: "Pick channels separately. Each surface has a different auth model and setup window.",
     choices: [
       choice("google-chat", "Google Chat", "Workspace bot endpoint, signing secret, and app authentication.", "workspace", "cyan", "Workspace bots are powerful; start with mentioned spaces before broad visibility.", controls("Reply mode", "Draft first", "Visibility", "Mentioned spaces"), channelFields("google-chat")),
-      choice("slack", "Slack", "Bot token, signing secret, app-level token, and channel install.", "bot", "lavender", "Draft-first keeps humans in control; auto-reply should be limited to low-risk channels.", controls("Reply mode", "Draft first", "Visibility", "Selected channels"), channelFields("slack")),
+      choice("slack", "Slack", "Bot token, app-level token, and Socket Mode install.", "bot", "lavender", "Draft-first keeps humans in control; auto-reply should be limited to low-risk channels.", controls("Reply mode", "Draft first", "Visibility", "Selected channels"), channelFields("slack")),
       choice("teams", "Microsoft Teams", "Bot app ID, tenant ID, client secret, and Teams app package.", "enterprise", "peach", "Teams setup benefits from explicit tenant and org install choices.", controls("Reply mode", "Manual first", "Install scope", "Team")),
       choice("whatsapp", "WhatsApp", "Business phone ID, access token, verify token, and webhook secret.", "business", "lime", "WhatsApp should default to human-reviewed drafts for customer-facing messages.", controls("Reply mode", "Draft first", "Visibility", "Selected numbers"), channelFields("whatsapp")),
       choice("discord", "Discord", "Bot token, application ID, public key, and guild/channel defaults.", "community", "lavender", "Discord can move fast; selected guild/channel scope prevents surprise reach.", controls("Reply mode", "Draft first", "Visibility", "Selected channels"), channelFields("discord")),
@@ -198,8 +199,8 @@ function channelFields(id: string): readonly Field[] {
   const fields: Record<string, readonly Field[]> = {
     slack: [
       { label: "Bot token/env", placeholder: "SLACK_BOT_TOKEN" },
-      { label: "Signing secret", placeholder: "SLACK_SIGNING_SECRET" },
       { label: "App token/env", placeholder: "SLACK_APP_TOKEN" },
+      { label: "HTTP fallback secret", placeholder: "SLACK_SIGNING_SECRET" },
     ],
     whatsapp: [
       { label: "Phone number ID", placeholder: "WHATSAPP_PHONE_NUMBER_ID" },
@@ -244,8 +245,14 @@ export async function runMusterOnboardingTui(args: readonly string[] = [], optio
   emitKeypressEvents(input);
   const wasRaw = input.isRaw;
   input.setRawMode(true);
-  output.write("\x1b[?25l");
-  const render = () => output.write(`\x1b[2J\x1b[H${renderOnboarding(state, width, useColor)}`);
+  output.write("\x1b[?1049h\x1b[?25l");
+  let lastFrame = "";
+  const render = () => {
+    const frame = renderOnboarding(state, width, useColor);
+    if (frame === lastFrame) return;
+    lastFrame = frame;
+    output.write(`\x1b[H\x1b[2J${frame}\x1b[J`);
+  };
   render();
   const result = await new Promise<{ saved: boolean; handoffToChat: boolean }>((resolve) => {
     const onKeypress = async (_chunk: string, key: { name?: string; ctrl?: boolean }) => {
@@ -259,11 +266,12 @@ export async function runMusterOnboardingTui(args: readonly string[] = [], optio
         resolve({ saved: false, handoffToChat: false });
         return;
       }
+      let handled = true;
       if (key.name === "up") moveCursor(state, -1);
-      if (key.name === "down") moveCursor(state, 1);
-      if (key.name === "space") toggleCurrent(state);
-      if (key.name === "escape") back(state);
-      if (key.name === "return" || key.name === "enter") {
+      else if (key.name === "down") moveCursor(state, 1);
+      else if (key.name === "space") toggleCurrent(state);
+      else if (key.name === "escape") back(state);
+      else if (key.name === "return" || key.name === "enter") {
         if (currentStep(state).id === "finish") {
           state.applied = await applyOnboardingProfile(state, cwd);
           state.saved = true;
@@ -274,13 +282,15 @@ export async function runMusterOnboardingTui(args: readonly string[] = [], optio
         } else {
           next(state);
         }
+      } else {
+        handled = false;
       }
-      render();
+      if (handled) render();
     };
     const cleanup = () => {
       input.off("keypress", onKeypress);
       input.setRawMode(wasRaw);
-      output.write("\x1b[?25h\n");
+      output.write("\x1b[?25h\x1b[?1049l\n");
     };
     input.on("keypress", onKeypress);
   });
@@ -345,7 +355,8 @@ function renderChoices(step: Step, state: OnboardingState, width: number, useCol
     const focused = index === state.cursor;
     const marker = checked ? "✓" : "◇";
     const text = `${marker} ${item.label.padEnd(24)} ${item.badge.padEnd(14)} ${item.detail}`;
-    rows.push(frame(focused ? paint(` ${truncate(text, width - 8)} `, "selection", useColor) : `${paint(marker, item.tone, useColor)} ${paint(item.label.padEnd(24), "text", useColor)} ${paint(item.badge.padEnd(14), item.tone, useColor)} ${paint(truncate(item.detail, width - 48), "dim", useColor)}`, width, useColor));
+    const selectedRow = truncate(` ${text}`, width - 4).padEnd(width - 4);
+    rows.push(frame(focused ? paint(selectedRow, "selection", useColor) : `${paint(marker, item.tone, useColor)} ${paint(item.label.padEnd(24), "text", useColor)} ${paint(item.badge.padEnd(14), item.tone, useColor)} ${paint(truncate(item.detail, width - 48), "dim", useColor)}`, width, useColor));
   }
   return rows;
 }
@@ -558,7 +569,7 @@ async function applyChannelSelections(state: OnboardingState, cwd: string, confi
   let gateway: GatewayConfig = result.config;
   const entries: Array<[string, SetupAction]> = [
     ["google-chat", { kind: "channel", id: "gchat", label: "Google Chat app", command: "muster channels setup gchat --public-url https://your-domain.example", url: "https://console.cloud.google.com/apis/library/chat.googleapis.com", env: ["GOOGLE_CHAT_SIGNING_SECRET"], note: "Gateway token is initialized; add the public webhook URL in Google Chat app setup." }],
-    ["slack", { kind: "channel", id: "slack", label: "Slack app", command: "muster channels setup slack --bot-token-env SLACK_BOT_TOKEN --signing-secret-env SLACK_SIGNING_SECRET --public-url https://your-domain.example", url: "https://api.slack.com/apps", env: ["SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET"], note: "Create a Slack app, set env vars, then run the setup command to persist verified secrets." }],
+    ["slack", { kind: "channel", id: "slack", label: "Slack app", command: "muster channels setup slack --bot-token-env SLACK_BOT_TOKEN --app-token-env SLACK_APP_TOKEN", url: "https://api.slack.com/apps", env: ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"], note: "Create a Slack app, enable Socket Mode, set env vars, then run the setup command. HTTP webhook mode remains available with --mode http." }],
     ["teams", { kind: "channel", id: "teams", label: "Microsoft Teams app", command: "muster channels setup teams --hmac-secret-env TEAMS_HMAC_SECRET --public-url https://your-domain.example", url: "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade", env: ["TEAMS_HMAC_SECRET"], note: "Register the bot/app, then add the gateway webhook URL." }],
     ["whatsapp", { kind: "channel", id: "whatsapp", label: "WhatsApp Cloud API", command: "muster channels setup whatsapp --access-token-env WHATSAPP_ACCESS_TOKEN --verify-token-env WHATSAPP_VERIFY_TOKEN --phone-number-id-env WHATSAPP_PHONE_NUMBER_ID --public-url https://your-domain.example", url: "https://developers.facebook.com/docs/whatsapp/cloud-api/get-started", env: ["WHATSAPP_ACCESS_TOKEN", "WHATSAPP_VERIFY_TOKEN", "WHATSAPP_PHONE_NUMBER_ID"], note: "Meta credentials are not stored until env vars are present and setup is run." }],
     ["discord", { kind: "channel", id: "discord", label: "Discord interactions", command: "muster channels setup discord --bot-token-env DISCORD_BOT_TOKEN --public-key-env DISCORD_PUBLIC_KEY --public-url https://your-domain.example", url: "https://discord.com/developers/applications", env: ["DISCORD_BOT_TOKEN", "DISCORD_PUBLIC_KEY"], note: "Configure the Discord interaction endpoint to the gateway URL." }],
@@ -698,47 +709,7 @@ function setupEnv(entry: { readonly requiresEnv?: readonly string[]; readonly re
 }
 
 function mcpConfigFromCatalogEntry(entry: ReturnType<typeof listBuiltinMcpServers>[number], cwd: string): McpServerConfig | undefined {
-  if (!entry.install) return undefined;
-  const install = entry.install;
-  if (install.transport.kind === "stdio" && install.transport.args?.some((arg) => arg.includes("${") && !resolveMcpInstallTemplate(arg, cwd))) return undefined;
-  const transport = install.transport.kind === "http"
-    ? {
-        kind: "http" as const,
-        url: resolveMcpInstallTemplate(install.transport.url, cwd) ?? install.transport.url,
-        ...(install.transport.headers ? { headers: resolveMcpInstallRecord(install.transport.headers, cwd) } : {}),
-      }
-    : {
-        kind: "stdio" as const,
-        command: install.transport.command,
-        args: install.transport.args?.map((arg) => resolveMcpInstallTemplate(arg, cwd)).filter((arg): arg is string => Boolean(arg)),
-        ...(install.transport.env ? { env: resolveMcpInstallRecord(install.transport.env, cwd) } : {}),
-      };
-  return {
-    transport,
-    ...(install.auth ? { auth: install.auth } : {}),
-    ...(install.oauth ? { oauth: install.oauth } : {}),
-    ...(install.tools ? { tools: install.tools } : {}),
-    ...(install.limits ? { limits: install.limits } : {}),
-  };
-}
-
-function resolveMcpInstallRecord(record: Readonly<Record<string, string>>, cwd: string): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(record)
-      .map(([key, value]) => [key, resolveMcpInstallTemplate(value, cwd)])
-      .filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0),
-  );
-}
-
-function resolveMcpInstallTemplate(value: string, cwd: string): string | undefined {
-  if (value === "${CWD}") return cwd;
-  const fullEnv = /^\$\{([A-Z_][A-Z0-9_]*)\}$/.exec(value);
-  if (fullEnv) return process.env[fullEnv[1]];
-  if (/^[A-Z_][A-Z0-9_]*(?:\|[A-Z_][A-Z0-9_]*)+$/.test(value)) {
-    return value.split("|").map((name) => process.env[name]).find((candidate): candidate is string => Boolean(candidate));
-  }
-  if (/^[A-Z_][A-Z0-9_]*$/.test(value) && process.env[value]) return process.env[value];
-  return value.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (_match, name: string) => process.env[name] ?? "");
+  return rosterMcpConfigFromCatalogEntry(entry, { cwd });
 }
 
 function safeConfigKey(value: string): string {

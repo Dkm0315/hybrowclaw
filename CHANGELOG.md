@@ -6,6 +6,40 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-07-05
+
+Muster 0.1.10 is the roster and integration-depth patch release. It turns the
+new integration catalog work into a production-grade release boundary, with
+explicit support depth, safer MCP activation, and artifact workflow verification
+kept separate from the earlier channel readiness train.
+
+### Added
+- Added Roster support-depth summaries across owned packs, channel adapters,
+  installable MCPs, host reuse, setup-plan-only entries, auth mode, source, risk,
+  and support class so integration gaps are visible before activation.
+- Added release-gate QA for roster support depth inside the channel/plugin setup
+  scorecard, including persisted roster matrix evidence in `catalog.json`.
+- Added `muster artifacts contract` and `muster artifacts verify` surfaces so
+  Office/PDF artifact workflows expose their contract, structural verifier, and
+  publish blockers directly from the CLI and integration workflow.
+
+### Changed
+- Hardened MCP activation so env-backed install specs validate required env vars
+  without writing raw secret values into `.muster/config.json`.
+- Resolved MCP stdio env and argument references at process start, preserving the
+  filtered-env boundary while keeping GitHub, Linear, Firecrawl, n8n, Postgres,
+  and other env-backed MCPs functional.
+- Reused the core roster MCP install resolver from onboarding so CLI and TUI
+  setup paths cannot drift or persist secrets differently.
+- Updated Artifact Studio integration guidance to run a real verified DOCX sample
+  and advertise artifact-specific next steps instead of generic plugin checks.
+
+### Fixed
+- Kept Telegram, Slack, and gateway behavior covered through the full gateway
+  regression suite while merging the roster/MCP/artifact release pass.
+- Fixed artifact-studio capability-loader expectations so declaration and
+  provider-led document workflow tools are treated as first-class exported tools.
+
 ## [0.1.9] - 2026-06-29
 
 Muster 0.1.9 is the Office artifacts and integration-readiness point release.
@@ -64,6 +98,43 @@ before the next heavier workflow release.
   ledger, browser automation, Frappe, and ERPNext.
 - Expanded sitemap and `llms.txt` to include guide and integration landing
   pages.
+
+## [0.1.9] - 2026-07-01
+
+Muster 0.1.9 deepens channel/operator setup and hardens live adapter behavior
+for Telegram, Slack, Google Chat, Discord, WhatsApp, Teams, and web embeds.
+
+### Added
+- Added `muster channels ready <channel>` as the single-command channel setup
+  path: it initializes gateway config, stores credentials without echoing
+  secrets, runs channel doctor checks, starts or prints the daemon command, and
+  runs a local sample simulation.
+- Added background gateway daemon management with
+  `muster gateway daemon start|stop|status|restart`, including Telegram
+  long-poll support through `--with-telegram-poll`.
+- Added explicit Telegram webhook registration as an advanced opt-in command:
+  `muster gateway webhook telegram --public-url https://...`.
+- Added delivery idempotency for adapter retries so Slack, Discord, WhatsApp,
+  Google Chat, Teams, and Telegram retries do not double-send replies or spend
+  tokens twice after successful processing.
+
+### Changed
+- Telegram setup now defaults to Hermes/OpenClaw-style background long polling:
+  a bot name and bot token are enough for the normal path; public HTTPS
+  webhooks are optional.
+- Channel catalogs, plugin setup guidance, integration workflows, and capability
+  packs now point users to `muster channels ready ...` instead of a multi-step
+  manual setup path.
+- Slack, Google Chat, Discord, WhatsApp, and Teams setup guidance now states the
+  exact required credentials and keeps the current adapter scope honest.
+
+### Fixed
+- Google Chat and Teams authentication failures now return HTTP 401 instead of
+  generic server errors.
+- WhatsApp POST webhooks require and verify Meta app-secret signatures when
+  configured, with tests covering unsigned and signed requests.
+- Slack and WhatsApp retry deliveries are cached after platform auth so
+  duplicate platform retries do not duplicate outbound sends.
 
 ## [0.1.8] - 2026-06-27
 

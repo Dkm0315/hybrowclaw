@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { inspectCapabilityManifest, inspectCapabilityPack } from "../src/index.js";
+import { computeCapabilityEntrypointDigest, inspectCapabilityManifest, inspectCapabilityPack } from "../src/index.js";
 
 test("inspectCapabilityManifest accepts a safe read-only skill manifest", () => {
   const result = inspectCapabilityManifest("/tmp/example", {
@@ -144,7 +145,8 @@ test("capability readiness rejects unknown levels and unsafe secret redaction", 
 test("inspectCapabilityPack blocks a manifest whose entrypoint digest does not match", async () => {
   const dir = join(tmpdir(), `muster-capability-digest-${Date.now()}`);
   await mkdir(dir, { recursive: true });
-  await writeFile(join(dir, "index.js"), "export const tools = { noop: async () => ({ ok: true }) };\n", "utf8");
+  const entrypoint = "export const tools = { noop: async () => ({ ok: true }) };\n";
+  await writeFile(join(dir, "index.js"), entrypoint, "utf8");
   await writeFile(
     join(dir, "muster.capability.json"),
     `${JSON.stringify({
@@ -166,4 +168,5 @@ test("inspectCapabilityPack blocks a manifest whose entrypoint digest does not m
 
   assert.equal(result.status, "blocked");
   assert.match(result.blockers.join("\n"), /digest mismatch/);
+  assert.equal(await computeCapabilityEntrypointDigest(dir, { entrypoint: "index.js" }), `sha256:${createHash("sha256").update(entrypoint).digest("hex")}`);
 });

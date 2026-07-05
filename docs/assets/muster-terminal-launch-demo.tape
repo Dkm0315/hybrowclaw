@@ -36,7 +36,7 @@ Sleep 5s
 Ctrl+L
 Sleep 700ms
 
-Type "muster channels setup slack --bot-token-env SLACK_BOT_TOKEN --signing-secret-env SLACK_SIGNING_SECRET --public-url https://agent.example.com"
+Type "muster channels setup slack --bot-token-env SLACK_BOT_TOKEN --app-token-env SLACK_APP_TOKEN"
 Enter
 Sleep 3.4s
 

@@ -31,7 +31,7 @@ function publicBase(args: Record<string, unknown>, gateway?: GatewayLike): strin
 }
 
 function ready(gateway: GatewayLike | undefined, context: ChannelContext): boolean {
-  return Boolean(gateway?.gchat || context.config.GOOGLE_CHAT_VERIFICATION_TOKEN);
+  return Boolean(gateway?.gchat?.verificationToken || context.config.GOOGLE_CHAT_VERIFICATION_TOKEN);
 }
 
 export async function google_chat_setup_plan(args: Record<string, unknown>, context: ChannelContext) {
@@ -48,16 +48,16 @@ export async function google_chat_setup_plan(args: Record<string, unknown>, cont
       "A deployed Muster gateway URL reachable by Google Chat over HTTPS.",
       "Google Chat API enabled in the target Google Cloud project.",
       "A Google Chat app configured to send events to the Muster webhook URL.",
-      "Optional verification token configured in Google Cloud and Muster when you want shared-secret validation.",
+      "Verification token configured in Google Cloud and Muster so Google Chat can authenticate without Muster's gateway bearer token.",
     ],
     commands: [
       "muster gateway init",
-      `muster channels setup gchat --public-url ${base}`,
+      `muster channels ready gchat --verification-token-env GOOGLE_CHAT_VERIFICATION_TOKEN --public-url ${base}`,
       "muster channels status gchat",
-      "muster gateway start --port 7460",
+      "muster gateway daemon start --port 7460",
     ],
     notes: [
-      "Google Chat app identity lives in Google Cloud; Muster only needs the webhook URL and optional verification token.",
+      "Google Chat app identity lives in Google Cloud; Muster needs the webhook URL and verification token to accept real events.",
       "Use this channel when Telegram is unavailable in your region but Google Workspace is available.",
     ],
   };
@@ -65,17 +65,17 @@ export async function google_chat_setup_plan(args: Record<string, unknown>, cont
 
 export async function google_chat_gateway_check(args: Record<string, unknown>, context: ChannelContext) {
   const gateway = gatewayArg(args);
-  const hasGatewayEntry = Boolean(gateway?.gchat);
+  const hasGatewayEntry = Boolean(gateway?.gchat?.verificationToken || context.config.GOOGLE_CHAT_VERIFICATION_TOKEN);
   const hasVerificationToken = Boolean(gateway?.gchat?.verificationToken || context.config.GOOGLE_CHAT_VERIFICATION_TOKEN);
   return {
     channel: "google-chat",
     ready: ready(gateway, context),
     checks: [
-      { id: "gateway_config", ok: hasGatewayEntry, detail: hasGatewayEntry ? "gchat entry is present" : "Run: muster channels setup gchat --public-url <https-url>" },
-      { id: "verification_token", ok: hasVerificationToken, optional: true, detail: hasVerificationToken ? "verification token configured" : "Optional: add --verification-token-env GOOGLE_CHAT_VERIFICATION_TOKEN" },
+      { id: "gateway_config", ok: hasGatewayEntry, detail: hasGatewayEntry ? "gchat verification token is present" : "Run: muster channels ready gchat --verification-token-env GOOGLE_CHAT_VERIFICATION_TOKEN --public-url <https-url>" },
+      { id: "verification_token", ok: hasVerificationToken, detail: hasVerificationToken ? "verification token configured" : "Add --verification-token-env GOOGLE_CHAT_VERIFICATION_TOKEN" },
       { id: "public_https_url", ok: Boolean(stringArg(args, "publicUrl")?.startsWith("https://")), detail: "Google Chat production webhooks require an HTTPS URL." },
     ],
-    next: hasGatewayEntry ? "Start the gateway and paste the webhook URL into Google Cloud Chat API configuration." : "Run muster channels setup gchat.",
+    next: hasGatewayEntry ? "Start the gateway daemon and paste the webhook URL into Google Cloud Chat API configuration." : "Run muster channels ready gchat with verification-token env.",
   };
 }
 

@@ -17,13 +17,22 @@ export interface GatewayCustomCommand {
 export interface GatewayConfig {
   readonly token: string;
   readonly port?: number;
+  readonly governance?: GatewayGovernanceConfig;
   readonly commands?: {
     readonly entries?: Record<string, GatewayCustomCommand>;
   };
   readonly telegram?: {
+    /** Friendly bot label shown in setup/status output; not used as a secret. */
+    readonly name?: string;
     readonly botToken: string;
     /** "draft" streams replies as live-edited drafts (sendMessage + editMessageText). */
     readonly stream?: "off" | "draft";
+    /** Native presence/progress behavior while a run is active. */
+    readonly status?: "off" | "typing";
+    /** High-level progress messages. Never exposes provider chain-of-thought. */
+    readonly thinking?: "off" | "progress";
+    /** Handling for a second message while the same chat already has a run. */
+    readonly busy?: "queue" | "reject";
     /**
      * Optional webhook secret. When set, Telegram echoes it in the
      * X-Telegram-Bot-Api-Secret-Token header; the gateway rejects any webhook
@@ -33,8 +42,18 @@ export interface GatewayConfig {
   };
   readonly slack?: {
     readonly botToken: string;
+    /** Slack Socket Mode app-level token (`xapp-...`). Avoids public HTTPS webhook setup. */
+    readonly appToken?: string;
+    /** Socket Mode is the local/private default; HTTP Events API stays available for public webhook deployments. */
+    readonly mode?: "socket" | "http";
     /** "draft" streams replies as live-edited drafts (chat.postMessage + chat.update). */
     readonly stream?: "off" | "draft";
+    /** Slack has no bot typing API; "message" posts/updates one progress note. */
+    readonly status?: "off" | "message";
+    /** High-level progress messages. Never exposes provider chain-of-thought. */
+    readonly thinking?: "off" | "progress";
+    /** Handling for a second message while the same Slack thread already has a run. */
+    readonly busy?: "queue" | "reject";
     /**
      * Slack app "Signing Secret". When set, every webhook is verified against
      * the X-Slack-Signature / X-Slack-Request-Timestamp headers (v0 HMAC-SHA256)
@@ -51,6 +70,8 @@ export interface GatewayConfig {
     readonly accessToken: string;
     readonly verifyToken: string;
     readonly phoneNumberId: string;
+    /** Meta app secret for X-Hub-Signature-256 POST webhook verification. */
+    readonly appSecret?: string;
     /** Graph API version segment; defaults to v19.0. */
     readonly apiVersion?: string;
   };
@@ -69,6 +90,52 @@ export interface GatewayDeviceRecord {
   readonly scopes?: readonly string[];
   readonly approved?: boolean;
   readonly migratedAt?: string;
+}
+
+export type GatewayGovernanceSubjectKind = "user" | "role" | "channel" | "surface" | "tenant" | "workspace";
+export type GatewayGovernanceRateWindow = "minute" | "hour" | "day" | "month";
+
+export interface GatewayGovernanceSubject {
+  readonly kind: GatewayGovernanceSubjectKind;
+  readonly id: string;
+}
+
+export interface GatewayGovernanceAssignment {
+  /** Friendly user id used in reports; defaults to the surface sender id. */
+  readonly userId?: string;
+  readonly roles?: readonly string[];
+  readonly tenantId?: string;
+  readonly workspaceId?: string;
+  readonly allowedSurfaces?: readonly string[];
+  readonly allowedChannels?: readonly string[];
+}
+
+export interface GatewayGovernanceValidationConfig {
+  readonly maxChars?: number;
+  readonly blockSecrets?: boolean;
+  readonly blockedPatterns?: readonly string[];
+}
+
+export interface GatewayGovernanceRateLimit {
+  readonly subject: GatewayGovernanceSubject;
+  readonly window: GatewayGovernanceRateWindow;
+  readonly maxRuns?: number;
+  readonly maxTokens?: number;
+}
+
+export interface GatewayGovernanceConfig {
+  readonly enabled?: boolean;
+  /**
+   * Assignments are keyed by the most specific available identity:
+   *   - "<surfaceId>:<senderId>"
+   *   - "<senderId>"
+   *   - "default"
+   */
+  readonly assignments?: Record<string, GatewayGovernanceAssignment>;
+  readonly requestValidation?: GatewayGovernanceValidationConfig;
+  readonly rateLimits?: readonly GatewayGovernanceRateLimit[];
+  /** Conservative output estimate for pre-run token/rate checks; defaults to 800. */
+  readonly estimatedOutputTokens?: number;
 }
 
 export const DEFAULT_GATEWAY_PORT = 7460;

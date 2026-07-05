@@ -15,6 +15,8 @@ const cliPath = resolve(import.meta.dirname, "..", "src", "index.ts");
 test("CLI help exposes terminal and pi surfaces", async () => {
   const { stdout } = await runCli(["help"]);
 
+  assert.match(stdout, /muster --version/);
+  assert.match(stdout, /muster update \[--manager npm\|pnpm\|yarn\|bun\] \[--target latest\] \[--apply\]/);
   assert.match(stdout, /muster tui ask/);
   assert.match(stdout, /muster onboard/);
   assert.match(stdout, /muster pi inspect/);
@@ -52,6 +54,27 @@ test("CLI help exposes terminal and pi surfaces", async () => {
   assert.match(stdout, /muster eval retrieval/);
 });
 
+test("CLI version and update commands are explicit", async () => {
+  const version = await runCli(["--version"]);
+  assert.equal(version.stdout.trim(), "muster 0.1.10");
+
+  const namedVersion = await runCli(["version"]);
+  assert.equal(namedVersion.stdout.trim(), "muster 0.1.10");
+
+  const update = await runCli(["update", "--manager", "npm", "--target", "0.1.10"]);
+  assert.match(update.stdout, /muster_current=0\.1\.10/);
+  assert.match(update.stdout, /package=@musterhq\/cli/);
+  assert.match(update.stdout, /target=0\.1\.10/);
+  assert.match(update.stdout, /manager=npm/);
+  assert.match(update.stdout, /command=npm install -g @musterhq\/cli@0\.1\.10/);
+  assert.match(update.stdout, /apply=false/);
+  assert.match(update.stdout, /next=muster update --apply/);
+
+  const badManager = await runCliAllowFailure(["update", "--manager", "bad"]);
+  assert.equal(badManager.code, 1);
+  assert.match(badManager.stderr, /--manager must be one of npm, pnpm, yarn, bun/);
+});
+
 test("gateway init redacts bearer token unless explicitly requested", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-cli-gateway-"));
   const coldStatus = await runCli(["gateway", "status"], cwd);
@@ -70,12 +93,18 @@ test("gateway init redacts bearer token unless explicitly requested", async () =
   assert.match(initializedStatus.stdout, /gateway_status=configured/);
   assert.match(initializedStatus.stdout, /token=configured/);
   assert.match(initializedStatus.stdout, /channels_ready=1\/7/);
-  assert.match(initializedStatus.stdout, /next="muster gateway start --port 7460"/);
+  assert.match(initializedStatus.stdout, /next="muster gateway daemon start --port 7460"/);
   assert.doesNotMatch(initializedStatus.stdout, /token=[0-9a-f]{48}/);
 
   const shown = await runCli(["gateway", "init", "--show-token"], cwd);
   assert.match(shown.stdout, /gateway_config=.*already exists/);
   assert.match(shown.stdout, /token=[0-9a-f]{48}/);
+
+  const daemonStatus = await runCli(["gateway", "daemon", "status"], cwd);
+  assert.match(daemonStatus.stdout, /gateway_daemon=stopped/);
+  assert.match(daemonStatus.stdout, /pid_file=.*\.muster\/gateway\.pid/);
+  assert.match(daemonStatus.stdout, /log_file=.*\.muster\/gateway\.log/);
+  assert.match(daemonStatus.stdout, /next=muster gateway daemon start/);
 });
 
 test("CLI onboarding preview exposes setup controls, impacts, and separate channel credentials", async () => {
@@ -252,7 +281,7 @@ test("CLI chat exposes a real named terminal chat surface without hanging in non
   assert.match(chatTelegramIntegration.stdout, /telegram/);
   assert.match(chatTelegramIntegration.stdout, /Impact/);
   assert.match(chatTelegramIntegration.stdout, /Next/);
-  assert.match(chatTelegramIntegration.stdout, /muster channels setup telegram/);
+  assert.match(chatTelegramIntegration.stdout, /muster channels ready telegram/);
   assert.match(chatTelegramIntegration.stdout, /Setup/);
   assert.match(chatTelegramIntegration.stdout, /Verify/);
   assert.match(chatTelegramIntegration.stdout, /Enable/);
@@ -970,18 +999,19 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
 
   const slackPluginSetup = await runCli(["plugins", "setup", "slack"], cwd);
   assert.match(slackPluginSetup.stdout, /plugin=slack source=openclaw risk=high/);
-  assert.match(slackPluginSetup.stdout, /channel=slack status=needs_setup command="muster channels setup slack"/);
+  assert.match(slackPluginSetup.stdout, /channel=slack status=needs_setup command="muster channels ready slack"/);
   assert.match(slackPluginSetup.stdout, /risk_note=High-risk integrations/);
 
   const enabledSlackPlugin = await runCli(["plugins", "enable", "slack", "--allow-high-risk"], cwd);
   assert.match(enabledSlackPlugin.stdout, /enabled plugin=slack/);
   assert.match(enabledSlackPlugin.stdout, /available_channels=slack/);
-  assert.match(enabledSlackPlugin.stdout, /channel=slack status=needs_setup command="muster channels setup slack"/);
-  assert.match(enabledSlackPlugin.stdout, /bot token\/signing-secret readiness/);
+  assert.match(enabledSlackPlugin.stdout, /channel=slack status=needs_setup command="muster channels ready slack"/);
+  assert.match(enabledSlackPlugin.stdout, /bot token\/app-token readiness/);
+  assert.match(enabledSlackPlugin.stdout, /signing secret only when you intentionally have a public HTTPS gateway/);
 
   const googleChatPluginSetup = await runCli(["plugins", "setup", "google-chat"], cwd);
   assert.match(googleChatPluginSetup.stdout, /plugin=google-chat source=openclaw risk=high/);
-  assert.match(googleChatPluginSetup.stdout, /channel=gchat status=needs_setup command="muster channels setup gchat"/);
+  assert.match(googleChatPluginSetup.stdout, /channel=gchat status=needs_setup command="muster channels ready gchat"/);
   assert.match(googleChatPluginSetup.stdout, /setup\/doctor pattern/);
 
   const enabledGoogleChatPlugin = await runCli(["plugins", "enable", "google-chat", "--allow-high-risk"], cwd);
@@ -990,7 +1020,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
 
   const discordPluginSetup = await runCli(["plugins", "setup", "discord"], cwd);
   assert.match(discordPluginSetup.stdout, /plugin=discord source=openclaw risk=high/);
-  assert.match(discordPluginSetup.stdout, /channel=discord status=needs_setup command="muster channels setup discord"/);
+  assert.match(discordPluginSetup.stdout, /channel=discord status=needs_setup command="muster channels ready discord"/);
   assert.match(discordPluginSetup.stdout, /bot-token\/public-key readiness/);
 
   const discordPluginCheck = await runCli(["plugins", "check", "discord"], cwd);
@@ -1004,7 +1034,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
 
   const whatsappPluginSetup = await runCli(["plugins", "setup", "whatsapp"], cwd);
   assert.match(whatsappPluginSetup.stdout, /plugin=whatsapp source=openclaw risk=high/);
-  assert.match(whatsappPluginSetup.stdout, /channel=whatsapp status=needs_setup command="muster channels setup whatsapp"/);
+  assert.match(whatsappPluginSetup.stdout, /channel=whatsapp status=needs_setup command="muster channels ready whatsapp"/);
   assert.match(whatsappPluginSetup.stdout, /Meta app setup/);
 
   const whatsappPluginCheck = await runCli(["plugins", "check", "whatsapp"], cwd);
@@ -1018,7 +1048,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
 
   const teamsPluginSetup = await runCli(["plugins", "setup", "teams"], cwd);
   assert.match(teamsPluginSetup.stdout, /plugin=teams source=openclaw risk=high/);
-  assert.match(teamsPluginSetup.stdout, /channel=teams status=needs_setup command="muster channels setup teams"/);
+  assert.match(teamsPluginSetup.stdout, /channel=teams status=needs_setup command="muster channels ready teams"/);
   assert.match(teamsPluginSetup.stdout, /Azure\/Teams app registration/);
 
   const teamsPluginCheck = await runCli(["plugins", "check", "teams"], cwd);
@@ -1201,7 +1231,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
 
   const matrixSetup = await runCli(["plugins", "setup", "matrix"], cwd);
   assert.match(matrixSetup.stdout, /plugin=matrix source=hermes risk=high action=setup_plan/);
-  assert.match(matrixSetup.stdout, /next_action=channel_setup command="muster channels setup matrix"/);
+  assert.match(matrixSetup.stdout, /next_action=channel_setup command="muster channels ready matrix"/);
   assert.match(matrixSetup.stdout, /next_action=open_setup url=https:\/\/matrix\.org\/docs\//);
 
   const figmaSetup = await runCli(["plugins", "setup", "figma"], cwd);
@@ -1216,6 +1246,26 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(appReuseSetup.stdout, /MUSTER_<PROVIDER>_PLUGIN_CACHE/);
   assert.match(appReuseSetup.stdout, /muster mcp add-http/);
   assert.match(appReuseSetup.stdout, /never copies opaque provider secrets silently/);
+
+  const unsupportedReusePayload = JSON.parse((await runCli(["plugins", "reuse", "unknown-provider", "--adopt-mcp", "figma", "--json"], cwd)).stdout);
+  assert.equal(unsupportedReusePayload.command, "plugins.reuse");
+  assert.equal(unsupportedReusePayload.status, "unsupported");
+  assert.equal(unsupportedReusePayload.policy, "adopt_mcp");
+  assert.deepEqual(unsupportedReusePayload.counts, { plugins: 0, apps: 0, mcps: 0 });
+  assert.deepEqual(unsupportedReusePayload.requestedAdoptions, ["figma"]);
+  assert.deepEqual(unsupportedReusePayload.adoptions, []);
+  assert.deepEqual(unsupportedReusePayload.mutation, { wouldWriteConfig: false, boundary: "none", configuredMcps: [] });
+
+  const missingProviderReusePayload = JSON.parse((await runCli(["plugins", "reuse", "empty-provider", "--adopt-mcp", "figma", "--json"], cwd, {
+    MUSTER_EMPTY_PROVIDER_PLUGIN_CACHE: join(cwd, "missing-provider-cache"),
+  })).stdout);
+  assert.equal(missingProviderReusePayload.command, "plugins.reuse");
+  assert.equal(missingProviderReusePayload.status, "not_found");
+  assert.equal(missingProviderReusePayload.policy, "adopt_mcp");
+  assert.deepEqual(missingProviderReusePayload.counts, { plugins: 0, apps: 0, mcps: 0 });
+  assert.deepEqual(missingProviderReusePayload.requestedAdoptions, ["figma"]);
+  assert.deepEqual(missingProviderReusePayload.adoptions, []);
+  assert.deepEqual(missingProviderReusePayload.mutation, { wouldWriteConfig: false, boundary: "none", configuredMcps: [] });
 
   const providerCache = join(cwd, "provider-cache", "curated", "figma", "2.0.12");
   await mkdir(providerCache, { recursive: true });
@@ -1235,9 +1285,9 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(providerReuse.stdout, /plugin=figma provider=test-provider version=2\.0\.12/);
   assert.match(providerReuse.stdout, /app=figma mode=required auth=reuse_host next="muster plugins setup figma"/);
   assert.match(providerReuse.stdout, /app=google-calendar mode=optional auth=reuse_host next="muster plugins setup google-calendar"/);
-  assert.match(providerReuse.stdout, /mcp=figma transport=http url=https:\/\/mcp\.figma\.com\/mcp next="muster mcp install figma && muster mcp login figma"/);
-  assert.match(providerReuse.stdout, /mcp=github transport=http url=https:\/\/api\.githubcopilot\.com\/mcp\/ next="muster mcp add-http github https:\/\/api\.githubcopilot\.com\/mcp\/ --oauth"/);
-  assert.match(providerReuse.stdout, /mcp=local-tool transport=stdio command=node .*server\.js next="muster mcp add-stdio local-tool node .*server\.js"/);
+  assert.match(providerReuse.stdout, /mcp=figma transport=http url=https:\/\/mcp\.figma\.com\/mcp auth=oauth next="muster mcp install figma && muster mcp login figma"/);
+  assert.match(providerReuse.stdout, /mcp=github transport=http url=https:\/\/api\.githubcopilot\.com\/mcp\/ auth=api_key next="muster mcp add-http github https:\/\/api\.githubcopilot\.com\/mcp\/"/);
+  assert.match(providerReuse.stdout, /mcp=local-tool transport=stdio command=node .*server\.js auth=local next="muster mcp add-stdio local-tool node .*server\.js"/);
   assert.doesNotMatch(providerReuse.stdout, /sk-provider-token-should-not-print/);
   assert.match(providerReuse.stdout, /adopt_mcp=muster plugins reuse <provider> --adopt-mcp <id>/);
   assert.match(providerReuse.stdout, /explicit_mcp_http=muster mcp add-http <name> <url> \[--oauth \.\.\.\]/);
@@ -1245,21 +1295,51 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(providerReuse.stdout, /explicit_plugin=muster plugins inspect <path> && muster plugins load <path> \[--allow-high-risk\]/);
   assert.match(providerReuse.stdout, /explicit_skill=muster skills catalog && muster skills enable <id>/);
 
+  const providerReuseJson = await runCli(["plugins", "reuse", "test-provider", "--json"], cwd, {
+    MUSTER_TEST_PROVIDER_PLUGIN_CACHE: join(cwd, "provider-cache"),
+  });
+  const providerReusePayload = JSON.parse(providerReuseJson.stdout);
+  assert.equal(providerReusePayload.schemaVersion, 1);
+  assert.equal(providerReusePayload.command, "plugins.reuse");
+  assert.equal(providerReusePayload.provider, "test-provider");
+  assert.equal(providerReusePayload.status, "discovered");
+  assert.deepEqual(providerReusePayload.counts, { plugins: 1, apps: 2, mcps: 3 });
+  assert.equal(providerReusePayload.source.layout, "provider-cache");
+  assert.equal(providerReusePayload.policy, "discover_only");
+  assert.deepEqual(providerReusePayload.safety, { secrets: "not_read", tokens: "not_copied" });
+  assert.equal(providerReusePayload.mutationBoundary, "none");
+  assert.deepEqual(providerReusePayload.mutation, { wouldWriteConfig: false, boundary: "none", configuredMcps: [] });
+  assert.equal(providerReusePayload.plugins[0].apps[0].next, "muster plugins setup figma");
+  assert.equal(providerReusePayload.plugins[0].mcps[0].next, "muster mcp install figma && muster mcp login figma");
+  assert.equal(providerReusePayload.plugins[0].mcps.find((mcp: { id: string }) => mcp.id === "github").auth, "api_key");
+  assert.equal(providerReusePayload.plugins[0].mcps.find((mcp: { id: string }) => mcp.id === "github").next, "muster mcp add-http github https://api.githubcopilot.com/mcp/");
+  assert.match(providerReusePayload.nextActions.join("\n"), /muster skills catalog && muster skills enable <id>/);
+  assert.doesNotMatch(providerReuseJson.stdout, /sk-provider-token-should-not-print/);
+
+  const skippedProviderAdoptionJson = await runCli(["plugins", "reuse", "test-provider", "--adopt-mcp", "github", "--adopt-mcp", "missing", "--json"], cwd, {
+    MUSTER_TEST_PROVIDER_PLUGIN_CACHE: join(cwd, "provider-cache"),
+  });
+  const skippedProviderAdoptionPayload = JSON.parse(skippedProviderAdoptionJson.stdout);
+  assert.equal(skippedProviderAdoptionPayload.policy, "adopt_mcp");
+  assert.deepEqual(skippedProviderAdoptionPayload.mutation, { wouldWriteConfig: false, boundary: "none", configuredMcps: [] });
+  assert.equal(skippedProviderAdoptionPayload.mutationBoundary, "none");
+  assert.ok(skippedProviderAdoptionPayload.adoptions.some((adoption: { id: string; status: string; auth?: string }) => adoption.id === "github" && adoption.status === "skipped" && adoption.auth === "api_key"));
+  assert.ok(skippedProviderAdoptionPayload.adoptions.some((adoption: { id: string; status: string }) => adoption.id === "missing" && adoption.status === "not_found"));
+  assert.doesNotMatch(skippedProviderAdoptionJson.stdout, /sk-provider-token-should-not-print/);
+
   const adoptedProviderMcps = await runCli(["plugins", "reuse", "test-provider", "--adopt-mcp", "github", "--adopt-mcp", "local-tool", "--adopt-mcp", "missing"], cwd, {
     MUSTER_TEST_PROVIDER_PLUGIN_CACHE: join(cwd, "provider-cache"),
   });
   assert.match(adoptedProviderMcps.stdout, /policy=adopt_mcp secrets=not_read tokens=not_copied/);
-  assert.match(adoptedProviderMcps.stdout, /adopted_mcp=github provider=test-provider status=configured transport=http auth=oauth next="muster mcp login github"/);
+  assert.match(adoptedProviderMcps.stdout, /adopted_mcp=github provider=test-provider status=skipped transport=http auth=api_key next="muster mcp add-http github https:\/\/api\.githubcopilot\.com\/mcp\/"/);
   assert.match(adoptedProviderMcps.stdout, /adopted_mcp=local-tool provider=test-provider status=configured transport=stdio auth=none next="muster mcp test local-tool"/);
   assert.match(adoptedProviderMcps.stdout, /adopted_mcp=missing status=not_found provider=test-provider/);
   assert.match(adoptedProviderMcps.stdout, /adoption_note=Provider secrets and OAuth tokens were not copied/);
   assert.doesNotMatch(adoptedProviderMcps.stdout, /sk-provider-token-should-not-print/);
 
   const adoptedStatus = await runCli(["mcp", "status"], cwd);
-  assert.match(adoptedStatus.stdout, /mcp=github transport=http https:\/\/api\.githubcopilot\.com\/mcp\/ auth=oauth/);
   assert.match(adoptedStatus.stdout, /mcp=local-tool transport=stdio node .*server\.js auth=none/);
   assert.doesNotMatch(adoptedStatus.stdout, /sk-provider-token-should-not-print/);
-  await runCli(["mcp", "remove", "github"], cwd);
   await runCli(["mcp", "remove", "local-tool"], cwd);
 
   const developerToolsCheck = await runCli(["plugins", "check", "developer-tools"], cwd);
@@ -1290,7 +1370,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
 
   const codexSetup = await runCli(["plugins", "setup", "codex"], cwd);
   assert.match(codexSetup.stdout, /plugin=codex source=hermes risk=medium/);
-  assert.match(codexSetup.stdout, /~\/\.codex\/auth\.json/);
+  assert.match(codexSetup.stdout, /host-managed Codex home/);
   assert.match(codexSetup.stdout, /codex exec --json/);
 
   const codexCheck = await runCli(["plugins", "check", "codex"], cwd);
@@ -1493,9 +1573,9 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(dashboard.stdout, /start=muster dashboard start --port 7461/);
 
   const channelCatalog = await runCli(["channels", "list"], cwd);
-  assert.match(channelCatalog.stdout, /telegram\t--bot-token-env\tmuster channels setup telegram/);
-  assert.match(channelCatalog.stdout, /slack\t--bot-token-env,--signing-secret-env\tmuster channels setup slack/);
-  assert.match(channelCatalog.stdout, /gchat\t--verification-token-env\tmuster channels setup gchat/);
+  assert.match(channelCatalog.stdout, /telegram\t--bot-token-env\tmuster channels ready telegram/);
+  assert.match(channelCatalog.stdout, /slack\t--bot-token-env,--app-token-env\tmuster channels ready slack/);
+  assert.match(channelCatalog.stdout, /gchat\t--verification-token-env\tmuster channels ready gchat/);
 
   const coldChannelStatus = await runCli(["channels", "status"], cwd);
   assert.match(coldChannelStatus.stdout, /gateway_config=missing next="muster gateway init"/);
@@ -1523,14 +1603,19 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(channelDoctorBeforeSetup.stdout, /channel=telegram status=needs_setup missing=telegram\.botToken/);
   assert.match(channelDoctorBeforeSetup.stdout, /channel=web status=ready missing=-/);
   assert.match(channelDoctorBeforeSetup.stdout, /guardrails=signature_or_token_check,draft_first_when_supported,no_secret_echo,scoped_memory,token_ledger/);
-  assert.match(channelDoctorBeforeSetup.stdout, /next=muster channels setup telegram/);
+  assert.match(channelDoctorBeforeSetup.stdout, /next=muster channels ready telegram/);
 
   const slackPlanBeforeSetup = await runCli(["channels", "plan", "slack", "--public-url", "https://example.test/muster"], cwd);
   assert.match(slackPlanBeforeSetup.stdout, /channel_plan=slack label="Slack App" ready=false/);
   assert.match(slackPlanBeforeSetup.stdout, /operator_contract=inbound_normalize -> scoped_memory_recall -> policy_gate -> draft_or_reply -> token_ledger/);
-  assert.match(slackPlanBeforeSetup.stdout, /webhook_url=https:\/\/example\.test\/muster\/v1\/adapters\/slack/);
-  assert.match(slackPlanBeforeSetup.stdout, /missing_setup=slack\.botToken,slack\.signingSecret/);
-  assert.match(slackPlanBeforeSetup.stdout, /security=signature_or_token_check:slack-signature-required approval_required_for_mutations:true secrets_printed:false/);
+  assert.match(slackPlanBeforeSetup.stdout, /ingress=socket_mode webhook_url=-/);
+  assert.match(slackPlanBeforeSetup.stdout, /missing_setup=slack\.botToken,slack\.appToken/);
+  assert.match(slackPlanBeforeSetup.stdout, /security=signature_or_token_check:slack-socket-app-token approval_required_for_mutations:true secrets_printed:false/);
+
+  const slackHttpPlanBeforeSetup = await runCli(["channels", "plan", "slack", "--mode", "http", "--public-url", "https://example.test/muster"], cwd);
+  assert.match(slackHttpPlanBeforeSetup.stdout, /webhook_url=https:\/\/example\.test\/muster\/v1\/adapters\/slack/);
+  assert.match(slackHttpPlanBeforeSetup.stdout, /missing_setup=slack\.botToken,slack\.signingSecret/);
+  assert.match(slackHttpPlanBeforeSetup.stdout, /security=signature_or_token_check:slack-signature-required approval_required_for_mutations:true secrets_printed:false/);
 
   const telegramSimulation = await runCli(["channels", "simulate", "telegram", "--message", "what is pending today?"], cwd);
   assert.match(telegramSimulation.stdout, /channel_simulation=telegram normalized=true/);
@@ -1548,55 +1633,106 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(telegramDoctorBeforeSetup.stdout, /channel_doctor=telegram status=needs_setup/);
   assert.match(telegramDoctorBeforeSetup.stdout, /check=telegram_live status=warning detail="not run; add --live to call getMe without printing the token"/);
 
+  const simpleTelegramCwd = await mkdtemp(join(tmpdir(), "muster-cli-telegram-connect-"));
+  const simpleTelegramConnect = await runCli(
+    ["channels", "connect", "telegram", "--name", "cto-demo-bot", "--bot-token", "123456:telegram-direct-token"],
+    simpleTelegramCwd,
+  );
+  assert.match(simpleTelegramConnect.stdout, /channel_connect=telegram status=ready/);
+  assert.match(simpleTelegramConnect.stdout, /channel=telegram .*ready=true/);
+  assert.match(simpleTelegramConnect.stdout, /ingress=background_long_poll/);
+  assert.match(simpleTelegramConnect.stdout, /start=muster gateway daemon start --with-telegram-poll --port 7460/);
+  assert.match(simpleTelegramConnect.stdout, /verify=muster channels doctor telegram --live/);
+  assert.doesNotMatch(simpleTelegramConnect.stdout, /webhook_url=/);
+  assert.doesNotMatch(simpleTelegramConnect.stdout, /123456:telegram-direct-token/);
+
+  const simpleTelegramStatus = await runCli(["channels", "status", "telegram"], simpleTelegramCwd);
+  assert.match(simpleTelegramStatus.stdout, /channel=telegram ready=true/);
+  assert.match(simpleTelegramStatus.stdout, /name=cto-demo-bot bot_token=configured secret_token=configured/);
+  assert.doesNotMatch(simpleTelegramStatus.stdout, /123456:telegram-direct-token/);
+
+  const oneCommandTelegramCwd = await mkdtemp(join(tmpdir(), "muster-cli-telegram-ready-"));
+  const oneCommandTelegram = await runCli(
+    ["channels", "ready", "telegram", "--name", "cto-demo-bot", "--bot-token", "123456:telegram-direct-token", "--no-start", "--message", "demo hello"],
+    oneCommandTelegramCwd,
+  );
+  assert.match(oneCommandTelegram.stdout, /channel_ready=telegram status=ready/);
+  assert.match(oneCommandTelegram.stdout, /single_command=true/);
+  assert.match(oneCommandTelegram.stdout, /daemon=skipped start="muster gateway daemon start --with-telegram-poll --port 7460"/);
+  assert.match(oneCommandTelegram.stdout, /channel_simulation=telegram normalized=true/);
+  assert.match(oneCommandTelegram.stdout, /done=channel_ready channel=telegram daemon=skipped sample=local_simulation/);
+  assert.doesNotMatch(oneCommandTelegram.stdout, /webhook_url=|123456:telegram-direct-token/);
+
+  const oneCommandSlackMissing = await runCli(["channels", "ready", "slack", "--no-start"], await mkdtemp(join(tmpdir(), "muster-cli-slack-ready-missing-")));
+  assert.match(oneCommandSlackMissing.stdout, /channel_ready=slack status=needs_setup/);
+  assert.match(oneCommandSlackMissing.stdout, /missing_setup=slack\.botToken,slack\.appToken/);
+  assert.match(oneCommandSlackMissing.stdout, /enable=blocked next="muster channels ready slack"/);
+
+  const oneCommandSlackCwd = await mkdtemp(join(tmpdir(), "muster-cli-slack-ready-"));
+  const oneCommandSlack = await runCli(
+    ["channels", "ready", "slack", "--bot-token", "xoxb-direct", "--app-token", "xapp-direct", "--no-start", "--message", "demo hello"],
+    oneCommandSlackCwd,
+  );
+  assert.match(oneCommandSlack.stdout, /channel_ready=slack status=ready/);
+  assert.match(oneCommandSlack.stdout, /ingress=socket_mode/);
+  assert.match(oneCommandSlack.stdout, /channel_doctor=slack status=warning/);
+  assert.match(oneCommandSlack.stdout, /daemon=skipped start="muster gateway daemon start --with-slack-socket --port 7460"/);
+  assert.match(oneCommandSlack.stdout, /channel_simulation=slack normalized=true/);
+  assert.doesNotMatch(oneCommandSlack.stdout, /xoxb-direct|xapp-direct/);
+
   const telegramSetup = await runCli(
-    ["channels", "setup", "telegram", "--bot-token-env", "MUSTER_TEST_TELEGRAM_BOT", "--secret-token-env", "MUSTER_TEST_TELEGRAM_SECRET", "--stream", "draft", "--public-url", "https://tg.example.test"],
+    ["channels", "setup", "telegram", "--name", "cto-demo-bot", "--bot-token-env", "MUSTER_TEST_TELEGRAM_BOT", "--stream", "draft", "--public-url", "https://tg.example.test"],
     cwd,
-    { MUSTER_TEST_TELEGRAM_BOT: "123456:telegram-secret-token", MUSTER_TEST_TELEGRAM_SECRET: "telegram-webhook-secret" },
+    { MUSTER_TEST_TELEGRAM_BOT: "123456:telegram-secret-token" },
   );
   assert.match(telegramSetup.stdout, /channel=telegram .*ready=true/);
   assert.match(telegramSetup.stdout, /webhook_url=https:\/\/tg\.example\.test\/v1\/adapters\/telegram/);
   assert.match(telegramSetup.stdout, /setup_url=https:\/\/core\.telegram\.org\/bots\/tutorial/);
+  assert.match(telegramSetup.stdout, /webhook=muster gateway webhook telegram --public-url https:\/\/tg\.example\.test/);
+  assert.match(telegramSetup.stdout, /start=muster gateway daemon start --port 7460/);
   assert.doesNotMatch(telegramSetup.stdout, /123456:telegram-secret-token|telegram-webhook-secret/);
 
   const telegramStatus = await runCli(["channels", "status", "telegram"], cwd);
   assert.match(telegramStatus.stdout, /channel=telegram ready=true/);
-  assert.match(telegramStatus.stdout, /bot_token=configured secret_token=configured stream=draft/);
+  assert.match(telegramStatus.stdout, /name=cto-demo-bot bot_token=configured secret_token=configured stream=draft/);
   assert.doesNotMatch(telegramStatus.stdout, /123456:telegram-secret-token|telegram-webhook-secret/);
 
   const telegramDoctor = await runCli(["channels", "doctor", "telegram"], cwd);
   assert.match(telegramDoctor.stdout, /channel_doctor=telegram status=warning/);
   assert.match(telegramDoctor.stdout, /check=channel_config status=passed detail="telegram has required local credentials"/);
-  assert.match(telegramDoctor.stdout, /check=webhook_auth status=passed detail="Telegram secret-token header is configured"/);
+  assert.match(telegramDoctor.stdout, /check=webhook_auth status=passed detail="Telegram webhook secret is configured"/);
   assert.match(telegramDoctor.stdout, /check=telegram_live status=warning detail="not run; add --live to call getMe without printing the token"/);
   assert.match(telegramDoctor.stdout, /next=muster channels doctor telegram --live/);
   assert.doesNotMatch(telegramDoctor.stdout, /123456:telegram-secret-token|telegram-webhook-secret/);
 
   const slackSetup = await runCli(
-    ["channels", "setup", "slack", "--bot-token-env", "MUSTER_TEST_SLACK_BOT", "--signing-secret-env", "MUSTER_TEST_SLACK_SECRET", "--stream", "draft", "--public-url", "https://example.test/muster"],
+    ["channels", "setup", "slack", "--bot-token-env", "MUSTER_TEST_SLACK_BOT", "--app-token-env", "MUSTER_TEST_SLACK_APP", "--stream", "draft"],
     cwd,
-    { MUSTER_TEST_SLACK_BOT: "xoxb-secret", MUSTER_TEST_SLACK_SECRET: "slack-signing-secret" },
+    { MUSTER_TEST_SLACK_BOT: "xoxb-secret", MUSTER_TEST_SLACK_APP: "xapp-secret" },
   );
   assert.match(slackSetup.stdout, /channel=slack .*ready=true/);
-  assert.match(slackSetup.stdout, /webhook_url=https:\/\/example\.test\/muster\/v1\/adapters\/slack/);
-  assert.doesNotMatch(slackSetup.stdout, /xoxb-secret|slack-signing-secret/);
+  assert.match(slackSetup.stdout, /ingress=socket_mode/);
+  assert.match(slackSetup.stdout, /start=muster gateway daemon start --with-slack-socket --port 7460/);
+  assert.doesNotMatch(slackSetup.stdout, /xoxb-secret|xapp-secret/);
 
   const slackStatus = await runCli(["channels", "status", "slack"], cwd);
   assert.match(slackStatus.stdout, /channel=slack ready=true/);
-  assert.match(slackStatus.stdout, /bot_token=configured signing_secret=configured stream=draft/);
-  assert.doesNotMatch(slackStatus.stdout, /xoxb-secret|slack-signing-secret/);
+  assert.match(slackStatus.stdout, /mode=socket bot_token=configured app_token=configured signing_secret=missing stream=draft/);
+  assert.doesNotMatch(slackStatus.stdout, /xoxb-secret|xapp-secret/);
 
   const slackPlanAfterSetup = await runCli(["channels", "plan", "slack", "--public-url", "https://example.test/muster"], cwd);
   assert.match(slackPlanAfterSetup.stdout, /channel_plan=slack label="Slack App" ready=true/);
+  assert.match(slackPlanAfterSetup.stdout, /ingress=socket_mode webhook_url=-/);
   assert.match(slackPlanAfterSetup.stdout, /reply_mode=draft_stream/);
-  assert.doesNotMatch(slackPlanAfterSetup.stdout, /xoxb-secret|slack-signing-secret/);
+  assert.doesNotMatch(slackPlanAfterSetup.stdout, /xoxb-secret|xapp-secret/);
 
   const channelDoctorAfterSetup = await runCli(["channels", "doctor"], cwd);
   assert.match(channelDoctorAfterSetup.stdout, /channel_doctor=all status=needs_setup ready=3\/7/);
   assert.match(channelDoctorAfterSetup.stdout, /channel=telegram status=warning missing=- warnings=telegram\.live_check_available auth=secret-token-header-recommended reply=draft_stream next="muster channels doctor telegram --live"/);
-  assert.match(channelDoctorAfterSetup.stdout, /channel=slack status=ready missing=- warnings=- auth=slack-signature-required reply=draft_stream/);
-  assert.match(channelDoctorAfterSetup.stdout, /channel=gchat status=needs_setup missing=gchat section/);
-  assert.match(channelDoctorAfterSetup.stdout, /next=muster channels setup gchat/);
-  assert.doesNotMatch(channelDoctorAfterSetup.stdout, /123456:telegram-secret-token|telegram-webhook-secret|xoxb-secret|slack-signing-secret/);
+  assert.match(channelDoctorAfterSetup.stdout, /channel=slack status=warning missing=- warnings=slack\.live_check_available,slack\.files_write_live_check_available auth=slack-socket-app-token reply=draft_stream next="muster channels doctor slack --live"/);
+  assert.match(channelDoctorAfterSetup.stdout, /channel=gchat status=needs_setup missing=gchat\.verificationToken/);
+  assert.match(channelDoctorAfterSetup.stdout, /next=muster channels ready gchat/);
+  assert.doesNotMatch(channelDoctorAfterSetup.stdout, /123456:telegram-secret-token|telegram-webhook-secret|xoxb-secret|xapp-secret/);
 
   const gchatSetup = await runCli(["channels", "setup", "gchat", "--public-url", "https://chat.example.test"], cwd);
   assert.match(gchatSetup.stdout, /channel=gchat .*ready=false/);
@@ -1605,9 +1741,9 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
 
   const integrationGuide = await runCli(["integrations"], cwd);
   assert.match(integrationGuide.stdout, /Muster integrations/);
-  assert.match(integrationGuide.stdout, /channel\tgchat\tneeds setup\tmuster channels setup gchat/);
-  assert.match(integrationGuide.stdout, /channel\ttelegram\tready\tmuster gateway start/);
-  assert.match(integrationGuide.stdout, /channel\tslack\tready\tmuster gateway start/);
+  assert.match(integrationGuide.stdout, /channel\tgchat\tneeds setup\tmuster channels ready gchat/);
+  assert.match(integrationGuide.stdout, /channel\ttelegram\tready\tmuster gateway daemon start/);
+  assert.match(integrationGuide.stdout, /channel\tslack\tready\tmuster gateway daemon start/);
   assert.match(integrationGuide.stdout, /plugin\tweb-search\tavailable\tmuster plugins enable web-search/);
   assert.match(integrationGuide.stdout, /plugin\tgithub\tneeds GITHUB_PERSONAL_ACCESS_TOKEN\tmuster plugins enable github/);
   assert.match(integrationGuide.stdout, /plugin\tnotion\tneeds NOTION_API_KEY\|NOTION_API_TOKEN\tmuster plugins enable notion --allow-high-risk/);
@@ -1628,8 +1764,8 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(integrationStatus.stdout, /plugin=github missing=GITHUB_PERSONAL_ACCESS_TOKEN/);
   assert.match(integrationStatus.stdout, /mcp=github missing=GITHUB_PERSONAL_ACCESS_TOKEN\|GITHUB_TOKEN/);
   assert.match(integrationStatus.stdout, /channels_optional/);
-  assert.match(integrationStatus.stdout, /telegram\tready\tmuster gateway start/);
-  assert.match(integrationStatus.stdout, /gchat\tneeds_setup\tmuster channels setup gchat/);
+  assert.match(integrationStatus.stdout, /telegram\tready\tmuster gateway daemon start/);
+  assert.match(integrationStatus.stdout, /gchat\tneeds_setup\tmuster channels ready gchat/);
   assert.match(integrationStatus.stdout, /1\. channel ready; add another surface only when you need it/);
   assert.match(integrationStatus.stdout, /guardrails=draft_first_for_channels, scoped_memory, explicit_mcp_auth, no_secret_echo/);
 
@@ -1645,7 +1781,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
 
   const gchatWorkflow = await runCli(["integrations", "workflow", "gchat"], cwd);
   assert.match(gchatWorkflow.stdout, /integration_workflow=gchat kind=channel ready=false/);
-  assert.match(gchatWorkflow.stdout, /auth=verification-token-optional missing=gchat section/);
+  assert.match(gchatWorkflow.stdout, /auth=verification-token-required missing=gchat\.verificationToken/);
   assert.match(gchatWorkflow.stdout, /failure_behavior=blocked until required setup is present; local simulation still works/);
 
   const githubPluginWorkflow = await runCli(["integrations", "workflow", "github"], cwd);
@@ -1695,6 +1831,8 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   const mcpCatalog = await runCli(["mcp", "catalog"], cwd);
   assert.match(mcpCatalog.stdout, /parallel-search\s+openclaw\s+web\s+risk=medium\s+auth=none/);
   assert.match(mcpCatalog.stdout, /firecrawl\s+openclaw\s+web\s+risk=high\s+auth=api_key env=FIRECRAWL_API_KEY/);
+  assert.match(mcpCatalog.stdout, /github\s+hermes\s+developer\s+risk=high\s+auth=api_key/);
+  assert.match(mcpCatalog.stdout, /browser\s+openclaw\s+web\s+risk=high\s+auth=local/);
   assert.match(mcpCatalog.stdout, /notion\s+hermes\s+productivity\s+risk=high\s+auth=oauth/);
   assert.match(mcpCatalog.stdout, /figma\s+muster\s+design\s+risk=high\s+auth=oauth/);
   assert.match(mcpCatalog.stdout, /data-analytics-widgets\s+muster\s+data\s+risk=medium\s+auth=local/);
@@ -2046,6 +2184,19 @@ test("CLI capability inspect reports safe manifest status", async () => {
   assert.match(stdout, /risk=low/);
   assert.match(stdout, /id=redis-runbook/);
 
+  const nextSkillBody = "Be careful with Redis operational runbooks.\nUse safe dry-runs first.\n";
+  await writeFile(join(pack, "SKILL.md"), nextSkillBody, "utf8");
+  const expectedDigest = `sha256:${createHash("sha256").update(nextSkillBody).digest("hex")}`;
+  const digest = await runCli(["capability", "digest", pack]);
+  assert.match(digest.stdout, new RegExp(`capability=redis-runbook digest=${expectedDigest}`));
+  assert.match(digest.stdout, /write=false/);
+  const writtenDigest = await runCli(["capability", "digest", pack, "--write"]);
+  assert.match(writtenDigest.stdout, /write=true/);
+  const manifest = JSON.parse(await readFile(join(pack, "muster.capability.json"), "utf8")) as { digest?: string };
+  assert.equal(manifest.digest, expectedDigest);
+  const inspectedAfterDigest = await runCli(["capability", "inspect", pack]);
+  assert.match(inspectedAfterDigest.stdout, /status=ready/);
+
   const builtIn = await runCli(["capability", "inspect", "capability-packs/web-search"]);
   assert.match(builtIn.stdout, /status=ready/);
   assert.match(builtIn.stdout, /id=web-search/);
@@ -2088,6 +2239,794 @@ test("CLI capability load honors configured plugin deny policy", async () => {
 
   assert.equal(result.code, 1);
   assert.match(result.stderr, /denied by plugins\.deny/);
+});
+
+test("CLI roster inspect and install verify entries into a lockfile", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-cli-roster-"));
+  const pack = await mkdtemp(join(tmpdir(), "muster-cli-roster-pack-"));
+  const entrypoint = "export const tools = { ping: async () => ({ ok: true }) };\n";
+  const digest = `sha256:${createHash("sha256").update(entrypoint).digest("hex")}`;
+  await mkdir(join(pack, "src"), { recursive: true });
+  await mkdir(join(pack, "evals"), { recursive: true });
+  await writeFile(join(pack, "src", "index.mjs"), entrypoint, "utf8");
+  await writeFile(join(pack, "evals", "ping.json"), "{\"cases\":[]}\n", "utf8");
+  await writeFile(join(pack, "manifest.json"), `${JSON.stringify({
+    schemaVersion: 1,
+    id: "demo-pack",
+    name: "Demo Pack",
+    version: "0.1.0",
+    kind: "tool",
+    entrypoint: "src/index.mjs",
+    permissions: ["network"],
+    sandbox: "network_limited",
+    evals: ["evals/ping.json"],
+    implementedTools: ["ping"],
+    digest,
+    readiness: {
+      level: "verified",
+      status: "beta",
+      actionability: "local_tool",
+      owner: "muster-core",
+      surfaces: ["cli"],
+      setup: { urls: ["https://example.test/demo"], requiredEnv: [], requiredAnyEnv: [], credentialStorage: "none" },
+      diagnostics: { doctorCommand: "muster capability doctor demo-pack", smokeCommand: "muster capability test demo-pack", latencyBudgetMs: 250, requiresLiveCredentials: false },
+      safety: { risk: "medium", permissionMode: "ask", mutationApproval: "never", resultCapBytes: 4096, secretRedaction: true },
+      evidence: { unitTests: ["packages/cli/test/cli.test.ts"], qaSuites: ["pack_readiness"], liveArtifacts: [], docs: ["README.md"] },
+    },
+  }, null, 2)}\n`, "utf8");
+  const indexPath = join(cwd, "roster.index.json");
+  const lockPath = join(cwd, ".muster", "roster.lock.json");
+  await writeFile(indexPath, `${JSON.stringify({
+    schemaVersion: 1,
+    generatedAt: "2026-07-05T00:00:00.000Z",
+    entries: [{
+      schemaVersion: 1,
+      id: "demo-pack",
+      version: "0.1.0",
+      kind: "tool",
+      source: { type: "local", path: pack },
+      digest,
+      compatibility: { muster: ">=0.1.0" },
+      actionability: "local_tool",
+      risk: "medium",
+    }, {
+      schemaVersion: 1,
+      id: "demo-pack",
+      version: "0.2.0",
+      kind: "tool",
+      source: { type: "local", path: pack },
+      digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      compatibility: { muster: ">=9.0.0" },
+      actionability: "local_tool",
+      risk: "medium",
+    }],
+  }, null, 2)}\n`, "utf8");
+
+  const inspected = await runCli(["roster", "inspect", "demo-pack", "--index", indexPath, "--muster-version", "0.1.9", "--version", "0.1.0"], cwd);
+  assert.match(inspected.stdout, /capability=demo-pack version=0\.1\.0 status=ready/);
+  assert.match(inspected.stdout, /gate=diagnostics status=passed/);
+
+  const strictInspected = await runCliAllowFailure(["roster", "inspect", "demo-pack", "--index", indexPath, "--muster-version", "0.1.9", "--version", "0.1.0", "--require-metadata", "--json"], cwd);
+  const strictInspectPayload = JSON.parse(strictInspected.stdout) as { requireMetadata: boolean; verification: { status: string; gates: Array<{ id: string; status: string; summary: string }> } };
+  assert.equal(strictInspected.code, 1);
+  assert.equal(strictInspectPayload.requireMetadata, true);
+  assert.equal(strictInspectPayload.verification.status, "blocked");
+  assert.ok(strictInspectPayload.verification.gates.some((gate) => gate.id === "metadata" && gate.status === "blocked" && /required/.test(gate.summary)));
+
+  const strictInstall = await runCliAllowFailure(["roster", "install", "demo-pack", "--index", indexPath, "--lock", lockPath, "--muster-version", "0.1.9", "--version", "0.1.0", "--require-metadata"], cwd);
+  assert.equal(strictInstall.code, 1);
+  assert.match(strictInstall.stderr, /metadata: index metadata is required for this verification profile/);
+
+  const earlyVerified = await runCliAllowFailure(["roster", "verify", "--index", indexPath, "--muster-version", "0.1.9"], cwd);
+  assert.equal(earlyVerified.code, 1);
+  assert.match(earlyVerified.stdout, /roster_verify status=blocked ready=1 blocked=1 total=2/);
+  assert.match(earlyVerified.stdout, /index_summary total=2 metadata=0\/2 diagnostics=0 evals=0 live_credentials=0 tools=0/);
+  assert.match(earlyVerified.stdout, /verify_summary total=2 ready=1 blocked=1 blocked_entries=1/);
+  assert.match(earlyVerified.stdout, /gate_summary=compatibility passed=1 blocked=1/);
+  assert.match(earlyVerified.stdout, /gate_summary=digest passed=1 blocked=1/);
+  assert.match(earlyVerified.stdout, /repair=demo-pack@0\.2\.0 gate=compatibility command="review compatibility\.muster for demo-pack@0\.2\.0 or upgrade Muster"/);
+  assert.match(earlyVerified.stdout, /repair=demo-pack@0\.2\.0 gate=digest command="muster capability digest .* --write"/);
+
+  const earlyVerifiedJson = await runCliAllowFailure(["roster", "verify", "--index", indexPath, "--muster-version", "0.1.9", "--json"], cwd);
+  const verifiedPayload = JSON.parse(earlyVerifiedJson.stdout) as {
+    indexSummary: { total: number; withMetadata: number; missingMetadata: number; implementedTools: string[] };
+    summary: {
+      blockedEntries: string[];
+      gateTotals: Record<string, { passed: number; blocked: number }>;
+      blockersByGate: Record<string, string[]>;
+      repairs: Array<{ entry: string; gate: string; command: string }>;
+    };
+  };
+  assert.equal(earlyVerifiedJson.code, 1);
+  assert.equal(verifiedPayload.indexSummary.total, 2);
+  assert.equal(verifiedPayload.indexSummary.withMetadata, 0);
+  assert.equal(verifiedPayload.indexSummary.missingMetadata, 2);
+  assert.deepEqual(verifiedPayload.indexSummary.implementedTools, []);
+  assert.deepEqual(verifiedPayload.summary.blockedEntries, ["demo-pack@0.2.0"]);
+  assert.deepEqual(verifiedPayload.summary.gateTotals.compatibility, { passed: 1, blocked: 1 });
+  assert.ok(verifiedPayload.summary.blockersByGate.digest.some((item) => item.includes("does not match manifest")));
+  assert.ok(verifiedPayload.summary.repairs.some((repair) => repair.entry === "demo-pack@0.2.0" && repair.gate === "digest" && /muster capability digest .* --write/.test(repair.command)));
+
+  const strictVerifiedJson = await runCliAllowFailure(["roster", "verify", "--index", indexPath, "--muster-version", "0.1.9", "--require-metadata", "--json"], cwd);
+  const strictVerifiedPayload = JSON.parse(strictVerifiedJson.stdout) as {
+    requireMetadata: boolean;
+    summary: { blockedEntries: string[]; gateTotals: Record<string, { passed: number; blocked: number }>; repairs: Array<{ entry: string; gate: string; command: string }> };
+  };
+  assert.equal(strictVerifiedJson.code, 1);
+  assert.equal(strictVerifiedPayload.requireMetadata, true);
+  assert.deepEqual(strictVerifiedPayload.summary.gateTotals.metadata, { passed: 0, blocked: 2 });
+  assert.deepEqual(strictVerifiedPayload.summary.blockedEntries, ["demo-pack@0.1.0", "demo-pack@0.2.0"]);
+  assert.ok(strictVerifiedPayload.summary.repairs.some((repair) => repair.entry === "demo-pack@0.1.0" && repair.gate === "metadata" && /muster roster index .* --dry-run/.test(repair.command)));
+
+  const profileVerifiedJson = await runCliAllowFailure(["roster", "verify", "--index", indexPath, "--muster-version", "0.1.9", "--registry-profile", "verified", "--json"], cwd);
+  const profileVerifiedPayload = JSON.parse(profileVerifiedJson.stdout) as {
+    registryProfile: string;
+    requireMetadata: boolean;
+    minReadinessLevel: string;
+    summary: { gateTotals: Record<string, { passed: number; blocked: number }>; blockedEntries: string[] };
+  };
+  assert.equal(profileVerifiedJson.code, 1);
+  assert.equal(profileVerifiedPayload.registryProfile, "verified");
+  assert.equal(profileVerifiedPayload.requireMetadata, true);
+  assert.equal(profileVerifiedPayload.minReadinessLevel, "verified");
+  assert.deepEqual(profileVerifiedPayload.summary.gateTotals.metadata, { passed: 0, blocked: 2 });
+  assert.deepEqual(profileVerifiedPayload.summary.blockedEntries, ["demo-pack@0.1.0", "demo-pack@0.2.0"]);
+
+  const generatedIndexPath = join(cwd, "generated.roster.index.json");
+  const generatedIndex = await runCli(["roster", "index", "--out", generatedIndexPath, "--muster-version", "0.1.9", "--muster-compatibility", ">=0.1.0", "--generated-at", "2026-07-05T00:00:00.000Z", pack], cwd);
+  assert.match(generatedIndex.stdout, /roster_index status=ready entries=1 out=.*generated\.roster\.index\.json/);
+  assert.match(generatedIndex.stdout, /summary_total=1 metadata=1\/1 diagnostics=1 evals=1 live_credentials=0 tools=1/);
+  assert.match(generatedIndex.stdout, /entry=demo-pack version=0\.1\.0 kind=tool source=local:/);
+  const generatedIndexJson = JSON.parse(await readFile(generatedIndexPath, "utf8")) as { entries: Array<{ id: string; version: string; source: { type: string; path?: string } }> };
+  assert.deepEqual(generatedIndexJson.entries.map((entry) => `${entry.id}@${entry.version}:${entry.source.type}`), ["demo-pack@0.1.0:local"]);
+  const generatedInspect = await runCli(["roster", "inspect", "demo-pack", "--index", generatedIndexPath, "--muster-version", "0.1.9"], cwd);
+  assert.match(generatedInspect.stdout, /capability=demo-pack version=0\.1\.0 status=ready/);
+  const generatedStrictInspect = await runCli(["roster", "inspect", "demo-pack", "--index", generatedIndexPath, "--muster-version", "0.1.9", "--require-metadata"], cwd);
+  assert.match(generatedStrictInspect.stdout, /capability=demo-pack version=0\.1\.0 status=ready/);
+  assert.match(generatedStrictInspect.stdout, /gate=metadata status=passed/);
+  const generatedVerifiedInspect = await runCli(["roster", "inspect", "demo-pack", "--index", generatedIndexPath, "--muster-version", "0.1.9", "--require-metadata", "--min-readiness", "verified"], cwd);
+  assert.match(generatedVerifiedInspect.stdout, /capability=demo-pack version=0\.1\.0 status=ready/);
+  const generatedVerifiedProfileInspect = await runCli(["roster", "inspect", "demo-pack", "--index", generatedIndexPath, "--muster-version", "0.1.9", "--registry-profile", "verified", "--json"], cwd);
+  const generatedVerifiedProfilePayload = JSON.parse(generatedVerifiedProfileInspect.stdout) as { registryProfile: string; requireMetadata: boolean; minReadinessLevel: string; verification: { status: string } };
+  assert.equal(generatedVerifiedProfilePayload.registryProfile, "verified");
+  assert.equal(generatedVerifiedProfilePayload.requireMetadata, true);
+  assert.equal(generatedVerifiedProfilePayload.minReadinessLevel, "verified");
+  assert.equal(generatedVerifiedProfilePayload.verification.status, "ready");
+  const generatedReleaseInspect = await runCliAllowFailure(["roster", "inspect", "demo-pack", "--index", generatedIndexPath, "--muster-version", "0.1.9", "--require-metadata", "--min-readiness", "release_ready", "--json"], cwd);
+  const generatedReleasePayload = JSON.parse(generatedReleaseInspect.stdout) as { minReadinessLevel: string; verification: { status: string; gates: Array<{ id: string; status: string; summary: string }> } };
+  assert.equal(generatedReleaseInspect.code, 1);
+  assert.equal(generatedReleasePayload.minReadinessLevel, "release_ready");
+  assert.equal(generatedReleasePayload.verification.status, "blocked");
+  assert.ok(generatedReleasePayload.verification.gates.some((gate) => gate.id === "readiness" && gate.status === "blocked" && /required minimum release_ready/.test(gate.summary)));
+  const generatedReleaseProfileInspect = await runCliAllowFailure(["roster", "inspect", "demo-pack", "--index", generatedIndexPath, "--muster-version", "0.1.9", "--registry-profile", "release", "--json"], cwd);
+  const generatedReleaseProfilePayload = JSON.parse(generatedReleaseProfileInspect.stdout) as { registryProfile: string; requireMetadata: boolean; minReadinessLevel: string; verification: { status: string } };
+  assert.equal(generatedReleaseProfileInspect.code, 1);
+  assert.equal(generatedReleaseProfilePayload.registryProfile, "release");
+  assert.equal(generatedReleaseProfilePayload.requireMetadata, true);
+  assert.equal(generatedReleaseProfilePayload.minReadinessLevel, "release_ready");
+  assert.equal(generatedReleaseProfilePayload.verification.status, "blocked");
+  const generatedReleaseVerify = await runCliAllowFailure(["roster", "verify", "--index", generatedIndexPath, "--muster-version", "0.1.9", "--require-metadata", "--min-readiness", "release_ready", "--json"], cwd);
+  const generatedReleaseVerifyPayload = JSON.parse(generatedReleaseVerify.stdout) as { summary: { repairs: Array<{ gate: string; command: string }> } };
+  assert.equal(generatedReleaseVerify.code, 1);
+  assert.ok(generatedReleaseVerifyPayload.summary.repairs.some((repair) => repair.gate === "readiness" && /muster qa run pack_readiness --evidence /.test(repair.command)));
+  assert.ok(generatedReleaseVerifyPayload.summary.repairs.some((repair) => repair.gate === "readiness" && /muster roster index .* --dry-run/.test(repair.command)));
+
+  const builtinIndex = await runCli(["roster", "index", "--builtin-packs", "--skip-blocked", "--dry-run", "--muster-version", "0.1.9", "--muster-compatibility", ">=0.1.0"], cwd);
+  const builtinIndexJson = JSON.parse(builtinIndex.stdout) as { entries: Array<{ id: string; source: { type: string; path?: string } }> };
+  assert.ok(builtinIndexJson.entries.some((entry) => entry.id === "frappe-federated-bridge" && entry.source.type === "local"));
+  assert.match(builtinIndex.stderr, /skipped=.*capability-packs\/browser reason=Cannot publish capability pack "browser" without a verified digest\./);
+  assert.match(builtinIndex.stderr, /repair=.*capability-packs\/browser command="muster capability digest .*capability-packs\/browser --write"/);
+  assert.match(builtinIndex.stderr, /repair=.*capability-packs\/browser command="muster capability inspect .*capability-packs\/browser"/);
+
+  const builtinIndexReport = await runCli(["roster", "index", "--builtin-packs", "--skip-blocked", "--dry-run", "--json", "--muster-version", "0.1.9", "--muster-compatibility", ">=0.1.0"], cwd);
+  const builtinIndexReportJson = JSON.parse(builtinIndexReport.stdout) as {
+    command: string;
+    dryRun: boolean;
+    summary: { total: number; withMetadata: number; byReadinessLevel: Record<string, number>; implementedTools: string[] };
+    index: { entries: Array<{ id: string }> };
+    skipped: Array<{ path: string; reason: string; repair: string[] }>;
+  };
+  assert.equal(builtinIndexReportJson.command, "roster.index");
+  assert.equal(builtinIndexReportJson.dryRun, true);
+  assert.equal(builtinIndexReportJson.summary.total, builtinIndexReportJson.index.entries.length);
+  assert.equal(builtinIndexReportJson.summary.withMetadata, builtinIndexReportJson.index.entries.length);
+  assert.ok((builtinIndexReportJson.summary.byReadinessLevel.verified ?? 0) > 0);
+  assert.ok(builtinIndexReportJson.summary.implementedTools.length > 0);
+  assert.ok(builtinIndexReportJson.index.entries.some((entry) => entry.id === "frappe-federated-bridge"));
+  assert.ok(builtinIndexReportJson.skipped.some((item) =>
+    /capability-packs\/browser$/.test(item.path) &&
+    /without a verified digest/.test(item.reason) &&
+    item.repair.some((repair) => /muster capability digest .*capability-packs\/browser --write/.test(repair))
+  ));
+  assert.equal(builtinIndexReport.stderr, "");
+
+  const emptyCatalog = await runCli(["roster", "catalog", "--host", "codex"], cwd, { MUSTER_CODEX_PLUGIN_CACHE: join(cwd, "missing-host") });
+  assert.match(emptyCatalog.stdout, /roster_catalog entries=\d+ detected_hosts=0 host_scan=enabled host_cache=miss/);
+  assert.match(emptyCatalog.stdout, /slack\tplugin\topenclaw\towned_pack,channel_adapter\tauth=-\thosts=-/);
+  assert.match(emptyCatalog.stdout, /mcp:figma\tmcp\tmuster\tmcp_installable\tauth=oauth\thosts=-/);
+
+  const hostPlugin = join(cwd, "host-cache", "openai-curated-remote", "figma", "2.0.12");
+  await mkdir(hostPlugin, { recursive: true });
+  await writeFile(join(hostPlugin, ".app.json"), `${JSON.stringify({
+    apps: {
+      figma: { required: true },
+      slack: { required: true },
+    },
+  }, null, 2)}\n`, "utf8");
+  await writeFile(join(hostPlugin, ".mcp.json"), `${JSON.stringify({
+    mcpServers: {
+      figma: { type: "http", url: "https://mcp.figma.com/mcp" },
+      dataAnalyticsWidgets: { command: "node", args: ["./server.cjs"] },
+    },
+  }, null, 2)}\n`, "utf8");
+  const hostPluginSecondVersion = join(cwd, "host-cache", "openai-curated-remote", "figma", "2.0.13");
+  await mkdir(hostPluginSecondVersion, { recursive: true });
+  await writeFile(join(hostPluginSecondVersion, ".app.json"), `${JSON.stringify({
+    apps: {
+      notion: { optional: true },
+    },
+  }, null, 2)}\n`, "utf8");
+
+  const unscannedCatalog = await runCli(["roster", "catalog"], cwd, { MUSTER_CODEX_PLUGIN_CACHE: join(cwd, "host-cache") });
+  assert.match(unscannedCatalog.stdout, /roster_catalog entries=\d+ detected_hosts=0 host_scan=skipped host_cache=skipped/);
+  assert.match(unscannedCatalog.stdout, /slack\tplugin\topenclaw\towned_pack,channel_adapter\tauth=-\thosts=-/);
+
+  const catalog = await runCli(["roster", "catalog", "--host", "codex"], cwd, { MUSTER_CODEX_PLUGIN_CACHE: join(cwd, "host-cache") });
+  assert.match(catalog.stdout, /roster_catalog entries=\d+ detected_hosts=5 host_scan=enabled host_cache=miss/);
+  assert.match(catalog.stdout, /host_evidence=codex cache=miss layout=provider-cache connectors=5 apps=3 mcps=2 sources=2 fingerprint=[a-f0-9]{16}/);
+  assert.match(catalog.stdout, /slack\tplugin\topenclaw\towned_pack,channel_adapter,host_reuse\tauth=host_oauth\thosts=codex:app:host_oauth/);
+  assert.match(catalog.stdout, /figma\tplugin\tmuster\tmcp_installable,host_reuse\tauth=oauth,host_oauth\thosts=codex:app:host_oauth,codex:mcp:oauth/);
+  assert.match(catalog.stdout, /notion\tplugin\thermes\towned_pack,mcp_installable,host_reuse\tauth=env,oauth,host_oauth\thosts=codex:app:host_oauth/);
+  assert.match(catalog.stdout, /mcp:figma\tmcp\tmuster\tmcp_installable,host_reuse\tauth=oauth\thosts=codex:mcp:oauth/);
+  assert.match(catalog.stdout, /mcp:data-analytics-widgets\tmcp\tmuster\thost_reuse\tauth=local\thosts=codex:mcp:local/);
+  const catalogJson = JSON.parse((await runCli(["roster", "catalog", "--host", "codex", "--json"], cwd, { MUSTER_CODEX_PLUGIN_CACHE: join(cwd, "host-cache") })).stdout) as {
+    command: string;
+    hostScan: string;
+    hostCache: string;
+    detectedHosts: number;
+    hostEvidence: Array<{ provider: string; cacheStatus: string; connectorCount: number; appCount: number; mcpCount: number; sourceCount: number; fingerprint: string }>;
+	    matrix: {
+	      summary: { total: number; ownedPacks: number; channelAdapters: number; mcpInstallable: number; hostReuse: number; setupPlanOnly: number; byAuth: Record<string, number> };
+	      entries: Array<{ id: string; support: string[]; hosts: string[] }>;
+	    };
+	  };
+  assert.equal(catalogJson.command, "roster.catalog");
+  assert.equal(catalogJson.hostScan, "enabled");
+  assert.equal(catalogJson.hostCache, "hit");
+  assert.equal(catalogJson.detectedHosts, 5);
+  assert.equal(catalogJson.hostEvidence[0]?.provider, "codex");
+  assert.equal(catalogJson.hostEvidence[0]?.cacheStatus, "hit");
+  assert.equal(catalogJson.hostEvidence[0]?.connectorCount, 5);
+  assert.equal(catalogJson.hostEvidence[0]?.appCount, 3);
+  assert.equal(catalogJson.hostEvidence[0]?.mcpCount, 2);
+  assert.equal(catalogJson.hostEvidence[0]?.sourceCount, 2);
+	  assert.match(catalogJson.hostEvidence[0]?.fingerprint ?? "", /^[a-f0-9]{64}$/);
+	  assert.deepEqual(catalogJson.matrix.entries.find((entry) => entry.id === "slack")?.support, ["owned_pack", "channel_adapter", "host_reuse"]);
+	  assert.deepEqual(catalogJson.matrix.entries.find((entry) => entry.id === "mcp:data-analytics-widgets")?.hosts, ["codex:mcp:local"]);
+	  assert.equal(catalogJson.matrix.summary.total, catalogJson.matrix.entries.length);
+	  assert.equal(catalogJson.matrix.summary.hostReuse, catalogJson.matrix.entries.filter((entry) => entry.support.includes("host_reuse")).length);
+	  assert.equal(catalogJson.matrix.summary.channelAdapters, catalogJson.matrix.entries.filter((entry) => entry.support.includes("channel_adapter")).length);
+	  assert.ok(catalogJson.matrix.summary.byAuth.host_oauth >= 1);
+	  const catalogReportPath = join(cwd, "reports", "roster-catalog.json");
+	  const catalogReportRun = await runCli(["roster", "catalog", "--host", "codex", "--report", catalogReportPath], cwd, { MUSTER_CODEX_PLUGIN_CACHE: join(cwd, "host-cache") });
+	  assert.match(catalogReportRun.stdout, /report=.*roster-catalog\.json/);
+	  assert.match(catalogReportRun.stdout, /roster_catalog entries=\d+ detected_hosts=5/);
+	  assert.match(catalogReportRun.stdout, /support_summary owned_packs=\d+ channel_adapters=\d+ mcp_installable=\d+ host_reuse=\d+ setup_plan_only=\d+/);
+	  const catalogReport = JSON.parse(await readFile(catalogReportPath, "utf8")) as typeof catalogJson;
+	  assert.equal(catalogReport.command, "roster.catalog");
+	  assert.equal(catalogReport.hostScan, "enabled");
+	  assert.equal(catalogReport.detectedHosts, 5);
+	  assert.equal(catalogReport.matrix.summary.hostReuse, catalogJson.matrix.summary.hostReuse);
+	  const warmCatalog = await runCli(["roster", "catalog", "--host", "codex"], cwd, { MUSTER_CODEX_PLUGIN_CACHE: join(cwd, "host-cache") });
+	  assert.match(warmCatalog.stdout, /roster_catalog entries=\d+ detected_hosts=5 host_scan=enabled host_cache=hit/);
+	  assert.match(warmCatalog.stdout, /support_summary owned_packs=\d+ channel_adapters=\d+ mcp_installable=\d+ host_reuse=\d+ setup_plan_only=\d+/);
+	  assert.match(warmCatalog.stdout, /host_evidence=codex cache=hit layout=provider-cache connectors=5 apps=3 mcps=2 sources=2 fingerprint=[a-f0-9]{16}/);
+  const refreshedCatalog = await runCli(["roster", "catalog", "--host", "codex", "--refresh-host-cache"], cwd, { MUSTER_CODEX_PLUGIN_CACHE: join(cwd, "host-cache") });
+  assert.match(refreshedCatalog.stdout, /roster_catalog entries=\d+ detected_hosts=5 host_scan=enabled host_cache=refresh/);
+
+  const builtinPlan = await runCli(["roster", "plan", "slack"], cwd, { MUSTER_CODEX_PLUGIN_CACHE: join(cwd, "host-cache") });
+  assert.match(builtinPlan.stdout, /roster_plan id=slack kind=builtin_plugin status=ready targets=2 host_scan=skipped host_cache=skipped/);
+  assert.match(builtinPlan.stdout, /depth=partial_runtime .*owned_runtime:channel_adapter.*hot_path=pure_projection cache=not_required/);
+  assert.match(builtinPlan.stdout, /gate=credentials status=needs_action summary=channel_adapter:slack requires env/);
+  assert.match(builtinPlan.stdout, /gate=diagnostics status=needs_action summary=channel adapter setup must run through gateway diagnostics: muster channels doctor slack/);
+  assert.match(builtinPlan.stdout, /target=capability_pack owner=muster id=slack status=ready/);
+  assert.match(builtinPlan.stdout, /target=channel_adapter owner=gateway id=slack status=needs_credentials/);
+  assert.doesNotMatch(builtinPlan.stdout, /target=host_connector/);
+  const blockedChannelActivation = await runCliAllowFailure(["roster", "activate", "channel:slack", "--dry-run", "--json"], cwd);
+  assert.equal(blockedChannelActivation.code, 1);
+  const blockedChannelPayload = JSON.parse(blockedChannelActivation.stdout) as {
+    kind: string;
+    plan: { status: string; gatewayInitialized: boolean; missing: string[]; setupCommand: string; mutationBoundary: string };
+    mutation: { wouldWriteConfig: boolean; didWriteConfig: boolean; boundary: string };
+    result?: { enabled: string; configPath: string; postInstallCommands: string[] };
+  };
+  assert.equal(blockedChannelPayload.kind, "channel_adapter");
+  assert.equal(blockedChannelPayload.plan.status, "blocked");
+  assert.equal(blockedChannelPayload.plan.gatewayInitialized, false);
+  assert.deepEqual(blockedChannelPayload.plan.missing, ["slack.botToken", "slack.appToken"]);
+  assert.equal(blockedChannelPayload.plan.setupCommand, "muster channels ready slack");
+  assert.equal(blockedChannelPayload.plan.mutationBoundary, "gateway channel config only via muster channels ready");
+  assert.equal(blockedChannelPayload.mutation.wouldWriteConfig, false);
+  assert.equal(blockedChannelPayload.mutation.didWriteConfig, false);
+  assert.equal(blockedChannelPayload.mutation.boundary, "gateway channel config only via muster channels ready");
+  const blockedChannelReportPath = join(cwd, "reports", "blocked-channel-activation.json");
+  const blockedChannelReportRun = await runCliAllowFailure(["roster", "activate", "channel:slack", "--dry-run", "--report", blockedChannelReportPath], cwd);
+  assert.equal(blockedChannelReportRun.code, 1);
+  assert.match(blockedChannelReportRun.stdout, /report=.*blocked-channel-activation\.json/);
+  const blockedChannelReport = JSON.parse(await readFile(blockedChannelReportPath, "utf8")) as typeof blockedChannelPayload;
+  assert.equal(blockedChannelReport.plan.status, "blocked");
+  assert.deepEqual(blockedChannelReport.plan.missing, ["slack.botToken", "slack.appToken"]);
+  assert.equal(blockedChannelReport.mutation.didWriteConfig, false);
+  await runCli(["channels", "ready", "slack", "--bot-token", "xoxb-test", "--app-token", "xapp-test", "--no-start"], cwd);
+  const readyChannelActivation = await runCli(["roster", "activate", "channel:slack", "--dry-run"], cwd);
+  assert.match(readyChannelActivation.stdout, /activation=channel:slack kind=channel_adapter status=ready/);
+  assert.match(readyChannelActivation.stdout, /route=\/v1\/adapters\/slack ingress=socket_mode auth=slack-socket-app-token reply=direct_post/);
+  assert.match(readyChannelActivation.stdout, /start=muster gateway daemon start --with-slack-socket --port 7460/);
+  assert.match(readyChannelActivation.stdout, /mutation_boundary=gateway channel config only via muster channels ready/);
+  assert.match(readyChannelActivation.stdout, /config=unchanged dry_run=true/);
+  const enabledChannelActivation = await runCli(["roster", "activate", "channel:slack"], cwd);
+  assert.match(enabledChannelActivation.stdout, /activation=channel:slack kind=channel_adapter status=ready/);
+  assert.match(enabledChannelActivation.stdout, /config=unchanged/);
+  assert.match(enabledChannelActivation.stdout, /enabled=slack/);
+
+  const hostPlan = await runCli(["roster", "plan", "slack", "--host", "codex"], cwd, { MUSTER_CODEX_PLUGIN_CACHE: join(cwd, "host-cache") });
+  assert.match(hostPlan.stdout, /roster_plan id=slack kind=builtin_plugin status=ready targets=3 host_scan=enabled host_cache=hit/);
+  assert.match(hostPlan.stdout, /host_evidence=codex cache=hit layout=provider-cache connectors=5 apps=3 mcps=2 sources=2 fingerprint=[a-f0-9]{16}/);
+  assert.match(hostPlan.stdout, /depth=partial_runtime .*evidence=.*explicit_host_scan.*hot_path=explicit_host_scan cache=host_scan_cacheable/);
+  assert.match(hostPlan.stdout, /gate=host_evidence status=passed summary=1 host connector\(s\) supplied as evidence; opaque host secrets are not copied/);
+  assert.match(hostPlan.stdout, /target=host_connector owner=host id=slack status=ready auth=host_oauth command=muster plugins reuse codex/);
+  const hostPlanJson = JSON.parse((await runCli(["roster", "plan", "slack", "--host", "codex", "--json"], cwd, { MUSTER_CODEX_PLUGIN_CACHE: join(cwd, "host-cache") })).stdout) as {
+    command: string;
+    hostScan: string;
+    hostEvidence: Array<{ provider: string; cacheStatus: string; connectorCount: number }>;
+    projection: { id: string; kind: string; depth: { level: string; speed: { hotPath: string; cache: string } }; targets: Array<{ kind: string; owner: string; id: string; status: string }>; gates: Array<{ id: string; status: string }> };
+  };
+  assert.equal(hostPlanJson.command, "roster.plan");
+  assert.equal(hostPlanJson.hostScan, "enabled");
+  assert.equal(hostPlanJson.projection.id, "slack");
+  assert.equal(hostPlanJson.hostEvidence[0]?.connectorCount, 5);
+  assert.equal(hostPlanJson.projection.depth.level, "partial_runtime");
+  assert.equal(hostPlanJson.projection.depth.speed.hotPath, "explicit_host_scan");
+  assert.ok(hostPlanJson.projection.targets.some((target) => target.kind === "host_connector" && target.owner === "host" && target.id === "slack" && target.status === "ready"));
+  assert.ok(hostPlanJson.projection.gates.some((gate) => gate.id === "mutation_boundary" && gate.status === "passed"));
+  const planReportPath = join(cwd, "reports", "slack-plan.json");
+  const planReportRun = await runCli(["roster", "plan", "slack", "--host", "codex", "--report", planReportPath], cwd, { MUSTER_CODEX_PLUGIN_CACHE: join(cwd, "host-cache") });
+  assert.match(planReportRun.stdout, /report=.*slack-plan\.json/);
+  assert.match(planReportRun.stdout, /roster_plan id=slack kind=builtin_plugin status=ready/);
+  const planReport = JSON.parse(await readFile(planReportPath, "utf8")) as typeof hostPlanJson;
+  assert.equal(planReport.command, "roster.plan");
+  assert.ok(planReport.projection.targets.some((target) => target.kind === "channel_adapter" && target.owner === "gateway" && target.id === "slack"));
+
+  const linearPlan = await runCli(["roster", "plan", "mcp:linear"], cwd);
+  assert.match(linearPlan.stdout, /roster_plan id=mcp:linear kind=builtin_mcp status=needs_credentials targets=1 host_scan=skipped host_cache=skipped/);
+  assert.match(linearPlan.stdout, /depth=credentials_required .*auth=oauth .*hot_path=pure_projection cache=not_required/);
+  assert.match(linearPlan.stdout, /target=mcp_server owner=mcp id=linear status=needs_credentials auth=oauth command=muster mcp install linear && muster mcp oauth setup linear/);
+  const linearDryRunActivation = await runCli(["roster", "activate", "mcp:linear", "--dry-run"], cwd);
+  assert.match(linearDryRunActivation.stdout, /activation=mcp:linear kind=builtin_mcp status=ready/);
+  assert.match(linearDryRunActivation.stdout, /mcp_server=linear transport=http https:\/\/mcp\.linear\.app\/mcp auth=oauth/);
+  assert.match(linearDryRunActivation.stdout, /next=muster mcp oauth setup linear/);
+  assert.match(linearDryRunActivation.stdout, /config=unchanged dry_run=true/);
+  const linearActivationJson = JSON.parse((await runCli(["roster", "activate", "mcp:linear", "--dry-run", "--json"], cwd)).stdout) as {
+    command: string;
+    kind: string;
+    dryRun: boolean;
+    plan: { status: string; mutationBoundary: string; mcpPolicy: { servers: { linear?: { auth?: string; transport: { kind: string; url?: string } } } }; postInstallCommands: string[] };
+    mutation: { wouldWriteConfig: boolean; didWriteConfig: boolean; boundary: string };
+    result?: { enabled: string; configPath: string; postInstallCommands: string[] };
+  };
+  assert.equal(linearActivationJson.command, "roster.activate");
+  assert.equal(linearActivationJson.kind, "builtin_mcp");
+  assert.equal(linearActivationJson.dryRun, true);
+  assert.equal(linearActivationJson.plan.status, "ready");
+  assert.equal(linearActivationJson.plan.mutationBoundary, "tools.mcp.servers only");
+  assert.equal(linearActivationJson.plan.mcpPolicy.servers.linear?.auth, "oauth");
+  assert.equal(linearActivationJson.plan.mcpPolicy.servers.linear?.transport.url, "https://mcp.linear.app/mcp");
+  assert.deepEqual(linearActivationJson.plan.postInstallCommands, ["muster mcp oauth setup linear"]);
+  assert.equal(linearActivationJson.mutation.wouldWriteConfig, false);
+  assert.equal(linearActivationJson.mutation.didWriteConfig, false);
+  assert.equal(linearActivationJson.mutation.boundary, "tools.mcp.servers only");
+  const linearActivationJsonApply = JSON.parse((await runCli(["roster", "activate", "mcp:linear", "--json"], cwd)).stdout) as typeof linearActivationJson;
+  assert.equal(linearActivationJsonApply.dryRun, false);
+  assert.equal(linearActivationJsonApply.mutation.wouldWriteConfig, true);
+  assert.equal(linearActivationJsonApply.mutation.didWriteConfig, true);
+  assert.equal(linearActivationJsonApply.result?.enabled, "linear");
+  assert.deepEqual(linearActivationJsonApply.result?.postInstallCommands, ["muster mcp oauth setup linear"]);
+  const linearReportPath = join(cwd, "reports", "linear-activation.json");
+  const linearReportRun = await runCli(["roster", "activate", "mcp:linear", "--report", linearReportPath], cwd);
+  assert.match(linearReportRun.stdout, /report=.*linear-activation\.json/);
+  const linearReport = JSON.parse(await readFile(linearReportPath, "utf8")) as typeof linearActivationJson;
+  assert.equal(linearReport.mutation.wouldWriteConfig, true);
+  assert.equal(linearReport.mutation.didWriteConfig, true);
+  assert.equal(linearReport.result?.enabled, "linear");
+  const configAfterLinear = JSON.parse(await readFile(join(cwd, ".muster", "config.json"), "utf8")) as {
+    tools?: { mcp?: { servers?: Record<string, { auth?: string; transport: { kind: string; url?: string } }> } };
+	  };
+	  assert.equal(configAfterLinear.tools?.mcp?.servers?.linear?.auth, "oauth");
+	  assert.equal(configAfterLinear.tools?.mcp?.servers?.linear?.transport.url, "https://mcp.linear.app/mcp");
+	  const githubSecret = "ghp_roster_secret_token";
+	  const githubActivationJson = JSON.parse((await runCli(["roster", "activate", "mcp:github", "--json"], cwd, { GITHUB_TOKEN: githubSecret })).stdout) as {
+	    plan: { status: string; mcpPolicy: { servers: { github?: { transport: { kind: string; env?: Record<string, string> } } } } };
+	    mutation: { didWriteConfig: boolean; boundary: string };
+	    result?: { enabled: string };
+	  };
+	  assert.equal(githubActivationJson.plan.status, "ready");
+	  assert.equal(githubActivationJson.mutation.didWriteConfig, true);
+	  assert.equal(githubActivationJson.mutation.boundary, "tools.mcp.servers only");
+	  assert.equal(githubActivationJson.result?.enabled, "github");
+	  assert.deepEqual(githubActivationJson.plan.mcpPolicy.servers.github?.transport.env, {
+	    GITHUB_PERSONAL_ACCESS_TOKEN: "GITHUB_PERSONAL_ACCESS_TOKEN|GITHUB_TOKEN",
+	  });
+	  assert.doesNotMatch(JSON.stringify(githubActivationJson), new RegExp(githubSecret));
+	  const githubReportPath = join(cwd, "reports", "github-activation.json");
+	  const githubReportRun = await runCli(["roster", "activate", "mcp:github", "--report", githubReportPath], cwd, { GITHUB_TOKEN: githubSecret });
+	  assert.match(githubReportRun.stdout, /report=.*github-activation\.json/);
+	  assert.doesNotMatch(githubReportRun.stdout, new RegExp(githubSecret));
+	  const githubReport = JSON.parse(await readFile(githubReportPath, "utf8")) as typeof githubActivationJson;
+	  assert.deepEqual(githubReport.plan.mcpPolicy.servers.github?.transport.env, {
+	    GITHUB_PERSONAL_ACCESS_TOKEN: "GITHUB_PERSONAL_ACCESS_TOKEN|GITHUB_TOKEN",
+	  });
+	  assert.doesNotMatch(JSON.stringify(githubReport), new RegExp(githubSecret));
+	  const configAfterGithub = JSON.parse(await readFile(join(cwd, ".muster", "config.json"), "utf8")) as {
+	    tools?: { mcp?: { servers?: Record<string, { transport: { kind: string; env?: Record<string, string> } }> } };
+	  };
+	  assert.deepEqual(configAfterGithub.tools?.mcp?.servers?.github?.transport.env, {
+	    GITHUB_PERSONAL_ACCESS_TOKEN: "GITHUB_PERSONAL_ACCESS_TOKEN|GITHUB_TOKEN",
+	  });
+	  assert.doesNotMatch(JSON.stringify(configAfterGithub), new RegExp(githubSecret));
+	  const skillPlan = await runCli(["roster", "plan", "skill:systematic-debugging"], cwd);
+  assert.match(skillPlan.stdout, /roster_plan id=skill:systematic-debugging kind=builtin_skill status=ready targets=1 host_scan=skipped host_cache=skipped/);
+  assert.match(skillPlan.stdout, /depth=verified_runtime .*skill:systematic-debugging.*skill_guidance.*hot_path=pure_projection cache=not_required/);
+  assert.match(skillPlan.stdout, /target=skill owner=skill id=systematic-debugging status=ready auth=- command=muster skills enable systematic-debugging/);
+  const skillDryRunActivation = await runCli(["roster", "activate", "skill:systematic-debugging", "--dry-run", "--json"], cwd);
+  const skillDryRunPayload = JSON.parse(skillDryRunActivation.stdout) as {
+    kind: string;
+    projection: { kind: string; status: string; targets: Array<{ kind: string; id: string }> };
+    mutation: { wouldWriteConfig: boolean; didWriteConfig: boolean; boundary: string };
+    result?: { enabled: string; next: string };
+  };
+  assert.equal(skillDryRunPayload.kind, "builtin_skill");
+  assert.equal(skillDryRunPayload.projection.kind, "builtin_skill");
+  assert.equal(skillDryRunPayload.projection.status, "ready");
+  assert.equal(skillDryRunPayload.projection.targets.some((target) => target.kind === "skill" && target.id === "systematic-debugging"), true);
+  assert.equal(skillDryRunPayload.mutation.wouldWriteConfig, false);
+  assert.equal(skillDryRunPayload.mutation.didWriteConfig, false);
+  assert.equal(skillDryRunPayload.mutation.boundary, "profile skill file and skills.entries only");
+  const skillActivationJson = JSON.parse((await runCli(["roster", "activate", "skill:systematic-debugging", "--json"], cwd)).stdout) as typeof skillDryRunPayload;
+  assert.equal(skillActivationJson.mutation.wouldWriteConfig, true);
+  assert.equal(skillActivationJson.mutation.didWriteConfig, true);
+  assert.equal(skillActivationJson.result?.enabled, "systematic-debugging");
+  assert.equal(skillActivationJson.result?.next, "muster skills view systematic-debugging");
+  const skillReportPath = join(cwd, "reports", "skill-activation.json");
+  const skillReportRun = await runCli(["roster", "activate", "skill:systematic-debugging", "--report", skillReportPath], cwd);
+  assert.match(skillReportRun.stdout, /report=.*skill-activation\.json/);
+  const skillReport = JSON.parse(await readFile(skillReportPath, "utf8")) as typeof skillDryRunPayload;
+  assert.equal(skillReport.mutation.wouldWriteConfig, true);
+  assert.equal(skillReport.mutation.didWriteConfig, true);
+  assert.equal(skillReport.result?.enabled, "systematic-debugging");
+  const rosterListedSkills = await runCli(["skills", "list"], cwd);
+  assert.match(rosterListedSkills.stdout, /active\s+systematic-debugging/);
+
+  const verified = await runCliAllowFailure(["roster", "verify", "--index", indexPath, "--muster-version", "0.1.9"], cwd);
+  assert.equal(verified.code, 1);
+  assert.match(verified.stdout, /roster_verify status=blocked ready=1 blocked=1 total=2/);
+  assert.match(verified.stdout, /entry=demo-pack version=0\.2\.0 status=blocked/);
+  const verifiedJsonRun = await runCliAllowFailure(["roster", "verify", "--index", indexPath, "--muster-version", "0.1.9", "--json"], cwd);
+  assert.equal(verifiedJsonRun.code, 1);
+  const verifiedJson = JSON.parse(verifiedJsonRun.stdout) as { command: string; report: { status: string; readyCount: number; blockedCount: number; results: Array<{ entry: { version: string }; status: string }> } };
+  assert.equal(verifiedJson.command, "roster.verify");
+  assert.equal(verifiedJson.report.status, "blocked");
+  assert.equal(verifiedJson.report.readyCount, 1);
+  assert.equal(verifiedJson.report.blockedCount, 1);
+  assert.ok(verifiedJson.report.results.some((result) => result.entry.version === "0.2.0" && result.status === "blocked"));
+  const verifyReportPath = join(cwd, "reports", "verify.json");
+  const verifyReportRun = await runCliAllowFailure(["roster", "verify", "--index", indexPath, "--muster-version", "0.1.9", "--report", verifyReportPath], cwd);
+  assert.equal(verifyReportRun.code, 1);
+  assert.match(verifyReportRun.stdout, /report=.*verify\.json/);
+  assert.match(verifyReportRun.stdout, /roster_verify status=blocked ready=1 blocked=1 total=2/);
+  const verifyReport = JSON.parse(await readFile(verifyReportPath, "utf8")) as typeof verifiedJson;
+  assert.equal(verifyReport.command, "roster.verify");
+  assert.equal(verifyReport.report.blockedCount, 1);
+
+  const published = await runCli(["roster", "publish", "--dry-run", pack, "--source-path", pack, "--muster-compatibility", ">=0.1.0", "--muster-version", "0.1.9"], cwd);
+  const publishedEntry = JSON.parse(published.stdout) as { id: string; digest: string; actionability: string; risk: string };
+  assert.equal(publishedEntry.id, "demo-pack");
+  assert.equal(publishedEntry.digest, digest);
+  assert.equal(publishedEntry.actionability, "local_tool");
+  assert.equal(publishedEntry.risk, "medium");
+  const publishedJson = JSON.parse((await runCli(["roster", "publish", "--dry-run", pack, "--source-path", pack, "--muster-compatibility", ">=0.1.0", "--muster-version", "0.1.9", "--json"], cwd)).stdout) as {
+    command: string;
+    dryRun: boolean;
+    packPath: string;
+    sourcePath: string;
+    musterVersion: string;
+    musterCompatibility: string;
+    entry: { id: string; digest: string };
+    verification: { status: string };
+  };
+  assert.equal(publishedJson.command, "roster.publish");
+  assert.equal(publishedJson.dryRun, true);
+  assert.equal(publishedJson.packPath, pack);
+  assert.equal(publishedJson.sourcePath, pack);
+  assert.equal(publishedJson.musterVersion, "0.1.9");
+  assert.equal(publishedJson.musterCompatibility, ">=0.1.0");
+  assert.equal(publishedJson.entry.id, "demo-pack");
+  assert.equal(publishedJson.entry.digest, digest);
+  assert.equal(publishedJson.verification.status, "ready");
+  const publishReportPath = join(cwd, "reports", "publish.json");
+  const publishReportRun = await runCli(["roster", "publish", "--dry-run", pack, "--source-path", pack, "--muster-compatibility", ">=0.1.0", "--muster-version", "0.1.9", "--report", publishReportPath], cwd);
+  assert.match(publishReportRun.stdout, /report=.*publish\.json/);
+  assert.match(publishReportRun.stdout, /"id": "demo-pack"/);
+  const publishReport = JSON.parse(await readFile(publishReportPath, "utf8")) as typeof publishedJson;
+  assert.equal(publishReport.command, "roster.publish");
+  assert.equal(publishReport.entry.digest, digest);
+  assert.equal(publishReport.verification.status, "ready");
+
+  const installed = await runCli(["roster", "install", "demo-pack", "--index", indexPath, "--lock", lockPath, "--muster-version", "0.1.9", "--version", "0.1.0"], cwd);
+  assert.match(installed.stdout, /locked=demo-pack version=0\.1\.0/);
+  assert.match(installed.stdout, /lock=.*roster\.lock\.json/);
+  const lock = JSON.parse(await readFile(lockPath, "utf8")) as { entries: Record<string, { digest: string; actionability: string }> };
+  assert.equal(lock.entries["demo-pack"].digest, digest);
+  assert.equal(lock.entries["demo-pack"].actionability, "local_tool");
+
+  const dryRunActivation = await runCli(["roster", "activate", "demo-pack", "--lock", lockPath, "--dry-run"], cwd);
+  assert.match(dryRunActivation.stdout, /activation=demo-pack status=ready/);
+  assert.match(dryRunActivation.stdout, /activation_verify=ready muster=0\.1\.10/);
+  assert.match(dryRunActivation.stdout, /allow=demo-pack/);
+  assert.match(dryRunActivation.stdout, /config=unchanged dry_run=true/);
+  const activationJson = JSON.parse((await runCli(["roster", "activate", "demo-pack", "--lock", lockPath, "--dry-run", "--json"], cwd)).stdout) as {
+    command: string;
+    dryRun: boolean;
+    plan: { status: string; pluginPolicy: { allow?: string[]; load?: { paths?: string[] } } };
+    verification: { status: string; gates: Array<{ id: string; status: string }> };
+    mutation: { wouldWriteConfig: boolean; boundary: string };
+  };
+  assert.equal(activationJson.command, "roster.activate");
+  assert.equal(activationJson.dryRun, true);
+  assert.equal(activationJson.plan.status, "ready");
+  assert.deepEqual(activationJson.plan.pluginPolicy.allow, ["demo-pack"]);
+  assert.equal(activationJson.verification.status, "ready");
+  assert.equal(activationJson.verification.gates.some((gate) => gate.id === "lock" && gate.status === "passed"), true);
+  assert.equal(activationJson.mutation.wouldWriteConfig, false);
+  assert.equal(activationJson.mutation.didWriteConfig, false);
+  assert.equal(activationJson.mutation.boundary, "plugins.allow/load/entries only");
+  const activationReportPath = join(cwd, "reports", "activation.json");
+  const activationReportRun = await runCli(["roster", "activate", "demo-pack", "--lock", lockPath, "--dry-run", "--report", activationReportPath], cwd);
+  assert.match(activationReportRun.stdout, /report=.*activation\.json/);
+  assert.match(activationReportRun.stdout, /activation=demo-pack status=ready/);
+  const activationReport = JSON.parse(await readFile(activationReportPath, "utf8")) as typeof activationJson;
+  assert.equal(activationReport.command, "roster.activate");
+  assert.equal(activationReport.verification.status, "ready");
+  const verifiedLock = await runCli(["roster", "lock", "--lock", lockPath, "--verify", "--muster-version", "0.1.9"], cwd);
+  assert.match(verifiedLock.stdout, /roster_lock_verify status=ready ready=1 blocked=0 total=1/);
+  assert.match(verifiedLock.stdout, /gate_summary=lock passed=1 blocked=0/);
+  const verifiedLockJson = JSON.parse((await runCli(["roster", "lock", "--lock", lockPath, "--verify", "--muster-version", "0.1.9", "--json"], cwd)).stdout) as {
+    command: string;
+    summary: { gateTotals: Record<string, { passed: number; blocked: number }> };
+    report: { status: string };
+  };
+  assert.equal(verifiedLockJson.command, "roster.lock.verify");
+  assert.equal(verifiedLockJson.report.status, "ready");
+  assert.deepEqual(verifiedLockJson.summary.gateTotals.lock, { passed: 1, blocked: 0 });
+
+  const lockedPlan = await runCli(["roster", "plan", "demo-pack", "--lock", lockPath], cwd);
+  assert.match(lockedPlan.stdout, /roster_plan id=demo-pack kind=locked_capability status=ready targets=1 host_scan=skipped host_cache=skipped/);
+  assert.match(lockedPlan.stdout, /depth=verified_runtime .*evidence=.*capability_readiness.*hot_path=activation_only cache=lockfile/);
+  assert.match(lockedPlan.stdout, /gate=diagnostics status=passed summary=readiness declares muster capability doctor demo-pack and muster capability test demo-pack/);
+  assert.match(lockedPlan.stdout, /gate=mutation_boundary status=passed summary=activation mutates only plugin allow\/load policy for the locked pack/);
+  assert.match(lockedPlan.stdout, /target=capability_pack owner=muster id=demo-pack status=ready/);
+  assert.match(lockedPlan.stdout, /command=muster roster activate demo-pack/);
+  const lockedPlanJson = JSON.parse((await runCli(["roster", "plan", "demo-pack", "--lock", lockPath, "--json"], cwd)).stdout) as {
+    lockPath: string;
+    projection: { kind: string; targets: Array<{ kind: string; id: string; command?: string }> };
+  };
+  assert.equal(lockedPlanJson.lockPath, lockPath);
+  assert.equal(lockedPlanJson.projection.kind, "locked_capability");
+  assert.deepEqual(lockedPlanJson.projection.targets.map((target) => `${target.kind}:${target.id}:${target.command}`), ["capability_pack:demo-pack:muster roster activate demo-pack"]);
+
+  const inspectedJson = JSON.parse((await runCli(["roster", "inspect", "demo-pack", "--index", generatedIndexPath, "--muster-version", "0.1.9", "--json"], cwd)).stdout) as {
+    command: string;
+    verification: { status: string; entry: { id: string; version: string }; gates: Array<{ id: string; status: string }> };
+  };
+  assert.equal(inspectedJson.command, "roster.inspect");
+  assert.equal(inspectedJson.verification.status, "ready");
+  assert.equal(inspectedJson.verification.entry.id, "demo-pack");
+  assert.ok(inspectedJson.verification.gates.every((gate) => gate.status === "passed"));
+  const inspectReportPath = join(cwd, "reports", "inspect.json");
+  const inspectReportRun = await runCli(["roster", "inspect", "demo-pack", "--index", generatedIndexPath, "--muster-version", "0.1.9", "--report", inspectReportPath], cwd);
+  assert.match(inspectReportRun.stdout, /report=.*inspect\.json/);
+  assert.match(inspectReportRun.stdout, /capability=demo-pack version=0\.1\.0 status=ready/);
+  const inspectReport = JSON.parse(await readFile(inspectReportPath, "utf8")) as typeof inspectedJson;
+  assert.equal(inspectReport.command, "roster.inspect");
+  assert.equal(inspectReport.verification.status, "ready");
+
+  const allPlanReportPath = join(cwd, "reports", "all-plans.json");
+  const allPlan = await runCli(["roster", "plan", "--all", "--lock", lockPath, "--report", allPlanReportPath], cwd, { MUSTER_CODEX_PLUGIN_CACHE: join(cwd, "host-cache") });
+  assert.match(allPlan.stdout, /report=.*all-plans\.json/);
+  assert.match(allPlan.stdout, /roster_plan_catalog total=\d+ ready=\d+ needs_credentials=\d+ setup_only=\d+ blocked=0 host_scan=skipped host_cache=skipped/);
+  assert.match(allPlan.stdout, /depth=partial_runtime plans=\d+/);
+  assert.match(allPlan.stdout, /depth=setup_only plans=\d+/);
+  assert.match(allPlan.stdout, /owner=muster:capability_pack targets=\d+/);
+  assert.match(allPlan.stdout, /next=.* priority=20 reason=credentials command=/);
+  assert.match(allPlan.stdout, /plan=demo-pack kind=locked_capability status=ready targets=1 blockers=0/);
+  assert.doesNotMatch(allPlan.stdout, /host_scan=enabled/);
+  const allPlanReport = JSON.parse(await readFile(allPlanReportPath, "utf8")) as {
+    command: string;
+    mode: string;
+    hostScan: string;
+    hostEvidence?: Array<{ provider: string; cacheStatus: string; connectorCount: number }>;
+    catalog: {
+      summary: { blocked: number; depthLevels: Record<string, number>; targetOwners: Record<string, number> };
+      plans: Array<{ id: string; kind: string }>;
+      nextActions: Array<{ planId: string; priority: number; reason: string; command?: string }>;
+    };
+  };
+  assert.equal(allPlanReport.command, "roster.plan");
+  assert.equal(allPlanReport.mode, "all");
+  assert.equal(allPlanReport.hostScan, "skipped");
+  assert.deepEqual(allPlanReport.hostEvidence, []);
+  assert.equal(allPlanReport.catalog.summary.blocked, 0);
+  assert.ok(allPlanReport.catalog.summary.depthLevels.partial_runtime > 0);
+  assert.ok(allPlanReport.catalog.summary.targetOwners["muster:capability_pack"] > 0);
+  assert.ok(allPlanReport.catalog.plans.some((plan) => plan.id === "demo-pack" && plan.kind === "locked_capability"));
+  assert.equal(allPlanReport.catalog.nextActions.some((action) => action.reason === "blocked"), false);
+  assert.ok(allPlanReport.catalog.nextActions.some((action) => action.planId === "slack" && action.reason === "credentials" && action.command === "muster channels setup slack"));
+  assert.ok(allPlanReport.catalog.nextActions.some((action) => action.planId === "slack" && action.reason === "diagnostics" && action.command === "muster channels doctor slack"));
+  assert.ok(allPlanReport.catalog.nextActions.some((action) => action.planId === "mcp:linear" && action.reason === "credentials" && action.command === "muster mcp install linear && muster mcp oauth setup linear"));
+  assert.ok(allPlanReport.catalog.nextActions.some((action) => action.planId === "mcp:google-drive" && action.reason === "host_evidence" && action.command === "muster mcp add-stdio google-drive <configured-google-drive-mcp-command>"));
+  assert.equal(allPlanReport.catalog.nextActions.every((action, index, actions) => index === 0 || actions[index - 1]!.priority <= action.priority), true);
+
+  const activationApplyJson = JSON.parse((await runCli(["roster", "activate", "demo-pack", "--lock", lockPath, "--json"], cwd)).stdout) as typeof activationJson & { result?: { enabled: string; configPath: string } };
+  assert.equal(activationApplyJson.dryRun, false);
+  assert.equal(activationApplyJson.mutation.wouldWriteConfig, true);
+  assert.equal(activationApplyJson.mutation.didWriteConfig, true);
+  assert.equal(activationApplyJson.result?.enabled, "demo-pack");
+  const activationApplyReportPath = join(cwd, "reports", "activation-apply.json");
+  const activationApplyReportRun = await runCli(["roster", "activate", "demo-pack", "--lock", lockPath, "--report", activationApplyReportPath], cwd);
+  assert.match(activationApplyReportRun.stdout, /report=.*activation-apply\.json/);
+  const activationApplyReport = JSON.parse(await readFile(activationApplyReportPath, "utf8")) as typeof activationApplyJson;
+  assert.equal(activationApplyReport.mutation.wouldWriteConfig, true);
+  assert.equal(activationApplyReport.mutation.didWriteConfig, true);
+  assert.equal(activationApplyReport.result?.enabled, "demo-pack");
+  const config = JSON.parse(await readFile(join(cwd, ".muster", "config.json"), "utf8")) as {
+    plugins?: { allow?: string[]; load?: { paths?: string[] }; entries?: Record<string, { enabled?: boolean }> };
+  };
+  assert.ok(config.plugins?.allow?.includes("demo-pack"));
+  assert.ok(config.plugins?.load?.paths?.includes(pack));
+  assert.equal(config.plugins?.entries?.["demo-pack"]?.enabled, true);
+
+  await execFileAsync("git", ["init"], { cwd: pack });
+  await execFileAsync("git", ["config", "user.email", "muster@example.test"], { cwd: pack });
+  await execFileAsync("git", ["config", "user.name", "Muster Test"], { cwd: pack });
+  await execFileAsync("git", ["add", "."], { cwd: pack });
+  await execFileAsync("git", ["commit", "-m", "seed demo pack"], { cwd: pack });
+  const { stdout: commit } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: pack });
+  const gitIndexPath = join(cwd, "roster.git.index.json");
+  const materializedLockPath = join(cwd, ".muster", "roster.git.lock.json");
+  const materializeCache = join(cwd, ".muster", "roster-cache");
+  await writeFile(gitIndexPath, `${JSON.stringify({
+    schemaVersion: 1,
+    entries: [{
+      schemaVersion: 1,
+      id: "demo-pack",
+      version: "0.1.0",
+      kind: "tool",
+      source: { type: "git", url: pack, ref: commit.trim() },
+      digest,
+      compatibility: { muster: ">=0.1.0" },
+      actionability: "local_tool",
+      risk: "medium",
+    }],
+  }, null, 2)}\n`, "utf8");
+
+  const materialized = await runCli(["roster", "materialize", "demo-pack", "--index", gitIndexPath, "--lock", materializedLockPath, "--cache", materializeCache, "--muster-version", "0.1.9"], cwd);
+  assert.match(materialized.stdout, /materialized=demo-pack version=0\.1\.0/);
+  assert.match(materialized.stdout, /source=git/);
+  assert.match(materialized.stdout, /status=ready/);
+  const materializedLock = JSON.parse(await readFile(materializedLockPath, "utf8")) as {
+    entries: Record<string, { source: { type: string; ref?: string }; resolvedPath?: string }>;
+  };
+  assert.equal(materializedLock.entries["demo-pack"].source.type, "git");
+  assert.equal(materializedLock.entries["demo-pack"].source.ref, commit.trim());
+  assert.ok(materializedLock.entries["demo-pack"].resolvedPath?.includes(join(".muster", "roster-cache")));
+  const materializedJsonLockPath = join(cwd, ".muster", "roster.git.json.lock.json");
+  const materializedJsonCache = join(cwd, ".muster", "roster-cache-json");
+  const materializedJson = JSON.parse((await runCli(["roster", "materialize", "demo-pack", "--index", gitIndexPath, "--lock", materializedJsonLockPath, "--cache", materializedJsonCache, "--muster-version", "0.1.9", "--json"], cwd)).stdout) as {
+    command: string;
+    cacheDir: string;
+    result: { materializedPath: string; verification: { status: string }; lockEntry: { id: string; source: { type: string }; resolvedPath?: string } };
+  };
+  assert.equal(materializedJson.command, "roster.materialize");
+  assert.equal(materializedJson.cacheDir, materializedJsonCache);
+  assert.equal(materializedJson.result.verification.status, "ready");
+  assert.equal(materializedJson.result.lockEntry.id, "demo-pack");
+  assert.equal(materializedJson.result.lockEntry.source.type, "git");
+  assert.equal(materializedJson.result.lockEntry.resolvedPath, materializedJson.result.materializedPath);
+  const materializedReportPath = join(cwd, "reports", "materialize.json");
+  const materializedReportLockPath = join(cwd, ".muster", "roster.git.report.lock.json");
+  const materializedReport = await runCli(["roster", "materialize", "demo-pack", "--index", gitIndexPath, "--lock", materializedReportLockPath, "--cache", join(cwd, ".muster", "roster-cache-report"), "--muster-version", "0.1.9", "--report", materializedReportPath], cwd);
+  assert.match(materializedReport.stdout, /report=.*materialize\.json/);
+  assert.match(materializedReport.stdout, /materialized=demo-pack version=0\.1\.0/);
+  const materializedReportJson = JSON.parse(await readFile(materializedReportPath, "utf8")) as typeof materializedJson;
+  assert.equal(materializedReportJson.command, "roster.materialize");
+  assert.equal(materializedReportJson.result.verification.status, "ready");
+
+  const manifest = JSON.parse(await readFile(join(pack, "manifest.json"), "utf8")) as Record<string, unknown>;
+  await writeFile(join(pack, "manifest.json"), `${JSON.stringify({ ...manifest, digest: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }, null, 2)}\n`, "utf8");
+  const tamperedActivation = await runCliAllowFailure(["roster", "activate", "demo-pack", "--lock", lockPath, "--muster-version", "0.1.9", "--dry-run"], cwd);
+  assert.equal(tamperedActivation.code, 1);
+  assert.match(tamperedActivation.stdout, /activation=demo-pack status=ready/);
+  assert.match(tamperedActivation.stdout, /activation_verify=blocked muster=0\.1\.9/);
+  assert.match(tamperedActivation.stdout, /verify_gate=digest status=blocked/);
+  const tamperedActivationReportPath = join(cwd, "reports", "tampered-activation.json");
+  const tamperedActivationReportRun = await runCliAllowFailure(["roster", "activate", "demo-pack", "--lock", lockPath, "--muster-version", "0.1.9", "--dry-run", "--report", tamperedActivationReportPath], cwd);
+  assert.equal(tamperedActivationReportRun.code, 1);
+  assert.match(tamperedActivationReportRun.stdout, /report=.*tampered-activation\.json/);
+  const tamperedActivationReport = JSON.parse(await readFile(tamperedActivationReportPath, "utf8")) as typeof activationJson;
+  assert.equal(tamperedActivationReport.verification.status, "blocked");
+  assert.equal(tamperedActivationReport.verification.gates.some((gate) => gate.id === "digest" && gate.status === "blocked"), true);
+  assert.equal(tamperedActivationReport.mutation.didWriteConfig, false);
+
+  const driftPack = await mkdtemp(join(tmpdir(), "muster-cli-roster-drift-pack-"));
+  await mkdir(join(driftPack, "src"), { recursive: true });
+  await mkdir(join(driftPack, "evals"), { recursive: true });
+  const driftEntrypoint = "export const tools = { drift: async () => ({ ok: true }) };\n";
+  const driftDigest = `sha256:${createHash("sha256").update(driftEntrypoint).digest("hex")}`;
+  await writeFile(join(driftPack, "src", "index.js"), driftEntrypoint, "utf8");
+  await writeFile(join(driftPack, "evals", "drift.json"), "{\"cases\":[]}\n", "utf8");
+  const driftManifest = {
+    schemaVersion: 1,
+    id: "drift-pack",
+    name: "Drift Pack",
+    version: "0.1.0",
+    kind: "tool",
+    entrypoint: "src/index.js",
+    permissions: ["network"],
+    sandbox: "network_limited",
+    evals: ["evals/drift.json"],
+    implementedTools: ["drift"],
+    digest: driftDigest,
+    readiness: {
+      level: "verified",
+      status: "beta",
+      actionability: "local_tool",
+      owner: "muster-core",
+      surfaces: ["cli"],
+      setup: { urls: ["https://example.test/drift"], requiredEnv: [], requiredAnyEnv: [], credentialStorage: "none" },
+      diagnostics: { doctorCommand: "muster capability doctor drift-pack", smokeCommand: "muster capability test drift-pack", latencyBudgetMs: 250, requiresLiveCredentials: false },
+      safety: { risk: "medium", permissionMode: "ask", mutationApproval: "never", resultCapBytes: 4096, secretRedaction: true },
+      evidence: { unitTests: ["packages/cli/test/cli.test.ts"], qaSuites: ["pack_readiness"], liveArtifacts: [], docs: ["README.md"] },
+    },
+  };
+  await writeFile(join(driftPack, "manifest.json"), `${JSON.stringify(driftManifest, null, 2)}\n`, "utf8");
+  const driftIndexPath = join(cwd, "drift.roster.index.json");
+  const driftLockPath = join(cwd, ".muster", "drift.roster.lock.json");
+  await runCli(["roster", "index", "--out", driftIndexPath, "--muster-version", "0.1.9", "--muster-compatibility", ">=0.1.0", driftPack], cwd);
+  await runCli(["roster", "install", "drift-pack", "--index", driftIndexPath, "--lock", driftLockPath, "--muster-version", "0.1.9"], cwd);
+  await writeFile(join(driftPack, "manifest.json"), `${JSON.stringify({
+    ...driftManifest,
+    readiness: {
+      ...driftManifest.readiness,
+      safety: { ...driftManifest.readiness.safety, risk: "high" },
+    },
+  }, null, 2)}\n`, "utf8");
+  const staleLockActivation = await runCliAllowFailure(["roster", "activate", "drift-pack", "--lock", driftLockPath, "--muster-version", "0.1.9", "--dry-run"], cwd);
+  assert.equal(staleLockActivation.code, 1);
+  assert.match(staleLockActivation.stdout, /activation=drift-pack status=ready/);
+  assert.match(staleLockActivation.stdout, /activation_verify=blocked muster=0\.1\.9/);
+  assert.match(staleLockActivation.stdout, /verify_gate=lock status=blocked summary=lock metadata drift detected: readiness/);
+  const staleLockActivationReportPath = join(cwd, "reports", "stale-lock-activation.json");
+  const staleLockActivationReportRun = await runCliAllowFailure(["roster", "activate", "drift-pack", "--lock", driftLockPath, "--muster-version", "0.1.9", "--dry-run", "--report", staleLockActivationReportPath], cwd);
+  assert.equal(staleLockActivationReportRun.code, 1);
+  assert.match(staleLockActivationReportRun.stdout, /report=.*stale-lock-activation\.json/);
+  const staleLockActivationReport = JSON.parse(await readFile(staleLockActivationReportPath, "utf8")) as typeof activationJson;
+  assert.equal(staleLockActivationReport.verification.status, "blocked");
+  assert.equal(staleLockActivationReport.verification.gates.some((gate) => gate.id === "lock" && gate.status === "blocked"), true);
+  assert.equal(staleLockActivationReport.mutation.didWriteConfig, false);
+  const staleLockVerify = await runCliAllowFailure(["roster", "lock", "--lock", driftLockPath, "--verify", "--muster-version", "0.1.9"], cwd);
+  assert.equal(staleLockVerify.code, 1);
+  assert.match(staleLockVerify.stdout, /roster_lock_verify status=blocked ready=0 blocked=1 total=1/);
+  assert.match(staleLockVerify.stdout, /gate_summary=lock passed=0 blocked=1/);
+  assert.match(staleLockVerify.stdout, /repair=drift-pack@0\.1\.0 gate=lock command="muster roster activate drift-pack --dry-run"/);
 });
 
 test("CLI artifacts command plans gated workflows and creates local files", async () => {
@@ -2505,6 +3444,7 @@ test("CLI codex doctor and QA scorecard expose runtime maturity without false po
   assert.match(scorecard.stdout, /failed\s+mcp\.auth_workflow/);
   assert.match(scorecard.stdout, /unknown\s+qa\.pty_tui/);
   assert.match(scorecard.stdout, /unknown\s+qa\.frappe2_real_prompts/);
+  assert.match(scorecard.stdout, /release_ready=unknown mode=advisory reason=run_with_--strict-release_before_release_claims/);
   assert.match(scorecard.stdout, /required_suites=pty_tui,provider_latency,mcp_auth_failure,memory_retrieval_speed,channel_plugin_setup,frappe2_real_prompts,pack_readiness/);
   assert.match(scorecard.stdout, /providers:/);
   assert.match(scorecard.stdout, /passed\s+codex\s+codex-cli model=gpt-5\.5/);
@@ -2527,6 +3467,7 @@ test("CLI codex doctor and QA scorecard expose runtime maturity without false po
   assert.equal(packDirScorecard.code, 1);
   assert.match(packDirScorecard.stdout, /qa_scorecard status=failed/);
   assert.match(packDirScorecard.stdout, /passed\s+qa\.pack_readiness\s+Capability pack readiness metadata and release claims are consistent/);
+  assert.match(packDirScorecard.stdout, /release_ready=no mode=strict reason=scorecard_or_strict_release_failed/);
   assert.match(packDirScorecard.stdout, new RegExp(`evidence=${packRunArtifact.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 
   const ptyRunArtifact = join(cwd, "qa-artifacts", "pty-run");
@@ -2649,9 +3590,10 @@ test("CLI codex doctor and QA scorecard expose runtime maturity without false po
   const channelRunArtifact = join(cwd, "qa-artifacts", "channel-plugin-run");
   const channelEvidencePath = join(cwd, "channel-evidence.json");
   const channelRun = await runCli(["qa", "run", "channel_plugin_setup", "--artifact-dir", channelRunArtifact, "--evidence", channelEvidencePath], cwd);
-  assert.match(channelRun.stdout, /qa_suite=channel_plugin_setup status=passed/);
-  assert.match(channelRun.stdout, /case=catalog_core_surfaces status=passed/);
-  assert.match(channelRun.stdout, /case=catalog_actionability_evidence status=passed/);
+	  assert.match(channelRun.stdout, /qa_suite=channel_plugin_setup status=passed/);
+	  assert.match(channelRun.stdout, /case=catalog_core_surfaces status=passed/);
+	  assert.match(channelRun.stdout, /case=roster_support_depth status=passed/);
+	  assert.match(channelRun.stdout, /case=catalog_actionability_evidence status=passed/);
   assert.match(channelRun.stdout, /case=everyday_capability_breadth status=passed/);
   assert.match(channelRun.stdout, /case=skill_catalog_breadth status=passed/);
   assert.match(channelRun.stdout, /case=mcp_auth_install_depth status=passed/);
@@ -2667,9 +3609,10 @@ test("CLI codex doctor and QA scorecard expose runtime maturity without false po
   const channelManifest = JSON.parse(await readFile(join(channelRunArtifact, "manifest.json"), "utf8")) as { status: string; suite: string; caseCount: number };
   assert.equal(channelManifest.suite, "channel_plugin_setup");
   assert.equal(channelManifest.status, "passed");
-  assert.ok(channelManifest.caseCount >= 13);
-  const channelCases = await readFile(join(channelRunArtifact, "cases.jsonl"), "utf8");
-  assert.match(channelCases, /"id":"catalog_actionability_evidence","status":"passed"/);
+	  assert.ok(channelManifest.caseCount >= 13);
+	  const channelCases = await readFile(join(channelRunArtifact, "cases.jsonl"), "utf8");
+	  assert.match(channelCases, /"id":"roster_support_depth","status":"passed"/);
+	  assert.match(channelCases, /"id":"catalog_actionability_evidence","status":"passed"/);
   assert.match(channelCases, /"id":"everyday_capability_breadth","status":"passed"/);
   assert.match(channelCases, /"id":"skill_catalog_breadth","status":"passed"/);
   assert.match(channelCases, /"id":"mcp_auth_install_depth","status":"passed"/);
@@ -2680,12 +3623,24 @@ test("CLI codex doctor and QA scorecard expose runtime maturity without false po
   const channelOperatorCases = JSON.parse(await readFile(join(channelRunArtifact, "operator-cases.json"), "utf8")) as { id: string; status: string; evidence: { simulations?: { channel: string; ok: boolean }[] } }[];
   assert.ok(channelOperatorCases.some((testCase) => testCase.id === "operator_plan_slack" && testCase.status === "passed"));
   assert.ok(channelOperatorCases.some((testCase) => testCase.id === "operator_simulations" && testCase.evidence.simulations?.some((simulation) => simulation.channel === "whatsapp" && simulation.ok)));
-  const channelCatalog = JSON.parse(await readFile(join(channelRunArtifact, "catalog.json"), "utf8")) as { plugins: { id: string }[]; mcpServers: { id: string }[] };
-  assert.ok(channelCatalog.plugins.some((plugin) => plugin.id === "web-frameworks"));
-  assert.ok(channelCatalog.mcpServers.some((mcp) => mcp.id === "browser"));
+	  const channelCatalog = JSON.parse(await readFile(join(channelRunArtifact, "catalog.json"), "utf8")) as {
+	    plugins: { id: string }[];
+	    mcpServers: { id: string }[];
+	    rosterMatrix: {
+	      summary: { ownedPacks: number; channelAdapters: number; mcpInstallable: number; hostReuse: number };
+	      entries: Array<{ id: string; support: string[] }>;
+	    };
+	  };
+	  assert.ok(channelCatalog.plugins.some((plugin) => plugin.id === "web-frameworks"));
+	  assert.ok(channelCatalog.mcpServers.some((mcp) => mcp.id === "browser"));
+	  assert.ok(channelCatalog.rosterMatrix.summary.ownedPacks > 0);
+	  assert.ok(channelCatalog.rosterMatrix.summary.channelAdapters >= 2);
+	  assert.ok(channelCatalog.rosterMatrix.summary.mcpInstallable >= 4);
+	  assert.equal(channelCatalog.rosterMatrix.summary.hostReuse, 0);
+	  assert.deepEqual(channelCatalog.rosterMatrix.entries.find((entry) => entry.id === "slack")?.support, ["owned_pack", "channel_adapter"]);
   const channelScorecard = await runCliAllowFailure(["qa", "scorecard", "--codex-command", codex, "--latest-version", "0.1.0", "--evidence", channelEvidencePath], cwd);
   assert.equal(channelScorecard.code, 1);
-  assert.match(channelScorecard.stdout, /passed\s+qa\.channel_plugin_setup\s+Channel\/plugin catalog depth, setup guidance, skill\/MCP breadth, unsafe-plugin refusal, and enable\/disable policy verified; channel operator plans, adapter simulations, and integration action loops verified/);
+	  assert.match(channelScorecard.stdout, /passed\s+qa\.channel_plugin_setup\s+Roster support depth, channel\/plugin catalog depth, setup guidance, skill\/MCP breadth, unsafe-plugin refusal, and enable\/disable policy verified; channel operator plans, adapter simulations, and integration action loops verified/);
   assert.match(channelScorecard.stdout, /unknown\s+qa\.frappe2_real_prompts/);
 
   const fakeSsh = await writeFakeSsh(cwd);
@@ -2758,6 +3713,7 @@ test("CLI codex doctor and QA scorecard expose runtime maturity without false po
   assert.match(evidencedScorecard.stdout, /qa_scorecard status=passed/);
   assert.match(evidencedScorecard.stdout, /passed\s+mcp\.auth_workflow/);
   assert.match(evidencedScorecard.stdout, /passed\s+qa\.frappe2_real_prompts\s+global Frappe-2 prompt regression verified/);
+  assert.match(evidencedScorecard.stdout, /release_ready=unknown mode=advisory reason=run_with_--strict-release_before_release_claims/);
   assert.match(evidencedScorecard.stdout, new RegExp(`evidence=${evidencePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 
   const strictThinScorecard = await runCliAllowFailure(["qa", "scorecard", "--strict-release", "--codex-command", codex, "--latest-version", "0.1.0", "--evidence", evidencePath], cwd);
@@ -2766,6 +3722,7 @@ test("CLI codex doctor and QA scorecard expose runtime maturity without false po
   assert.match(strictThinScorecard.stdout, /strict_release status=failed/);
   assert.match(strictThinScorecard.stdout, /failed\s+strict\.pty_tui\s+missing required passed case\(s\): slash_overlay_stable/);
   assert.match(strictThinScorecard.stdout, /failed\s+strict\.provider_latency\s+missing required passed case\(s\): sample_1, overhead_p50_gate/);
+  assert.match(strictThinScorecard.stdout, /release_ready=no mode=strict reason=scorecard_or_strict_release_failed/);
 });
 
 async function writeFakeCodex(cwd: string, version: string): Promise<string> {

@@ -6,7 +6,7 @@
   "kind": "channel",
   "slot": "channel-telegram",
   "entrypoint": "src/index.ts",
-  "description": "Telegram bot setup, gateway readiness, and update debugging helpers for regions where the Bot API is reachable.",
+  "description": "Telegram bot setup, background polling or webhook readiness, and update debugging helpers for regions where the Bot API is reachable.",
   "permissions": [
     "messages",
     "secrets"
@@ -24,7 +24,7 @@
     "telegram_gateway_check",
     "telegram_update_summary"
   ],
-  "status": "v0: setup and diagnostic helpers; live Telegram delivery may be regionally unavailable.",
+  "status": "v0: bot name + token setup, long-poll happy path, webhook diagnostics, and live Telegram delivery checks; Bot API availability may vary by region.",
   "readiness": {
     "level": "setup_plan",
     "status": "experimental",
@@ -41,8 +41,7 @@
         "https://core.telegram.org/bots/api#setwebhook"
       ],
       "requiredEnv": [
-        "TELEGRAM_BOT_TOKEN",
-        "TELEGRAM_SECRET_TOKEN"
+        "TELEGRAM_BOT_TOKEN"
       ],
       "requiredAnyEnv": [],
       "credentialStorage": "env"

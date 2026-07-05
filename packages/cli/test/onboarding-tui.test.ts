@@ -1,11 +1,38 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile } from "node:fs/promises";
+import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { loadConfig } from "@musterhq/core";
 import { loadGatewayConfig } from "@musterhq/gateway";
-import { applyOnboardingProfile, globalOnboardingProfilePath, onboardingProfilePath, onboardingStateForSelections } from "../src/onboarding-tui.js";
+import { applyOnboardingProfile, globalOnboardingProfilePath, onboardingProfilePath, onboardingStateForSelections, runMusterOnboardingTui } from "../src/onboarding-tui.js";
+
+function fakeTtyInput(): PassThrough & NodeJS.ReadStream {
+  const input = new PassThrough() as PassThrough & NodeJS.ReadStream & { isRaw: boolean };
+  input.isTTY = true;
+  input.isRaw = false;
+  input.setRawMode = (mode: boolean) => {
+    input.isRaw = mode;
+    return input;
+  };
+  return input;
+}
+
+function fakeTtyOutput(): { output: PassThrough & NodeJS.WriteStream; read: () => string } {
+  const output = new PassThrough() as PassThrough & NodeJS.WriteStream;
+  output.isTTY = true;
+  output.columns = 100;
+  let raw = "";
+  output.on("data", (chunk) => {
+    raw += chunk.toString("utf8");
+  });
+  return { output, read: () => raw };
+}
+
+async function tick(): Promise<void> {
+  await new Promise((resolve) => setImmediate(resolve));
+}
 
 test("onboarding applies real providers, plugins, MCPs, channels, memory policy, and profiles", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-onboarding-apply-"));
@@ -64,4 +91,25 @@ test("onboarding applies real providers, plugins, MCPs, channels, memory policy,
 
   assert.equal(globalProfile.lastWorkspaceProfilePath, onboardingProfilePath(cwd));
   assert.ok(globalProfile.configured.includes("memory:scoped-policy"));
+});
+
+test("interactive onboarding redraws in one live screen and ignores normal character keys", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-onboarding-redraw-"));
+  const input = fakeTtyInput();
+  const { output, read } = fakeTtyOutput();
+  const running = runMusterOnboardingTui(["--no-chat", "--no-color"], { cwd, input, output });
+
+  await tick();
+  input.write("\x1b[B");
+  await tick();
+  input.write("x");
+  await tick();
+  input.write("q");
+
+  const result = await running;
+  const raw = read();
+  assert.equal(result.saved, false);
+  assert.match(raw, /\x1b\[\?1049h/, "onboarding should enter the alternate screen to avoid scrollback panes");
+  assert.match(raw, /\x1b\[\?1049l/, "onboarding should leave the alternate screen on cleanup");
+  assert.equal((raw.match(/Muster onboarding/g) ?? []).length, 2, "initial render plus Down update only; ordinary character keys should not append duplicate frames");
 });

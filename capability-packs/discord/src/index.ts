@@ -47,21 +47,21 @@ export async function discord_setup_plan(args: Record<string, unknown>, context:
   return {
     channel: "discord",
     label: "Discord App",
-    ready: token,
+    ready: token && publicKey,
     webhookUrl: `${base}${ROUTE}`,
     setupUrls: SETUP_URLS,
     prerequisites: [
       "Discord application created in the Developer Portal.",
       "Bot token copied into an environment variable for gateway outbound replies.",
       "Interactions endpoint URL set to the Muster Discord adapter webhook.",
-      "Application public key copied when you want gateway-level Ed25519 signature verification.",
+      "Application public key copied for gateway-level Ed25519 signature verification.",
       "A slash command whose text option carries the user prompt.",
     ],
     commands: [
       "muster gateway init",
-      `muster channels setup discord --bot-token-env DISCORD_BOT_TOKEN --public-key-env DISCORD_PUBLIC_KEY --public-url ${base}`,
+      `muster channels ready discord --bot-token-env DISCORD_BOT_TOKEN --public-key-env DISCORD_PUBLIC_KEY --public-url ${base}`,
       "muster channels status discord",
-      "muster gateway start --port 7460",
+      "muster gateway daemon start --port 7460",
     ],
     notes: [
       "Discord sends slash-command interactions to the webhook and expects a synchronous response.",
@@ -71,7 +71,7 @@ export async function discord_setup_plan(args: Record<string, unknown>, context:
     security: {
       botTokenConfigured: token,
       publicKeyConfigured: publicKey,
-      recommendation: "Store DISCORD_BOT_TOKEN and DISCORD_PUBLIC_KEY outside prompts; `muster channels setup` reads env values and never prints them.",
+      recommendation: "Store DISCORD_BOT_TOKEN and DISCORD_PUBLIC_KEY outside prompts; `muster channels ready` reads env values and never prints them.",
     },
   };
 }
@@ -82,13 +82,13 @@ export async function discord_gateway_check(args: Record<string, unknown>, conte
   const publicKey = hasPublicKey(gateway, context);
   return {
     channel: "discord",
-    ready: token,
+    ready: token && publicKey,
     checks: [
-      { id: "bot_token", ok: token, detail: token ? "bot token configured" : "Set DISCORD_BOT_TOKEN and run channels setup." },
-      { id: "public_key", ok: publicKey, optional: true, detail: publicKey ? "public key configured" : "Add DISCORD_PUBLIC_KEY for Discord interaction signature verification." },
+      { id: "bot_token", ok: token, detail: token ? "bot token configured" : "Set DISCORD_BOT_TOKEN and run channels ready." },
+      { id: "public_key", ok: publicKey, detail: publicKey ? "public key configured" : "Add DISCORD_PUBLIC_KEY for Discord interaction signature verification." },
       { id: "public_https_url", ok: Boolean(stringArg(args, "publicUrl")?.startsWith("https://")), detail: "Discord Interaction Endpoint URLs must be public HTTPS in production." },
     ],
-    next: token ? "Start the gateway and paste the webhook URL into Discord Interactions Endpoint URL." : "Run muster channels setup discord with bot-token env.",
+    next: token && publicKey ? "Start the gateway daemon and paste the webhook URL into Discord Interactions Endpoint URL." : "Run muster channels ready discord with bot-token and public-key env.",
   };
 }
 

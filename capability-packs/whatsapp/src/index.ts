@@ -8,6 +8,7 @@ interface GatewayLike {
     readonly accessToken?: string;
     readonly verifyToken?: string;
     readonly phoneNumberId?: string;
+    readonly appSecret?: string;
     readonly apiVersion?: string;
   } | null;
 }
@@ -48,8 +49,12 @@ function hasPhoneNumberId(gateway: GatewayLike | undefined, context: ChannelCont
   return Boolean(gateway?.whatsapp?.phoneNumberId || context.config.WHATSAPP_PHONE_NUMBER_ID);
 }
 
+function hasAppSecret(gateway: GatewayLike | undefined, context: ChannelContext): boolean {
+  return Boolean(gateway?.whatsapp?.appSecret || context.config.WHATSAPP_APP_SECRET);
+}
+
 function ready(gateway: GatewayLike | undefined, context: ChannelContext): boolean {
-  return hasAccessToken(gateway, context) && hasVerifyToken(gateway, context) && hasPhoneNumberId(gateway, context);
+  return hasAccessToken(gateway, context) && hasVerifyToken(gateway, context) && hasPhoneNumberId(gateway, context) && hasAppSecret(gateway, context);
 }
 
 export async function whatsapp_setup_plan(args: Record<string, unknown>, context: ChannelContext) {
@@ -69,13 +74,14 @@ export async function whatsapp_setup_plan(args: Record<string, unknown>, context
       "Permanent or long-lived access token stored in WHATSAPP_ACCESS_TOKEN.",
       "Webhook verify token stored in WHATSAPP_VERIFY_TOKEN.",
       "Phone Number ID stored in WHATSAPP_PHONE_NUMBER_ID.",
+      "Meta app secret stored in WHATSAPP_APP_SECRET for X-Hub-Signature-256 POST verification.",
       "Public HTTPS gateway URL for Meta webhook delivery.",
     ],
     commands: [
       "muster gateway init",
-      `muster channels setup whatsapp --access-token-env WHATSAPP_ACCESS_TOKEN --verify-token-env WHATSAPP_VERIFY_TOKEN --phone-number-id-env WHATSAPP_PHONE_NUMBER_ID --api-version ${apiVersion} --public-url ${base}`,
+      `muster channels ready whatsapp --access-token-env WHATSAPP_ACCESS_TOKEN --verify-token-env WHATSAPP_VERIFY_TOKEN --phone-number-id-env WHATSAPP_PHONE_NUMBER_ID --app-secret-env WHATSAPP_APP_SECRET --api-version ${apiVersion} --public-url ${base}`,
       "muster channels status whatsapp",
-      "muster gateway start --port 7460",
+      "muster gateway daemon start --port 7460",
     ],
     notes: [
       "Muster uses Meta's Cloud API webhook handshake and replies through the Graph /messages endpoint.",
@@ -90,16 +96,18 @@ export async function whatsapp_gateway_check(args: Record<string, unknown>, cont
   const token = hasAccessToken(gateway, context);
   const verify = hasVerifyToken(gateway, context);
   const phone = hasPhoneNumberId(gateway, context);
+  const appSecret = hasAppSecret(gateway, context);
   return {
     channel: "whatsapp",
-    ready: token && verify && phone,
+    ready: token && verify && phone && appSecret,
     checks: [
-      { id: "access_token", ok: token, detail: token ? "access token configured" : "Set WHATSAPP_ACCESS_TOKEN and run channels setup." },
-      { id: "verify_token", ok: verify, detail: verify ? "verify token configured" : "Set WHATSAPP_VERIFY_TOKEN and run channels setup." },
-      { id: "phone_number_id", ok: phone, detail: phone ? "phone number id configured" : "Set WHATSAPP_PHONE_NUMBER_ID and run channels setup." },
+      { id: "access_token", ok: token, detail: token ? "access token configured" : "Set WHATSAPP_ACCESS_TOKEN and run channels ready." },
+      { id: "verify_token", ok: verify, detail: verify ? "verify token configured" : "Set WHATSAPP_VERIFY_TOKEN and run channels ready." },
+      { id: "phone_number_id", ok: phone, detail: phone ? "phone number id configured" : "Set WHATSAPP_PHONE_NUMBER_ID and run channels ready." },
+      { id: "app_secret", ok: appSecret, detail: appSecret ? "app secret configured for POST signature checks" : "Set WHATSAPP_APP_SECRET and run channels ready." },
       { id: "public_https_url", ok: Boolean(stringArg(args, "publicUrl")?.startsWith("https://")), detail: "Meta webhooks require a public HTTPS callback URL in production." },
     ],
-    next: token && verify && phone ? "Start the gateway and paste the callback URL plus verify token into Meta webhook configuration." : "Run muster channels setup whatsapp with access-token, verify-token, and phone-number-id env vars.",
+    next: token && verify && phone && appSecret ? "Start the gateway daemon and paste the callback URL plus verify token into Meta webhook configuration." : "Run muster channels ready whatsapp with access-token, verify-token, phone-number-id, and app-secret env vars.",
   };
 }
 

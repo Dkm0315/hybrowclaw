@@ -46,18 +46,21 @@ export async function telegram_setup_plan(args: Record<string, unknown>, context
     prerequisites: [
       "Telegram Bot API reachable from your deployment region.",
       "Bot token created with BotFather.",
-      "Public HTTPS gateway URL for webhook mode, or local long-poll mode for reachable development environments.",
-      "Optional webhook secret token for request validation.",
+      "Bot name is optional but recommended for human-readable setup output.",
+      "Muster auto-generates the webhook secret during bot-token setup.",
+      "Public HTTPS gateway URL for webhook mode, or background long-poll daemon fallback for reachable development environments.",
     ],
     commands: [
       "muster gateway init",
-      `muster channels setup telegram --bot-token-env TELEGRAM_BOT_TOKEN --public-url ${base}`,
-      "muster gateway poll",
+      `muster channels setup telegram --name my-telegram-bot --bot-token-env TELEGRAM_BOT_TOKEN --public-url ${base}`,
+      `muster gateway webhook telegram --public-url ${base}`,
+      "muster gateway daemon start --port 7460",
+      "muster gateway daemon start --with-telegram-poll",
       "muster channels status telegram",
     ],
     notes: [
       "If Telegram is blocked in your region, keep this backend disabled and test Google Chat, Slack, web, or Discord instead.",
-      "Long-poll mode avoids a public URL but still requires Bot API reachability.",
+      "Long-poll mode avoids a public URL but should run through the daemon, not a foreground terminal.",
     ],
   };
 }
@@ -71,10 +74,10 @@ export async function telegram_gateway_check(args: Record<string, unknown>, cont
     ready: token,
     checks: [
       { id: "bot_token", ok: token, detail: token ? "bot token configured" : "Set TELEGRAM_BOT_TOKEN and run channels setup." },
-      { id: "secret_token", ok: secret, optional: true, detail: secret ? "webhook secret configured" : "Optional: set TELEGRAM_SECRET_TOKEN for webhook request validation." },
+      { id: "secret_token", ok: secret, detail: secret ? "webhook secret configured" : "Run channels setup with TELEGRAM_BOT_TOKEN; Muster auto-generates the webhook secret." },
       { id: "public_https_url", ok: Boolean(stringArg(args, "publicUrl")?.startsWith("https://")), optional: true, detail: "Webhook mode requires HTTPS; local poll mode does not." },
     ],
-    next: token ? "Use muster gateway poll locally or configure Telegram setWebhook to the webhook URL." : "Create a BotFather token, export TELEGRAM_BOT_TOKEN, then run channels setup.",
+    next: token ? "Run muster gateway webhook telegram --public-url <https-url> and start the gateway daemon; use daemon --with-telegram-poll only as a local fallback." : "Create a BotFather token, export TELEGRAM_BOT_TOKEN, then run channels setup.",
   };
 }
 

@@ -923,8 +923,9 @@ test("channel packs produce setup plans, readiness checks, and safe payload summ
     { config: {} },
   );
   assert.equal(googlePlan.webhookUrl, "https://chat.example.test/v1/adapters/gchat");
-  assert.equal(googlePlan.ready, true);
+  assert.equal(googlePlan.ready, false);
   assert.match(googlePlan.notes.join(" "), /Telegram is unavailable/);
+  assert.ok(googlePlan.commands.some((command) => command === "muster gateway daemon start --port 7460"));
 
   const googleCheck = await google_chat_gateway_check({ publicUrl: "http://localhost:7460", gatewayConfig: {} }, { config: {} });
   assert.equal(googleCheck.ready, false);
@@ -940,16 +941,26 @@ test("channel packs produce setup plans, readiness checks, and safe payload summ
   assert.deepEqual(googleSummary, { type: "MESSAGE", text: "hello", space: "spaces/AAA", user: "Ada", thread: "spaces/AAA/threads/BBB" });
 
   const slackPlan = await slack_setup_plan(
-    { publicUrl: "https://slack.example.test", gatewayConfig: { slack: { botToken: "xoxb", signingSecret: "secret" } } },
+    { publicUrl: "https://slack.example.test", gatewayConfig: { slack: { botToken: "xoxb", appToken: "xapp" } } },
     { config: {} },
   );
   assert.equal(slackPlan.ready, true);
-  assert.equal(slackPlan.webhookUrl, "https://slack.example.test/v1/adapters/slack");
+  assert.equal(slackPlan.mode, "socket");
+  assert.equal(slackPlan.webhookUrl, undefined);
 
   const slackCheck = await slack_gateway_check({ gatewayConfig: { slack: { botToken: "xoxb" } } }, { config: {} });
   assert.equal(slackCheck.ready, false);
-  assert.equal(slackCheck.checks[1].id, "signing_secret");
+  assert.equal(slackCheck.mode, "socket");
+  assert.equal(slackCheck.checks[1].id, "app_token");
   assert.equal(slackCheck.checks[1].ok, false);
+  assert.equal(slackCheck.checks[2].id, "file_upload_scope");
+  assert.equal(slackCheck.checks[2].ok, false);
+  assert.match(slackCheck.checks[2].detail, /doctor slack --live/);
+
+  const slackHttpCheck = await slack_gateway_check({ publicUrl: "https://slack.example.test", gatewayConfig: { slack: { botToken: "xoxb", mode: "http" } } }, { config: {} });
+  assert.equal(slackHttpCheck.ready, false);
+  assert.equal(slackHttpCheck.mode, "http");
+  assert.equal(slackHttpCheck.checks[1].id, "signing_secret");
 
   const slackSummary = await slack_event_summary({ event: { type: "message", channel: "C1", user: "U1", text: "hi", ts: "123.4" }, team_id: "T1" });
   assert.deepEqual(slackSummary, { type: "message", team: "T1", channel: "C1", user: "U1", text: "hi", threadTs: "123.4" });
@@ -1004,7 +1015,7 @@ test("channel packs produce setup plans, readiness checks, and safe payload summ
   assert.deepEqual(telegramSummary, { updateId: 42, chatId: "123", chatType: "private", user: "ada", text: "/start" });
 
   const whatsappPlan = await whatsapp_setup_plan(
-    { publicUrl: "https://wa.example.test", gatewayConfig: { whatsapp: { accessToken: "token", verifyToken: "verify", phoneNumberId: "pnid", apiVersion: "v20.0" } } },
+    { publicUrl: "https://wa.example.test", gatewayConfig: { whatsapp: { accessToken: "token", verifyToken: "verify", phoneNumberId: "pnid", appSecret: "app-secret", apiVersion: "v20.0" } } },
     { config: {} },
   );
   assert.equal(whatsappPlan.ready, true);
@@ -1014,7 +1025,7 @@ test("channel packs produce setup plans, readiness checks, and safe payload summ
 
   const whatsappCheck = await whatsapp_gateway_check({ gatewayConfig: { whatsapp: { accessToken: "token" } } }, { config: {} });
   assert.equal(whatsappCheck.ready, false);
-  assert.deepEqual(whatsappCheck.checks.map((check) => check.id), ["access_token", "verify_token", "phone_number_id", "public_https_url"]);
+  assert.deepEqual(whatsappCheck.checks.map((check) => check.id), ["access_token", "verify_token", "phone_number_id", "app_secret", "public_https_url"]);
   assert.equal(whatsappCheck.checks[1].ok, false);
 
   const whatsappSummary = await whatsapp_webhook_summary({
@@ -1390,7 +1401,7 @@ test("new integration packs load through the capability loader", async () => {
   assert.deepEqual(claudeCode.toolNames.sort(), ["claude-code__claude_code_mode_policy", "claude-code__claude_code_readiness", "claude-code__claude_code_session_policy", "claude-code__claude_code_setup_plan"]);
   assert.deepEqual(codexNativeTools.toolNames.sort(), ["codex-native-tools__codex_native_approval_policy", "codex-native-tools__codex_native_fast_path", "codex-native-tools__codex_native_surface_plan", "codex-native-tools__codex_native_tool_policy"]);
   assert.deepEqual(codexWebSearch.toolNames.sort(), ["codex-web-search__codex_web_research_policy", "codex-web-search__codex_web_search_fallback_plan", "codex-web-search__codex_web_search_readiness", "codex-web-search__codex_web_search_setup_plan"]);
-  assert.deepEqual(artifactStudio.toolNames.sort(), ["artifact-studio__artifact_capability_plan", "artifact-studio__artifact_goal_passes", "artifact-studio__artifact_structural_verify", "artifact-studio__dashboard_manifest", "artifact-studio__docx_document", "artifact-studio__markdown_report", "artifact-studio__office_artifact_contract", "artifact-studio__office_artifact_workflow", "artifact-studio__office_tool_integrations", "artifact-studio__pdf_document", "artifact-studio__pptx_presentation", "artifact-studio__rows_to_csv", "artifact-studio__xlsx_workbook"]);
+  assert.deepEqual(artifactStudio.toolNames.sort(), ["artifact-studio__artifact_capability_plan", "artifact-studio__artifact_goal_passes", "artifact-studio__artifact_structural_verify", "artifact-studio__dashboard_manifest", "artifact-studio__declare_artifact", "artifact-studio__document_generation_workflow", "artifact-studio__docx_document", "artifact-studio__markdown_report", "artifact-studio__office_artifact_contract", "artifact-studio__office_artifact_workflow", "artifact-studio__office_tool_integrations", "artifact-studio__pdf_document", "artifact-studio__pptx_presentation", "artifact-studio__rows_to_csv", "artifact-studio__validate_artifact_file", "artifact-studio__xlsx_workbook"]);
   assert.equal(typeof registry["web-search__duckduckgo_search"], "function");
   assert.equal(typeof registry["research-lab__arxiv_search"], "function");
   assert.equal(typeof registry["github__github_repo_summary"], "function");

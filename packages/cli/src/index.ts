@@ -56,7 +56,28 @@ import {
   saveFlow,
   inspectClaudeCode,
   inspectCapabilityPack,
+  inspectCapabilityManifest,
+  computeCapabilityEntrypointDigest,
   loadCapabilityPack,
+  applyRosterActivationPlan,
+  applyRosterMcpActivationPlan,
+  buildRosterProjectionCatalog,
+  buildRosterEntryFromPack,
+  buildRosterIndexFromPacks,
+  buildRosterSupportMatrix,
+  installRosterCapability,
+  materializeRosterCapability,
+  planRosterBuiltinProjection,
+  planRosterActivation,
+  planRosterMcpActivation,
+  planRosterLockProjection,
+  rosterMcpConfigFromCatalogEntry,
+  summarizeRosterIndex,
+  summarizeRosterVerification,
+  verifyRosterCapability,
+  verifyRosterIndex,
+  verifyRosterLock,
+  verifyRosterLockedCapability,
   inspectPiCommands,
   inspectPiRuntime,
   inspectPiTools,
@@ -67,12 +88,14 @@ import {
   probeMemorySearchLatency,
   rebuildMemoryIndex,
   listBuiltinMcpServers,
+  loadRosterIndex,
   resolveBuiltinCapabilityMentions,
   type BuiltinMcpCatalogEntry,
-  type BuiltinMcpInstallSpec,
   type BuiltinCapabilityMention,
   type BuiltinSkillCatalogEntry,
   type BuiltinPluginCatalogEntry,
+  type CapabilityReadinessLevel,
+  type RosterCapabilityMetadata,
   mcpOAuthStatus,
   removeMcpOAuthToken,
   writeMcpOAuthToken,
@@ -132,6 +155,7 @@ import {
   listTokenRecords,
   renderTokenTable,
   listSpans,
+  readRosterLock,
   renderTracesTable,
   skillsIndexPath,
   activeProfile,
@@ -158,8 +182,8 @@ import {
   renderIntegrityReport,
   connectMcpServers,
   clearCodexAppServerSessions,
-  artifact_structural_verify,
   artifact_goal_passes,
+  artifact_structural_verify,
   docx_document,
   office_artifact_contract,
   office_artifact_workflow,
@@ -177,6 +201,7 @@ import {
   initGatewayConfig,
   loadGatewayConfig,
   loadPairings,
+  pollSlackSocket,
   pollTelegram,
   saveGatewayConfig,
   slackEventToSurfaceMessage,
@@ -185,8 +210,9 @@ import {
   telegramUpdateToSurfaceMessage,
   whatsAppWebhookToSurfaceMessages
 } from "@musterhq/gateway";
-import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { existsSync, openSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { access, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -211,6 +237,8 @@ process.on("warning", (warning) => {
 });
 
 const [, , command, ...args] = process.argv;
+const CLI_MUSTER_VERSION = "0.1.10";
+const CLI_PACKAGE_NAME = "@musterhq/cli";
 
 async function main(): Promise<void> {
   if (command === "--skip-onboarding" || command === "--no-onboarding") {
@@ -226,6 +254,14 @@ async function main(): Promise<void> {
     case "-h":
       printBanner();
       printHelp();
+      return;
+    case "version":
+    case "--version":
+    case "-v":
+      printVersion();
+      return;
+    case "update":
+      await updateCommand(args);
       return;
     case "init":
       await init();
@@ -260,6 +296,9 @@ async function main(): Promise<void> {
       return;
     case "capability":
       await capability(args);
+      return;
+    case "roster":
+      await rosterCommand(args);
       return;
     case "artifacts":
       await artifactsCommand(args);
@@ -370,6 +409,8 @@ function printHelp(): void {
 
 Usage:
   muster                                    # first run: onboarding; after setup: interactive chat
+  muster --version
+  muster update [--manager npm|pnpm|yarn|bun] [--target latest] [--apply]
   muster --skip-onboarding                  # open chat even if onboarding is incomplete
   muster init
   muster onboard [--preview] [--color=always|never] [--step purpose|style|provider|integrations|channels|memory|finish]
@@ -393,7 +434,17 @@ Usage:
   muster eval retrieval list [path-or-dir]
   muster eval retrieval <path-or-dir> [--min-recall 1] [--min-mrr 1] [--max-leakage-rate 0] [--max-stale-hit-rate 0] [--max-p95-ms 50] [--artifact-dir DIR]
   muster capability inspect <path>
+  muster capability digest <path> [--write]
   muster capability load <path> [--allow-high-risk]
+  muster roster catalog [--host provider|--scan-hosts] [--no-host-cache|--refresh-host-cache] [--host-cache path] [--host-cache-ttl-ms n] [--json] [--report path]
+  muster roster index --out roster.index.json [--builtin-packs] [--skip-blocked] [pack-path ...] [--dry-run]
+  muster roster plan <id|--all> [--lock .muster/roster.lock.json] [--host provider|--scan-hosts] [--no-host-cache|--refresh-host-cache] [--json] [--report path]
+  muster roster verify [--index roster.index.json] [--muster-version x.y.z] [--registry-profile verified|release] [--require-metadata] [--min-readiness level] [--json] [--report path]
+  muster roster inspect|install <id> [--index roster.index.json] [--lock .muster/roster.lock.json] [--version x.y.z] [--muster-version x.y.z] [--registry-profile verified|release] [--require-metadata] [--min-readiness level] [--json] [--report path]
+  muster roster lock [--lock .muster/roster.lock.json] [--verify] [--muster-version x.y.z] [--json] [--report path]
+  muster roster materialize <id> [--index roster.index.json] [--lock .muster/roster.lock.json] [--cache .muster/roster-cache] [--version x.y.z] [--muster-version x.y.z] [--registry-profile verified|release] [--require-metadata] [--min-readiness level] [--json] [--report path]
+  muster roster activate <id|mcp:id|channel:id|skill:id> [--lock .muster/roster.lock.json] [--muster-version x.y.z] [--dry-run] [--json] [--report path]
+  muster roster publish --dry-run <path> [--source-path path] [--muster-compatibility >=0.1.0] [--muster-version x.y.z] [--json] [--report path]
   muster artifacts contract [--formats docx,xlsx,pptx,pdf]
   muster artifacts plan --format docx|xlsx|pptx|pdf [--destination local|google-drive|microsoft-365] [--polished]
   muster artifacts create --format docx|xlsx|pptx|pdf --title "..." [--summary "..."] [--spec spec.json] [--out path]
@@ -401,7 +452,7 @@ Usage:
   muster plugins list | catalog | setup <id> | reuse <provider> [--adopt-mcp id|--adopt-all-mcps] | context frappe <setup|docs|module|build> | enable <id> | disable <id> | policy | inspect <path> | load <path>
   muster mcp list | status [name] | login <name> | logout <name> | catalog | check [id] | install <id> | oauth status|setup|import ... | add-http <name> <url> [--oauth ...] | add-stdio <name> <command> [args...] | test <name>
   muster dashboard status | start [--port 7461] [--host 127.0.0.1]
-  muster channels list | status [channel] | plan <channel> | simulate <channel> [--message TEXT] | doctor <channel> [--live] | setup <channel> [--public-url URL] [secret env flags]
+  muster channels list | status [channel] | plan <channel> | simulate <channel> [--message TEXT] | doctor <channel> [--live] | setup|connect|ready <channel> [--mode socket|http] [--public-url URL] [secret flags]
   muster integrations [list|guide|status|workflow <id>|setup <id>|verify <id>|enable <id>|sample <id>]  # guided setup for channels, plugins, and MCPs
   muster context graph [episode-id] [--scope tenant:hybrow] [--latest]
   muster latency "prompt" [--runs 3] [--runtime codex] [--provider X] [--model Y] [--scope user:me] [--timeout-ms 30000]
@@ -453,8 +504,10 @@ Usage:
   muster flow runs | show <run-id> | approve <run-id> | reject <run-id>
   muster gateway init
   muster gateway status              # readiness without printing bearer tokens
-  muster gateway start [--port 7460]
-  muster gateway poll                 # Telegram long-poll (no public webhook URL needed)
+  muster gateway start [--port 7460] [--with-telegram-poll] [--with-slack-socket]
+  muster gateway daemon start|stop|status|restart [--with-telegram-poll] [--with-slack-socket]
+  muster gateway webhook telegram --public-url https://your-domain.example
+  muster gateway poll                 # local Telegram long-poll fallback; daemonize with gateway daemon start --with-telegram-poll
   muster pairing list | approve <code>
   muster flow replay <run-id> [--live-agents]
   muster flow diff <run-id-a> <run-id-b>
@@ -464,6 +517,66 @@ Usage:
 Design rule:
   One active runtime per run. Providers/models can route dynamically by task.
 `);
+}
+
+function printVersion(): void {
+  console.log(`muster ${CLI_MUSTER_VERSION}`);
+}
+
+async function updateCommand(commandArgs: string[] = []): Promise<void> {
+  if (commandArgs.includes("--help") || commandArgs.includes("-h")) {
+    console.log("Usage: muster update [--manager npm|pnpm|yarn|bun] [--target latest] [--apply]");
+    return;
+  }
+  const manager = readUpdateManager(commandArgs);
+  const target = readFlag(commandArgs, "--target") ?? readFlag(commandArgs, "--latest-version") ?? "latest";
+  const update = updateCommandForManager(manager, target);
+  console.log(`muster_current=${CLI_MUSTER_VERSION}`);
+  console.log(`package=${CLI_PACKAGE_NAME}`);
+  console.log(`target=${target}`);
+  console.log(`manager=${manager}`);
+  console.log(`command=${update.command} ${update.args.join(" ")}`);
+  if (!commandArgs.includes("--apply")) {
+    console.log("apply=false");
+    console.log("next=muster update --apply");
+    return;
+  }
+  console.log("apply=true");
+  await runUpdateCommand(update.command, update.args);
+}
+
+type UpdateManager = "npm" | "pnpm" | "yarn" | "bun";
+
+function readUpdateManager(args: readonly string[]): UpdateManager {
+  const explicit = readFlag([...args], "--manager");
+  if (explicit) {
+    if (explicit === "npm" || explicit === "pnpm" || explicit === "yarn" || explicit === "bun") return explicit;
+    throw new Error("--manager must be one of npm, pnpm, yarn, bun.");
+  }
+  const userAgent = process.env.npm_config_user_agent ?? "";
+  if (userAgent.startsWith("pnpm/")) return "pnpm";
+  if (userAgent.startsWith("yarn/")) return "yarn";
+  if (userAgent.startsWith("bun/")) return "bun";
+  return "npm";
+}
+
+function updateCommandForManager(manager: UpdateManager, target: string): { readonly command: string; readonly args: readonly string[] } {
+  const spec = `${CLI_PACKAGE_NAME}@${target}`;
+  if (manager === "pnpm") return { command: "pnpm", args: ["add", "-g", spec] };
+  if (manager === "yarn") return { command: "yarn", args: ["global", "add", spec] };
+  if (manager === "bun") return { command: "bun", args: ["add", "-g", spec] };
+  return { command: "npm", args: ["install", "-g", spec] };
+}
+
+async function runUpdateCommand(commandName: string, commandArgs: readonly string[]): Promise<void> {
+  await new Promise<void>((resolveRun, rejectRun) => {
+    const child = spawn(commandName, [...commandArgs], { stdio: "inherit" });
+    child.on("error", rejectRun);
+    child.on("exit", (code, signal) => {
+      if (code === 0) resolveRun();
+      else rejectRun(new Error(`Update command failed${signal ? ` with signal ${signal}` : ` with exit code ${code ?? "unknown"}`}.`));
+    });
+  });
 }
 
 async function init(): Promise<void> {
@@ -629,10 +742,10 @@ const CHAT_PLUGIN_OPTIONS = listBuiltinPlugins().map((plugin) => ({
   description: `${plugin.category} · ${plugin.actionability} · ${plugin.source} · risk ${plugin.risk}${plugin.aliases?.length ? ` · ${plugin.aliases.join(", ")}` : ""} · ${plugin.description}`,
 }));
 const CHAT_REUSE_PROVIDER_PRESETS: readonly PickerOption[] = [
-  { value: "codex", label: "codex", description: "scan ~/.codex/plugins/cache or CODEX_HOME for authenticated apps/MCPs" },
-  { value: "claude", label: "claude", description: "scan ~/.claude/plugins/cache or CLAUDE_HOME when available" },
-  { value: "openclaw", label: "openclaw", description: "scan ~/.openclaw/plugins or OPENCLAW_HOME when available" },
-  { value: "hermes", label: "hermes", description: "scan ~/.hermes/plugins or HERMES_HOME when available" },
+  { value: "codex", label: "codex", description: "scan CODEX_HOME or the local Codex host cache for authenticated apps/MCPs" },
+  { value: "claude", label: "claude", description: "scan CLAUDE_HOME or the local Claude host cache when available" },
+  { value: "openclaw", label: "openclaw", description: "scan OPENCLAW_HOME or the local OpenClaw host cache when available" },
+  { value: "hermes", label: "hermes", description: "scan HERMES_HOME or the local Hermes host cache when available" },
   { value: "custom", label: "custom", description: "set MUSTER_<PROVIDER>_PLUGIN_CACHE or MUSTER_PROVIDER_PLUGIN_CACHE" },
 ];
 const CHAT_MCP_OPTIONS = listBuiltinMcpServers().map((server) => ({
@@ -3092,51 +3205,7 @@ function builtinMcpConfig(id: string): McpServerConfig | undefined {
 }
 
 function mcpConfigFromCatalogEntry(entry: BuiltinMcpCatalogEntry): McpServerConfig | undefined {
-  if (!entry.install) return undefined;
-  return mcpConfigFromInstallSpec(entry.install);
-}
-
-function mcpConfigFromInstallSpec(install: BuiltinMcpInstallSpec): McpServerConfig | undefined {
-  if (install.transport.kind === "stdio" && install.transport.args?.some((arg: string) => arg.includes("${") && !resolveMcpInstallTemplate(arg))) return undefined;
-  const transport = install.transport.kind === "http"
-    ? {
-        kind: "http" as const,
-        url: resolveMcpInstallTemplate(install.transport.url) ?? install.transport.url,
-        ...(install.transport.headers ? { headers: resolveMcpInstallRecord(install.transport.headers) } : {}),
-      }
-    : {
-        kind: "stdio" as const,
-        command: install.transport.command,
-        args: install.transport.args?.map((arg) => resolveMcpInstallTemplate(arg)).filter((arg): arg is string => Boolean(arg)),
-        ...(install.transport.env ? { env: resolveMcpInstallRecord(install.transport.env) } : {}),
-      };
-  const config: McpServerConfig = {
-    transport,
-    ...(install.auth ? { auth: install.auth } : {}),
-    ...(install.oauth ? { oauth: install.oauth } : {}),
-    ...(install.tools ? { tools: install.tools } : {}),
-    ...(install.limits ? { limits: install.limits } : {}),
-  };
-  return config;
-}
-
-function resolveMcpInstallRecord(record: Readonly<Record<string, string>>): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(record)
-      .map(([key, value]) => [key, resolveMcpInstallTemplate(value)])
-      .filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0),
-  );
-}
-
-function resolveMcpInstallTemplate(value: string): string | undefined {
-  if (value === "${CWD}") return process.cwd();
-  const fullEnv = /^\$\{([A-Z_][A-Z0-9_]*)\}$/.exec(value);
-  if (fullEnv) return process.env[fullEnv[1]];
-  if (/^[A-Z_][A-Z0-9_]*(?:\|[A-Z_][A-Z0-9_]*)+$/.test(value)) {
-    return value.split("|").map((name) => process.env[name]).find((candidate): candidate is string => Boolean(candidate));
-  }
-  if (/^[A-Z_][A-Z0-9_]*$/.test(value) && process.env[value]) return process.env[value];
-  return value.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (_match, name: string) => process.env[name] ?? "");
+  return rosterMcpConfigFromCatalogEntry(entry, { cwd: process.cwd() });
 }
 
 async function configureBuiltinMcp(id: string): Promise<boolean> {
@@ -3207,7 +3276,7 @@ async function printPluginSetupStatus(
     for (const channel of setup.channels) {
       const spec = findChannelSpec(channel);
       const ready = spec && gateway ? channelReady(spec.id, gateway) : false;
-      console.log(`channel=${channel} status=${ready ? "ready" : "needs_setup"} command="muster channels setup ${channel}"`);
+      console.log(`channel=${channel} status=${ready ? "ready" : "needs_setup"} command="muster channels ready ${channel}"`);
     }
   }
   if (setup.mcpServers?.length) console.log(`available_mcp=${setup.mcpServers.join(",")}`);
@@ -3234,6 +3303,18 @@ async function directoryExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function capabilityManifestPath(packPath: string): Promise<string> {
+  for (const candidate of [join(packPath, "muster.capability.json"), join(packPath, "manifest.json")]) {
+    try {
+      await access(candidate);
+      return candidate;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  throw new Error(`Capability pack manifest not found in ${packPath}.`);
 }
 
 async function resolveBuiltinPackPath(plugin: BuiltinPluginCatalogEntry): Promise<string | undefined> {
@@ -3302,7 +3383,7 @@ async function printPluginCheck(plugin: BuiltinPluginCatalogEntry): Promise<void
     ? plugin.setup?.mcpServers?.length
       ? `muster mcp check ${plugin.setup.mcpServers[0]}`
       : plugin.setup?.channels?.length
-        ? `muster channels setup ${plugin.setup.channels[0]}`
+        ? `muster channels ready ${plugin.setup.channels[0]}`
         : "muster plugins list"
     : `muster plugins enable ${plugin.id}${plugin.risk === "high" ? " --allow-high-risk" : ""}`;
   console.log(`next="${next}"`);
@@ -3363,7 +3444,7 @@ function chatPluginSetupLines(plugin: BuiltinPluginCatalogEntry): string[] {
   const missing = missingSetupEnv(setup);
   if (missing.length) lines.push(`${color("Missing env", "yellow")} ${missing.join(", ")}`);
   if (setup.defaultMcpServers?.length) lines.push(`${color("Default MCP", "accent")} ${setup.defaultMcpServers.join(", ")} configured by CLI enable`);
-  if (setup.channels?.length) lines.push(`${color("Channel setup", "accent")} ${setup.channels.map((id) => `muster channels setup ${id}`).join(" · ")}`);
+  if (setup.channels?.length) lines.push(`${color("Channel setup", "accent")} ${setup.channels.map((id) => `muster channels ready ${id}`).join(" · ")}`);
   if (setup.mcpServers?.length) lines.push(`${color("MCP options", "accent")} ${setup.mcpServers.join(", ")}`);
   for (const note of setup.notes ?? []) lines.push(color(note, "dim"));
   lines.push(...pluginNextActions(plugin).map((line) => color(line, "dim")));
@@ -3387,7 +3468,7 @@ function pluginNextActions(plugin: BuiltinPluginCatalogEntry): string[] {
 
   if (plugin.setup?.channels?.length) {
     for (const channel of plugin.setup.channels) {
-      actions.push(`next_action=channel_setup command="muster channels setup ${channel}"`);
+      actions.push(`next_action=channel_setup command="muster channels ready ${channel}"`);
     }
   }
 
@@ -3798,8 +3879,31 @@ async function capability(args: string[]): Promise<void> {
     console.log(`use in flows: { "kind": "tool", "tool": "${loaded.toolNames[0]}" } with: muster flow run <id> --pack ${path}`);
     return;
   }
+  if (subcommand === "digest") {
+    if (!path) throw new Error("Usage: muster capability digest <path> [--write]");
+    const packPath = resolveWorkspacePath(path);
+    const manifestPath = await capabilityManifestPath(packPath);
+    const raw = JSON.parse(await readFile(manifestPath, "utf8")) as unknown;
+    const inspection = inspectCapabilityManifest(packPath, raw);
+    if (!inspection.manifest) {
+      console.log(`capability=${path} status=blocked manifest=${manifestPath}`);
+      for (const blocker of inspection.blockers) console.log(`blocker=${blocker}`);
+      process.exitCode = 1;
+      return;
+    }
+    const digest = await computeCapabilityEntrypointDigest(packPath, inspection.manifest);
+    console.log(`capability=${inspection.manifest.id} digest=${digest} entrypoint=${inspection.manifest.entrypoint}`);
+    if (!args.includes("--write")) {
+      console.log(`manifest=${manifestPath} write=false`);
+      return;
+    }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`Capability manifest ${manifestPath} must be a JSON object.`);
+    await writeFile(manifestPath, `${JSON.stringify({ ...(raw as Record<string, unknown>), digest }, null, 2)}\n`, "utf8");
+    console.log(`manifest=${manifestPath} write=true`);
+    return;
+  }
   if (subcommand !== "inspect" || !path) {
-    throw new Error("Usage: muster capability <inspect|load> <path>");
+    throw new Error("Usage: muster capability <inspect|digest|load> <path>");
   }
   const report = await inspectCapabilityPack(resolveWorkspacePath(path));
   console.log(`status=${report.status}`);
@@ -3825,6 +3929,895 @@ async function capability(args: string[]): Promise<void> {
     for (const warning of report.warnings) console.log(`- ${warning}`);
   }
   if (report.status === "blocked") process.exitCode = 1;
+}
+
+async function rosterCommand(args: string[]): Promise<void> {
+  const subcommand = args[0];
+  const id = args[1];
+  const jsonOutput = args.includes("--json");
+  if (subcommand === "catalog" || subcommand === undefined) {
+    const { shouldScanHosts, detection } = await rosterHostDetectionFromArgs(args);
+    const hostConnectors = detection.connectors;
+    const matrix = buildRosterSupportMatrix({ hostConnectors });
+    const payload = {
+      schemaVersion: 1,
+      command: "roster.catalog",
+      hostScan: shouldScanHosts ? "enabled" : "skipped",
+      hostCache: detection.cacheStatus,
+      detectedHosts: hostConnectors.length,
+      hostConnectors,
+      hostEvidence: detection.evidence,
+      matrix,
+    };
+    if (jsonOutput) {
+      await printRosterJsonOrReport(args, payload, { jsonOutput });
+      return;
+    }
+    await printRosterJsonOrReport(args, payload, { jsonOutput });
+    console.log(`roster_catalog entries=${matrix.entries.length} detected_hosts=${hostConnectors.length} host_scan=${shouldScanHosts ? "enabled" : "skipped"} host_cache=${detection.cacheStatus}`);
+    console.log([
+      `support_summary owned_packs=${matrix.summary.ownedPacks}`,
+      `channel_adapters=${matrix.summary.channelAdapters}`,
+      `mcp_installable=${matrix.summary.mcpInstallable}`,
+      `host_reuse=${matrix.summary.hostReuse}`,
+      `setup_plan_only=${matrix.summary.setupPlanOnly}`,
+    ].join(" "));
+    for (const item of detection.evidence) printRosterHostEvidence(item);
+    for (const entry of matrix.entries) {
+      const auth = entry.auth.length ? entry.auth.join(",") : "-";
+      const hosts = entry.hosts.length ? entry.hosts.join(",") : "-";
+      const pack = entry.packPath ?? "-";
+      const mcps = entry.mcpServers.length ? entry.mcpServers.join(",") : "-";
+      const channels = entry.channels.length ? entry.channels.join(",") : "-";
+      console.log(`${entry.id}\t${entry.kind}\t${entry.source}\t${entry.support.join(",")}\tauth=${auth}\thosts=${hosts}\tpack=${pack}\tmcps=${mcps}\tchannels=${channels}`);
+    }
+    return;
+  }
+  if (subcommand === "index") {
+    const outPath = readFlag(args, "--out");
+    const packPaths = rosterIndexPackArgs(args.slice(1));
+    if (args.includes("--builtin-packs")) {
+      for (const plugin of listBuiltinPlugins()) {
+        if (!plugin.packPath) continue;
+        const packPath = await resolveBuiltinPackPath(plugin);
+        if (!packPath) throw new Error(`Built-in capability pack ${plugin.id} was not found at ${plugin.packPath}.`);
+        packPaths.push(packPath);
+      }
+    }
+    const uniquePackPaths = [...new Set(packPaths)];
+    if (!outPath && !args.includes("--dry-run")) {
+      throw new Error("Usage: muster roster index --out roster.index.json [--builtin-packs] [--skip-blocked] [pack-path ...] [--dry-run]");
+    }
+    const musterCompatibility = readFlag(args, "--muster-compatibility") ?? `>=${CLI_MUSTER_VERSION}`;
+    const musterVersion = readFlag(args, "--muster-version") ?? CLI_MUSTER_VERSION;
+    const skipBlocked = args.includes("--skip-blocked");
+    const skipped: RosterSkippedPack[] = [];
+    const index = skipBlocked
+      ? await buildRosterIndexSkippingBlocked(uniquePackPaths, {
+        musterCompatibility,
+        musterVersion,
+        generatedAt: readFlag(args, "--generated-at"),
+      }, skipped)
+      : await buildRosterIndexFromPacks(uniquePackPaths, {
+        musterCompatibility,
+        musterVersion,
+        cwd: process.cwd(),
+        generatedAt: readFlag(args, "--generated-at"),
+      });
+    const resolvedOutPath = outPath ? resolveWorkspacePath(outPath) : undefined;
+    const summary = summarizeRosterIndex(index);
+    const reportPayload = {
+      schemaVersion: 1,
+      command: "roster.index",
+      dryRun: args.includes("--dry-run"),
+      outPath: resolvedOutPath,
+      musterVersion,
+      musterCompatibility,
+      skipBlocked,
+      summary,
+      index,
+      skipped,
+    };
+    const indexPayload = `${JSON.stringify(index, null, 2)}\n`;
+    if (jsonOutput) {
+      if (!args.includes("--dry-run") && resolvedOutPath) {
+        await mkdir(dirname(resolvedOutPath), { recursive: true });
+        await writeFile(resolvedOutPath, indexPayload, "utf8");
+      }
+      await printRosterJsonOrReport(args, reportPayload, { jsonOutput });
+      return;
+    }
+    if (args.includes("--dry-run")) {
+      await printRosterJsonOrReport(args, reportPayload, { jsonOutput });
+      for (const item of skipped) printSkippedRosterPack(item, "stderr");
+      console.log(indexPayload.trimEnd());
+      return;
+    }
+    await mkdir(dirname(resolvedOutPath!), { recursive: true });
+    await writeFile(resolvedOutPath!, indexPayload, "utf8");
+    await printRosterJsonOrReport(args, reportPayload, { jsonOutput });
+    console.log(`roster_index status=ready entries=${index.entries.length} out=${resolvedOutPath}`);
+    console.log([
+      `summary_total=${summary.total}`,
+      `metadata=${summary.withMetadata}/${summary.total}`,
+      `diagnostics=${summary.withDiagnostics}`,
+      `evals=${summary.withEvalFixtures}`,
+      `live_credentials=${summary.requiresLiveCredentials}`,
+      `tools=${summary.implementedTools.length}`,
+    ].join(" "));
+    for (const entry of index.entries) {
+      console.log(`entry=${entry.id} version=${entry.version} kind=${entry.kind} source=${entry.source.type}:${entry.source.type === "local" ? entry.source.path : entry.source.url}`);
+      if (entry.metadata) printRosterEntryMetadata(entry.metadata);
+    }
+    for (const item of skipped) printSkippedRosterPack(item, "stdout");
+    return;
+  }
+  if (subcommand === "plan") {
+    if (!id && !args.includes("--all")) throw new Error("Usage: muster roster plan <id|--all> [--lock .muster/roster.lock.json] [--host provider|--scan-hosts] [--no-host-cache|--refresh-host-cache]");
+    const lockPath = resolveWorkspacePath(readFlag(args, "--lock") ?? join(".muster", "roster.lock.json"));
+    const lock = await readRosterLock(lockPath).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    });
+    const { shouldScanHosts, detection } = await rosterHostDetectionFromArgs(args);
+    if (args.includes("--all")) {
+      const catalog = buildRosterProjectionCatalog({ lock, cwd: process.cwd(), hostConnectors: detection.connectors });
+      const payload = {
+        schemaVersion: 1,
+        command: "roster.plan",
+        mode: "all",
+        lockPath: lock ? lockPath : undefined,
+        hostScan: shouldScanHosts ? "enabled" : "skipped",
+        hostCache: detection.cacheStatus,
+        detectedHosts: detection.connectors.length,
+        hostEvidence: detection.evidence,
+        catalog,
+      };
+      if (jsonOutput) {
+        await printRosterJsonOrReport(args, payload, { jsonOutput });
+        if (catalog.summary.blocked) process.exitCode = 1;
+        return;
+      }
+      await printRosterJsonOrReport(args, payload, { jsonOutput });
+      console.log(`roster_plan_catalog total=${catalog.summary.total} ready=${catalog.summary.ready} needs_credentials=${catalog.summary.needsCredentials} setup_only=${catalog.summary.setupOnly} blocked=${catalog.summary.blocked} host_scan=${shouldScanHosts ? "enabled" : "skipped"} host_cache=${detection.cacheStatus}`);
+      for (const item of detection.evidence) printRosterHostEvidence(item);
+      for (const [level, count] of Object.entries(catalog.summary.depthLevels)) console.log(`depth=${level} plans=${count}`);
+      for (const [owner, count] of Object.entries(catalog.summary.targetOwners)) console.log(`owner=${owner} targets=${count}`);
+      for (const action of catalog.nextActions.slice(0, 12)) {
+        console.log([
+          `next=${action.planId}`,
+          `priority=${action.priority}`,
+          `reason=${action.reason}`,
+          `command=${action.command ?? "-"}`,
+          `summary=${action.summary}`,
+        ].join(" "));
+      }
+      for (const plan of catalog.plans) {
+        console.log(`plan=${plan.id} kind=${plan.kind} status=${plan.status} targets=${plan.targets.length} blockers=${plan.blockers.length}`);
+      }
+      if (catalog.summary.blocked) process.exitCode = 1;
+      return;
+    }
+    const projection = lock?.entries[id]
+      ? planRosterLockProjection(lock, id, { cwd: process.cwd() })
+      : planRosterBuiltinProjection(id, { hostConnectors: detection.connectors });
+    const payload = {
+      schemaVersion: 1,
+      command: "roster.plan",
+      lockPath: lock?.entries[id] ? lockPath : undefined,
+      hostScan: shouldScanHosts ? "enabled" : "skipped",
+      hostCache: detection.cacheStatus,
+      detectedHosts: detection.connectors.length,
+      hostEvidence: detection.evidence,
+      projection,
+    };
+    if (jsonOutput) {
+      await printRosterJsonOrReport(args, payload, { jsonOutput });
+      if (projection.status === "blocked") process.exitCode = 1;
+      return;
+    }
+    await printRosterJsonOrReport(args, payload, { jsonOutput });
+    console.log(`roster_plan id=${projection.id} kind=${projection.kind} status=${projection.status} targets=${projection.targets.length} host_scan=${shouldScanHosts ? "enabled" : "skipped"} host_cache=${detection.cacheStatus}`);
+    for (const item of detection.evidence) printRosterHostEvidence(item);
+    console.log([
+      `depth=${projection.depth.level}`,
+      `capabilities=${projection.depth.capabilities.length ? projection.depth.capabilities.join(",") : "-"}`,
+      `auth=${projection.depth.auth.length ? projection.depth.auth.join(",") : "-"}`,
+      `evidence=${projection.depth.evidence.length ? projection.depth.evidence.join(",") : "-"}`,
+      `hot_path=${projection.depth.speed.hotPath}`,
+      `cache=${projection.depth.speed.cache}`,
+    ].join(" "));
+    for (const gap of projection.depth.gaps) console.log(`gap=${gap}`);
+    if (lock?.entries[id]) console.log(`lock=${lockPath}`);
+    for (const blocker of projection.blockers) console.log(`blocker=${blocker}`);
+    for (const gate of projection.gates) console.log(`gate=${gate.id} status=${gate.status} summary=${gate.summary}`);
+    for (const target of projection.targets) {
+      console.log([
+        `target=${target.kind}`,
+        `owner=${target.owner}`,
+        `id=${target.id}`,
+        `status=${target.status}`,
+        `auth=${target.auth?.length ? target.auth.join(",") : "-"}`,
+        `command=${target.command ?? "-"}`,
+        `source=${target.source ?? "-"}`,
+      ].join(" "));
+    }
+    for (const note of projection.notes) console.log(`note=${note}`);
+    if (projection.status === "blocked") process.exitCode = 1;
+    return;
+  }
+  if (subcommand === "publish") {
+    const packPathArg = args.find((arg, index) => index > 0 && !arg.startsWith("--") && args[index - 1] !== "--source-path" && args[index - 1] !== "--muster-compatibility" && args[index - 1] !== "--muster-version");
+    if (!args.includes("--dry-run") || !packPathArg) {
+      throw new Error("Usage: muster roster publish --dry-run <path> [--source-path path] [--muster-compatibility >=0.1.0] [--muster-version x.y.z] [--json] [--report path]");
+    }
+    const packPath = resolveWorkspacePath(packPathArg);
+    const sourcePath = readFlag(args, "--source-path") ?? packPath;
+    const musterCompatibility = readFlag(args, "--muster-compatibility") ?? `>=${CLI_MUSTER_VERSION}`;
+    const musterVersion = readFlag(args, "--muster-version") ?? CLI_MUSTER_VERSION;
+    const draft = await buildRosterEntryFromPack(packPath, {
+      source: { type: "local", path: sourcePath },
+      musterCompatibility,
+      musterVersion,
+      cwd: process.cwd(),
+    });
+    const payload = {
+      schemaVersion: 1,
+      command: "roster.publish",
+      dryRun: true,
+      packPath,
+      sourcePath,
+      musterVersion,
+      musterCompatibility,
+      entry: draft.entry,
+      verification: draft.verification,
+    };
+    await printRosterJsonOrReport(args, payload, { jsonOutput });
+    if (jsonOutput) return;
+    console.log(JSON.stringify(draft.entry, null, 2));
+    return;
+  }
+
+  if (subcommand === "verify") {
+    const indexPath = resolveWorkspacePath(readFlag(args, "--index") ?? "roster.index.json");
+    const musterVersion = readFlag(args, "--muster-version") ?? CLI_MUSTER_VERSION;
+    const verificationProfile = readRosterVerificationProfile(args);
+    const index = await loadRosterIndex(indexPath);
+    const report = await verifyRosterIndex(index, { musterVersion, cwd: process.cwd(), requireMetadata: verificationProfile.requireMetadata, minReadinessLevel: verificationProfile.minReadinessLevel });
+    const indexSummary = summarizeRosterIndex(index);
+    const summary = summarizeRosterVerification(report);
+    const payload = {
+      schemaVersion: 1,
+      command: "roster.verify",
+      indexPath,
+      musterVersion,
+      registryProfile: verificationProfile.registryProfile,
+      requireMetadata: verificationProfile.requireMetadata,
+      minReadinessLevel: verificationProfile.minReadinessLevel,
+      indexSummary,
+      summary,
+      report,
+    };
+    if (jsonOutput) {
+      await printRosterJsonOrReport(args, payload, { jsonOutput });
+      if (report.status === "blocked") process.exitCode = 1;
+      return;
+    }
+    await printRosterJsonOrReport(args, payload, { jsonOutput });
+    console.log(`roster_verify status=${report.status} ready=${report.readyCount} blocked=${report.blockedCount} total=${report.results.length}`);
+    console.log([
+      `index_summary total=${indexSummary.total}`,
+      `metadata=${indexSummary.withMetadata}/${indexSummary.total}`,
+      `diagnostics=${indexSummary.withDiagnostics}`,
+      `evals=${indexSummary.withEvalFixtures}`,
+      `live_credentials=${indexSummary.requiresLiveCredentials}`,
+      `tools=${indexSummary.implementedTools.length}`,
+    ].join(" "));
+    console.log(`verify_summary total=${summary.total} ready=${summary.ready} blocked=${summary.blocked} blocked_entries=${summary.blockedEntries.length}`);
+    for (const [gateId, totals] of Object.entries(summary.gateTotals)) {
+      console.log(`gate_summary=${gateId} passed=${totals.passed} blocked=${totals.blocked}`);
+    }
+    for (const repair of summary.repairs) {
+      console.log(`repair=${repair.entry} gate=${repair.gate} command="${repair.command}"`);
+    }
+    for (const result of report.results) {
+      console.log(`entry=${result.entry.id} version=${result.entry.version} status=${result.status}`);
+      for (const gate of result.gates.filter((gate) => gate.status === "blocked")) {
+        console.log(`  gate=${gate.id} status=${gate.status} summary=${gate.summary}`);
+      }
+    }
+    if (report.status === "blocked") process.exitCode = 1;
+    return;
+  }
+
+  if (subcommand === "activate") {
+    if (!id) throw new Error("Usage: muster roster activate <id|mcp:id|channel:id|skill:id> [--lock .muster/roster.lock.json] [--muster-version x.y.z] [--dry-run] [--json] [--report path]");
+    const dryRun = args.includes("--dry-run");
+    if (id.startsWith("skill:")) {
+      const skillId = id.slice("skill:".length);
+      const projection = planRosterBuiltinProjection(id);
+      const target = projection.targets.find((item) => item.kind === "skill" && item.id === skillId);
+      const payload = {
+        schemaVersion: 1,
+        command: "roster.activate",
+        kind: "builtin_skill",
+        id,
+        dryRun,
+        projection,
+        mutation: {
+          configPath: configPath(process.cwd()),
+          wouldWriteConfig: projection.status !== "blocked" && Boolean(target) && !dryRun,
+          didWriteConfig: false,
+          boundary: "profile skill file and skills.entries only",
+        },
+      };
+      if (jsonOutput) {
+        if (projection.status !== "blocked" && target && !dryRun) {
+          await ensureDefaultConfig(process.cwd());
+          const skill = await enableBuiltinSkill(skillId, process.cwd());
+          await printRosterJsonOrReport(args, {
+            ...payload,
+            mutation: { ...payload.mutation, didWriteConfig: true },
+            result: { enabled: skill.id, source: skill.source, risk: skill.risk, next: `muster skills view ${skill.id}` },
+          }, { jsonOutput });
+          return;
+        }
+        await printRosterJsonOrReport(args, payload, { jsonOutput });
+        if (projection.status === "blocked" || !target) process.exitCode = 1;
+        return;
+      }
+      const willApplySkill = projection.status !== "blocked" && Boolean(target) && !dryRun;
+      if (!willApplySkill) await printRosterJsonOrReport(args, payload, { jsonOutput });
+      console.log(`activation=${id} kind=builtin_skill status=${projection.status}`);
+      for (const blocker of projection.blockers) console.log(`blocker=${blocker}`);
+      for (const gate of projection.gates) console.log(`gate=${gate.id} status=${gate.status} summary=${gate.summary}`);
+      if (!target || projection.status === "blocked") {
+        process.exitCode = 1;
+        return;
+      }
+      console.log(`skill=${target.id} command=${target.command ?? `muster skills enable ${skillId}`}`);
+      console.log("mutation_boundary=profile skill file and skills.entries only");
+      if (dryRun) {
+        console.log("config=unchanged dry_run=true");
+        return;
+      }
+      await ensureDefaultConfig(process.cwd());
+      const skill = await enableBuiltinSkill(skillId, process.cwd());
+      console.log(`enabled=${skill.id} source=${skill.source} risk=${skill.risk}`);
+      console.log(`config=${configPath(process.cwd())}`);
+      console.log(`next=muster skills view ${skill.id}`);
+      await printRosterJsonOrReport(args, {
+        ...payload,
+        mutation: { ...payload.mutation, didWriteConfig: true },
+        result: { enabled: skill.id, source: skill.source, risk: skill.risk, next: `muster skills view ${skill.id}` },
+      }, { jsonOutput });
+      return;
+    }
+    if (id.startsWith("channel:")) {
+      const channelId = id.slice("channel:".length);
+      const spec = requireChannelSpec(channelId);
+      const gateway = await loadGatewayConfig().then(
+        (config) => ({ config, initialized: true }),
+        () => ({ config: emptyGatewayConfig(), initialized: false }),
+      );
+      const requestedSlackMode = commandLineSlackMode(args);
+      const publicUrl = readFlag(args, "--public-url")?.replace(/\/$/, "");
+      const missing = channelMissingSetup(spec.id, gateway.config, requestedSlackMode);
+      const ready = missing.length === 0;
+      const activationPlan = {
+        id: spec.id,
+        status: ready ? "ready" : "blocked",
+        gatewayInitialized: gateway.initialized,
+        missing,
+        route: spec.route ?? "/v1/messages",
+        ingress: channelIngressMode(spec.id, gateway.config, { publicUrl, slackMode: requestedSlackMode }),
+        authMode: channelAuthModeForConfig(spec.id, gateway.config, requestedSlackMode),
+        replyMode: channelReplyMode(spec.id, gateway.config),
+        setupCommand: `muster channels ready ${spec.id}${spec.id === "slack" && requestedSlackMode ? ` --mode ${requestedSlackMode}` : ""}${publicUrl ? ` --public-url ${publicUrl}` : ""}`,
+        doctorCommand: `muster channels doctor ${spec.id}${spec.id === "telegram" || spec.id === "slack" ? " --live" : ""}`,
+        startCommand: channelStartCommand(spec.id, gateway.config, { publicUrl, slackMode: requestedSlackMode }),
+        webhookCommand: spec.id === "telegram" && publicUrl ? `muster gateway webhook telegram --public-url ${publicUrl}` : undefined,
+        localSimulationCommand: `muster channels simulate ${spec.id} --message "hello"`,
+        mutationBoundary: "gateway channel config only via muster channels ready",
+        notes: spec.notes,
+      };
+      const payload = {
+        schemaVersion: 1,
+        command: "roster.activate",
+        kind: "channel_adapter",
+        id,
+        dryRun,
+        plan: activationPlan,
+        mutation: {
+          configPath: gatewayConfigPath(process.cwd()),
+          wouldWriteConfig: false,
+          didWriteConfig: false,
+          boundary: activationPlan.mutationBoundary,
+        },
+      };
+      if (jsonOutput) {
+        await printRosterJsonOrReport(args, payload, { jsonOutput });
+        if (!ready) process.exitCode = 1;
+        return;
+      }
+      await printRosterJsonOrReport(args, payload, { jsonOutput });
+      console.log(`activation=${id} kind=channel_adapter status=${activationPlan.status}`);
+      console.log(`gateway_config=${gateway.initialized ? "configured" : "missing"} path=${gatewayConfigPath(process.cwd())}`);
+      console.log(`route=${activationPlan.route} ingress=${activationPlan.ingress} auth=${activationPlan.authMode} reply=${activationPlan.replyMode}`);
+      for (const item of missing) console.log(`missing=${item}`);
+      console.log(`setup=${activationPlan.setupCommand}`);
+      console.log(`doctor=${activationPlan.doctorCommand}`);
+      console.log(`simulate=${activationPlan.localSimulationCommand}`);
+      console.log(`start=${activationPlan.startCommand}`);
+      if (activationPlan.webhookCommand) console.log(`webhook=${activationPlan.webhookCommand}`);
+      console.log(`mutation_boundary=${activationPlan.mutationBoundary}`);
+      if (!ready) {
+        process.exitCode = 1;
+        return;
+      }
+      console.log(dryRun ? "config=unchanged dry_run=true" : "config=unchanged");
+      if (!dryRun) console.log(`enabled=${spec.id}`);
+      return;
+    }
+    if (id.startsWith("mcp:")) {
+      const plan = planRosterMcpActivation(id, { cwd: process.cwd() });
+      const payload = {
+        schemaVersion: 1,
+        command: "roster.activate",
+        kind: "builtin_mcp",
+        id,
+        dryRun,
+        plan,
+        mutation: {
+          configPath: configPath(process.cwd()),
+          wouldWriteConfig: plan.status === "ready" && !dryRun,
+          didWriteConfig: false,
+          boundary: plan.mutationBoundary,
+        },
+      };
+      if (jsonOutput) {
+        if (plan.status === "ready" && !dryRun) {
+          await ensureDefaultConfig(process.cwd());
+          const config = await loadConfig(process.cwd());
+          const next = { ...config, tools: applyRosterMcpActivationPlan(config.tools, plan) };
+          await saveConfig(next, process.cwd());
+          await printRosterJsonOrReport(args, {
+            ...payload,
+            mutation: { ...payload.mutation, didWriteConfig: true },
+            result: { enabled: plan.id, configPath: configPath(process.cwd()), postInstallCommands: plan.postInstallCommands },
+          }, { jsonOutput });
+          return;
+        }
+        await printRosterJsonOrReport(args, payload, { jsonOutput });
+        if (plan.status === "blocked") process.exitCode = 1;
+        return;
+      }
+      const willApplyMcp = plan.status === "ready" && !dryRun;
+      if (!willApplyMcp) await printRosterJsonOrReport(args, payload, { jsonOutput });
+      console.log(`activation=${id} kind=builtin_mcp status=${plan.status}`);
+      for (const blocker of plan.blockers) console.log(`blocker=${blocker}`);
+      for (const [serverId, server] of Object.entries(plan.mcpPolicy.servers)) {
+        const transport = server.transport.kind === "stdio"
+          ? `stdio ${server.transport.command} ${(server.transport.args ?? []).join(" ")}`.trim()
+          : `http ${server.transport.url}`;
+        console.log(`mcp_server=${serverId} transport=${transport} auth=${server.auth ?? "none"}`);
+      }
+      for (const command of plan.postInstallCommands) console.log(`next=${command}`);
+      if (plan.status === "blocked") {
+        process.exitCode = 1;
+        return;
+      }
+      if (dryRun) {
+        console.log("config=unchanged dry_run=true");
+        return;
+      }
+      await ensureDefaultConfig(process.cwd());
+      const config = await loadConfig(process.cwd());
+      const next = { ...config, tools: applyRosterMcpActivationPlan(config.tools, plan) };
+      await saveConfig(next, process.cwd());
+      console.log(`config=${configPath(process.cwd())}`);
+      console.log(`enabled=${plan.id}`);
+      await printRosterJsonOrReport(args, {
+        ...payload,
+        mutation: { ...payload.mutation, didWriteConfig: true },
+        result: { enabled: plan.id, configPath: configPath(process.cwd()), postInstallCommands: plan.postInstallCommands },
+      }, { jsonOutput });
+      return;
+    }
+    const lockPath = resolveWorkspacePath(readFlag(args, "--lock") ?? join(".muster", "roster.lock.json"));
+    const musterVersion = readFlag(args, "--muster-version") ?? CLI_MUSTER_VERSION;
+    const lock = await readRosterLock(lockPath);
+    const plan = planRosterActivation(lock, id, { cwd: process.cwd() });
+    const activationVerification = plan.status === "ready"
+      ? await verifyRosterLockedCapability(lock, id, { musterVersion, cwd: process.cwd() })
+      : undefined;
+    const payload = {
+      schemaVersion: 1,
+      command: "roster.activate",
+      id,
+      lockPath,
+      musterVersion,
+      dryRun: args.includes("--dry-run"),
+      plan,
+      verification: activationVerification,
+      mutation: {
+        configPath: configPath(process.cwd()),
+        wouldWriteConfig: plan.status === "ready" && activationVerification?.status === "ready" && !dryRun,
+        didWriteConfig: false,
+        boundary: "plugins.allow/load/entries only",
+      },
+    };
+    if (jsonOutput) {
+      if (plan.status === "ready" && activationVerification?.status === "ready" && !dryRun) {
+        await ensureDefaultConfig(process.cwd());
+        const config = await loadConfig(process.cwd());
+        const next = { ...config, plugins: applyRosterActivationPlan(config.plugins, plan) };
+        await saveConfig(next, process.cwd());
+        await printRosterJsonOrReport(args, {
+          ...payload,
+          dryRun,
+          mutation: { ...payload.mutation, didWriteConfig: true },
+          result: { enabled: id, configPath: configPath(process.cwd()) },
+        }, { jsonOutput });
+        return;
+      }
+      await printRosterJsonOrReport(args, payload, { jsonOutput });
+      if (plan.status === "blocked" || activationVerification?.status === "blocked") process.exitCode = 1;
+      return;
+    }
+    const willApplyLockedCapability = plan.status === "ready" && activationVerification?.status === "ready" && !dryRun;
+    if (!willApplyLockedCapability) await printRosterJsonOrReport(args, payload, { jsonOutput });
+    console.log(`activation=${id} status=${plan.status} lock=${lockPath}`);
+    if (plan.entry) {
+      console.log(`locked_version=${plan.entry.version} digest=${plan.entry.digest} actionability=${plan.entry.actionability} risk=${plan.entry.risk}`);
+    }
+    for (const blocker of plan.blockers) console.log(`blocker=${blocker}`);
+    for (const allowed of plan.pluginPolicy.allow ?? []) console.log(`allow=${allowed}`);
+    for (const loadPath of plan.pluginPolicy.load?.paths ?? []) console.log(`load_path=${loadPath}`);
+    for (const [entryId, entryPolicy] of Object.entries(plan.pluginPolicy.entries ?? {})) {
+      console.log(`plugin_entry=${entryId} enabled=${entryPolicy.enabled === true}`);
+    }
+    if (plan.status === "blocked") {
+      process.exitCode = 1;
+      return;
+    }
+    if (!activationVerification) throw new Error(`Activation verification did not run for ${id}.`);
+    console.log(`activation_verify=${activationVerification.status} muster=${musterVersion}`);
+    for (const gate of activationVerification.gates.filter((gate) => gate.status === "blocked")) {
+      console.log(`verify_gate=${gate.id} status=${gate.status} summary=${gate.summary}`);
+    }
+    if (activationVerification.status === "blocked") {
+      process.exitCode = 1;
+      return;
+    }
+    if (args.includes("--dry-run")) {
+      console.log("config=unchanged dry_run=true");
+      return;
+    }
+    await ensureDefaultConfig(process.cwd());
+    const config = await loadConfig(process.cwd());
+    const next = { ...config, plugins: applyRosterActivationPlan(config.plugins, plan) };
+    await saveConfig(next, process.cwd());
+    console.log(`config=${configPath(process.cwd())}`);
+    console.log(`enabled=${id}`);
+    await printRosterJsonOrReport(args, {
+      ...payload,
+      dryRun,
+      mutation: { ...payload.mutation, didWriteConfig: true },
+      result: { enabled: id, configPath: configPath(process.cwd()) },
+    }, { jsonOutput });
+    return;
+  }
+
+  if (subcommand === "materialize") {
+    if (!id) throw new Error("Usage: muster roster materialize <id> [--index roster.index.json] [--lock .muster/roster.lock.json] [--cache .muster/roster-cache] [--version x.y.z] [--muster-version x.y.z] [--registry-profile verified|release] [--require-metadata] [--min-readiness level] [--json] [--report path]");
+    const indexPath = resolveWorkspacePath(readFlag(args, "--index") ?? "roster.index.json");
+    const lockPath = resolveWorkspacePath(readFlag(args, "--lock") ?? join(".muster", "roster.lock.json"));
+    const cacheDir = resolveWorkspacePath(readFlag(args, "--cache") ?? join(".muster", "roster-cache"));
+    const musterVersion = readFlag(args, "--muster-version") ?? CLI_MUSTER_VERSION;
+    const version = readFlag(args, "--version");
+    const verificationProfile = readRosterVerificationProfile(args);
+    const index = await loadRosterIndex(indexPath);
+    const result = await materializeRosterCapability(index, id, { cacheDir, lockPath, musterVersion, version, cwd: process.cwd(), requireMetadata: verificationProfile.requireMetadata, minReadinessLevel: verificationProfile.minReadinessLevel });
+    const payload = {
+      schemaVersion: 1,
+      command: "roster.materialize",
+      indexPath,
+      lockPath,
+      cacheDir,
+      musterVersion,
+      registryProfile: verificationProfile.registryProfile,
+      requireMetadata: verificationProfile.requireMetadata,
+      minReadinessLevel: verificationProfile.minReadinessLevel,
+      result,
+    };
+    if (jsonOutput) {
+      await printRosterJsonOrReport(args, payload, { jsonOutput });
+      return;
+    }
+    await printRosterJsonOrReport(args, payload, { jsonOutput });
+    console.log(`materialized=${result.lockEntry.id} version=${result.lockEntry.version} source=${result.lockEntry.source.type} status=${result.verification.status}`);
+    console.log(`path=${result.materializedPath}`);
+    console.log(`digest=${result.lockEntry.digest}`);
+    console.log(`lock=${lockPath} entries=${Object.keys(result.lock.entries).length}`);
+    return;
+  }
+
+  if ((subcommand !== "inspect" && subcommand !== "install" && subcommand !== "lock") || (subcommand !== "lock" && !id)) {
+    throw new Error("Usage: muster roster inspect|install <id> [--index roster.index.json] [--lock .muster/roster.lock.json] [--version x.y.z] [--muster-version x.y.z] [--registry-profile verified|release] [--require-metadata] [--min-readiness level]");
+  }
+
+  const indexPath = resolveWorkspacePath(readFlag(args, "--index") ?? "roster.index.json");
+  const lockPath = resolveWorkspacePath(readFlag(args, "--lock") ?? join(".muster", "roster.lock.json"));
+  const musterVersion = readFlag(args, "--muster-version") ?? CLI_MUSTER_VERSION;
+  const version = readFlag(args, "--version");
+  const verificationProfile = readRosterVerificationProfile(args);
+
+  if (subcommand === "lock") {
+    const lock = await readRosterLock(lockPath);
+    if (args.includes("--verify")) {
+      const report = await verifyRosterLock(lock, { musterVersion, cwd: process.cwd() });
+      const summary = summarizeRosterVerification(report);
+      const payload = {
+        schemaVersion: 1,
+        command: "roster.lock.verify",
+        lockPath,
+        musterVersion,
+        summary,
+        report,
+      };
+      if (jsonOutput) {
+        await printRosterJsonOrReport(args, payload, { jsonOutput });
+        if (report.status === "blocked") process.exitCode = 1;
+        return;
+      }
+      await printRosterJsonOrReport(args, payload, { jsonOutput });
+      console.log(`roster_lock_verify status=${report.status} ready=${report.readyCount} blocked=${report.blockedCount} total=${report.results.length} lock=${lockPath}`);
+      console.log(`verify_summary total=${summary.total} ready=${summary.ready} blocked=${summary.blocked} blocked_entries=${summary.blockedEntries.length}`);
+      for (const [gateId, totals] of Object.entries(summary.gateTotals)) {
+        console.log(`gate_summary=${gateId} passed=${totals.passed} blocked=${totals.blocked}`);
+      }
+      for (const repair of summary.repairs) {
+        console.log(`repair=${repair.entry} gate=${repair.gate} command="${repair.command}"`);
+      }
+      for (const result of report.results) {
+        console.log(`entry=${result.entry.id} version=${result.entry.version} status=${result.status}`);
+        for (const gate of result.gates.filter((gate) => gate.status === "blocked")) {
+          console.log(`  gate=${gate.id} status=${gate.status} summary=${gate.summary}`);
+        }
+      }
+      if (report.status === "blocked") process.exitCode = 1;
+      return;
+    }
+    const payload = {
+      schemaVersion: 1,
+      command: "roster.lock",
+      lockPath,
+      lock,
+    };
+    if (jsonOutput) {
+      await printRosterJsonOrReport(args, payload, { jsonOutput });
+      return;
+    }
+    await printRosterJsonOrReport(args, payload, { jsonOutput });
+    console.log(`lock=${lockPath} entries=${Object.keys(lock.entries).length}`);
+    for (const entry of Object.values(lock.entries)) {
+      console.log(`entry=${entry.id} version=${entry.version} kind=${entry.kind} actionability=${entry.actionability} risk=${entry.risk} digest=${entry.digest}`);
+    }
+    return;
+  }
+
+  const index = await loadRosterIndex(indexPath);
+  const candidates = index.entries.filter((entry) => entry.id === id && (!version || entry.version === version));
+  if (!candidates.length) throw new Error(`Roster capability ${id}${version ? `@${version}` : ""} was not found in ${indexPath}.`);
+  const entry = [...candidates].sort((a, b) => b.version.localeCompare(a.version))[0]!;
+  const verification = await verifyRosterCapability(entry, { musterVersion, cwd: process.cwd(), requireMetadata: verificationProfile.requireMetadata, minReadinessLevel: verificationProfile.minReadinessLevel });
+  if (jsonOutput && subcommand === "inspect") {
+    await printRosterJsonOrReport(args, {
+      schemaVersion: 1,
+      command: "roster.inspect",
+      indexPath,
+      musterVersion,
+      registryProfile: verificationProfile.registryProfile,
+      requireMetadata: verificationProfile.requireMetadata,
+      minReadinessLevel: verificationProfile.minReadinessLevel,
+      verification,
+    }, { jsonOutput });
+    if (verification.status === "blocked") process.exitCode = 1;
+    return;
+  }
+  if (jsonOutput && subcommand === "install") {
+    const result = await installRosterCapability(index, entry.id, { lockPath, musterVersion, version: entry.version, requireMetadata: verificationProfile.requireMetadata, minReadinessLevel: verificationProfile.minReadinessLevel });
+    await printRosterJsonOrReport(args, {
+      schemaVersion: 1,
+      command: "roster.install",
+      indexPath,
+      lockPath,
+      musterVersion,
+      registryProfile: verificationProfile.registryProfile,
+      requireMetadata: verificationProfile.requireMetadata,
+      minReadinessLevel: verificationProfile.minReadinessLevel,
+      result,
+    }, { jsonOutput });
+    return;
+  }
+  if (subcommand === "inspect") {
+    await printRosterJsonOrReport(args, {
+      schemaVersion: 1,
+      command: "roster.inspect",
+      indexPath,
+      musterVersion,
+      registryProfile: verificationProfile.registryProfile,
+      requireMetadata: verificationProfile.requireMetadata,
+      minReadinessLevel: verificationProfile.minReadinessLevel,
+      verification,
+    }, { jsonOutput });
+  }
+  console.log(`capability=${entry.id} version=${entry.version} status=${verification.status} index=${indexPath}`);
+  console.log(`source=${entry.source.type}${entry.source.type === "local" ? ` path=${entry.source.path}` : ""}`);
+  console.log(`actionability=${entry.actionability} risk=${entry.risk} compatibility=${entry.compatibility.muster}`);
+  if (entry.metadata) printRosterEntryMetadata(entry.metadata);
+  for (const gate of verification.gates) console.log(`gate=${gate.id} status=${gate.status} summary=${gate.summary}`);
+  if (subcommand === "inspect") {
+    if (verification.status === "blocked") process.exitCode = 1;
+    return;
+  }
+
+  const result = await installRosterCapability(index, entry.id, { lockPath, musterVersion, version: entry.version, requireMetadata: verificationProfile.requireMetadata, minReadinessLevel: verificationProfile.minReadinessLevel });
+  await printRosterJsonOrReport(args, {
+    schemaVersion: 1,
+    command: "roster.install",
+    indexPath,
+    lockPath,
+    musterVersion,
+    registryProfile: verificationProfile.registryProfile,
+    requireMetadata: verificationProfile.requireMetadata,
+    minReadinessLevel: verificationProfile.minReadinessLevel,
+    result,
+  }, { jsonOutput });
+  console.log(`locked=${result.lockEntry.id} version=${result.lockEntry.version} digest=${result.lockEntry.digest}`);
+  console.log(`lock=${lockPath} entries=${Object.keys(result.lock.entries).length}`);
+}
+
+async function printRosterJsonOrReport(args: readonly string[], payload: unknown, options: { readonly jsonOutput: boolean }): Promise<void> {
+  const reportPath = readFlag([...args], "--report");
+  if (reportPath) {
+    const resolvedReportPath = resolveWorkspacePath(reportPath);
+    await mkdir(dirname(resolvedReportPath), { recursive: true });
+    await writeFile(resolvedReportPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    if (!options.jsonOutput) console.log(`report=${resolvedReportPath}`);
+  }
+  if (options.jsonOutput) console.log(JSON.stringify(payload, null, 2));
+}
+
+async function buildRosterIndexSkippingBlocked(
+  packPaths: readonly string[],
+  options: { readonly musterCompatibility: string; readonly musterVersion: string; readonly generatedAt?: string },
+  skipped: RosterSkippedPack[],
+): Promise<Awaited<ReturnType<typeof buildRosterIndexFromPacks>>> {
+  const entries: Awaited<ReturnType<typeof buildRosterEntryFromPack>>["entry"][] = [];
+  const seen = new Set<string>();
+  for (const packPath of packPaths) {
+    try {
+      const inspectionPath = resolve(process.cwd(), packPath);
+      const draft = await buildRosterEntryFromPack(inspectionPath, {
+        source: { type: "local", path: packPath },
+        musterCompatibility: options.musterCompatibility,
+        musterVersion: options.musterVersion,
+        cwd: process.cwd(),
+      });
+      const key = `${draft.entry.id}@${draft.entry.version}`;
+      if (seen.has(key)) throw new Error(`Duplicate roster index entry ${key}.`);
+      seen.add(key);
+      entries.push(draft.entry);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      skipped.push({
+        path: packPath,
+        reason,
+        repair: rosterSkippedPackRepair(packPath, reason),
+      });
+    }
+  }
+  if (!entries.length) {
+    throw new Error(`No verified capability packs could be indexed.${skipped.length ? ` Skipped ${skipped.length} blocked pack(s).` : ""}`);
+  }
+  return {
+    schemaVersion: 1,
+    generatedAt: options.generatedAt ?? new Date().toISOString(),
+    entries: entries.sort((left, right) => left.id.localeCompare(right.id) || left.version.localeCompare(right.version)),
+  };
+}
+
+interface RosterSkippedPack {
+  readonly path: string;
+  readonly reason: string;
+  readonly repair: readonly string[];
+}
+
+type RosterRegistryProfile = "verified" | "release";
+
+interface RosterVerificationCliProfile {
+  readonly registryProfile?: RosterRegistryProfile;
+  readonly requireMetadata: boolean;
+  readonly minReadinessLevel?: CapabilityReadinessLevel;
+}
+
+function readRosterVerificationProfile(args: readonly string[]): RosterVerificationCliProfile {
+  const registryProfile = readRosterRegistryProfileFlag(args);
+  const explicitMinReadiness = readRosterMinReadinessFlag(args);
+  const profileMinReadiness: CapabilityReadinessLevel | undefined = registryProfile === "release"
+    ? "release_ready"
+    : registryProfile === "verified"
+      ? "verified"
+      : undefined;
+  return {
+    registryProfile,
+    requireMetadata: args.includes("--require-metadata") || registryProfile !== undefined,
+    minReadinessLevel: explicitMinReadiness ?? profileMinReadiness,
+  };
+}
+
+function readRosterRegistryProfileFlag(args: readonly string[]): RosterRegistryProfile | undefined {
+  const value = readFlag([...args], "--registry-profile");
+  if (!value) return undefined;
+  if (value === "verified" || value === "release") return value;
+  throw new Error("--registry-profile must be verified or release.");
+}
+
+function readRosterMinReadinessFlag(args: readonly string[]): CapabilityReadinessLevel | undefined {
+  const value = readFlag([...args], "--min-readiness");
+  if (!value) return undefined;
+  if (
+    value === "listed" ||
+    value === "setup_plan" ||
+    value === "installable" ||
+    value === "executable" ||
+    value === "verified" ||
+    value === "release_ready"
+  ) return value;
+  throw new Error("--min-readiness must be one of listed, setup_plan, installable, executable, verified, release_ready.");
+}
+
+function rosterSkippedPackRepair(packPath: string, reason: string): readonly string[] {
+  const steps: string[] = [];
+  if (/without a verified digest|digest must be sha256|digest mismatch|digest could not read/i.test(reason)) {
+    steps.push(`muster capability digest ${packPath} --write`);
+    steps.push(`muster capability inspect ${packPath}`);
+  }
+  if (/without readiness metadata|readiness metadata is required|readiness diagnostics require/i.test(reason)) {
+    steps.push(`add readiness metadata with doctorCommand and smokeCommand in ${packPath}/manifest.json`);
+    steps.push(`muster capability inspect ${packPath}`);
+  }
+  if (/at least one eval fixture|required|missing eval fixture/i.test(reason)) {
+    steps.push(`add or fix eval fixture paths declared in ${packPath}/manifest.json`);
+    steps.push(`muster capability inspect ${packPath}`);
+  }
+  if (!steps.length) steps.push(`muster capability inspect ${packPath}`);
+  return [...new Set(steps)];
+}
+
+function printSkippedRosterPack(item: RosterSkippedPack, stream: "stdout" | "stderr"): void {
+  const line = `skipped=${item.path} reason=${item.reason}`;
+  if (stream === "stderr") console.error(line);
+  else console.log(line);
+  for (const repair of item.repair) {
+    const repairLine = `repair=${item.path} command="${repair}"`;
+    if (stream === "stderr") console.error(repairLine);
+    else console.log(repairLine);
+  }
+}
+
+function printRosterEntryMetadata(metadata: RosterCapabilityMetadata): void {
+  console.log([
+    `readiness=${metadata.readiness.level}/${metadata.readiness.status}`,
+    `surfaces=${metadata.readiness.surfaces.length ? metadata.readiness.surfaces.join(",") : "-"}`,
+    `credentials=${metadata.setup.credentialStorage}`,
+    `live_credentials=${metadata.diagnostics.requiresLiveCredentials}`,
+    `latency_budget_ms=${metadata.diagnostics.latencyBudgetMs ?? "-"}`,
+    `evals=${metadata.evals.length}`,
+    `tools=${metadata.implementedTools.length ? metadata.implementedTools.join(",") : "-"}`,
+  ].join(" "));
 }
 
 type CliArtifactResult = {
@@ -4021,7 +5014,9 @@ async function pluginsCommand(args: string[]): Promise<void> {
     return;
   }
   if (action === "reuse" || action === "discover") {
-    await pluginReuseCommand(path ?? "codex", args.slice(2));
+    const providerArg = pluginReuseProviderArg(args.slice(1));
+    const rest = args.slice(1).filter((_, index) => index !== providerArg.index);
+    await pluginReuseCommand(providerArg.provider, rest);
     return;
   }
   if (action === "enable" && path) {
@@ -4100,14 +5095,384 @@ interface ProviderReuseApp {
 interface ProviderReuseMcp {
   readonly id: string;
   readonly transport: "http" | "stdio";
+  readonly auth: "oauth" | "api_key" | "local";
   readonly url?: string;
   readonly command?: string;
   readonly args?: readonly string[];
 }
 
+interface ProviderReuseAdoptionResult {
+  readonly id: string;
+  readonly provider: string;
+  readonly status: "configured" | "skipped" | "not_found";
+  readonly transport?: string;
+  readonly auth?: string;
+  readonly next?: string;
+}
+
+type RosterHostConnector = { provider: string; kind: "app" | "mcp"; id: string; auth: string; transport?: string; source?: string };
+type RosterHostCacheStatus = "skipped" | "disabled" | "hit" | "miss" | "refresh";
+
+interface RosterHostDetection {
+  readonly connectors: readonly RosterHostConnector[];
+  readonly cacheStatus: RosterHostCacheStatus;
+  readonly evidence: readonly RosterHostEvidence[];
+}
+
+interface RosterHostEvidence {
+  readonly provider: string;
+  readonly root: string;
+  readonly layout: ProviderReuseSource["layout"];
+  readonly cacheStatus: Exclude<RosterHostCacheStatus, "skipped" | "disabled"> | "disabled";
+  readonly fingerprint: string;
+  readonly scannedAt: string;
+  readonly connectorCount: number;
+  readonly appCount: number;
+  readonly mcpCount: number;
+  readonly sourceCount: number;
+}
+
+interface RosterHostDetectionOptions {
+  readonly cachePath: string;
+  readonly useCache: boolean;
+  readonly refreshCache: boolean;
+  readonly ttlMs: number;
+}
+
+async function rosterHostDetectionFromArgs(args: string[]): Promise<{ readonly shouldScanHosts: boolean; readonly detection: RosterHostDetection }> {
+  const requestedHosts = readFlags(args, "--host");
+  const shouldScanHosts = requestedHosts.length > 0 || args.includes("--scan-hosts");
+  const detection = shouldScanHosts
+    ? await detectRosterHostConnectors(requestedHosts, {
+      cachePath: resolveWorkspacePath(readFlag(args, "--host-cache") ?? join(".muster", "roster", "host-scan-cache.json")),
+      refreshCache: args.includes("--refresh-host-cache"),
+      useCache: !args.includes("--no-host-cache"),
+      ttlMs: rosterHostScanCacheTtlMs(args),
+    })
+    : emptyRosterHostDetection("skipped");
+  return { shouldScanHosts, detection };
+}
+
+interface RosterHostScanCacheFile {
+  readonly schemaVersion: 1;
+  readonly generatedBy: "muster-roster";
+  readonly entries: Record<string, RosterHostScanCacheEntry>;
+}
+
+interface RosterHostScanCacheEntry {
+  readonly schemaVersion: 1;
+  readonly cliVersion: string;
+  readonly provider: string;
+  readonly root: string;
+  readonly layout: ProviderReuseSource["layout"];
+  readonly fingerprint: string;
+  readonly scannedAt: string;
+  readonly sourceCount?: number;
+  readonly connectors: readonly RosterHostConnector[];
+}
+
+function emptyRosterHostDetection(cacheStatus: RosterHostCacheStatus): RosterHostDetection {
+  return { connectors: [], cacheStatus, evidence: [] };
+}
+
+async function detectRosterHostConnectors(hosts: readonly string[] = [], options?: RosterHostDetectionOptions): Promise<RosterHostDetection> {
+  const detectionOptions = options ?? {
+    cachePath: join(process.cwd(), ".muster", "roster", "host-scan-cache.json"),
+    useCache: false,
+    refreshCache: false,
+    ttlMs: 0,
+  };
+  const targets = hosts.length ? hosts : ["codex", "claude", "openclaw", "hermes"];
+  const connectors: RosterHostConnector[] = [];
+  const evidence: RosterHostEvidence[] = [];
+  let cacheStatus: RosterHostCacheStatus = detectionOptions.useCache === false ? "disabled" : detectionOptions.refreshCache ? "refresh" : "miss";
+  let cache = detectionOptions.useCache ? await readRosterHostScanCache(detectionOptions.cachePath) : emptyRosterHostScanCache();
+  let cacheChanged = false;
+  for (const host of targets) {
+    const source = providerReuseSource(host);
+    if (!source) continue;
+    const fingerprint = await providerReuseSourceFingerprint(source);
+    const cacheKey = rosterHostScanCacheKey(source);
+    const cached = detectionOptions.useCache && !detectionOptions.refreshCache ? cache.entries[cacheKey] : undefined;
+    if (cached && rosterHostScanCacheEntryFresh(cached, source, fingerprint, detectionOptions.ttlMs)) {
+      connectors.push(...cached.connectors);
+      evidence.push(rosterHostEvidenceFromConnectors(source, cached.connectors, {
+        cacheStatus: "hit",
+        fingerprint: cached.fingerprint,
+        scannedAt: cached.scannedAt,
+        sourceCount: cached.sourceCount,
+      }));
+      cacheStatus = cacheStatus === "miss" ? "hit" : cacheStatus;
+      continue;
+    }
+    const scannedAt = new Date().toISOString();
+    const scan = await scanRosterHostConnectorsFromSource(source);
+    const scanned = scan.connectors;
+    connectors.push(...scanned);
+    evidence.push(rosterHostEvidenceFromConnectors(source, scanned, {
+      cacheStatus: detectionOptions.useCache === false ? "disabled" : detectionOptions.refreshCache ? "refresh" : "miss",
+      fingerprint,
+      scannedAt,
+      sourceCount: scan.sourceCount,
+    }));
+    if (detectionOptions.useCache) {
+      cache = {
+        schemaVersion: 1,
+        generatedBy: "muster-roster",
+        entries: {
+          ...cache.entries,
+          [cacheKey]: {
+            schemaVersion: 1,
+            cliVersion: CLI_MUSTER_VERSION,
+            provider: source.provider,
+            root: source.root,
+            layout: source.layout,
+            fingerprint,
+            scannedAt,
+            sourceCount: scan.sourceCount,
+            connectors: scanned,
+          },
+        },
+      };
+      cacheChanged = true;
+    }
+  }
+  if (detectionOptions.useCache && cacheChanged) await writeRosterHostScanCache(detectionOptions.cachePath, cache);
+  return {
+    connectors: sortRosterHostConnectors(connectors),
+    cacheStatus,
+    evidence: sortRosterHostEvidence(evidence),
+  };
+}
+
+async function scanRosterHostConnectorsFromSource(source: ProviderReuseSource): Promise<{ readonly connectors: readonly RosterHostConnector[]; readonly sourceCount: number }> {
+  const connectors: RosterHostConnector[] = [];
+  const plugins = await scanProviderPluginReuseCandidates(source);
+  for (const plugin of plugins) {
+    for (const app of plugin.apps) {
+      connectors.push({ provider: source.provider, kind: "app", id: app.id, auth: "host_oauth", transport: "app", source: plugin.sourceRoot });
+    }
+    for (const mcp of plugin.mcps) {
+      connectors.push({ provider: source.provider, kind: "mcp", id: mcp.id, auth: mcp.auth, transport: mcp.transport, source: plugin.sourceRoot });
+    }
+  }
+  return { connectors: sortRosterHostConnectors(connectors), sourceCount: plugins.length };
+}
+
+function sortRosterHostConnectors(connectors: readonly RosterHostConnector[]): readonly RosterHostConnector[] {
+  return [...connectors].sort((left, right) =>
+    left.provider.localeCompare(right.provider) ||
+    left.kind.localeCompare(right.kind) ||
+    left.id.localeCompare(right.id) ||
+    (left.source ?? "").localeCompare(right.source ?? "")
+  );
+}
+
+function rosterHostEvidenceFromConnectors(
+  source: ProviderReuseSource,
+  connectors: readonly RosterHostConnector[],
+  detail: {
+    readonly cacheStatus: RosterHostEvidence["cacheStatus"];
+    readonly fingerprint: string;
+    readonly scannedAt: string;
+    readonly sourceCount?: number;
+  },
+): RosterHostEvidence {
+  const sourceCount = detail.sourceCount ?? new Set(connectors.map((connector) => connector.source ?? "unknown")).size;
+  return {
+    provider: source.provider,
+    root: source.root,
+    layout: source.layout,
+    cacheStatus: detail.cacheStatus,
+    fingerprint: detail.fingerprint,
+    scannedAt: detail.scannedAt,
+    connectorCount: connectors.length,
+    appCount: connectors.filter((connector) => connector.kind === "app").length,
+    mcpCount: connectors.filter((connector) => connector.kind === "mcp").length,
+    sourceCount,
+  };
+}
+
+function sortRosterHostEvidence(evidence: readonly RosterHostEvidence[]): readonly RosterHostEvidence[] {
+  return [...evidence].sort((left, right) =>
+    left.provider.localeCompare(right.provider) ||
+    left.root.localeCompare(right.root) ||
+    left.layout.localeCompare(right.layout)
+  );
+}
+
+function printRosterHostEvidence(evidence: RosterHostEvidence): void {
+  console.log([
+    `host_evidence=${evidence.provider}`,
+    `cache=${evidence.cacheStatus}`,
+    `layout=${evidence.layout}`,
+    `connectors=${evidence.connectorCount}`,
+    `apps=${evidence.appCount}`,
+    `mcps=${evidence.mcpCount}`,
+    `sources=${evidence.sourceCount}`,
+    `fingerprint=${evidence.fingerprint.slice(0, 16)}`,
+    `scanned_at=${evidence.scannedAt}`,
+  ].join(" "));
+}
+
+function rosterHostScanCacheTtlMs(args: string[]): number {
+  const raw = readFlag(args, "--host-cache-ttl-ms") ?? process.env.MUSTER_ROSTER_HOST_SCAN_CACHE_TTL_MS;
+  if (!raw) return 5 * 60 * 1000;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 5 * 60 * 1000;
+}
+
+function rosterIndexPackArgs(args: readonly string[]): string[] {
+  const valueFlags = new Set(["--out", "--muster-version", "--muster-compatibility", "--generated-at"]);
+  const booleanFlags = new Set(["--builtin-packs", "--dry-run"]);
+  const paths: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (valueFlags.has(arg)) {
+      index += 1;
+      continue;
+    }
+    if (booleanFlags.has(arg)) continue;
+    if (arg.startsWith("--")) continue;
+    paths.push(arg);
+  }
+  return paths;
+}
+
+function emptyRosterHostScanCache(): RosterHostScanCacheFile {
+  return { schemaVersion: 1, generatedBy: "muster-roster", entries: {} };
+}
+
+async function readRosterHostScanCache(path: string): Promise<RosterHostScanCacheFile> {
+  const raw = await readJsonObject(path);
+  if (!raw || raw.schemaVersion !== 1 || raw.generatedBy !== "muster-roster" || !raw.entries || typeof raw.entries !== "object" || Array.isArray(raw.entries)) {
+    return emptyRosterHostScanCache();
+  }
+  const entries: Record<string, RosterHostScanCacheEntry> = {};
+  for (const [key, value] of Object.entries(raw.entries)) {
+    const entry = parseRosterHostScanCacheEntry(value);
+    if (entry) entries[key] = entry;
+  }
+  return { schemaVersion: 1, generatedBy: "muster-roster", entries };
+}
+
+function parseRosterHostScanCacheEntry(value: unknown): RosterHostScanCacheEntry | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entry = value as Record<string, unknown>;
+  if (
+    entry.schemaVersion !== 1 ||
+    entry.cliVersion !== CLI_MUSTER_VERSION ||
+    typeof entry.provider !== "string" ||
+    typeof entry.root !== "string" ||
+    (entry.layout !== "codex-cache" && entry.layout !== "provider-cache") ||
+    typeof entry.fingerprint !== "string" ||
+    typeof entry.scannedAt !== "string" ||
+    !Array.isArray(entry.connectors)
+  ) {
+    return undefined;
+  }
+  const connectors = entry.connectors.flatMap((connector) => parseRosterHostConnector(connector));
+  return {
+    schemaVersion: 1,
+    cliVersion: CLI_MUSTER_VERSION,
+    provider: entry.provider,
+    root: entry.root,
+    layout: entry.layout,
+    fingerprint: entry.fingerprint,
+    scannedAt: entry.scannedAt,
+    sourceCount: typeof entry.sourceCount === "number" && Number.isFinite(entry.sourceCount) && entry.sourceCount >= 0
+      ? entry.sourceCount
+      : undefined,
+    connectors,
+  };
+}
+
+function parseRosterHostConnector(value: unknown): RosterHostConnector[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  const connector = value as Record<string, unknown>;
+  if (
+    typeof connector.provider !== "string" ||
+    (connector.kind !== "app" && connector.kind !== "mcp") ||
+    typeof connector.id !== "string" ||
+    typeof connector.auth !== "string"
+  ) {
+    return [];
+  }
+  return [{
+    provider: connector.provider,
+    kind: connector.kind,
+    id: connector.id,
+    auth: connector.auth,
+    transport: typeof connector.transport === "string" ? connector.transport : undefined,
+    source: typeof connector.source === "string" ? connector.source : undefined,
+  }];
+}
+
+async function writeRosterHostScanCache(path: string, cache: RosterHostScanCacheFile): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  await writeFile(path, `${JSON.stringify(cache, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+}
+
+function rosterHostScanCacheEntryFresh(entry: RosterHostScanCacheEntry, source: ProviderReuseSource, fingerprint: string, ttlMs: number): boolean {
+  const scannedAt = Date.parse(entry.scannedAt);
+  return entry.cliVersion === CLI_MUSTER_VERSION &&
+    entry.provider === source.provider &&
+    entry.root === source.root &&
+    entry.layout === source.layout &&
+    entry.fingerprint === fingerprint &&
+    Number.isFinite(scannedAt) &&
+    Date.now() - scannedAt <= ttlMs;
+}
+
+function rosterHostScanCacheKey(source: ProviderReuseSource): string {
+  const digest = createHash("sha256")
+    .update(`${source.provider}\n${source.layout}\n${source.root}`)
+    .digest("hex")
+    .slice(0, 24);
+  return `${source.provider}-${digest}`;
+}
+
+function pluginReuseProviderArg(args: readonly string[]): { readonly provider: string; readonly index: number } {
+  const valueFlags = new Set(["--adopt-mcp", "--report"]);
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (valueFlags.has(arg)) {
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--")) continue;
+    return { provider: arg, index };
+  }
+  return { provider: "codex", index: -1 };
+}
+
 async function pluginReuseCommand(host: string, args: string[] = []): Promise<void> {
+  const jsonOutput = args.includes("--json");
+  const requestedAdoptions = readFlags(args, "--adopt-mcp").map(normalizeProviderMcpId);
+  const adoptAll = args.includes("--adopt-all-mcps") || args.includes("--adopt-all-mcp");
+  const policy = requestedAdoptions.length || adoptAll ? "adopt_mcp" : "discover_only";
   const source = providerReuseSource(host);
   if (!source) {
+    const payload = {
+      schemaVersion: 1,
+      command: "plugins.reuse",
+      provider: host,
+      status: "unsupported",
+      supported: ["codex", "claude", "openclaw", "hermes", "custom"],
+      customEnv: `MUSTER_${providerEnvKey(host)}_PLUGIN_CACHE`,
+      counts: { plugins: 0, apps: 0, mcps: 0 },
+      policy,
+      safety: { secrets: "not_read", tokens: "not_copied" },
+      requestedAdoptions,
+      adoptAllMcps: adoptAll,
+      plugins: [],
+      adoptions: [],
+      mutationBoundary: "none",
+      mutation: { wouldWriteConfig: false, boundary: "none", configuredMcps: [] },
+      note: "Reuse is provider-manifest driven. Point the provider cache env var at a local plugin directory that contains .app.json or .mcp.json manifests.",
+    };
+    await printRosterJsonOrReport(args, payload, { jsonOutput });
+    if (jsonOutput) return;
     console.log(`provider=${host} status=unsupported`);
     console.log("supported=codex,claude,openclaw,hermes,custom");
     console.log(`custom_env=MUSTER_${providerEnvKey(host)}_PLUGIN_CACHE`);
@@ -4117,15 +5482,104 @@ async function pluginReuseCommand(host: string, args: string[] = []): Promise<vo
   const candidates = await scanProviderPluginReuseCandidates(source);
   const appCount = candidates.reduce((count, plugin) => count + plugin.apps.length, 0);
   const mcpCount = candidates.reduce((count, plugin) => count + plugin.mcps.length, 0);
-  const requestedAdoptions = readFlags(args, "--adopt-mcp").map(normalizeProviderMcpId);
-  const adoptAll = args.includes("--adopt-all-mcps") || args.includes("--adopt-all-mcp");
-  console.log(`provider=${source.provider} status=${candidates.length ? "discovered" : "not_found"} plugins=${candidates.length} apps=${appCount} mcps=${mcpCount}`);
-  console.log(`${requestedAdoptions.length || adoptAll ? "policy=adopt_mcp" : "policy=discover_only"} secrets=not_read tokens=not_copied`);
+  const plugins = candidates.map((plugin) => ({
+    id: plugin.id,
+    provider: plugin.provider,
+    version: plugin.version,
+    sourceRoot: plugin.sourceRoot,
+    apps: plugin.apps.map((app) => ({
+      id: app.id,
+      mode: app.required ? "required" : app.optional ? "optional" : "available",
+      auth: "reuse_host",
+      next: providerAppSetupPlugin(app.id, plugin.id) ? `muster plugins setup ${providerAppSetupPlugin(app.id, plugin.id)}` : "muster plugins catalog",
+    })),
+    mcps: plugin.mcps.map((mcp) => ({
+      id: mcp.id,
+      transport: mcp.transport,
+      auth: mcp.auth,
+      url: mcp.transport === "http" ? mcp.url : undefined,
+      command: mcp.transport === "stdio" ? mcp.command : undefined,
+      args: mcp.transport === "stdio" ? mcp.args : undefined,
+      next: providerMcpNextCommand(mcp, plugin),
+    })),
+  }));
+  const adoptions: ProviderReuseAdoptionResult[] = [];
   if (!candidates.length) {
+    await printRosterJsonOrReport(args, {
+      schemaVersion: 1,
+      command: "plugins.reuse",
+      provider: source.provider,
+      status: "not_found",
+      source,
+      counts: { plugins: 0, apps: 0, mcps: 0 },
+      policy,
+      safety: { secrets: "not_read", tokens: "not_copied" },
+      requestedAdoptions,
+      adoptAllMcps: adoptAll,
+      checked: source.root,
+      plugins,
+      adoptions,
+      mutationBoundary: "none",
+      mutation: { wouldWriteConfig: false, boundary: "none", configuredMcps: [] },
+      nextActions: [
+        `Install or authenticate provider plugins, or set MUSTER_${providerEnvKey(source.provider)}_PLUGIN_CACHE to the provider plugin cache path.`,
+      ],
+    }, { jsonOutput });
+    if (jsonOutput) return;
+    console.log(`provider=${source.provider} status=not_found plugins=0 apps=0 mcps=0`);
+    console.log(`policy=${policy} secrets=not_read tokens=not_copied`);
     console.log(`checked=${source.root}`);
     console.log(`next=Install or authenticate provider plugins, or set MUSTER_${providerEnvKey(source.provider)}_PLUGIN_CACHE to the provider plugin cache path.`);
     return;
   }
+  if (requestedAdoptions.length || adoptAll) {
+    const allMcps = candidates.flatMap((plugin) => plugin.mcps.map((mcp) => ({ plugin, mcp })));
+    const selected = adoptAll
+      ? allMcps
+      : requestedAdoptions.flatMap((id) => allMcps.filter((candidate) => candidate.mcp.id === id));
+    const missing = adoptAll ? [] : requestedAdoptions.filter((id) => !allMcps.some((candidate) => candidate.mcp.id === id));
+    for (const id of missing) adoptions.push({ id, provider: source.provider, status: "not_found" });
+    const seen = new Set<string>();
+    for (const candidate of selected) {
+      if (seen.has(candidate.mcp.id)) continue;
+      seen.add(candidate.mcp.id);
+      const result = await adoptProviderReuseMcp(candidate.mcp, candidate.plugin);
+      adoptions.push({ id: candidate.mcp.id, provider: source.provider, ...result });
+    }
+  }
+  const nextActions = [
+    "muster mcp catalog",
+    "muster plugins setup authenticated-app-reuse",
+    "muster plugins reuse <provider> --adopt-mcp <id>",
+    "muster plugins reuse <provider> --adopt-all-mcps",
+    "muster mcp add-http <name> <url> [--oauth ...]",
+    "muster mcp add-stdio <name> <command> [args...]",
+    "muster plugins inspect <path> && muster plugins load <path> [--allow-high-risk]",
+    "muster skills catalog && muster skills enable <id>",
+  ];
+  const configuredAdoptions = adoptions.filter((adoption) => adoption.status === "configured");
+  const mutationBoundary = configuredAdoptions.length ? "tools.mcp.servers only" : "none";
+  await printRosterJsonOrReport(args, {
+    schemaVersion: 1,
+    command: "plugins.reuse",
+    provider: source.provider,
+    status: "discovered",
+    source,
+    counts: { plugins: candidates.length, apps: appCount, mcps: mcpCount },
+    policy,
+    safety: { secrets: "not_read", tokens: "not_copied" },
+    requestedAdoptions,
+    adoptAllMcps: adoptAll,
+    plugins,
+    adoptions,
+    mutationBoundary,
+    mutation: { wouldWriteConfig: configuredAdoptions.length > 0, boundary: mutationBoundary, configuredMcps: configuredAdoptions.map((adoption) => adoption.id) },
+    adoptionNote: adoptions.some((adoption) => adoption.status !== "not_found") ? "Provider secrets and OAuth tokens were not copied; run login/test commands to authenticate or verify Muster-owned config." : undefined,
+    nextActions,
+  }, { jsonOutput });
+  if (jsonOutput) return;
+  console.log(`provider=${source.provider} status=discovered plugins=${candidates.length} apps=${appCount} mcps=${mcpCount}`);
+  console.log(`policy=${policy} secrets=not_read tokens=not_copied`);
   for (const plugin of candidates) {
     const apps = plugin.apps.length ? plugin.apps.map((app) => `${app.id}${app.required ? "(required)" : app.optional ? "(optional)" : ""}`).join(",") : "-";
     const mcps = plugin.mcps.length ? plugin.mcps.map((mcp) => mcp.id).join(",") : "-";
@@ -4139,25 +5593,17 @@ async function pluginReuseCommand(host: string, args: string[] = []): Promise<vo
     for (const mcp of plugin.mcps) {
       const next = providerMcpNextCommand(mcp, plugin);
       const detail = mcp.transport === "http" ? `url=${mcp.url ?? "-"}` : `command=${mcp.command ?? "-"} ${(mcp.args ?? []).join(" ")}`.trim();
-      console.log(`  mcp=${mcp.id} transport=${mcp.transport} ${detail} next="${next}"`);
+      console.log(`  mcp=${mcp.id} transport=${mcp.transport} ${detail} auth=${mcp.auth} next="${next}"`);
     }
   }
-  if (requestedAdoptions.length || adoptAll) {
-    const allMcps = candidates.flatMap((plugin) => plugin.mcps.map((mcp) => ({ plugin, mcp })));
-    const selected = adoptAll
-      ? allMcps
-      : requestedAdoptions.flatMap((id) => allMcps.filter((candidate) => candidate.mcp.id === id));
-    const missing = adoptAll ? [] : requestedAdoptions.filter((id) => !allMcps.some((candidate) => candidate.mcp.id === id));
-    for (const id of missing) console.log(`adopted_mcp=${id} status=not_found provider=${source.provider}`);
-    const seen = new Set<string>();
-    for (const candidate of selected) {
-      if (seen.has(candidate.mcp.id)) continue;
-      seen.add(candidate.mcp.id);
-      const result = await adoptProviderReuseMcp(candidate.mcp, candidate.plugin);
-      console.log(`adopted_mcp=${candidate.mcp.id} provider=${source.provider} status=${result.status} transport=${result.transport} auth=${result.auth} next="${result.next}"`);
+  for (const adoption of adoptions) {
+    if (adoption.status === "not_found") {
+      console.log(`adopted_mcp=${adoption.id} status=not_found provider=${adoption.provider}`);
+      continue;
     }
-    if (selected.length) console.log("adoption_note=Provider secrets and OAuth tokens were not copied; run login/test commands to authenticate or verify Muster-owned config.");
+    console.log(`adopted_mcp=${adoption.id} provider=${adoption.provider} status=${adoption.status} transport=${adoption.transport} auth=${adoption.auth} next="${adoption.next}"`);
   }
+  if (adoptions.some((adoption) => adoption.status !== "not_found")) console.log("adoption_note=Provider secrets and OAuth tokens were not copied; run login/test commands to authenticate or verify Muster-owned config.");
   console.log("next=muster mcp catalog");
   console.log("next=muster plugins setup authenticated-app-reuse");
   console.log("adopt_mcp=muster plugins reuse <provider> --adopt-mcp <id>");
@@ -4190,6 +5636,9 @@ async function adoptProviderReuseMcp(mcp: ProviderReuseMcp, plugin: ProviderReus
     };
   }
   if (mcp.transport === "http" && mcp.url) {
+    if (mcp.auth === "api_key") {
+      return { status: "skipped", transport: "http", auth: "api_key", next: providerMcpNextCommand(mcp, plugin) };
+    }
     const config = await loadConfig();
     const server: McpServerConfig = {
       transport: { kind: "http", url: mcp.url },
@@ -4305,6 +5754,32 @@ async function providerPluginManifestRoots(source: ProviderReuseSource): Promise
   return roots;
 }
 
+async function providerReuseSourceFingerprint(source: ProviderReuseSource): Promise<string> {
+  const rows: string[] = [`schema=1`, `provider=${source.provider}`, `layout=${source.layout}`, `root=${source.root}`];
+  await collectProviderReuseFingerprintRows(source.root, 0, rows);
+  return createHash("sha256").update(rows.sort().join("\n")).digest("hex");
+}
+
+async function collectProviderReuseFingerprintRows(path: string, depth: number, rows: string[]): Promise<void> {
+  if (rows.length > 2000) {
+    rows.push("truncated=true");
+    return;
+  }
+  try {
+    const detail = await stat(path);
+    rows.push(`${depth}:${path}:${detail.isDirectory() ? "dir" : "file"}:${Math.trunc(detail.mtimeMs)}:${detail.size}`);
+    if (!detail.isDirectory() || depth >= 4) return;
+    for (const entry of await safeReadDir(path)) {
+      if (entry.name.startsWith(".")) {
+        if (entry.name !== ".app.json" && entry.name !== ".mcp.json") continue;
+      }
+      await collectProviderReuseFingerprintRows(join(path, entry.name), depth + 1, rows);
+    }
+  } catch {
+    rows.push(`${depth}:${path}:missing`);
+  }
+}
+
 async function safeReadDir(path: string): Promise<import("node:fs").Dirent[]> {
   try {
     return await readdir(path, { withFileTypes: true });
@@ -4348,6 +5823,7 @@ async function readProviderReuseMcps(path: string, versionPath: string): Promise
         return {
           id: normalizeProviderMcpId(id),
           transport: "http" as const,
+          auth: providerHttpMcpAuth(server),
           url: typeof server.url === "string" ? server.url : undefined,
         };
       }
@@ -4356,6 +5832,7 @@ async function readProviderReuseMcps(path: string, versionPath: string): Promise
       return {
         id: normalizeProviderMcpId(id),
         transport: "stdio" as const,
+        auth: "local" as const,
         command,
         args: args.map((arg) => arg.startsWith("./") ? resolve(versionPath, arg) : arg),
       };
@@ -4373,12 +5850,27 @@ async function readJsonObject(path: string): Promise<Record<string, unknown> | u
 }
 
 function normalizeProviderCapabilityId(id: string): string {
-  return id.replace(/_/g, "-");
+  return id
+    .replace(/_/g, "-")
+    .replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`)
+    .replace(/^-/, "")
+    .toLowerCase();
 }
 
 function normalizeProviderMcpId(id: string): string {
-  if (id === "dataAnalyticsWidgets") return "data-analytics-widgets";
   return normalizeProviderCapabilityId(id);
+}
+
+function providerHttpMcpAuth(server: Record<string, unknown>): "oauth" | "api_key" {
+  const secretFields = ["apiKey", "api_key", "bearerToken", "accessToken", "token", "authorization"];
+  if (secretFields.some((field) => typeof server[field] === "string" && (server[field] as string).length > 0)) return "api_key";
+  const headers = server.headers && typeof server.headers === "object" && !Array.isArray(server.headers)
+    ? server.headers as Record<string, unknown>
+    : undefined;
+  const authorization = typeof headers?.Authorization === "string" ? headers.Authorization : undefined;
+  if (authorization) return "api_key";
+  if (headers && Object.entries(headers).some(([key, value]) => /api[-_]?key|token|authorization/i.test(key) && typeof value === "string" && value.length > 0)) return "api_key";
+  return "oauth";
 }
 
 function providerAppSetupPlugin(appId: string, pluginId: string): string | undefined {
@@ -4409,6 +5901,7 @@ function providerMcpNextCommand(mcp: ProviderReuseMcp, plugin: ProviderReusePlug
   if (mcp.transport === "http") {
     const builtin = findBuiltinMcpEntry(mcp.id);
     if (builtin?.install?.transport.kind === "http" && builtin.install.transport.url === mcp.url) return `muster mcp install ${mcp.id} && muster mcp login ${mcp.id}`;
+    if (mcp.auth === "api_key" && mcp.url) return `muster mcp add-http ${mcp.id} ${mcp.url}`;
     if (mcp.url) return `muster mcp add-http ${mcp.id} ${mcp.url} --oauth`;
   }
   const command = mcp.command;
@@ -5153,7 +6646,7 @@ async function dashboardCommand(args: string[]): Promise<void> {
       console.log(`token_ledger=records=${tokenRecords.length} today_in=${todayInputTokens} today_out=${todayOutputTokens} today_cost_usd=${todayCostUsd.toFixed(4)}`);
       console.log(`sessions=backend=${store.backend} recent=${sessionCount} latest=${latestSession?.id ?? "-"}`);
       console.log(`next_personal_pack=${JSON.stringify(nextPersonalPack ? `muster plugins enable ${nextPersonalPack}` : "configured")}`);
-      console.log(`next_channel=${JSON.stringify(gateway ? nextChannel ? `muster channels setup ${nextChannel}` : "configured" : "muster gateway init")}`);
+      console.log(`next_channel=${JSON.stringify(gateway ? nextChannel ? `muster channels ready ${nextChannel}` : "configured" : "muster gateway init")}`);
       console.log(`next_mcp=${JSON.stringify(nextMcp ? `muster mcp install ${nextMcp}` : "configured")}`);
       console.log("start=muster dashboard start --port 7461");
     } finally {
@@ -6048,6 +7541,12 @@ async function qaCommand(args: string[]): Promise<void> {
     ? validateStrictReleaseEvidence(storedEvidence)
     : undefined;
   if (strictValidation) console.log(renderStrictReleaseValidation(strictValidation));
+  if (args.includes("--strict-release")) {
+    const releaseReady = scorecard.status === "passed" && strictValidation?.status === "passed";
+    console.log(`release_ready=${releaseReady ? "yes" : "no"} mode=strict reason=${releaseReady ? "scorecard_and_strict_release_passed" : "scorecard_or_strict_release_failed"}`);
+  } else {
+    console.log("release_ready=unknown mode=advisory reason=run_with_--strict-release_before_release_claims");
+  }
   console.log(`evidence=${evidencePath}`);
   console.log(`required_suites=${REQUIRED_QA_SUITES.join(",")}`);
   if (providerReports.length) {
@@ -6261,10 +7760,10 @@ function channelOperatorQaCases(): Array<{ readonly id: string; readonly status:
   const slack = requireChannelSpec("slack");
   const slackMissing = channelMissingSetup("slack", config);
   const slackPlanPassed = slack.route === "/v1/adapters/slack" &&
-    channelAuthMode("slack") === "slack-signature-required" &&
+    channelAuthModeForConfig("slack", config) === "slack-socket-app-token" &&
     channelReplyMode("slack", config) === "direct_post" &&
     slackMissing.includes("slack.botToken") &&
-    slackMissing.includes("slack.signingSecret");
+    slackMissing.includes("slack.appToken");
   const simulations = (["telegram", "slack", "gchat", "discord", "whatsapp", "teams", "web"] as const).map((channel) => {
     const simulated = simulateChannelInbound(channel, "qa local simulation");
     return {
@@ -6280,7 +7779,7 @@ function channelOperatorQaCases(): Array<{ readonly id: string; readonly status:
       id: "operator_plan_slack",
       status: slackPlanPassed ? "passed" : "failed",
       summary: slackPlanPassed ? "Slack operator plan exposes route, auth mode, reply mode, and missing setup" : "Slack operator plan contract is incomplete",
-      evidence: { route: slack.route, authMode: channelAuthMode("slack"), replyMode: channelReplyMode("slack", config), missing: slackMissing },
+      evidence: { route: slack.route, authMode: channelAuthModeForConfig("slack", config), replyMode: channelReplyMode("slack", config), missing: slackMissing },
     },
     {
       id: "operator_simulations",
@@ -7406,7 +8905,7 @@ async function gatewayCommand(commandArgs: string[]): Promise<void> {
       console.log("token=<redacted> (stored in gateway_config; rerun with --show-token only in a trusted terminal)");
     }
     console.log("Surfaces authenticate with: Authorization: Bearer <token>");
-    console.log(`next: muster gateway start --port ${result.config.port ?? DEFAULT_GATEWAY_PORT}`);
+    console.log(`next: muster gateway daemon start --port ${result.config.port ?? DEFAULT_GATEWAY_PORT}`);
     return;
   }
   if (action === "status") {
@@ -7418,7 +8917,7 @@ async function gatewayCommand(commandArgs: string[]): Promise<void> {
       ? CHANNEL_SETUP_SPECS.filter((spec) => channelReady(spec.id, gateway.config)).length
       : 0;
     const next = gateway.initialized
-      ? `muster gateway start --port ${gateway.config.port ?? DEFAULT_GATEWAY_PORT}`
+      ? `muster gateway daemon start --port ${gateway.config.port ?? DEFAULT_GATEWAY_PORT}`
       : "muster gateway init";
     console.log(`gateway_status=${gateway.initialized ? "configured" : "missing"}`);
     console.log(`gateway_config=${gatewayConfigPath()}`);
@@ -7432,9 +8931,32 @@ async function gatewayCommand(commandArgs: string[]): Promise<void> {
     const gateway = await loadGatewayConfig();
     const config = await loadConfig();
     const port = readNumberFlag(commandArgs, "--port") ?? gateway.port ?? DEFAULT_GATEWAY_PORT;
+    const controller = new AbortController();
+    process.on("SIGINT", () => controller.abort());
+    process.on("SIGTERM", () => controller.abort());
     await startGatewayServer({ config, gateway, cwd: process.cwd(), log: (line) => console.log(line) }, port);
     console.log("routes: GET /v1/health | POST /v1/messages | POST /v1/flows/<run>/approve|reject | POST /v1/adapters/telegram|slack|discord|whatsapp|gchat|teams");
+    if (commandArgs.includes("--with-telegram-poll")) {
+      void pollTelegram({ config, gateway, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) }).catch((error) => {
+        console.error(`telegram poll failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      console.log("telegram_poll=background_in_process");
+    }
+    if (commandArgs.includes("--with-slack-socket")) {
+      void pollSlackSocket({ config, gateway, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) }).catch((error) => {
+        console.error(`slack socket failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      console.log("slack_socket=background_in_process");
+    }
     console.log("stop with Ctrl-C");
+    return;
+  }
+  if (action === "daemon") {
+    await gatewayDaemonCommand(commandArgs.slice(1));
+    return;
+  }
+  if (action === "webhook") {
+    await gatewayWebhookCommand(commandArgs.slice(1));
     return;
   }
   if (action === "poll") {
@@ -7448,7 +8970,129 @@ async function gatewayCommand(commandArgs: string[]): Promise<void> {
     await pollTelegram({ config, gateway, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) });
     return;
   }
-  throw new Error("Usage: muster gateway <init|status|start [--port 7460]|poll>");
+  throw new Error("Usage: muster gateway <init|status|start [--port 7460] [--with-telegram-poll] [--with-slack-socket]|daemon start|stop|status|restart [--with-telegram-poll] [--with-slack-socket]|webhook telegram --public-url URL|poll>");
+}
+
+function gatewayPidPath(cwd = process.cwd()): string {
+  return join(cwd, ".muster", "gateway.pid");
+}
+
+function gatewayLogPath(cwd = process.cwd()): string {
+  return join(cwd, ".muster", "gateway.log");
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readGatewayPid(cwd = process.cwd()): Promise<number | undefined> {
+  const raw = await readFile(gatewayPidPath(cwd), "utf8").catch(() => "");
+  const pid = Number(raw.trim());
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+async function gatewayDaemonCommand(args: string[]): Promise<void> {
+  const [subcommand = "status"] = args;
+  const pidPath = gatewayPidPath();
+  const logPath = gatewayLogPath();
+  if (subcommand === "status") {
+    const pid = await readGatewayPid();
+    const alive = pid !== undefined && processIsAlive(pid);
+    console.log(`gateway_daemon=${alive ? "running" : "stopped"}`);
+    console.log(`pid=${pid ?? "-"}`);
+    console.log(`pid_file=${pidPath}`);
+    console.log(`log_file=${logPath}`);
+    console.log(`next=${alive ? "muster gateway daemon stop" : "muster gateway daemon start"}`);
+    return;
+  }
+  if (subcommand === "stop") {
+    const pid = await readGatewayPid();
+    if (!pid || !processIsAlive(pid)) {
+      await unlink(pidPath).catch(() => undefined);
+      console.log("gateway_daemon=stopped");
+      return;
+    }
+    process.kill(pid, "SIGTERM");
+    for (let i = 0; i < 20; i += 1) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 150));
+      if (!processIsAlive(pid)) break;
+    }
+    await unlink(pidPath).catch(() => undefined);
+    console.log("gateway_daemon=stopped");
+    return;
+  }
+  if (subcommand === "restart") {
+    await gatewayDaemonCommand(["stop"]);
+    await gatewayDaemonCommand(["start", ...args.slice(1)]);
+    return;
+  }
+  if (subcommand === "start") {
+    const existing = await readGatewayPid();
+    if (existing && processIsAlive(existing)) {
+      console.log(`gateway_daemon=running pid=${existing}`);
+      console.log(`log_file=${logPath}`);
+      return;
+    }
+    await mkdir(dirname(pidPath), { recursive: true, mode: 0o700 });
+    const gateway = await loadGatewayConfig();
+    const port = readNumberFlag(args, "--port") ?? gateway.port ?? DEFAULT_GATEWAY_PORT;
+    const childArgs = [process.argv[1], "gateway", "start", "--port", String(port)];
+    if (args.includes("--with-telegram-poll")) childArgs.push("--with-telegram-poll");
+    if (args.includes("--with-slack-socket")) childArgs.push("--with-slack-socket");
+    const out = openSync(logPath, "a", 0o600);
+    const child = spawn(process.execPath, childArgs, {
+      cwd: process.cwd(),
+      detached: true,
+      stdio: ["ignore", out, out],
+      env: process.env,
+    });
+    child.unref();
+    await writeFile(pidPath, `${child.pid}\n`, { encoding: "utf8", mode: 0o600 });
+    console.log(`gateway_daemon=started pid=${child.pid}`);
+    console.log(`port=${port}`);
+    console.log(`pid_file=${pidPath}`);
+    console.log(`log_file=${logPath}`);
+    console.log(`health=http://127.0.0.1:${port}/v1/health`);
+    return;
+  }
+  throw new Error("Usage: muster gateway daemon start|stop|status|restart [--with-telegram-poll] [--with-slack-socket] [--port 7460]");
+}
+
+async function gatewayWebhookCommand(args: string[]): Promise<void> {
+  const [channel] = args;
+  if (channel !== "telegram") throw new Error("Usage: muster gateway webhook telegram --public-url https://your-domain.example");
+  const gateway = await loadGatewayConfig();
+  const publicUrl = readFlag(args, "--public-url")?.replace(/\/$/, "");
+  if (!publicUrl || !publicUrl.startsWith("https://")) throw new Error("--public-url must be a public https:// URL for Telegram webhooks.");
+  const botToken = gateway.telegram?.botToken;
+  if (!botToken) throw new Error("Telegram bot token missing. Run: muster channels ready telegram --bot-token-env TELEGRAM_BOT_TOKEN");
+  const secretToken = gateway.telegram?.secretToken;
+  if (!secretToken) throw new Error("Telegram webhook secret missing. Run: muster channels ready telegram --bot-token-env TELEGRAM_BOT_TOKEN");
+  const url = `${publicUrl}/v1/adapters/telegram`;
+  const response = await fetch(`https://api.telegram.org/bot${botToken}/setWebhook`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      url,
+      secret_token: secretToken,
+      drop_pending_updates: false,
+      allowed_updates: ["message"],
+    }),
+    signal: AbortSignal.timeout(12_000),
+  });
+  const body = await response.json().catch(() => ({})) as { ok?: boolean; description?: string };
+  if (!response.ok || body.ok === false) {
+    throw new Error(`Telegram setWebhook failed: HTTP ${response.status}${body.description ? ` ${body.description}` : ""}`);
+  }
+  console.log("telegram_webhook=configured");
+  console.log(`webhook_url=${url}`);
+  console.log("secret_token=configured");
+  console.log(`next=muster gateway daemon start --port ${gateway.port ?? DEFAULT_GATEWAY_PORT}`);
 }
 
 type ChannelId = "telegram" | "slack" | "gchat" | "discord" | "whatsapp" | "teams" | "web";
@@ -7468,54 +9112,59 @@ const CHANNEL_SETUP_SPECS: readonly ChannelSetupSpec[] = [
     id: "telegram",
     label: "Telegram Bot",
     route: "/v1/adapters/telegram",
-    setupUrls: ["https://core.telegram.org/bots/tutorial", "https://core.telegram.org/bots/api#setwebhook"],
+    setupUrls: ["https://core.telegram.org/bots/tutorial"],
     requiredEnvFlags: ["--bot-token-env"],
-    optionalEnvFlags: ["--secret-token-env"],
-    notes: ["Webhook mode needs a public HTTPS URL; use `muster gateway poll` for local long-poll testing where Telegram is reachable."],
+    optionalEnvFlags: ["--name", "--bot-token", "--public-url", "--secret-token-env"],
+    notes: ["Simple setup: muster channels ready telegram --name <bot-name> --bot-token <token>. Muster generates the webhook secret internally. Add --public-url when you have a public HTTPS gateway and want Telegram webhooks instead of background long-poll fallback."],
   },
   {
     id: "slack",
     label: "Slack App",
     route: "/v1/adapters/slack",
-    setupUrls: ["https://api.slack.com/apps", "https://api.slack.com/apis/connections/events-api"],
-    requiredEnvFlags: ["--bot-token-env", "--signing-secret-env"],
-    notes: ["Enable Events API, subscribe to message/app_mention events, and paste the Request URL shown below."],
+    setupUrls: ["https://api.slack.com/apps", "https://api.slack.com/scopes/files:write", "https://api.slack.com/apis/connections/socket"],
+    requiredEnvFlags: ["--bot-token-env", "--app-token-env"],
+    optionalEnvFlags: ["--bot-token", "--app-token", "--mode", "--signing-secret-env", "--signing-secret", "--public-url"],
+    notes: [
+      "Default setup uses Slack Socket Mode: bot token plus app-level token, no public HTTPS URL. Use --mode http with --signing-secret-env and --public-url only when you want Slack Events API webhooks.",
+      "Add bot scopes app_mentions:read, channels:history, chat:write, files:write, im:history, and im:write, then reinstall the Slack app so the issued bot token actually receives them.",
+      "Generated PDFs, DOCX, XLSX, PPTX, and other artifacts need files:write; without it Muster can answer in Slack but can only return local MEDIA paths for files.",
+    ],
   },
   {
     id: "gchat",
     label: "Google Chat App",
     route: "/v1/adapters/gchat",
     setupUrls: ["https://console.cloud.google.com/apis/library/chat.googleapis.com", "https://developers.google.com/workspace/chat/quickstart/webhooks"],
-    requiredEnvFlags: [],
-    optionalEnvFlags: ["--verification-token-env"],
-    notes: ["Configure the Chat API app URL to the webhook below. Google Chat app identity is configured in Google Cloud, not by a bot token in Muster."],
+    requiredEnvFlags: ["--verification-token-env"],
+    optionalEnvFlags: ["--verification-token"],
+    notes: ["Configure the Chat API app URL to the webhook below. The verification token is required because Google Chat cannot send Muster's gateway bearer token."],
   },
   {
     id: "discord",
     label: "Discord App",
     route: "/v1/adapters/discord",
     setupUrls: ["https://discord.com/developers/applications"],
-    requiredEnvFlags: ["--bot-token-env"],
-    optionalEnvFlags: ["--public-key-env"],
-    notes: ["Bot-token message support is configured; interaction public-key verification is available when public key is supplied."],
+    requiredEnvFlags: ["--bot-token-env", "--public-key-env"],
+    optionalEnvFlags: ["--bot-token", "--public-key"],
+    notes: ["Discord interaction webhooks require the application public key because Discord cannot send Muster's gateway bearer token."],
   },
   {
     id: "whatsapp",
     label: "WhatsApp Cloud API",
     route: "/v1/adapters/whatsapp",
     setupUrls: ["https://developers.facebook.com/docs/whatsapp/cloud-api/get-started", "https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks"],
-    requiredEnvFlags: ["--access-token-env", "--verify-token-env", "--phone-number-id-env"],
-    optionalEnvFlags: ["--api-version"],
-    notes: ["Use a long-lived access token in production; the verify token is the webhook challenge secret you choose."],
+    requiredEnvFlags: ["--access-token-env", "--verify-token-env", "--phone-number-id-env", "--app-secret-env"],
+    optionalEnvFlags: ["--access-token", "--verify-token", "--phone-number-id", "--app-secret", "--api-version"],
+    notes: ["Use a long-lived access token in production; the verify token handles Meta's GET challenge and the app secret verifies POST webhooks."],
   },
   {
     id: "teams",
     label: "Microsoft Teams",
     route: "/v1/adapters/teams",
     setupUrls: ["https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/conversations/channel-and-group-conversations"],
-    requiredEnvFlags: [],
-    optionalEnvFlags: ["--hmac-secret-env"],
-    notes: ["The adapter accepts Teams-style webhook payloads; production bot OAuth registration still needs a fuller Teams app flow."],
+    requiredEnvFlags: ["--hmac-secret-env"],
+    optionalEnvFlags: ["--hmac-secret"],
+    notes: ["The adapter accepts Teams-style webhook payloads. The HMAC secret is required because Teams cannot send Muster's gateway bearer token."],
   },
   {
     id: "web",
@@ -7571,7 +9220,12 @@ async function channelsCommand(commandArgs: string[]): Promise<void> {
     await printChannelDoctor(spec, gateway.config, { live: commandArgs.includes("--live") });
     return;
   }
-  if (action === "setup" && channel) {
+  if (action === "ready" && channel) {
+    const spec = requireChannelSpec(channel);
+    await runChannelReady(spec, commandArgs);
+    return;
+  }
+  if ((action === "setup" || action === "connect") && channel) {
     const spec = requireChannelSpec(channel);
     const config = await loadOrInitGatewayConfig();
     const updated = applyChannelSetup(spec.id, config, commandArgs);
@@ -7579,47 +9233,99 @@ async function channelsCommand(commandArgs: string[]): Promise<void> {
       const path = await saveGatewayConfig(updated);
       console.log(`gateway_config=${path}`);
     }
-    printChannelSetup(spec, updated, commandArgs);
+    printChannelSetup(spec, updated, commandArgs, { friendly: action === "connect" });
     return;
   }
-  throw new Error("Usage: muster channels list | status [channel] | plan <channel> | simulate <channel> [--message TEXT] | doctor [telegram|slack|gchat|discord|whatsapp|teams|web] [--live] | setup <telegram|slack|gchat|discord|whatsapp|teams|web> [--public-url URL] [secret env flags]");
+  throw new Error("Usage: muster channels list | status [channel] | plan <channel> | simulate <channel> [--message TEXT] | doctor [telegram|slack|gchat|discord|whatsapp|teams|web] [--live] | setup|connect|ready <telegram|slack|gchat|discord|whatsapp|teams|web> [--public-url URL] [secret flags]");
+}
+
+async function runChannelReady(spec: ChannelSetupSpec, args: readonly string[]): Promise<void> {
+  const publicUrl = readFlag([...args], "--public-url")?.replace(/\/$/, "");
+  const noStart = args.includes("--no-start");
+  const setWebhook = args.includes("--set-webhook");
+  const config = await loadOrInitGatewayConfig();
+  const updated = applyChannelSetup(spec.id, config, args);
+  if (updated !== config) {
+    const path = await saveGatewayConfig(updated);
+    console.log(`gateway_config=${path}`);
+  }
+  const missing = channelMissingSetup(spec.id, updated);
+  const ready = missing.length === 0;
+  console.log(`channel_ready=${spec.id} status=${ready ? "ready" : "needs_setup"}`);
+  console.log(`single_command=true`);
+  if (missing.length) console.log(`missing_setup=${missing.join(",")}`);
+  printChannelSetup(spec, updated, args, { friendly: true });
+  await printChannelDoctor(spec, updated, { live: args.includes("--live") });
+  if (!ready) {
+    console.log(`enable=blocked next="muster channels ready ${spec.id}"`);
+    return;
+  }
+  if (spec.id === "telegram" && publicUrl && setWebhook) {
+    await gatewayWebhookCommand(["telegram", "--public-url", publicUrl]);
+  } else if (spec.id === "telegram" && publicUrl) {
+    console.log(`webhook_registration=skipped next="muster gateway webhook telegram --public-url ${publicUrl}"`);
+  }
+  if (noStart) {
+    const pollFlag = spec.id === "telegram" && !publicUrl ? " --with-telegram-poll" : "";
+    const slackSocketFlag = spec.id === "slack" && slackMode(updated) === "socket" ? " --with-slack-socket" : "";
+    console.log(`daemon=skipped start="muster gateway daemon start${pollFlag}${slackSocketFlag} --port ${updated.port ?? DEFAULT_GATEWAY_PORT}"`);
+  } else {
+    const daemonArgs = ["start", "--port", String(updated.port ?? DEFAULT_GATEWAY_PORT)];
+    if (spec.id === "telegram" && !publicUrl) daemonArgs.push("--with-telegram-poll");
+    if (spec.id === "slack" && slackMode(updated) === "socket") daemonArgs.push("--with-slack-socket");
+    await gatewayDaemonCommand(daemonArgs);
+  }
+  printChannelSimulation(spec, readFlag([...args], "--message") ?? "hello from Muster channel ready check");
+  console.log(`done=channel_ready channel=${spec.id} daemon=${noStart ? "skipped" : "started_or_running"} sample=local_simulation`);
 }
 
 function printChannelCatalog(): void {
   console.log("channel\tconfigured_by\tsetup");
   for (const spec of CHANNEL_SETUP_SPECS) {
     const auth = spec.requiredEnvFlags.length ? spec.requiredEnvFlags.join(",") : spec.optionalEnvFlags?.length ? spec.optionalEnvFlags.join(",") : "gateway token";
-    console.log(`${spec.id}\t${auth}\tmuster channels setup ${spec.id}`);
+    console.log(`${spec.id}\t${auth}\tmuster channels ready ${spec.id}`);
   }
 }
 
 function printChannelStatus(spec: ChannelSetupSpec, config: GatewayConfig): void {
   const ready = channelReady(spec.id, config);
-  console.log(`channel=${spec.id} ready=${ready} webhook=${spec.route ?? "-"} setup="muster channels setup ${spec.id}"`);
-  if (spec.id === "telegram") console.log(`  bot_token=${configured(Boolean(config.telegram?.botToken))} secret_token=${configured(Boolean(config.telegram?.secretToken))} stream=${config.telegram?.stream ?? "off"}`);
-  if (spec.id === "slack") console.log(`  bot_token=${configured(Boolean(config.slack?.botToken))} signing_secret=${configured(Boolean(config.slack?.signingSecret))} stream=${config.slack?.stream ?? "off"}`);
+  console.log(`channel=${spec.id} ready=${ready} webhook=${spec.route ?? "-"} setup="muster channels ready ${spec.id}"`);
+  if (spec.id === "telegram") console.log(`  name=${config.telegram?.name ?? "-"} bot_token=${configured(Boolean(config.telegram?.botToken))} secret_token=${configured(Boolean(config.telegram?.secretToken))} stream=${config.telegram?.stream ?? "off"} status=${config.telegram?.status ?? "typing"} thinking=${config.telegram?.thinking ?? "off"} busy=${config.telegram?.busy ?? "queue"}`);
+  if (spec.id === "slack") console.log(`  mode=${slackMode(config)} bot_token=${configured(Boolean(config.slack?.botToken))} app_token=${configured(Boolean(config.slack?.appToken))} signing_secret=${configured(Boolean(config.slack?.signingSecret))} stream=${config.slack?.stream ?? "off"} status=${config.slack?.status ?? "message"} thinking=${config.slack?.thinking ?? "off"} busy=${config.slack?.busy ?? "queue"}`);
   if (spec.id === "gchat") console.log(`  verification_token=${configured(Boolean(config.gchat?.verificationToken))}`);
   if (spec.id === "discord") console.log(`  bot_token=${configured(Boolean(config.discord?.botToken))} public_key=${configured(Boolean(config.discord?.publicKey))}`);
-  if (spec.id === "whatsapp") console.log(`  access_token=${configured(Boolean(config.whatsapp?.accessToken))} verify_token=${configured(Boolean(config.whatsapp?.verifyToken))} phone_number_id=${configured(Boolean(config.whatsapp?.phoneNumberId))}`);
+  if (spec.id === "whatsapp") console.log(`  access_token=${configured(Boolean(config.whatsapp?.accessToken))} verify_token=${configured(Boolean(config.whatsapp?.verifyToken))} phone_number_id=${configured(Boolean(config.whatsapp?.phoneNumberId))} app_secret=${configured(Boolean(config.whatsapp?.appSecret))}`);
   if (spec.id === "teams") console.log(`  hmac_secret=${configured(Boolean(config.teams?.hmacSecret))}`);
   if (spec.id === "web") console.log(`  bearer_token=${configured(Boolean(config.token))}`);
 }
 
 function printChannelOperatorPlan(spec: ChannelSetupSpec, config: GatewayConfig, args: readonly string[]): void {
   const publicUrl = readFlag([...args], "--public-url")?.replace(/\/$/, "");
+  const requestedSlackMode = commandLineSlackMode(args);
   const localBase = `http://127.0.0.1:${config.port ?? DEFAULT_GATEWAY_PORT}`;
   const webhookUrl = spec.route ? `${publicUrl ?? localBase}${spec.route}` : "-";
   const ready = channelReady(spec.id, config);
-  const missing = channelMissingSetup(spec.id, config);
+  const missing = channelMissingSetup(spec.id, config, requestedSlackMode);
   console.log(`channel_plan=${spec.id} label="${spec.label}" ready=${ready}`);
-  console.log(`route=${spec.route ?? "-"} webhook_url=${webhookUrl}`);
+  console.log(`route=${spec.route ?? "-"}`);
+  if (spec.id === "telegram" && !publicUrl) {
+    console.log("ingress=background_long_poll webhook_url=-");
+  } else if (spec.id === "slack" && slackMode(config, requestedSlackMode) === "socket") {
+    console.log("ingress=socket_mode webhook_url=-");
+  } else {
+    console.log(`webhook_url=${webhookUrl}`);
+  }
   console.log(`operator_contract=inbound_normalize -> scoped_memory_recall -> policy_gate -> draft_or_reply -> token_ledger`);
   console.log(`local_simulation=muster channels simulate ${spec.id} --message "hello"`);
-  console.log(`setup_command=muster channels setup ${spec.id}${publicUrl ? ` --public-url ${publicUrl}` : ""}`);
+  console.log(`setup_command=muster channels ready ${spec.id}${spec.id === "slack" && requestedSlackMode ? ` --mode ${requestedSlackMode}` : ""}${publicUrl ? ` --public-url ${publicUrl}` : ""}`);
   console.log(`doctor_command=muster channels doctor ${spec.id}${spec.id === "telegram" ? " --live" : ""}`);
-  console.log(`start_command=${spec.id === "telegram" ? "muster gateway poll" : `muster gateway start --port ${config.port ?? DEFAULT_GATEWAY_PORT}`}`);
-  console.log(`security=signature_or_token_check:${channelAuthMode(spec.id)} approval_required_for_mutations:true secrets_printed:false`);
+  const socketFlag = spec.id === "slack" && slackMode(config, requestedSlackMode) === "socket" ? " --with-slack-socket" : "";
+  console.log(`start_command=muster gateway daemon start${socketFlag} --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
+  if (spec.id === "telegram" && publicUrl) console.log(`webhook_command=muster gateway webhook telegram --public-url ${publicUrl}`);
+  else if (spec.id === "telegram") console.log("optional_webhook=muster gateway webhook telegram --public-url https://your-domain.example");
+  console.log(`security=signature_or_token_check:${channelAuthModeForConfig(spec.id, config, requestedSlackMode)} approval_required_for_mutations:true secrets_printed:false`);
   console.log(`reply_mode=${channelReplyMode(spec.id, config)}`);
+  if (spec.id === "slack") console.log("artifact_delivery=slack_native_files requires=files:write verify=\"muster channels doctor slack --live\"");
   if (missing.length) console.log(`missing_setup=${missing.join(",")}`);
   for (const url of spec.setupUrls) console.log(`setup_url=${url}`);
   for (const note of spec.notes) console.log(`note=${note}`);
@@ -7715,24 +9421,36 @@ function simulationFromSurface(message: { readonly surfaceId: string; readonly c
   };
 }
 
-function channelMissingSetup(channel: ChannelId, config: GatewayConfig): string[] {
+function channelMissingSetup(channel: ChannelId, config: GatewayConfig, override?: "socket" | "http"): string[] {
   if (channel === "telegram") return [config.telegram?.botToken ? "" : "telegram.botToken"].filter(Boolean);
-  if (channel === "slack") return [config.slack?.botToken ? "" : "slack.botToken", config.slack?.signingSecret ? "" : "slack.signingSecret"].filter(Boolean);
-  if (channel === "gchat") return [config.gchat ? "" : "gchat section"].filter(Boolean);
-  if (channel === "discord") return [config.discord?.botToken ? "" : "discord.botToken"].filter(Boolean);
-  if (channel === "whatsapp") return [config.whatsapp?.accessToken ? "" : "whatsapp.accessToken", config.whatsapp?.verifyToken ? "" : "whatsapp.verifyToken", config.whatsapp?.phoneNumberId ? "" : "whatsapp.phoneNumberId"].filter(Boolean);
-  if (channel === "teams") return [config.teams ? "" : "teams section"].filter(Boolean);
+  if (channel === "slack") {
+    const mode = slackMode(config, override);
+    return [
+      config.slack?.botToken ? "" : "slack.botToken",
+      mode === "socket" && !config.slack?.appToken ? "slack.appToken" : "",
+      mode === "http" && !config.slack?.signingSecret ? "slack.signingSecret" : "",
+    ].filter(Boolean);
+  }
+  if (channel === "gchat") return [config.gchat?.verificationToken ? "" : "gchat.verificationToken"].filter(Boolean);
+  if (channel === "discord") return [config.discord?.botToken ? "" : "discord.botToken", config.discord?.publicKey ? "" : "discord.publicKey"].filter(Boolean);
+  if (channel === "whatsapp") return [config.whatsapp?.accessToken ? "" : "whatsapp.accessToken", config.whatsapp?.verifyToken ? "" : "whatsapp.verifyToken", config.whatsapp?.phoneNumberId ? "" : "whatsapp.phoneNumberId", config.whatsapp?.appSecret ? "" : "whatsapp.appSecret"].filter(Boolean);
+  if (channel === "teams") return [config.teams?.hmacSecret ? "" : "teams.hmacSecret"].filter(Boolean);
   return [config.token ? "" : "gateway.token"].filter(Boolean);
 }
 
 function channelAuthMode(channel: ChannelId): string {
   if (channel === "telegram") return "secret-token-header-recommended";
-  if (channel === "slack") return "slack-signature-required";
+  if (channel === "slack") return "slack-socket-app-token";
   if (channel === "discord") return "ed25519-public-key-recommended";
   if (channel === "whatsapp") return "verify-token-and-graph-token";
-  if (channel === "gchat") return "verification-token-optional";
-  if (channel === "teams") return "hmac-secret-optional";
+  if (channel === "gchat") return "verification-token-required";
+  if (channel === "teams") return "hmac-secret-required";
   return "bearer-token";
+}
+
+function channelAuthModeForConfig(channel: ChannelId, config: GatewayConfig, override?: "socket" | "http"): string {
+  if (channel === "slack") return slackMode(config, override) === "socket" ? "slack-socket-app-token" : "slack-signature-required";
+  return channelAuthMode(channel);
 }
 
 function channelReplyMode(channel: ChannelId, config: GatewayConfig): string {
@@ -7741,6 +9459,35 @@ function channelReplyMode(channel: ChannelId, config: GatewayConfig): string {
   if (channel === "discord" || channel === "gchat" || channel === "teams") return "synchronous_response";
   if (channel === "whatsapp") return "graph_api_send";
   return "http_response";
+}
+
+function commandLineSlackMode(args: readonly string[]): "socket" | "http" | undefined {
+  const value = readFlag([...args], "--mode");
+  if (!value) return undefined;
+  if (value !== "socket" && value !== "http") throw new Error("--mode must be socket or http.");
+  return value;
+}
+
+function slackMode(config: GatewayConfig, override?: "socket" | "http"): "socket" | "http" {
+  if (override) return override;
+  if (config.slack?.mode) return config.slack.mode;
+  if (config.slack?.appToken) return "socket";
+  if (config.slack?.signingSecret) return "http";
+  return "socket";
+}
+
+function channelIngressMode(channel: ChannelId, config: GatewayConfig, options: { readonly publicUrl?: string; readonly slackMode?: "socket" | "http" } = {}): string {
+  if (channel === "telegram") return options.publicUrl ? "webhook" : "background_long_poll";
+  if (channel === "slack") return slackMode(config, options.slackMode) === "socket" ? "socket_mode" : "http_events";
+  if (channel === "web") return "gateway_http";
+  return "webhook";
+}
+
+function channelStartCommand(channel: ChannelId, config: GatewayConfig, options: { readonly publicUrl?: string; readonly slackMode?: "socket" | "http" } = {}): string {
+  const port = config.port ?? DEFAULT_GATEWAY_PORT;
+  if (channel === "telegram" && !options.publicUrl) return `muster gateway daemon start --with-telegram-poll --port ${port}`;
+  if (channel === "slack" && slackMode(config, options.slackMode) === "socket") return `muster gateway daemon start --with-slack-socket --port ${port}`;
+  return `muster gateway daemon start --port ${port}`;
 }
 
 function printChannelDoctorSummary(config: GatewayConfig, options: { readonly initialized?: boolean } = {}): void {
@@ -7763,28 +9510,32 @@ function printChannelDoctorSummary(config: GatewayConfig, options: { readonly in
     const next = !options.initialized && row.spec.id === "web"
       ? "muster gateway init"
       : row.ready
-      ? row.warnings.length ? `muster channels doctor ${row.spec.id}${row.spec.id === "telegram" ? " --live" : ""}` : `muster gateway start --port ${config.port ?? DEFAULT_GATEWAY_PORT}`
-      : `muster channels setup ${row.spec.id}`;
-    console.log(`  channel=${row.spec.id} status=${channelStatus} missing=${missing} warnings=${warnings} auth=${channelAuthMode(row.spec.id)} reply=${channelReplyMode(row.spec.id, config)} next="${next}"`);
+      ? row.warnings.length ? `muster channels doctor ${row.spec.id}${row.spec.id === "telegram" || row.spec.id === "slack" ? " --live" : ""}` : `muster gateway daemon start${row.spec.id === "slack" && slackMode(config) === "socket" ? " --with-slack-socket" : ""} --port ${config.port ?? DEFAULT_GATEWAY_PORT}`
+      : `muster channels ready ${row.spec.id}`;
+    console.log(`  channel=${row.spec.id} status=${channelStatus} missing=${missing} warnings=${warnings} auth=${channelAuthModeForConfig(row.spec.id, config)} reply=${channelReplyMode(row.spec.id, config)} next="${next}"`);
   }
   console.log("guardrails=signature_or_token_check,draft_first_when_supported,no_secret_echo,scoped_memory,token_ledger");
   const firstBlocked = rows.find((row) => !row.ready);
   const firstWarning = rows.find((row) => row.ready && row.warnings.length);
   if (!options.initialized) console.log("next=muster gateway init");
-  else if (firstBlocked) console.log(`next=muster channels setup ${firstBlocked.spec.id}`);
-  else if (firstWarning) console.log(`next=muster channels doctor ${firstWarning.spec.id}${firstWarning.spec.id === "telegram" ? " --live" : ""}`);
-  else console.log(`next=muster gateway start --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
+  else if (firstBlocked) console.log(`next=muster channels ready ${firstBlocked.spec.id}`);
+  else if (firstWarning) console.log(`next=muster channels doctor ${firstWarning.spec.id}${firstWarning.spec.id === "telegram" || firstWarning.spec.id === "slack" ? " --live" : ""}`);
+  else console.log(`next=muster gateway daemon start --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
 }
 
 function channelDoctorWarnings(channel: ChannelId, config: GatewayConfig): string[] {
   if (channel === "telegram") {
     return [
-      config.telegram?.secretToken ? "" : "telegram.secretToken_recommended",
+      config.telegram?.secretToken ? "" : "telegram.secretToken_auto_generated",
       config.telegram?.botToken ? "telegram.live_check_available" : "",
     ].filter(Boolean);
   }
-  if (channel === "discord" && config.discord?.botToken && !config.discord.publicKey) return ["discord.publicKey_recommended"];
-  if (channel === "teams" && !config.teams?.hmacSecret) return ["teams.hmacSecret_optional"];
+  if (channel === "slack") {
+    return [
+      config.slack?.botToken ? "slack.live_check_available" : "",
+      config.slack?.botToken ? "slack.files_write_live_check_available" : "",
+    ].filter(Boolean);
+  }
   return [];
 }
 
@@ -7796,18 +9547,45 @@ async function printChannelDoctor(
   const ready = channelReady(spec.id, config);
   const checks: Array<{ name: string; status: "passed" | "needs_setup" | "warning"; detail: string }> = [];
   checks.push({ name: "gateway_config", status: config.token ? "passed" : "needs_setup", detail: config.token ? "gateway bearer token exists" : "run muster gateway init" });
-  checks.push({ name: "channel_config", status: ready ? "passed" : "needs_setup", detail: ready ? `${spec.id} has required local credentials` : `run muster channels setup ${spec.id}` });
+  checks.push({ name: "channel_config", status: ready ? "passed" : "needs_setup", detail: ready ? `${spec.id} has required local credentials` : `run muster channels ready ${spec.id}` });
   if (spec.route) checks.push({ name: "webhook_route", status: "passed", detail: spec.route });
   if (spec.id === "telegram") {
     checks.push({
       name: "webhook_auth",
       status: config.telegram?.secretToken ? "passed" : "warning",
       detail: config.telegram?.secretToken
-        ? "Telegram secret-token header is configured"
-        : "configure --secret-token-env for public webhooks; bearer-only is acceptable for private/local tests",
+        ? "Telegram webhook secret is configured"
+        : "run channels setup again; Muster normally auto-generates this from the bot token setup",
     });
     if (options.live) checks.push(await telegramLiveDoctor(config.telegram?.botToken));
     else checks.push({ name: "telegram_live", status: "warning", detail: "not run; add --live to call getMe without printing the token" });
+  } else if (spec.id === "slack") {
+    const mode = slackMode(config);
+    const tokenTypeWarning = config.slack?.botToken && !config.slack.botToken.startsWith("xoxb-")
+      ? "Slack bot token does not look like an xoxb- bot token; user tokens can pass auth.test but fail bot/channel behavior."
+      : "Slack bot token shape looks like xoxb-.";
+    const appTokenWarning = mode === "socket" && config.slack?.appToken && !config.slack.appToken.startsWith("xapp-")
+      ? "Slack Socket Mode app token does not look like an xapp- token."
+      : mode === "socket" ? "Slack Socket Mode app token shape looks like xapp-." : "HTTP mode does not use an app-level token.";
+    checks.push({
+      name: "bot_token_type",
+      status: tokenTypeWarning.includes("does not look") ? "warning" : config.slack?.botToken ? "passed" : "needs_setup",
+      detail: tokenTypeWarning,
+    });
+    checks.push({
+      name: "app_token_type",
+      status: appTokenWarning.includes("does not look") ? "warning" : mode === "socket" && !config.slack?.appToken ? "needs_setup" : "passed",
+      detail: appTokenWarning,
+    });
+    checks.push({
+      name: mode === "socket" ? "socket_auth" : "webhook_auth",
+      status: ready ? "passed" : "needs_setup",
+      detail: mode === "socket"
+        ? "Slack Socket Mode uses bot token plus app-level token; no public URL required"
+        : "Slack Events API uses signing-secret verification and requires a public HTTPS Request URL",
+    });
+    if (options.live) checks.push(...await slackLiveDoctor(config.slack?.botToken, mode === "socket" ? config.slack?.appToken : undefined));
+    else checks.push({ name: "slack_live", status: "warning", detail: "not run; add --live to call auth.test and Socket Mode connection checks without printing tokens" });
   } else if (options.live) {
     checks.push({ name: "live_check", status: "warning", detail: "live doctor is currently implemented for telegram only" });
   }
@@ -7817,10 +9595,14 @@ async function printChannelDoctor(
   console.log(`channel_doctor=${spec.id} status=${status}`);
   for (const check of checks) console.log(`check=${check.name} status=${check.status} detail="${check.detail.replace(/"/g, "'")}"`);
   const next = failed
-    ? `muster channels setup ${spec.id}`
+    ? `muster channels ready ${spec.id}`
+    : spec.id === "slack" && checks.some((check) => check.name === "slack_file_upload" && check.status !== "passed")
+      ? "Add Slack bot scope files:write, reinstall the Slack app, then run muster channels doctor slack --live"
     : warnings && spec.id === "telegram" && !options.live
       ? "muster channels doctor telegram --live"
-      : `muster gateway start --port ${config.port ?? DEFAULT_GATEWAY_PORT}`;
+    : warnings && spec.id === "slack" && !options.live
+        ? "muster channels doctor slack --live"
+      : `muster gateway daemon start${spec.id === "slack" && slackMode(config) === "socket" ? " --with-slack-socket" : ""} --port ${config.port ?? DEFAULT_GATEWAY_PORT}`;
   console.log(`next=${next}`);
 }
 
@@ -7839,18 +9621,91 @@ async function telegramLiveDoctor(botToken: string | undefined): Promise<{ name:
   }
 }
 
-function printChannelSetup(spec: ChannelSetupSpec, config: GatewayConfig, args: readonly string[]): void {
+async function slackLiveDoctor(botToken: string | undefined, appToken: string | undefined): Promise<Array<{ name: string; status: "passed" | "needs_setup" | "warning"; detail: string }>> {
+  if (!botToken) return [{ name: "slack_live", status: "needs_setup", detail: "SLACK_BOT_TOKEN is not configured" }];
+  try {
+    const auth = await fetch("https://slack.com/api/auth.test", {
+      method: "POST",
+      headers: { authorization: `Bearer ${botToken}`, "content-type": "application/x-www-form-urlencoded" },
+      body: "",
+      signal: AbortSignal.timeout(8000),
+    });
+    const authBody = await auth.json().catch(() => ({})) as { ok?: boolean; team?: string; user?: string; error?: string };
+    if (!auth.ok || authBody.ok === false) {
+      return [{ name: "slack_live", status: "warning", detail: `Slack auth.test failed${authBody.error ? `: ${authBody.error}` : `: HTTP ${auth.status}`}` }];
+    }
+    const checks: Array<{ name: string; status: "passed" | "needs_setup" | "warning"; detail: string }> = [
+      { name: "slack_live", status: "passed", detail: `Slack bot token reachable for team ${authBody.team ?? "unknown"}` },
+      await slackFileUploadScopeDoctor(botToken, auth.headers.get("x-oauth-scopes")),
+    ];
+    if (!appToken) return checks;
+    const socket = await fetch("https://slack.com/api/apps.connections.open", {
+      method: "POST",
+      headers: { authorization: `Bearer ${appToken}`, "content-type": "application/x-www-form-urlencoded" },
+      body: "",
+      signal: AbortSignal.timeout(8000),
+    });
+    const socketBody = await socket.json().catch(() => ({})) as { ok?: boolean; url?: string; error?: string };
+    if (!socket.ok || socketBody.ok === false || !socketBody.url) {
+      checks.push({ name: "slack_socket", status: "warning", detail: `Slack Socket Mode check failed${socketBody.error ? `: ${socketBody.error}` : `: HTTP ${socket.status}`}` });
+      return checks;
+    }
+    checks.push({ name: "slack_socket", status: "passed", detail: "Socket Mode URL issued" });
+    return checks;
+  } catch (error) {
+    return [{ name: "slack_live", status: "warning", detail: `Slack live check failed: ${error instanceof Error ? error.message : String(error)}` }];
+  }
+}
+
+async function slackFileUploadScopeDoctor(botToken: string, oauthScopesHeader: string | null): Promise<{ name: string; status: "passed" | "needs_setup" | "warning"; detail: string }> {
+  const headerScopes = oauthScopesHeader
+    ?.split(",")
+    .map((scope) => scope.trim())
+    .filter(Boolean);
+  if (headerScopes?.length) {
+    return headerScopes.includes("files:write")
+      ? { name: "slack_file_upload", status: "passed", detail: "Slack bot token includes files:write for native artifact uploads" }
+      : { name: "slack_file_upload", status: "warning", detail: "Slack bot token is missing files:write; add it under OAuth & Permissions, reinstall the app, then retry artifact delivery" };
+  }
+  try {
+    const probe = await fetch("https://slack.com/api/files.getUploadURLExternal", {
+      method: "POST",
+      headers: { authorization: `Bearer ${botToken}`, "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ filename: "muster-scope-check.txt", length: "1" }).toString(),
+      signal: AbortSignal.timeout(8000),
+    });
+    const body = await probe.json().catch(() => ({})) as { ok?: boolean; error?: string };
+    if (probe.ok && body.ok !== false) {
+      return { name: "slack_file_upload", status: "passed", detail: "Slack files.getUploadURLExternal accepted the bot token; native artifact uploads are available" };
+    }
+    if (body.error === "missing_scope") {
+      return { name: "slack_file_upload", status: "warning", detail: "Slack file upload probe returned missing_scope; add files:write to Bot Token Scopes and reinstall the app" };
+    }
+    return { name: "slack_file_upload", status: "warning", detail: `Slack file upload probe failed${body.error ? `: ${body.error}` : `: HTTP ${probe.status}`}` };
+  } catch (error) {
+    return { name: "slack_file_upload", status: "warning", detail: `Slack file upload probe failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+function printChannelSetup(spec: ChannelSetupSpec, config: GatewayConfig, args: readonly string[], options: { readonly friendly?: boolean } = {}): void {
   const publicUrl = readFlag([...args], "--public-url")?.replace(/\/$/, "");
   const localBase = `http://127.0.0.1:${config.port ?? DEFAULT_GATEWAY_PORT}`;
   const base = publicUrl ?? localBase;
+  if (options.friendly) console.log(`channel_connect=${spec.id} status=${channelReady(spec.id, config) ? "ready" : "needs_setup"}`);
   console.log(`channel=${spec.id} label="${spec.label}" ready=${channelReady(spec.id, config)}`);
-  if (spec.route) console.log(`webhook_url=${base}${spec.route}`);
+  if (spec.route && !(spec.id === "telegram" && !publicUrl) && !(spec.id === "slack" && slackMode(config) === "socket")) console.log(`webhook_url=${base}${spec.route}`);
+  if (spec.id === "telegram" && !publicUrl) console.log("ingress=background_long_poll");
+  if (spec.id === "slack" && slackMode(config) === "socket") console.log("ingress=socket_mode");
   for (const url of spec.setupUrls) console.log(`setup_url=${url}`);
   if (spec.requiredEnvFlags.length) console.log(`required_env_flags=${spec.requiredEnvFlags.join(",")}`);
   if (spec.optionalEnvFlags?.length) console.log(`optional_env_flags=${spec.optionalEnvFlags.join(",")}`);
   for (const note of spec.notes) console.log(`note=${note}`);
   console.log("next=muster channels status " + spec.id);
-  if (spec.id !== "web") console.log(`start=muster gateway start --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
+  if (spec.id === "telegram" && publicUrl) console.log(`webhook=muster gateway webhook telegram --public-url ${publicUrl}`);
+  if (spec.id === "telegram" && !publicUrl) console.log(`start=muster gateway daemon start --with-telegram-poll --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
+  else if (spec.id === "slack" && slackMode(config) === "socket") console.log(`start=muster gateway daemon start --with-slack-socket --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
+  else if (spec.id !== "web") console.log(`start=muster gateway daemon start --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
+  if (options.friendly) console.log(`verify=muster channels doctor ${spec.id}${spec.id === "telegram" || spec.id === "slack" ? " --live" : ""}`);
 }
 
 async function loadOrInitGatewayConfig(): Promise<GatewayConfig> {
@@ -7864,48 +9719,83 @@ function emptyGatewayConfig(): GatewayConfig {
 
 function applyChannelSetup(channel: ChannelId, config: GatewayConfig, args: readonly string[]): GatewayConfig {
   if (channel === "telegram") {
-    const botToken = readEnvFlag(args, "--bot-token-env");
-    const secretToken = readOptionalEnvFlag(args, "--secret-token-env");
+    const name = readFlag([...args], "--name");
+    const botToken = readSecretFlag(args, "--bot-token", "--bot-token-env");
+    const secretToken = readOptionalEnvFlag(args, "--secret-token-env") ?? (botToken ? randomBytes(24).toString("hex") : undefined);
     const stream = readStreamFlag(args);
-    if (!botToken && !secretToken && !stream) return config;
-    return { ...config, telegram: { botToken: botToken ?? config.telegram?.botToken ?? "", secretToken: secretToken ?? config.telegram?.secretToken, stream: stream ?? config.telegram?.stream } };
+    const status = readTelegramStatusFlag(args);
+    const thinking = readThinkingFlag(args);
+    const busy = readBusyFlag(args);
+    if (!name && !botToken && !secretToken && !stream && !status && !thinking && !busy) return config;
+    return {
+      ...config,
+      telegram: {
+        name: name ?? config.telegram?.name,
+        botToken: botToken ?? config.telegram?.botToken ?? "",
+        secretToken: secretToken ?? config.telegram?.secretToken,
+        stream: stream ?? config.telegram?.stream,
+        status: status ?? config.telegram?.status ?? (botToken ? "typing" : undefined),
+        thinking: thinking ?? config.telegram?.thinking,
+        busy: busy ?? config.telegram?.busy ?? (botToken ? "queue" : undefined),
+      },
+    };
   }
   if (channel === "slack") {
-    const botToken = readEnvFlag(args, "--bot-token-env");
-    const signingSecret = readEnvFlag(args, "--signing-secret-env");
+    const botToken = readSecretFlag(args, "--bot-token", "--bot-token-env");
+    const appToken = readSecretFlag(args, "--app-token", "--app-token-env");
+    const signingSecret = readSecretFlag(args, "--signing-secret", "--signing-secret-env");
+    const requestedMode = commandLineSlackMode(args);
+    const mode = requestedMode ?? (appToken ? "socket" : signingSecret ? "http" : config.slack?.mode ?? "socket");
     const stream = readStreamFlag(args);
-    if (!botToken && !signingSecret && !stream) return config;
-    return { ...config, slack: { botToken: botToken ?? config.slack?.botToken ?? "", signingSecret: signingSecret ?? config.slack?.signingSecret, stream: stream ?? config.slack?.stream } };
+    const status = readSlackStatusFlag(args);
+    const thinking = readThinkingFlag(args);
+    const busy = readBusyFlag(args);
+    if (!botToken && !appToken && !signingSecret && !stream && !requestedMode && !status && !thinking && !busy) return config;
+    return {
+      ...config,
+      slack: {
+        botToken: botToken ?? config.slack?.botToken ?? "",
+        appToken: appToken ?? config.slack?.appToken,
+        signingSecret: signingSecret ?? config.slack?.signingSecret,
+        mode,
+        stream: stream ?? config.slack?.stream,
+        status: status ?? config.slack?.status ?? (botToken ? "message" : undefined),
+        thinking: thinking ?? config.slack?.thinking,
+        busy: busy ?? config.slack?.busy ?? (botToken ? "queue" : undefined),
+      },
+    };
   }
   if (channel === "gchat") {
-    const verificationToken = readOptionalEnvFlag(args, "--verification-token-env");
+    const verificationToken = readSecretFlag(args, "--verification-token", "--verification-token-env");
     if (!verificationToken) return config;
     return { ...config, gchat: { verificationToken } };
   }
   if (channel === "discord") {
-    const botToken = readEnvFlag(args, "--bot-token-env");
-    const publicKey = readOptionalEnvFlag(args, "--public-key-env");
+    const botToken = readSecretFlag(args, "--bot-token", "--bot-token-env");
+    const publicKey = readSecretFlag(args, "--public-key", "--public-key-env");
     if (!botToken && !publicKey) return config;
     return { ...config, discord: { botToken: botToken ?? config.discord?.botToken ?? "", publicKey: publicKey ?? config.discord?.publicKey } };
   }
   if (channel === "whatsapp") {
-    const accessToken = readEnvFlag(args, "--access-token-env");
-    const verifyToken = readEnvFlag(args, "--verify-token-env");
-    const phoneNumberId = readEnvFlag(args, "--phone-number-id-env");
+    const accessToken = readSecretFlag(args, "--access-token", "--access-token-env");
+    const verifyToken = readSecretFlag(args, "--verify-token", "--verify-token-env");
+    const phoneNumberId = readSecretFlag(args, "--phone-number-id", "--phone-number-id-env");
+    const appSecret = readSecretFlag(args, "--app-secret", "--app-secret-env");
     const apiVersion = readFlag([...args], "--api-version") ?? config.whatsapp?.apiVersion;
-    if (!accessToken && !verifyToken && !phoneNumberId && !apiVersion) return config;
+    if (!accessToken && !verifyToken && !phoneNumberId && !appSecret && !apiVersion) return config;
     return {
       ...config,
       whatsapp: {
         accessToken: accessToken ?? config.whatsapp?.accessToken ?? "",
         verifyToken: verifyToken ?? config.whatsapp?.verifyToken ?? "",
         phoneNumberId: phoneNumberId ?? config.whatsapp?.phoneNumberId ?? "",
+        appSecret: appSecret ?? config.whatsapp?.appSecret,
         apiVersion,
       },
     };
   }
   if (channel === "teams") {
-    const hmacSecret = readOptionalEnvFlag(args, "--hmac-secret-env");
+    const hmacSecret = readSecretFlag(args, "--hmac-secret", "--hmac-secret-env");
     if (!hmacSecret) return config;
     return { ...config, teams: { hmacSecret } };
   }
@@ -7924,11 +9814,11 @@ function findChannelSpec(channel: string): ChannelSetupSpec | undefined {
 
 function channelReady(channel: ChannelId, config: GatewayConfig): boolean {
   if (channel === "telegram") return Boolean(config.telegram?.botToken);
-  if (channel === "slack") return Boolean(config.slack?.botToken && config.slack.signingSecret);
-  if (channel === "gchat") return Boolean(config.gchat);
-  if (channel === "discord") return Boolean(config.discord?.botToken);
-  if (channel === "whatsapp") return Boolean(config.whatsapp?.accessToken && config.whatsapp.verifyToken && config.whatsapp.phoneNumberId);
-  if (channel === "teams") return Boolean(config.teams);
+  if (channel === "slack") return Boolean(config.slack?.botToken && (slackMode(config) === "socket" ? config.slack.appToken : config.slack.signingSecret));
+  if (channel === "gchat") return Boolean(config.gchat?.verificationToken);
+  if (channel === "discord") return Boolean(config.discord?.botToken && config.discord.publicKey);
+  if (channel === "whatsapp") return Boolean(config.whatsapp?.accessToken && config.whatsapp.verifyToken && config.whatsapp.phoneNumberId && config.whatsapp.appSecret);
+  if (channel === "teams") return Boolean(config.teams?.hmacSecret);
   return Boolean(config.token);
 }
 
@@ -7939,12 +9829,44 @@ function readStreamFlag(args: readonly string[]): "off" | "draft" | undefined {
   return value;
 }
 
+function readThinkingFlag(args: readonly string[]): "off" | "progress" | undefined {
+  const value = readFlag([...args], "--thinking");
+  if (!value) return undefined;
+  if (value !== "off" && value !== "progress") throw new Error("--thinking must be off or progress.");
+  return value;
+}
+
+function readBusyFlag(args: readonly string[]): "queue" | "reject" | undefined {
+  const value = readFlag([...args], "--busy");
+  if (!value) return undefined;
+  if (value !== "queue" && value !== "reject") throw new Error("--busy must be queue or reject.");
+  return value;
+}
+
+function readTelegramStatusFlag(args: readonly string[]): "off" | "typing" | undefined {
+  const value = readFlag([...args], "--status");
+  if (!value) return undefined;
+  if (value !== "off" && value !== "typing") throw new Error("--status must be off or typing for Telegram.");
+  return value;
+}
+
+function readSlackStatusFlag(args: readonly string[]): "off" | "message" | undefined {
+  const value = readFlag([...args], "--status");
+  if (!value) return undefined;
+  if (value !== "off" && value !== "message") throw new Error("--status must be off or message for Slack.");
+  return value;
+}
+
 function readEnvFlag(args: readonly string[], flag: string): string | undefined {
   const envName = readFlag([...args], flag);
   if (!envName) return undefined;
   const value = process.env[envName];
   if (!value) throw new Error(`Environment variable ${envName} is not set.`);
   return value;
+}
+
+function readSecretFlag(args: readonly string[], directFlag: string, envFlag: string): string | undefined {
+  return readFlag([...args], directFlag) ?? readEnvFlag(args, envFlag);
 }
 
 function readOptionalEnvFlag(args: readonly string[], flag: string): string | undefined {
@@ -7974,7 +9896,7 @@ async function printIntegrationReadiness(): Promise<void> {
   const configuredMcp = new Set(Object.keys(config?.tools?.mcp?.servers ?? {}));
   const channelRows = CHANNEL_SETUP_SPECS
     .filter((spec) => spec.id !== "web")
-    .map((spec) => ({ id: spec.id, ready: gateway ? channelReady(spec.id, gateway) : false, next: `muster channels setup ${spec.id}` }));
+    .map((spec) => ({ id: spec.id, ready: gateway ? channelReady(spec.id, gateway) : false, next: `muster channels ready ${spec.id}` }));
   const paPlugins = ["daily-ops", "google-workspace", "notion", "web-search", "research-lab", "artifact-studio", "security-review"];
   const pluginRows = paPlugins.flatMap((id) => {
     const plugin = listBuiltinPlugins().find((entry) => entry.id === id);
@@ -8031,7 +9953,7 @@ async function printIntegrationReadiness(): Promise<void> {
     }
   }
   console.log("channels_optional");
-  for (const row of channelRows) console.log(`  ${row.id}\t${row.ready ? "ready" : "needs_setup"}\t${row.ready ? "muster gateway start" : row.next}`);
+  for (const row of channelRows) console.log(`  ${row.id}\t${row.ready ? "ready" : "needs_setup"}\t${row.ready ? "muster gateway daemon start" : row.next}`);
   console.log("daily_life_packs");
   for (const row of pluginRows) {
     const status = row.enabled ? "enabled" : row.missing.length ? `needs_env:${row.missing.join("|")}` : "available";
@@ -8047,7 +9969,7 @@ async function printIntegrationReadiness(): Promise<void> {
   console.log("suggested_path");
   const steps: string[] = [];
   if (!gateway) steps.push("muster gateway init");
-  steps.push(!readyChannels ? "muster channels setup telegram" : "channel ready; add another surface only when you need it");
+  steps.push(!readyChannels ? "muster channels ready telegram" : "channel ready; add another surface only when you need it");
   const firstPlugin = pluginRows.find((row) => !row.enabled);
   if (firstPlugin) steps.push(`muster plugins enable ${firstPlugin.id}${firstPlugin.risk === "high" ? " --allow-high-risk" : ""}`);
   const firstMcp = mcpRows.find((row) => !row.configured);
@@ -8092,7 +10014,7 @@ async function integrationsCommand(args: string[]): Promise<void> {
   console.log("kind\tid\tstatus\tnext");
   for (const spec of CHANNEL_SETUP_SPECS) {
     const ready = gateway ? channelReady(spec.id, gateway) : false;
-    const next = ready ? `muster gateway start --port ${gateway?.port ?? DEFAULT_GATEWAY_PORT}` : `muster channels setup ${spec.id}`;
+    const next = ready ? `muster gateway daemon start --port ${gateway?.port ?? DEFAULT_GATEWAY_PORT}` : `muster channels ready ${spec.id}`;
     console.log(`channel\t${spec.id}\t${ready ? "ready" : "needs setup"}\t${next}`);
   }
 
@@ -8118,7 +10040,7 @@ async function integrationsCommand(args: string[]): Promise<void> {
   console.log("");
   console.log("For non-technical setup, start with a channel, then add capabilities:");
   console.log("1. muster integrations");
-  console.log("2. muster channels setup gchat --public-url https://your-domain.example");
+  console.log("2. muster channels ready gchat --public-url https://your-domain.example");
   console.log("3. muster plugins enable web-search");
   console.log("4. muster mcp install parallel-search");
 }
@@ -8158,12 +10080,12 @@ async function runChannelIntegrationAction(action: "setup" | "verify" | "enable"
   if (action === "enable") {
     const gateway = await loadGatewayConfig().catch(() => undefined);
     if (!gateway || !channelReady(spec.id, gateway)) {
-      console.log(`status=blocked next="muster channels setup ${spec.id}"`);
+      console.log(`status=blocked next="muster channels ready ${spec.id}"`);
       console.log("reason=channel setup is incomplete; gateway was not started");
       console.log(`integration_next=muster integrations setup ${spec.id}`);
       return;
     }
-    console.log(`status=ready start="muster gateway start --port ${gateway.port ?? DEFAULT_GATEWAY_PORT}"`);
+    console.log(`status=ready start="muster gateway daemon start --port ${gateway.port ?? DEFAULT_GATEWAY_PORT}"`);
     console.log(`integration_next=muster integrations sample ${spec.id}`);
     return;
   }
@@ -8274,10 +10196,10 @@ async function printChannelIntegrationWorkflow(spec: ChannelSetupSpec): Promise<
   const missing = channelMissingSetup(spec.id, gateway);
   console.log(`integration_workflow=${spec.id} kind=channel ready=${ready}`);
   console.log(`impact=turns ${spec.label} messages into governed Muster runs with scoped memory, policy gates, token ledger, and draft/send controls`);
-  console.log(`auth=${channelAuthMode(spec.id)} missing=${missing.length ? missing.join(",") : "-"}`);
-  console.log(`setup=muster channels setup ${spec.id}`);
+  console.log(`auth=${channelAuthModeForConfig(spec.id, gateway)} missing=${missing.length ? missing.join(",") : "-"}`);
+  console.log(`setup=muster channels ready ${spec.id}`);
   console.log(`verify=muster channels doctor ${spec.id}${spec.id === "telegram" ? " --live" : ""}`);
-  console.log(`enable=${ready ? `muster gateway start --port ${gateway.port ?? DEFAULT_GATEWAY_PORT}` : `muster channels setup ${spec.id}`}`);
+  console.log(`enable=${ready ? `muster gateway daemon start --port ${gateway.port ?? DEFAULT_GATEWAY_PORT}` : `muster channels ready ${spec.id}`}`);
   console.log(`sample=muster channels simulate ${spec.id} --message "hello from ${spec.id}"`);
   console.log(`failure_behavior=${ready ? "doctor reports warnings without printing secrets" : "blocked until required setup is present; local simulation still works"}`);
   for (const url of spec.setupUrls) console.log(`setup_url=${url}`);
@@ -8309,7 +10231,7 @@ async function printPluginIntegrationWorkflow(plugin: BuiltinPluginCatalogEntry)
   console.log(`setup=muster plugins setup ${plugin.id}`);
   console.log(`verify=muster plugins check ${plugin.id}`);
   console.log(`enable=muster plugins enable ${plugin.id}${riskFlag}`);
-  if (firstChannel) console.log(`related_channel=muster channels setup ${firstChannel}`);
+  if (firstChannel) console.log(`related_channel=muster channels ready ${firstChannel}`);
   if (firstMcp) console.log(`related_mcp=muster mcp ${missingMcpEnv(findBuiltinMcpEntry(firstMcp)).length ? "check" : "install"} ${firstMcp}`);
   if (plugin.id === "artifact-studio") console.log("related_artifacts=muster artifacts contract; muster artifacts plan --format pptx --destination google-drive --polished; muster artifacts verify <file>");
   console.log(`sample=${sample}`);

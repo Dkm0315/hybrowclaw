@@ -45,6 +45,7 @@ export type SlackInbound =
 interface SlackEnvelope {
   readonly type?: string;
   readonly challenge?: string;
+  readonly event_id?: string;
   readonly team_id?: string;
   readonly event?: {
     readonly type?: string;
@@ -56,6 +57,12 @@ interface SlackEnvelope {
     readonly ts?: string;
     readonly thread_ts?: string;
   };
+}
+
+export function slackDeliveryId(payload: unknown): string | undefined {
+  if (typeof payload !== "object" || payload === null) return undefined;
+  const eventId = (payload as SlackEnvelope).event_id;
+  return typeof eventId === "string" && eventId ? eventId : undefined;
 }
 
 /** Map a Slack Events API request body to the gateway envelope. */

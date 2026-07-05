@@ -44,6 +44,20 @@ interface WhatsAppWebhook {
   }>;
 }
 
+export function whatsAppMessageIds(payload: unknown): readonly string[] {
+  if (typeof payload !== "object" || payload === null) return [];
+  const webhook = payload as WhatsAppWebhook;
+  const ids: string[] = [];
+  for (const entry of webhook.entry ?? []) {
+    for (const change of entry.changes ?? []) {
+      for (const message of change.value?.messages ?? []) {
+        if (message.id) ids.push(message.id);
+      }
+    }
+  }
+  return ids;
+}
+
 /** Map a Cloud API webhook (entry[].changes[].value.messages[]) to SurfaceMessages. */
 export function whatsAppWebhookToSurfaceMessages(payload: unknown): readonly SurfaceMessage[] {
   if (typeof payload !== "object" || payload === null) return [];

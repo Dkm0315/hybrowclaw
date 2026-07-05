@@ -1,6 +1,6 @@
 {
   "name": "muster",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "private": true,
   "description": "Independent pi-native adaptive AI harness runtime.",
   "type": "module",

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { mkdtemp, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -111,6 +112,46 @@ test("invalid envelopes are rejected with 400 and a reason", async () => {
     assert.match(payload.error, /conversationId/);
   } finally {
     await gw.close();
+    llm.close();
+  }
+});
+
+test("WhatsApp POST webhooks require and verify Meta app-secret signatures", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-gw-whatsapp-sig-"));
+  const llm = await startStubServer(() => ({ status: 200, payload: { choices: [{ message: { content: "ok" } }] } }));
+  const init = await initGatewayConfig(cwd);
+  const gateway: GatewayConfig = {
+    ...init.config,
+    whatsapp: {
+      accessToken: "ACCESS",
+      verifyToken: "VERIFY",
+      phoneNumberId: "PHONE",
+      appSecret: "APP_SECRET",
+    },
+  };
+  const fetcher = (async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }) as Response) as typeof fetch;
+  const running = await startGatewayServer({ config: stubConfig(llm.url), gateway, cwd, fetcher }, 0);
+  const body = JSON.stringify({
+    object: "whatsapp_business_account",
+    entry: [{ changes: [{ field: "messages", value: { metadata: { phone_number_id: "PHONE" }, messages: [{ from: "919999999999", id: "m1", type: "text", text: { body: "hi" } }] } }] }],
+  });
+  try {
+    const unsigned = await fetch(`http://127.0.0.1:${running.port}/v1/adapters/whatsapp`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+    assert.equal(unsigned.status, 401);
+
+    const signature = `sha256=${createHmac("sha256", gateway.whatsapp!.appSecret!).update(body).digest("hex")}`;
+    const signed = await fetch(`http://127.0.0.1:${running.port}/v1/adapters/whatsapp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-hub-signature-256": signature },
+      body,
+    });
+    assert.equal(signed.status, 200);
+  } finally {
+    await running.close();
     llm.close();
   }
 });

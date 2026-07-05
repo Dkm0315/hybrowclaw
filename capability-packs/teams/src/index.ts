@@ -32,7 +32,7 @@ function publicBase(args: Record<string, unknown>, gateway?: GatewayLike): strin
 }
 
 function hasGatewayEntry(gateway: GatewayLike | undefined): boolean {
-  return Boolean(gateway?.teams);
+  return Boolean(gateway?.teams?.hmacSecret);
 }
 
 function hasHmacSecret(gateway: GatewayLike | undefined, context: ChannelContext): boolean {
@@ -52,17 +52,17 @@ export async function teams_setup_plan(args: Record<string, unknown>, context: C
       "Azure app registration or Bot Framework registration for the Teams app identity.",
       "A public HTTPS Muster gateway URL reachable by Microsoft Teams.",
       "Teams bot messaging endpoint set to the Muster Teams adapter webhook.",
-      "Optional shared HMAC secret configured in Teams middleware and Muster for private deployments.",
+      "Shared HMAC secret configured in Teams middleware and Muster so Teams traffic can authenticate without Muster's gateway bearer token.",
     ],
     commands: [
       "muster gateway init",
-      `muster channels setup teams --public-url ${base}`,
+      `muster channels ready teams --hmac-secret-env TEAMS_HMAC_SECRET --public-url ${base}`,
       "muster channels status teams",
-      "muster gateway start --port 7460",
+      "muster gateway daemon start --port 7460",
     ],
     notes: [
       "Muster's Teams adapter accepts Teams-style message activities and maps them to the same surface pipeline as other chat channels.",
-      "Use --hmac-secret-env TEAMS_HMAC_SECRET when your edge layer signs Teams activity payloads for the gateway.",
+      "Use --hmac-secret-env TEAMS_HMAC_SECRET so your edge layer can sign Teams activity payloads for the gateway.",
       "Production Bot Framework OAuth, SSO, and app manifest publishing remain explicit Azure/Teams setup steps.",
     ],
     security: {
@@ -81,11 +81,11 @@ export async function teams_gateway_check(args: Record<string, unknown>, context
     channel: "teams",
     ready: gatewayEntry,
     checks: [
-      { id: "gateway_config", ok: gatewayEntry, detail: gatewayEntry ? "teams entry is present" : "Run: muster channels setup teams --public-url <https-url>" },
+      { id: "gateway_config", ok: gatewayEntry, detail: gatewayEntry ? "teams HMAC entry is present" : "Run: muster channels ready teams --hmac-secret-env TEAMS_HMAC_SECRET --public-url <https-url>" },
       { id: "public_https_url", ok: https, detail: "Teams production messaging endpoints require a public HTTPS URL." },
-      { id: "hmac_secret", ok: hmac, optional: true, detail: hmac ? "HMAC secret configured" : "Optional: add --hmac-secret-env TEAMS_HMAC_SECRET when your edge layer signs requests." },
+      { id: "hmac_secret", ok: hmac, detail: hmac ? "HMAC secret configured" : "Add --hmac-secret-env TEAMS_HMAC_SECRET when your edge layer signs requests." },
     ],
-    next: gatewayEntry ? "Start the gateway and configure the Teams bot messaging endpoint." : "Run muster channels setup teams.",
+    next: gatewayEntry ? "Start the gateway daemon and configure the Teams bot messaging endpoint." : "Run muster channels ready teams with hmac-secret env.",
   };
 }
 

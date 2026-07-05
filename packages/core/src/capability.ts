@@ -146,6 +146,12 @@ export async function inspectCapabilityPack(path: string): Promise<CapabilityPac
   };
 }
 
+export async function computeCapabilityEntrypointDigest(path: string, manifest: Pick<CapabilityPackManifest, "entrypoint">): Promise<string> {
+  const entrypoint = isAbsolute(manifest.entrypoint) ? manifest.entrypoint : join(path, manifest.entrypoint);
+  const raw = await readFile(entrypoint);
+  return `sha256:${createHash("sha256").update(raw).digest("hex")}`;
+}
+
 export function inspectCapabilityManifest(path: string, value: unknown): CapabilityPackInspection {
   const blockers: string[] = [];
   const warnings: string[] = [];
@@ -504,17 +510,16 @@ function inspectReadinessEvidence(value: unknown, blockers: string[]): Capabilit
 async function verifyEntrypointDigest(path: string, manifest: CapabilityPackManifest): Promise<string | undefined> {
   const match = /^sha256:([a-f0-9]{64})$/i.exec(manifest.digest ?? "");
   if (!match) return `Capability digest must be sha256:<64 hex chars>; got ${JSON.stringify(manifest.digest)}.`;
-  const entrypoint = isAbsolute(manifest.entrypoint) ? manifest.entrypoint : join(path, manifest.entrypoint);
-  let raw: Buffer;
+  let actual: string;
   try {
-    raw = await readFile(entrypoint);
+    actual = await computeCapabilityEntrypointDigest(path, manifest);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
+    const entrypoint = isAbsolute(manifest.entrypoint) ? manifest.entrypoint : join(path, manifest.entrypoint);
     return `Capability digest could not read entrypoint ${entrypoint}: ${detail}`;
   }
-  const actual = createHash("sha256").update(raw).digest("hex");
   const expected = match[1].toLowerCase();
-  if (actual !== expected) return `Capability digest mismatch for ${manifest.entrypoint}: expected sha256:${expected}, got sha256:${actual}.`;
+  if (actual !== `sha256:${expected}`) return `Capability digest mismatch for ${manifest.entrypoint}: expected sha256:${expected}, got ${actual}.`;
   return undefined;
 }
 

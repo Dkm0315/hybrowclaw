@@ -470,6 +470,14 @@ test("whatsapp webhook posts governed reply to graph.facebook.com via injected f
     const body = outbound[0].body as { to: string; text: { body: string } };
     assert.equal(body.to, "919812345678");
     assert.equal(body.text.body, "12 episodes today");
+
+    const retry = await fetch(`http://127.0.0.1:${gw.port}/v1/adapters/whatsapp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer test-token" },
+      body: JSON.stringify(whatsAppNotification),
+    });
+    assert.equal(retry.status, 200);
+    assert.equal(outbound.length, 1, "WhatsApp retry with the same message id must not double-send or spend tokens twice");
   } finally {
     await gw.close();
     gw.llmClose();
@@ -495,7 +503,7 @@ test("gchat webhook checks the verification token and replies synchronously", as
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ ...gchatMessageEvent, token: "forged" }),
     });
-    assert.equal(forged.status, 500);
+    assert.equal(forged.status, 401);
   } finally {
     await gw.close();
     gw.llmClose();
@@ -527,7 +535,7 @@ test("teams webhook validates HMAC and replies synchronously", async () => {
       headers: { "content-type": "application/json" },
       body,
     });
-    assert.equal(unsigned.status, 500);
+    assert.equal(unsigned.status, 401);
   } finally {
     await gw.close();
     gw.llmClose();
