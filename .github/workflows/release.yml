@@ -44,8 +44,12 @@ jobs:
         run: |
           git config user.name "muster-release"
           git config user.email "release@muster.local"
-          git tag "v${{ inputs.version }}"
-          git push origin "v${{ inputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/v${{ inputs.version }}" >/dev/null; then
+            echo "Tag v${{ inputs.version }} already exists; reusing it."
+          else
+            git tag "v${{ inputs.version }}"
+            git push origin "v${{ inputs.version }}"
+          fi
 
       - name: Set versions
         run: |

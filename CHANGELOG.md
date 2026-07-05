@@ -6,6 +6,47 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-07-05
+
+Muster 0.1.10 is the roster and integration-depth patch release. It turns the
+new integration catalog work into a production-grade release boundary, with
+explicit support depth, safer MCP activation, and artifact workflow verification
+kept separate from the earlier channel readiness train.
+
+### Added
+- Added Roster support-depth summaries across owned packs, channel adapters,
+  installable MCPs, host reuse, setup-plan-only entries, auth mode, source, risk,
+  and support class so integration gaps are visible before activation.
+- Added release-gate QA for roster support depth inside the channel/plugin setup
+  scorecard, including persisted roster matrix evidence in `catalog.json`.
+- Added `muster artifacts contract` and `muster artifacts verify` surfaces so
+  Office/PDF artifact workflows expose their contract, structural verifier, and
+  publish blockers directly from the CLI and integration workflow.
+
+### Changed
+- Hardened MCP activation so env-backed install specs validate required env vars
+  without writing raw secret values into `.muster/config.json`.
+- Resolved MCP stdio env and argument references at process start, preserving the
+  filtered-env boundary while keeping GitHub, Linear, Firecrawl, n8n, Postgres,
+  and other env-backed MCPs functional.
+- Reused the core roster MCP install resolver from onboarding so CLI and TUI
+  setup paths cannot drift or persist secrets differently.
+- Updated Artifact Studio integration guidance to run a real verified DOCX sample
+  and advertise artifact-specific next steps instead of generic plugin checks.
+
+### Fixed
+- Kept Telegram, Slack, and gateway behavior covered through the full gateway
+  regression suite while merging the roster/MCP/artifact release pass.
+- Fixed artifact-studio capability-loader expectations so declaration and
+  provider-led document workflow tools are treated as first-class exported tools.
+
+## [0.1.9] - 2026-06-29
+
+Muster 0.1.9 is the Office artifacts and integration-readiness point release.
+It strengthens the document/PPT/PDF/Excel pillar, improves daily-life channel
+readiness, and makes the public website/npm discovery surface easier to trust
+before the next heavier workflow release.
+
 ### Added
 - Added governed first-party flow tool execution so saved flows can run audited
   core tools, while shell execution remains opt-in behind `--toolset full` and

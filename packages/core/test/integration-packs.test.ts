@@ -31,7 +31,7 @@ import { claude_code_mode_policy, claude_code_readiness, claude_code_session_pol
 import { codex_native_approval_policy, codex_native_fast_path, codex_native_surface_plan, codex_native_tool_policy } from "../../../capability-packs/codex-native-tools/src/index.js";
 import { codex_web_research_policy, codex_web_search_fallback_plan, codex_web_search_readiness, codex_web_search_setup_plan } from "../../../capability-packs/codex-web-search/src/index.js";
 import { frappe_context_build, frappe_context_setup_plan, frappe_docs_context, frappe_module_context } from "../../../capability-packs/frappe/src/index.js";
-import { artifact_capability_plan, artifact_goal_passes, docx_document, office_artifact_workflow, office_tool_integrations, pdf_document, pptx_presentation, xlsx_workbook } from "../../../capability-packs/artifact-studio/src/index.js";
+import { artifact_capability_plan, artifact_goal_passes, artifact_structural_verify, docx_document, office_artifact_contract, office_artifact_workflow, office_tool_integrations, pdf_document, pptx_presentation, xlsx_workbook } from "../../../capability-packs/artifact-studio/src/index.js";
 
 const webSearchPackDir = resolve(import.meta.dirname, "..", "..", "..", "capability-packs", "web-search");
 const researchPackDir = resolve(import.meta.dirname, "..", "..", "..", "capability-packs", "research-lab");
@@ -59,6 +59,7 @@ const codexPackDir = resolve(import.meta.dirname, "..", "..", "..", "capability-
 const claudeCodePackDir = resolve(import.meta.dirname, "..", "..", "..", "capability-packs", "claude-code");
 const codexNativeToolsPackDir = resolve(import.meta.dirname, "..", "..", "..", "capability-packs", "codex-native-tools");
 const codexWebSearchPackDir = resolve(import.meta.dirname, "..", "..", "..", "capability-packs", "codex-web-search");
+const artifactStudioPackDir = resolve(import.meta.dirname, "..", "..", "..", "capability-packs", "artifact-studio");
 
 test("web-search pack parses DuckDuckGo HTML and strips fetched pages", async () => {
   const fetch = async (url: string | URL) => {
@@ -126,6 +127,9 @@ test("artifact-studio creates bounded office/PDF artifacts and plans gated Offic
   assert.ok(docxBytes.subarray(0, 2).equals(Buffer.from("PK")));
   assert.match(docxBytes.toString("utf8"), /Muster Artifact Brief/);
   assert.match(docxBytes.toString("utf8"), /word\/document\.xml/);
+  const docxVerify = await artifact_structural_verify({ format: "docx", base64: docx.base64, requiredText: ["Muster Artifact Brief"] });
+  assert.equal(docxVerify.status, "passed");
+  assert.ok((docxVerify.checks as Array<{ id: string; status: string }>).some((check) => check.id === "part:word/document.xml" && check.status === "passed"));
 
   const xlsx = await xlsx_workbook({
     sheetName: "Token Ledger",
@@ -161,6 +165,9 @@ test("artifact-studio creates bounded office/PDF artifacts and plans gated Offic
   assert.equal(pdf.mimeType, "application/pdf");
   assert.match(Buffer.from(pdf.base64, "base64").toString("utf8"), /^%PDF-1\.4/);
   assert.match(Buffer.from(pdf.base64, "base64").toString("utf8"), /Artifact Gate/);
+  const badPdfVerify = await artifact_structural_verify({ format: "pdf", text: "not a pdf" });
+  assert.equal(badPdfVerify.status, "failed");
+  assert.match(String(badPdfVerify.failureBehavior), /block publish/);
 
   const plan = await artifact_capability_plan({ formats: ["docx", "xlsx", "pptx", "pdf"], hostCapabilities: { skills: ["documents", "spreadsheets"] } });
   assert.deepEqual(plan.local, ["docx", "xlsx", "pptx", "pdf"]);
@@ -186,6 +193,17 @@ test("artifact-studio creates bounded office/PDF artifacts and plans gated Offic
   ]);
   assert.equal((integrations.officeSuites as Array<{ id: string; available: boolean }>).find((item) => item.id === "google-drive")?.available, true);
   assert.match(String((integrations.policy as Record<string, unknown>).noFalseClaims), /available only when/);
+  assert.ok((integrations.local as Array<{ verifier?: string }>).every((item) => item.verifier === "artifact_structural_verify"));
+
+  const contract = await office_artifact_contract({ formats: ["docx", "xlsx", "pptx", "pdf"] });
+  assert.equal(contract.pillar, "office_artifacts");
+  assert.deepEqual((contract.formats as Array<{ format: string; verifier: string }>).map((item) => [item.format, item.verifier]), [
+    ["docx", "artifact_structural_verify"],
+    ["xlsx", "artifact_structural_verify"],
+    ["pptx", "artifact_structural_verify"],
+    ["pdf", "artifact_structural_verify"],
+  ]);
+  assert.ok((contract.noFalseClaims as string[]).some((item) => item.includes("visual QA requires")));
 
   const workflow = await office_artifact_workflow({ format: "pptx", destination: "google-slides", polished: true });
   assert.equal(workflow.mode, "local-draft-plus-app-server-polish");
@@ -1355,6 +1373,7 @@ test("new integration packs load through the capability loader", async () => {
   const claudeCode = await loadCapabilityPack(claudeCodePackDir, { registry, env: {} });
   const codexNativeTools = await loadCapabilityPack(codexNativeToolsPackDir, { registry, env: {} });
   const codexWebSearch = await loadCapabilityPack(codexWebSearchPackDir, { registry, env: {} });
+  const artifactStudio = await loadCapabilityPack(artifactStudioPackDir, { registry, env: {} });
 
   assert.deepEqual(web.toolNames.sort(), ["web-search__duckduckgo_search", "web-search__public_web_fetch"]);
   assert.deepEqual(research.toolNames, ["research-lab__arxiv_search"]);
@@ -1382,6 +1401,7 @@ test("new integration packs load through the capability loader", async () => {
   assert.deepEqual(claudeCode.toolNames.sort(), ["claude-code__claude_code_mode_policy", "claude-code__claude_code_readiness", "claude-code__claude_code_session_policy", "claude-code__claude_code_setup_plan"]);
   assert.deepEqual(codexNativeTools.toolNames.sort(), ["codex-native-tools__codex_native_approval_policy", "codex-native-tools__codex_native_fast_path", "codex-native-tools__codex_native_surface_plan", "codex-native-tools__codex_native_tool_policy"]);
   assert.deepEqual(codexWebSearch.toolNames.sort(), ["codex-web-search__codex_web_research_policy", "codex-web-search__codex_web_search_fallback_plan", "codex-web-search__codex_web_search_readiness", "codex-web-search__codex_web_search_setup_plan"]);
+  assert.deepEqual(artifactStudio.toolNames.sort(), ["artifact-studio__artifact_capability_plan", "artifact-studio__artifact_goal_passes", "artifact-studio__artifact_structural_verify", "artifact-studio__dashboard_manifest", "artifact-studio__declare_artifact", "artifact-studio__document_generation_workflow", "artifact-studio__docx_document", "artifact-studio__markdown_report", "artifact-studio__office_artifact_contract", "artifact-studio__office_artifact_workflow", "artifact-studio__office_tool_integrations", "artifact-studio__pdf_document", "artifact-studio__pptx_presentation", "artifact-studio__rows_to_csv", "artifact-studio__validate_artifact_file", "artifact-studio__xlsx_workbook"]);
   assert.equal(typeof registry["web-search__duckduckgo_search"], "function");
   assert.equal(typeof registry["research-lab__arxiv_search"], "function");
   assert.equal(typeof registry["github__github_repo_summary"], "function");
@@ -1407,6 +1427,7 @@ test("new integration packs load through the capability loader", async () => {
   assert.equal(typeof registry["openai__openai_provider_setup_plan"], "function");
   assert.equal(typeof registry["anthropic__anthropic_provider_setup_plan"], "function");
   assert.equal(typeof registry["codex__codex_runtime_setup_plan"], "function");
+  assert.equal(typeof registry["artifact-studio__artifact_structural_verify"], "function");
   assert.equal(typeof registry["claude-code__claude_code_setup_plan"], "function");
   assert.equal(typeof registry["codex-native-tools__codex_native_fast_path"], "function");
   assert.equal(typeof registry["codex-web-search__codex_web_search_setup_plan"], "function");

@@ -84,6 +84,12 @@ type WorkflowStep = {
   output: string;
 };
 
+type VerificationCheck = {
+  id: string;
+  status: "passed" | "failed";
+  summary: string;
+};
+
 const textEncoder = new TextEncoder();
 let crcTable: Uint32Array | undefined;
 
@@ -223,6 +229,85 @@ function sheetsArg(args: Record<string, unknown>): Sheet[] {
 
 function artifactResult(filename: string, mimeType: string, format: ArtifactResult["format"], bytes: Uint8Array): ArtifactResult {
   return { filename, mimeType, format, bytes: bytes.length, base64: Buffer.from(bytes).toString("base64") };
+}
+
+function artifactBytesArg(args: Record<string, unknown>): Uint8Array {
+  if (typeof args.base64 === "string" && args.base64.trim()) return Buffer.from(args.base64, "base64");
+  if (typeof args.text === "string") return encode(args.text);
+  return new Uint8Array();
+}
+
+function artifactFormatArg(args: Record<string, unknown>): ArtifactResult["format"] | undefined {
+  const value = stringArg(args, "format").toLowerCase();
+  return value === "docx" || value === "xlsx" || value === "pptx" || value === "pdf" ? value : undefined;
+}
+
+function hasZipHeader(bytes: Uint8Array): boolean {
+  return bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
+}
+
+function bytesText(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString("utf8");
+}
+
+function formatRequiredParts(format: ArtifactResult["format"]): readonly string[] {
+  if (format === "docx") return ["[Content_Types].xml", "word/document.xml"];
+  if (format === "xlsx") return ["[Content_Types].xml", "xl/workbook.xml", "xl/worksheets/sheet1.xml"];
+  if (format === "pptx") return ["[Content_Types].xml", "ppt/presentation.xml", "ppt/slides/slide1.xml"];
+  return [];
+}
+
+function artifactResultMimeType(format: ArtifactResult["format"]): string {
+  if (format === "docx") return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (format === "xlsx") return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  if (format === "pptx") return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+  return "application/pdf";
+}
+
+function verifyArtifactBytes(format: ArtifactResult["format"], bytes: Uint8Array, options: { readonly requiredText?: readonly string[] } = {}): VerificationCheck[] {
+  const text = bytesText(bytes);
+  const checks: VerificationCheck[] = [{
+    id: "non_empty",
+    status: bytes.length > 0 ? "passed" : "failed",
+    summary: bytes.length > 0 ? `${bytes.length} bytes present` : "artifact payload is empty",
+  }];
+  if (format === "pdf") {
+    checks.push({
+      id: "pdf_header",
+      status: text.startsWith("%PDF-") ? "passed" : "failed",
+      summary: text.startsWith("%PDF-") ? "PDF header detected" : "missing %PDF header",
+    });
+    checks.push({
+      id: "pdf_trailer",
+      status: /%%EOF\s*$/.test(text) ? "passed" : "failed",
+      summary: /%%EOF\s*$/.test(text) ? "PDF EOF trailer detected" : "missing PDF EOF trailer",
+    });
+  } else {
+    checks.push({
+      id: "zip_header",
+      status: hasZipHeader(bytes) ? "passed" : "failed",
+      summary: hasZipHeader(bytes) ? "OOXML ZIP header detected" : "missing OOXML ZIP header",
+    });
+    for (const part of formatRequiredParts(format)) {
+      checks.push({
+        id: `part:${part}`,
+        status: text.includes(part) ? "passed" : "failed",
+        summary: text.includes(part) ? `required package part ${part} is present` : `required package part ${part} is missing`,
+      });
+    }
+  }
+  for (const needle of options.requiredText ?? []) {
+    checks.push({
+      id: `content:${needle.slice(0, 32).replace(/\s+/g, "_")}`,
+      status: text.includes(needle) ? "passed" : "failed",
+      summary: text.includes(needle) ? `required content appears: ${needle}` : `required content missing: ${needle}`,
+    });
+  }
+  return checks;
+}
+
+function verificationStatus(checks: readonly VerificationCheck[]): "passed" | "failed" {
+  return checks.every((check) => check.status === "passed") ? "passed" : "failed";
 }
 
 function packageCoreProperties(title: string, subject: string): string {
@@ -670,6 +755,65 @@ export async function declare_artifact(args: {
   };
 }
 
+export async function artifact_structural_verify(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const format = artifactFormatArg(args);
+  if (!format) {
+    return {
+      status: "failed",
+      reason: "format must be one of docx, xlsx, pptx, pdf",
+      checks: [{ id: "format", status: "failed", summary: "missing or unsupported format" }],
+    };
+  }
+  const bytes = artifactBytesArg(args);
+  const requiredText = Array.isArray(args.requiredText) ? args.requiredText.map(String).filter(Boolean).slice(0, 20) : [];
+  const checks = verifyArtifactBytes(format, bytes, { requiredText });
+  const status = verificationStatus(checks);
+  return {
+    status,
+    format,
+    mimeType: artifactResultMimeType(format),
+    bytes: bytes.length,
+    checks,
+    failureBehavior: status === "passed"
+      ? "safe to hand to the next workflow gate"
+      : "block publish/share; return the failed checks and keep raw artifact out of broad memory",
+  };
+}
+
+export async function office_artifact_contract(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const requested = Array.isArray(args.formats) ? args.formats.map((item) => String(item).toLowerCase()) : ["docx", "xlsx", "pptx", "pdf"];
+  const formats = ["docx", "xlsx", "pptx", "pdf"].filter((format) => requested.includes(format));
+  return {
+    pillar: "office_artifacts",
+    promise: "Create editable Office/PDF drafts locally, verify package structure, then route to app-server skills or authenticated suites only when available.",
+    formats: formats.map((format) => ({
+      format,
+      localBuilder: { docx: "docx_document", xlsx: "xlsx_workbook", pptx: "pptx_presentation", pdf: "pdf_document" }[format],
+      verifier: "artifact_structural_verify",
+      appServerSkill: { docx: "documents", xlsx: "spreadsheets", pptx: "presentations", pdf: "pdf" }[format],
+      qualityGate: format === "xlsx"
+        ? "formula/range/content checks locally; app-server spreadsheet skill for charts, recalculation, and render QA"
+        : format === "pptx"
+          ? "slide/package/content checks locally; app-server presentation skill for layout previews and overlap QA"
+          : format === "docx"
+            ? "document package/content checks locally; app-server document skill for render QA, comments, redlines, and Google Docs import"
+            : "PDF header/trailer/content checks locally; app-server PDF skill for rendering, extraction, and visual QA",
+    })),
+    workflow: ["intake", "capabilities", "draft", "verify", "polish_or_setup_blocker", "approval_gated_publish", "receipt_and_eval"],
+    userControls: [
+      "choose local draft or polished app-server handoff",
+      "choose destination: local, Google Drive, Microsoft 365, or channel attachment",
+      "verify before publish",
+      "store artifact receipt in memory, not raw file body by default",
+    ],
+    noFalseClaims: [
+      "local builders are deterministic but intentionally basic",
+      "visual QA requires a renderer or host artifact skill",
+      "Google/Microsoft uploads require authenticated connectors and explicit approval",
+    ],
+  };
+}
+
 export async function artifact_capability_plan(args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const supportedLocal = ["markdown", "csv", "dashboard", "docx", "xlsx", "pptx", "pdf"];
   const requested = Array.isArray(args.formats) ? args.formats.map((item) => String(item).toLowerCase()) : supportedLocal;
@@ -714,10 +858,10 @@ export async function office_tool_integrations(args: Record<string, unknown>): P
   return {
     purpose: "office_artifact_generation",
     local: [
-      { id: "docx_document", formats: ["docx"], depth: "basic-editable", available: true, notes: "Dependency-light OOXML document package for deterministic CI and lightweight deliverables." },
-      { id: "xlsx_workbook", formats: ["xlsx"], depth: "basic-editable", available: true, notes: "Inline-string workbook for tabular outputs; formula/chart authoring should use an app-server spreadsheet skill." },
-      { id: "pptx_presentation", formats: ["pptx"], depth: "basic-editable", available: true, notes: "Simple editable deck package; polished layouts should route to a presentation skill." },
-      { id: "pdf_document", formats: ["pdf"], depth: "basic-static", available: true, notes: "Simple one-page PDF payload; visual QA and complex layout should route to a PDF/document skill." },
+      { id: "docx_document", formats: ["docx"], depth: "verified-editable-draft", available: true, verifier: "artifact_structural_verify", notes: "Dependency-light OOXML document package for deterministic CI and lightweight deliverables." },
+      { id: "xlsx_workbook", formats: ["xlsx"], depth: "verified-editable-draft", available: true, verifier: "artifact_structural_verify", notes: "Inline-string workbook for tabular outputs; formula/chart authoring should use an app-server spreadsheet skill." },
+      { id: "pptx_presentation", formats: ["pptx"], depth: "verified-editable-draft", available: true, verifier: "artifact_structural_verify", notes: "Simple editable deck package; polished layouts should route to a presentation skill." },
+      { id: "pdf_document", formats: ["pdf"], depth: "verified-static-draft", available: true, verifier: "artifact_structural_verify", notes: "Simple one-page PDF payload; visual QA and complex layout should route to a PDF/document skill." },
     ],
     appServerSkills: [
       { id: "documents", formats: ["docx", "google-docs"], available: hostSkills.includes("documents"), setup: "Enable the document plugin/skill in the active Codex or Claude app-server session." },
@@ -960,9 +1104,11 @@ export const tools = {
   xlsx_workbook,
   pptx_presentation,
   pdf_document,
+  artifact_structural_verify,
   validate_artifact_file,
   declare_artifact,
   artifact_capability_plan,
+  office_artifact_contract,
   office_tool_integrations,
   office_artifact_workflow,
   document_generation_workflow,

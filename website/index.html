@@ -102,16 +102,15 @@
       <feDisplacementMap in="SourceGraphic" in2="navSoft" scale="28" xChannelSelector="R" yChannelSelector="G" />
     </filter>
   </svg>
-  <!-- Scroll-progress bar: lavender→cyan, fixed to the top edge -->
+  <!-- Scroll-progress bar: violet, fixed to the top edge -->
   <div id="scroll-progress" aria-hidden="true"></div>
-  <!-- Liquid-lavender hero shader. CSS poster gradient paints immediately; canvas
-       fades in after first paint and sits BEHIND content, never intercepting clicks. -->
+  <!-- Brand field behind content, never intercepting clicks. -->
   <div id="hero-stage" aria-hidden="true">
     <canvas id="hero-canvas"></canvas>
   </div>
 
   <header class="topbar">
-    <a class="brand" href="/">muster<span class="brand-dot">.</span></a>
+    <a class="brand" href="/" aria-label="Muster home"><img src="/assets/brand/muster-logo.png" alt="Muster" /></a>
     <nav aria-label="Main">
       <a href="#problem">Problem</a>
       <a href="#solution">Controls</a>
@@ -135,15 +134,14 @@
     <!-- ============================ HERO ============================ -->
     <section class="hero" id="hero">
       <div class="hero-inner">
-        <p class="kicker hero-step">open-source · TypeScript · MIT</p>
-        <h1 class="hero-step">Muster is a governed agent harness for <em>long-running AI agents.</em></h1>
+        <p class="kicker hero-step">control layer for AI agents</p>
+        <h1 class="hero-step">One governed point for agents, tools, memory, models, and evals.</h1>
         <p class="sub hero-step">
-          Muster keeps memory scoped, tokens accounted, tools policy-wrapped,
-          and learning behind evals.
+          Muster is the control layer where independent AI systems assemble,
+          route through policy, and leave an auditable trail.
         </p>
         <p class="sub hero-step">
-          Built for production-minded agents that use MCP, browser automation,
-          Frappe / ERPNext, and multiple provider routes.
+          Many moving parts. One controlled runtime.
         </p>
         <div class="hero-cta hero-step">
           <div class="install" role="group" aria-label="Install command">
@@ -155,24 +153,19 @@
           <a class="btn-cta" href="#terminal">Run the demo</a>
           <a class="btn-ghost" href="https://github.com/Dkm0315/muster" rel="noopener">Star on GitHub →</a>
         </div>
-        <p class="hero-footnote hero-step">Agents that do not leak memory, waste tokens, or learn without tests.</p>
+        <p class="hero-footnote hero-step">Muster does not try to be the AI. Muster controls how AI behaves.</p>
       </div>
 
-      <!-- Floating glassmorphism cards drifting over the shader -->
-      <div class="hero-cards hero-step" aria-hidden="true">
-        <div class="glass-card card-ledger">
-          <span class="gc-label">token ledger</span>
-          <code class="gc-row">cloud route      48.1K in  <span class="gc-flag">6.2&times; waste</span></code>
-          <code class="gc-row dim">private route     1.8K in  ledgered ✓</code>
+      <div class="hero-system-map hero-step" aria-hidden="true">
+        <div class="route-label route-agents">agents</div>
+        <div class="route-label route-tools">tools</div>
+        <div class="route-label route-memory">memory</div>
+        <div class="route-label route-evals">evals</div>
+        <div class="muster-point">
+          <img src="/assets/brand/muster-mark.png" alt="" />
         </div>
-        <div class="glass-card card-savings">
-          <span class="gc-big">59%</span>
-          <span class="gc-sub">fewer tokens on long sessions</span>
-        </div>
-        <div class="glass-card card-verify">
-          <span class="gc-label">muster verify</span>
-          <code class="gc-row">integrity check: <span class="gc-ok">OK</span></code>
-        </div>
+        <div class="terminal-cue">&gt;_</div>
+        <div class="control-caption">governed runtime</div>
       </div>
     </section>
 

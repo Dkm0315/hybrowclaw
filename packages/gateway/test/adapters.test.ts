@@ -29,6 +29,14 @@ function slackSignature(timestamp: string, rawBody: string, secret: string): str
   return `v0=${createHmac("sha256", secret).update(`v0:${timestamp}:${rawBody}`, "utf8").digest("hex")}`;
 }
 
+async function waitForCondition(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) break;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+  }
+}
+
 // --- realistic fixtures (shape per Bot API / Events API docs) ---
 
 const telegramUpdate = {
@@ -889,7 +897,7 @@ test("slack socket mode acks envelopes and posts governed replies without a publ
     socket?.onopen?.({});
     await new Promise((resolvePromise) => setImmediate(resolvePromise));
     socket?.onmessage?.({ data: JSON.stringify({ envelope_id: "env-1", type: "events_api", payload: slackEventCallback }) });
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+    await waitForCondition(() => outbound.some((entry) => entry.url === "https://slack.com/api/chat.postMessage"));
     socket?.onclose?.({});
     await run;
     assert.deepEqual(sent.map((line) => JSON.parse(line)), [{ envelope_id: "env-1" }]);

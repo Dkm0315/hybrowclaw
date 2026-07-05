@@ -35,8 +35,10 @@ test("CLI help exposes terminal and pi surfaces", async () => {
   assert.match(stdout, /muster qa scorecard/);
   assert.match(stdout, /muster qa record/);
   assert.match(stdout, /muster capability inspect/);
+  assert.match(stdout, /muster artifacts contract/);
   assert.match(stdout, /muster artifacts plan/);
   assert.match(stdout, /muster artifacts create/);
+  assert.match(stdout, /muster artifacts verify/);
   assert.match(stdout, /muster plugins list/);
   assert.match(stdout, /muster plugins .*reuse <provider>/);
   assert.match(stdout, /muster plugins .*context frappe/);
@@ -54,13 +56,13 @@ test("CLI help exposes terminal and pi surfaces", async () => {
 
 test("CLI version and update commands are explicit", async () => {
   const version = await runCli(["--version"]);
-  assert.equal(version.stdout.trim(), "muster 0.1.9");
+  assert.equal(version.stdout.trim(), "muster 0.1.10");
 
   const namedVersion = await runCli(["version"]);
-  assert.equal(namedVersion.stdout.trim(), "muster 0.1.9");
+  assert.equal(namedVersion.stdout.trim(), "muster 0.1.10");
 
   const update = await runCli(["update", "--manager", "npm", "--target", "0.1.10"]);
-  assert.match(update.stdout, /muster_current=0\.1\.9/);
+  assert.match(update.stdout, /muster_current=0\.1\.10/);
   assert.match(update.stdout, /package=@musterhq\/cli/);
   assert.match(update.stdout, /target=0\.1\.10/);
   assert.match(update.stdout, /manager=npm/);
@@ -297,6 +299,21 @@ test("CLI chat exposes a real named terminal chat surface without hanging in non
   assert.match(chatGithubIntegration.stdout, /Next/);
   assert.match(chatGithubIntegration.stdout, /muster plugins setup github/);
   assert.doesNotMatch(chatGithubIntegration.stdout, /integration_workflow=github/);
+
+  const chatArtifactIntegration = await runCli(["chat", "/integrations artifact-studio"], cwd);
+  assert.match(chatArtifactIntegration.stdout, /Integration workflow/);
+  assert.match(chatArtifactIntegration.stdout, /artifact-studio/);
+  assert.match(chatArtifactIntegration.stdout, /Artifacts muster artifacts contract/);
+  assert.match(chatArtifactIntegration.stdout, /muster artifacts verify <file>/);
+  assert.match(chatArtifactIntegration.stdout, /muster integrations sample artifact-studio/);
+  assert.doesNotMatch(chatArtifactIntegration.stdout, /integration_workflow=artifact-studio/);
+
+  const artifactSample = await runCli(["chat", "/integrations sample artifact-studio"], cwd);
+  assert.match(artifactSample.stdout, /Integration sample/);
+  assert.match(artifactSample.stdout, /artifact-studio/);
+  assert.match(artifactSample.stdout, /verification=passed/);
+  assert.match(artifactSample.stdout, /sample_artifact=.*artifact-studio-brief\.docx/);
+  assert.match(artifactSample.stdout, /Next\s+muster artifacts contract --formats docx,xlsx,pptx,pdf/);
 
   const chatParallelIntegration = await runCli(["chat", "/integrations parallel-search"], cwd);
   assert.match(chatParallelIntegration.stdout, /Integration workflow/);
@@ -2753,7 +2770,7 @@ test("CLI roster inspect and install verify entries into a lockfile", async () =
 
   const dryRunActivation = await runCli(["roster", "activate", "demo-pack", "--lock", lockPath, "--dry-run"], cwd);
   assert.match(dryRunActivation.stdout, /activation=demo-pack status=ready/);
-  assert.match(dryRunActivation.stdout, /activation_verify=ready muster=0\.1\.9/);
+  assert.match(dryRunActivation.stdout, /activation_verify=ready muster=0\.1\.10/);
   assert.match(dryRunActivation.stdout, /allow=demo-pack/);
   assert.match(dryRunActivation.stdout, /config=unchanged dry_run=true/);
   const activationJson = JSON.parse((await runCli(["roster", "activate", "demo-pack", "--lock", lockPath, "--dry-run", "--json"], cwd)).stdout) as {
@@ -3023,13 +3040,26 @@ test("CLI artifacts command plans gated workflows and creates local files", asyn
   assert.match(plan.stdout, /publish tool=- risk=approval/);
   assert.match(plan.stdout, /goal_passes:/);
 
+  const contract = await runCli(["artifacts", "contract", "--formats", "docx,xlsx,pptx,pdf"], cwd);
+  assert.match(contract.stdout, /pillar=office_artifacts/);
+  assert.match(contract.stdout, /format=docx builder=docx_document verifier=artifact_structural_verify app_skill=documents/);
+  assert.match(contract.stdout, /format=xlsx builder=xlsx_workbook verifier=artifact_structural_verify app_skill=spreadsheets/);
+  assert.match(contract.stdout, /no_false_claim="visual QA requires/);
+
   const created = await runCli(["artifacts", "create", "--format", "docx", "--title", "Muster Board Brief", "--summary", "Scoped artifact output.", "--out", "out/brief.docx"], cwd);
   assert.match(created.stdout, /artifact=.*out\/brief\.docx/);
   assert.match(created.stdout, /format=docx/);
-  assert.match(created.stdout, /verification=structural package checks/);
+  assert.match(created.stdout, /verification=passed/);
+  assert.match(created.stdout, /verify_check=part:word\/document\.xml status=passed/);
+  assert.match(created.stdout, /visual_qa=use app-server document\/spreadsheet\/presentation\/PDF skills/);
   const bytes = await readFile(join(cwd, "out", "brief.docx"));
   assert.ok(bytes.subarray(0, 2).equals(Buffer.from("PK")));
   assert.match(bytes.toString("utf8"), /Muster Board Brief/);
+
+  const verified = await runCli(["artifacts", "verify", "out/brief.docx", "--require", "Muster Board Brief"], cwd);
+  assert.match(verified.stdout, /artifact=.*out\/brief\.docx/);
+  assert.match(verified.stdout, /verification=passed/);
+  assert.match(verified.stdout, /verify_check=content:Muster_Board_Brief status=passed/);
 
   await writeFile(join(cwd, "ledger-spec.json"), `${JSON.stringify({
     title: "Token Ledger Export",
@@ -3044,11 +3074,19 @@ test("CLI artifacts command plans gated workflows and creates local files", asyn
   const xlsx = await runCli(["artifacts", "create", "--format", "xlsx", "--spec", "ledger-spec.json", "--out", "out/ledger.xlsx"], cwd);
   assert.match(xlsx.stdout, /artifact=.*out\/ledger\.xlsx/);
   assert.match(xlsx.stdout, /format=xlsx/);
+  assert.match(xlsx.stdout, /verification=passed/);
   const xlsxBytes = await readFile(join(cwd, "out", "ledger.xlsx"));
   const xlsxText = xlsxBytes.toString("utf8");
   assert.match(xlsxText, /Ledger/);
   assert.match(xlsxText, /codex\/gpt-5\.5/);
   assert.match(xlsxText, /54600/);
+
+  const badPdf = join(cwd, "out", "bad.pdf");
+  await writeFile(badPdf, "not a pdf", "utf8");
+  const badVerify = await runCliAllowFailure(["artifacts", "verify", "out/bad.pdf"], cwd);
+  assert.equal(badVerify.code, 1);
+  assert.match(badVerify.stdout, /verification=failed/);
+  assert.match(badVerify.stdout, /verify_check=pdf_header status=failed/);
 });
 
 test("CLI skills index renders pinned skill digests", async () => {

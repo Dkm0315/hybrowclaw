@@ -1,36 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
   <title id="title">Muster logo</title>
-  <desc id="desc">Muster wordmark with a governed node harness mark.</desc>
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="360" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#F8F5FF"/>
-      <stop offset="0.58" stop-color="#ECFEFF"/>
-      <stop offset="1" stop-color="#F8F7F2"/>
-    </linearGradient>
-    <linearGradient id="accent" x1="94" y1="82" x2="286" y2="278" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#A78BFA"/>
-      <stop offset="0.5" stop-color="#06B6D4"/>
-      <stop offset="1" stop-color="#14B8A6"/>
-    </linearGradient>
-    <filter id="shadow" x="-20%" y="-30%" width="150%" height="170%">
-      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#0F172A" flood-opacity="0.14"/>
-    </filter>
-  </defs>
-  <rect width="1200" height="360" rx="64" fill="url(#bg)"/>
-  <g transform="translate(64 48)" filter="url(#shadow)">
-    <path d="M44 226V64c0-20 15-35 35-35h12c15 0 28 8 35 21l42 74 42-74c7-13 20-21 35-21h12c20 0 35 15 35 35v162" fill="none" stroke="#0F172A" stroke-opacity="0.12" stroke-width="72" stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M44 226V64c0-20 15-35 35-35h12c15 0 28 8 35 21l42 74 42-74c7-13 20-21 35-21h12c20 0 35 15 35 35v162" fill="none" stroke="url(#accent)" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
-    <g fill="url(#accent)" stroke="#FFFFFF" stroke-width="10">
-      <circle cx="44" cy="226" r="38"/>
-      <circle cx="94" cy="29" r="38"/>
-      <circle cx="242" cy="29" r="38"/>
-      <circle cx="292" cy="226" r="38"/>
-    </g>
-    <circle cx="168" cy="124" r="26" fill="#050505" fill-opacity="0.94"/>
-    <circle cx="168" cy="124" r="12" fill="#67E8F9"/>
-  </g>
-  <g transform="translate(424 79)">
-    <text x="0" y="116" fill="#0F172A" font-family="Hanken Grotesk, Inter, Arial, sans-serif" font-size="128" font-weight="800" letter-spacing="0">muster</text>
-    <text x="6" y="184" fill="#475569" font-family="JetBrains Mono, Menlo, monospace" font-size="31" font-weight="500">governed agent harness</text>
-  </g>
+  <desc id="desc">Muster wordmark with the governed point mark.</desc>
+  <image href="muster-logo.png" width="1200" height="360" preserveAspectRatio="xMidYMid meet"/>
 </svg>

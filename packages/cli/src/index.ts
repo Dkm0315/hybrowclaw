@@ -183,7 +183,9 @@ import {
   connectMcpServers,
   clearCodexAppServerSessions,
   artifact_goal_passes,
+  artifact_structural_verify,
   docx_document,
+  office_artifact_contract,
   office_artifact_workflow,
   office_tool_integrations,
   pdf_document,
@@ -235,7 +237,7 @@ process.on("warning", (warning) => {
 });
 
 const [, , command, ...args] = process.argv;
-const CLI_MUSTER_VERSION = "0.1.9";
+const CLI_MUSTER_VERSION = "0.1.10";
 const CLI_PACKAGE_NAME = "@musterhq/cli";
 
 async function main(): Promise<void> {
@@ -443,8 +445,10 @@ Usage:
   muster roster materialize <id> [--index roster.index.json] [--lock .muster/roster.lock.json] [--cache .muster/roster-cache] [--version x.y.z] [--muster-version x.y.z] [--registry-profile verified|release] [--require-metadata] [--min-readiness level] [--json] [--report path]
   muster roster activate <id|mcp:id|channel:id|skill:id> [--lock .muster/roster.lock.json] [--muster-version x.y.z] [--dry-run] [--json] [--report path]
   muster roster publish --dry-run <path> [--source-path path] [--muster-compatibility >=0.1.0] [--muster-version x.y.z] [--json] [--report path]
+  muster artifacts contract [--formats docx,xlsx,pptx,pdf]
   muster artifacts plan --format docx|xlsx|pptx|pdf [--destination local|google-drive|microsoft-365] [--polished]
   muster artifacts create --format docx|xlsx|pptx|pdf --title "..." [--summary "..."] [--spec spec.json] [--out path]
+  muster artifacts verify <file> [--format docx|xlsx|pptx|pdf] [--require text]
   muster plugins list | catalog | setup <id> | reuse <provider> [--adopt-mcp id|--adopt-all-mcps] | context frappe <setup|docs|module|build> | enable <id> | disable <id> | policy | inspect <path> | load <path>
   muster mcp list | status [name] | login <name> | logout <name> | catalog | check [id] | install <id> | oauth status|setup|import ... | add-http <name> <url> [--oauth ...] | add-stdio <name> <command> [args...] | test <name>
   muster dashboard status | start [--port 7461] [--host 127.0.0.1]
@@ -2754,6 +2758,7 @@ function printChatIntegrationWorkflow(rawLines: readonly string[]): void {
     ...formatWorkflowField(fields, "setup", "Setup"),
     ...formatWorkflowField(fields, "verify", "Verify"),
     ...formatWorkflowField(fields, "enable", "Enable"),
+    ...formatWorkflowField(fields, "related_artifacts", "Artifacts"),
     ...formatWorkflowField(fields, "sample", "Sample"),
     ...formatWorkflowField(fields, "failure_behavior", "Failure"),
     ...(setupUrls.length ? [`${color("Open", "accent")} ${setupUrls.join(" · ")}`] : []),
@@ -4827,6 +4832,15 @@ function artifactFormats(): string {
   return "docx|xlsx|pptx|pdf";
 }
 
+function artifactFormatFromPath(path: string): CliArtifactResult["format"] | undefined {
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".docx")) return "docx";
+  if (lower.endsWith(".xlsx")) return "xlsx";
+  if (lower.endsWith(".pptx")) return "pptx";
+  if (lower.endsWith(".pdf")) return "pdf";
+  return undefined;
+}
+
 function artifactOutputPath(args: string[], artifact: CliArtifactResult): string {
   const requested = readFlag(args, "--out");
   if (requested) {
@@ -4870,8 +4884,34 @@ async function readArtifactSpec(specPath: string): Promise<Record<string, unknow
   return parsed as Record<string, unknown>;
 }
 
+async function printArtifactVerification(format: CliArtifactResult["format"], bytes: Buffer | Uint8Array, requiredText: readonly string[] = []): Promise<"passed" | "failed"> {
+  const report = await artifact_structural_verify({
+    format,
+    base64: Buffer.from(bytes).toString("base64"),
+    requiredText,
+  }) as { status?: string; checks?: Array<{ id: string; status: string; summary: string }>; failureBehavior?: string };
+  const status = report.status === "passed" ? "passed" : "failed";
+  console.log(`verification=${status}`);
+  for (const check of report.checks ?? []) console.log(`verify_check=${check.id} status=${check.status} summary=${JSON.stringify(check.summary)}`);
+  if (report.failureBehavior) console.log(`failure_behavior=${JSON.stringify(report.failureBehavior)}`);
+  return status;
+}
+
 async function artifactsCommand(args: string[]): Promise<void> {
   const action = args[0];
+  if (action === "contract") {
+    const formats = readCsvFlag(args, "--formats") ?? ["docx", "xlsx", "pptx", "pdf"];
+    const contract = await office_artifact_contract({ formats });
+    console.log(`pillar=${(contract as Record<string, unknown>).pillar}`);
+    console.log(`promise=${JSON.stringify((contract as Record<string, unknown>).promise)}`);
+    for (const item of (contract as { formats: Array<Record<string, unknown>> }).formats) {
+      console.log(`format=${item.format} builder=${item.localBuilder} verifier=${item.verifier} app_skill=${item.appServerSkill}`);
+      console.log(`quality_gate=${JSON.stringify(item.qualityGate)}`);
+    }
+    console.log(`workflow=${((contract as { workflow: string[] }).workflow).join(" -> ")}`);
+    for (const claim of (contract as { noFalseClaims: string[] }).noFalseClaims) console.log(`no_false_claim=${JSON.stringify(claim)}`);
+    return;
+  }
   if (action === "plan") {
     const format = readFlag(args, "--format") ?? "docx";
     const destination = readFlag(args, "--destination") ?? "local";
@@ -4900,6 +4940,19 @@ async function artifactsCommand(args: string[]): Promise<void> {
     for (const pass of passes.passes as Array<{ id: string; owner: string }>) console.log(`- ${pass.id} owner=${pass.owner}`);
     return;
   }
+  if (action === "verify") {
+    const target = args[1] ?? readFlag(args, "--file");
+    if (!target) throw new Error(`Usage: muster artifacts verify <file> [--format ${artifactFormats()}] [--require text]`);
+    const format = (readFlag(args, "--format") as CliArtifactResult["format"] | undefined) ?? artifactFormatFromPath(target);
+    if (!format || !artifactFormats().split("|").includes(format)) throw new Error(`Unable to infer format. Pass --format ${artifactFormats()}.`);
+    const bytes = await readFile(resolve(process.cwd(), target));
+    const required = readFlags(args, "--require");
+    console.log(`artifact=${resolve(process.cwd(), target)}`);
+    console.log(`format=${format}`);
+    const status = await printArtifactVerification(format, bytes, required);
+    if (status !== "passed") process.exitCode = 1;
+    return;
+  }
   if (action === "create") {
     const format = readFlag(args, "--format");
     if (!format || !artifactFormats().split("|").includes(format)) throw new Error(`Usage: muster artifacts create --format ${artifactFormats()} --title "..." [--summary "..."] [--spec spec.json] [--out path]`);
@@ -4918,10 +4971,14 @@ async function artifactsCommand(args: string[]): Promise<void> {
     console.log(`format=${artifact.format}`);
     console.log(`mime=${artifact.mimeType}`);
     console.log(`bytes=${artifact.bytes}`);
-    console.log("verification=structural package checks are covered by artifact-studio tests; use app-server skills for render/visual QA.");
+    const requiredText = artifact.format === "xlsx"
+      ? [String(input.sheetName ?? "")].filter(Boolean)
+      : [String(input.title ?? "")].filter(Boolean);
+    await printArtifactVerification(artifact.format, Buffer.from(artifact.base64, "base64"), requiredText);
+    console.log("visual_qa=use app-server document/spreadsheet/presentation/PDF skills or local renderers for polished layout verification.");
     return;
   }
-  throw new Error(`Usage: muster artifacts plan --format ${artifactFormats()} [--destination local|google-drive|microsoft-365] [--polished] | muster artifacts create --format ${artifactFormats()} --title "..." [--summary "..."] [--spec spec.json] [--out path]`);
+  throw new Error(`Usage: muster artifacts contract [--formats docx,xlsx,pptx,pdf] | plan --format ${artifactFormats()} [--destination local|google-drive|microsoft-365] [--polished] | create --format ${artifactFormats()} --title "..." [--summary "..."] [--spec spec.json] [--out path] | verify <file> [--format ${artifactFormats()}] [--require text]`);
 }
 
 async function pluginsCommand(args: string[]): Promise<void> {
@@ -10067,6 +10124,19 @@ async function runPluginIntegrationAction(action: "setup" | "verify" | "enable" 
     console.log(`integration_next=muster integrations verify ${plugin.id}`);
     return;
   }
+  if (plugin.id === "artifact-studio") {
+    const out = join(dataDir(), "samples", "artifact-studio-brief.docx");
+    await artifactsCommand([
+      "create",
+      "--format", "docx",
+      "--title", "Muster Artifact Studio Sample",
+      "--summary", "A verified local DOCX draft created through the integration sample workflow.",
+      "--out", out,
+    ]);
+    console.log(`sample_artifact=${out}`);
+    console.log(`integration_next=muster artifacts contract --formats docx,xlsx,pptx,pdf`);
+    return;
+  }
   await pluginsCommand(["check", plugin.id]);
   console.log(`integration_next=muster integrations verify ${plugin.id}`);
 }
@@ -10148,6 +10218,8 @@ async function printPluginIntegrationWorkflow(plugin: BuiltinPluginCatalogEntry)
     ? `muster channels simulate ${firstChannel} --message "hello from ${plugin.id}"`
     : firstMcp
       ? `muster mcp check ${firstMcp}`
+      : plugin.id === "artifact-studio"
+        ? `muster integrations sample ${plugin.id}`
       : plugin.packPath
         ? `muster plugins check ${plugin.id}`
         : `muster plugins setup ${plugin.id}`;
@@ -10161,6 +10233,7 @@ async function printPluginIntegrationWorkflow(plugin: BuiltinPluginCatalogEntry)
   console.log(`enable=muster plugins enable ${plugin.id}${riskFlag}`);
   if (firstChannel) console.log(`related_channel=muster channels ready ${firstChannel}`);
   if (firstMcp) console.log(`related_mcp=muster mcp ${missingMcpEnv(findBuiltinMcpEntry(firstMcp)).length ? "check" : "install"} ${firstMcp}`);
+  if (plugin.id === "artifact-studio") console.log("related_artifacts=muster artifacts contract; muster artifacts plan --format pptx --destination google-drive --polished; muster artifacts verify <file>");
   console.log(`sample=${sample}`);
   console.log(`failure_behavior=${missing.length ? "setup/check reports missing env and does not enable credentials implicitly" : "check/setup reports readiness, warnings, or setup-only status before execution"}`);
   for (const url of plugin.setup?.setupUrls ?? []) console.log(`setup_url=${url}`);

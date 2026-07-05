@@ -31,14 +31,16 @@ That opens the terminal chat surface. First run opens onboarding; after setup it
 
 ![Muster terminal launch demo](docs/assets/muster-terminal-launch-demo.gif)
 
-This is the latest slowed terminal video from the current launch flow: onboarding/product context, governed chat, channel setup, MCP setup, live token ledger, and integrity checks. It uses the real Muster terminal colors and the same demo path a new user can run locally.
+**Watch the latest slowed launch video:** [MP4](docs/assets/muster-terminal-launch-demo.mp4) · [GIF](docs/assets/muster-terminal-launch-demo.gif)
+
+This is the latest terminal video from the current launch flow: onboarding/product context, governed chat, channel setup, MCP setup, live token ledger, and integrity checks. It uses the real Muster terminal colors and the same demo path a new user can run locally. The GIF is for inline GitHub preview; the MP4 is the higher-quality asset for Telegram, LinkedIn, GitHub release notes, and launch posts.
 
 Launch assets for GitHub, Telegram, LinkedIn, and release posts:
 
 | Asset | Use |
 |---|---|
 | [Slowed terminal GIF](docs/assets/muster-terminal-launch-demo.gif) | Inline GitHub/README preview |
-| [Slowed terminal MP4](docs/assets/muster-terminal-launch-demo.mp4) | Social posts and richer demos |
+| [Slowed launch MP4](docs/assets/muster-terminal-launch-demo.mp4) | Telegram, LinkedIn, GitHub release notes, and richer demos |
 | [Recording script](docs/assets/muster-terminal-launch-demo.tape) | Reproducible terminal capture source |
 
 Today you can run the same path locally:
@@ -81,6 +83,7 @@ Muster is not only a run loop. The harness is meant to become the controlled ope
 | **Tools** | Built-in and pack-provided actions for shell, files, git, browser work, web search, providers, Frappe/ERPNext, channels, and MCP. Tools should run with policy, receipts, caps, and clear failure states. |
 | **Skills** | Reusable workflows and instructions that can be listed, inspected, curated, activated, and attributed in the token ledger. Skills should make repeat work easier without hiding what changed. |
 | **Plugins** | Installable bundles that can bring tools, skills, MCP setup, auth guidance, tests, and policy defaults together. The catalog should tell users what is executable today, what needs credentials, and what is only a setup plan. |
+| **Office artifacts** | DOCX, XLSX, PPTX, and PDF workflows through `artifact-studio`: contract planning, deterministic local drafts, structural verification, app-server handoff guidance, approval-gated publish, and sample artifact generation. |
 | **Memory** | Scoped, indexed memory across tenant, workspace, user, role, session, tags, and time. Retrieval should be fast as memory grows, and leakage tests should catch unsafe cross-scope recall. |
 | **Channels** | Telegram, Slack, Discord, WhatsApp, Google Chat, Teams, and web entry points through the gateway, with setup checks and live diagnostics instead of silent webhook failure. |
 | **Personal agent app** | The direction for the user-facing product: `muster` opens a guided terminal agent today; named sessions, onboarding, channel setup, memory controls, and web/gateway surfaces move it toward a personal agent that can follow the user across work surfaces. |
@@ -265,6 +268,7 @@ Muster is pre-1.0. Core governance paths are implemented and tested; public APIs
 | Memory | Implemented. Scoped memory uses SQLite/FTS with receipt reporting, graph-linked expansion, latency probes, rebuild/doctor commands, and leakage tests. |
 | Token/cost | Implemented. Per-run ledger, cost estimates where pricing is known, replay-waste detection, session mode/id tracking, and skill attribution. |
 | Plugins | Implemented base system. In-repo capability packs are executable; broader catalog entries are marked by actionability and should not pretend setup-only packs are live runtime integrations. |
+| Office artifacts | Implemented as the `artifact-studio` pack. `muster artifacts contract`, `plan`, `create`, and `verify` cover DOCX/XLSX/PPTX/PDF drafts, structural checks, app-server skill handoffs, and integration samples. Polished visual QA still requires a document/spreadsheet/presentation/PDF app-server skill or local renderer. |
 | MCP | Implemented client, stdio/http registration, include/exclude policy, result caps, circuit breakers, OAuth/PKCE setup/import, and curated install catalog. |
 | Frappe/ERPNext | Implemented as a capability pack with docs/live-context setup, module/doc resources, Frappe tools, generic graph-retrieval eval fixtures, and web-framework checks. |
 | Gateway/channels | Framework and setup packs exist for Telegram, Slack, Discord, WhatsApp, Google Chat, Teams, and web. Production hardening depends on real provider credentials and webhook setup. |

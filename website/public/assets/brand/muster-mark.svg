@@ -1,34 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
   <title id="title">Muster mark</title>
-  <desc id="desc">Four governed nodes assembled into a connected M-shaped harness.</desc>
-  <defs>
-    <linearGradient id="bg" x1="88" y1="72" x2="426" y2="444" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#F8F5FF"/>
-      <stop offset="0.52" stop-color="#ECFEFF"/>
-      <stop offset="1" stop-color="#F8F7F2"/>
-    </linearGradient>
-    <linearGradient id="lavcyan" x1="92" y1="104" x2="430" y2="400" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#A78BFA"/>
-      <stop offset="0.5" stop-color="#06B6D4"/>
-      <stop offset="1" stop-color="#14B8A6"/>
-    </linearGradient>
-    <linearGradient id="nodeA" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#C4B5FD"/>
-      <stop offset="1" stop-color="#06B6D4"/>
-    </linearGradient>
-    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
-      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#0F172A" flood-opacity="0.18"/>
-    </filter>
-  </defs>
-  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
-  <path d="M108 350V162c0-24 18-42 42-42h14c19 0 34 10 43 26l49 87 49-87c9-16 24-26 43-26h14c24 0 42 18 42 42v188" fill="none" stroke="#0F172A" stroke-opacity="0.12" stroke-width="88" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M108 350V162c0-24 18-42 42-42h14c19 0 34 10 43 26l49 87 49-87c9-16 24-26 43-26h14c24 0 42 18 42 42v188" fill="none" stroke="url(#lavcyan)" stroke-width="54" stroke-linecap="round" stroke-linejoin="round" filter="url(#soft)"/>
-  <g fill="url(#nodeA)" stroke="#FFFFFF" stroke-width="14">
-    <circle cx="108" cy="350" r="50"/>
-    <circle cx="168" cy="120" r="50"/>
-    <circle cx="344" cy="120" r="50"/>
-    <circle cx="404" cy="350" r="50"/>
-  </g>
-  <circle cx="256" cy="234" r="34" fill="#050505" fill-opacity="0.95"/>
-  <circle cx="256" cy="234" r="16" fill="#67E8F9"/>
+  <desc id="desc">Four paths converging on the central Muster point.</desc>
+  <image href="muster-mark.png" width="512" height="512" preserveAspectRatio="xMidYMid meet"/>
 </svg>

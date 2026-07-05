@@ -33,7 +33,7 @@ function applyTheme(theme: Theme): void {
   else root.removeAttribute("data-theme");
   // keep the browser UI chrome (address bar) in step with the canvas
   const meta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
-  if (meta) meta.content = theme === "dark" ? "#0E0B1A" : "#F0EEE9";
+  if (meta) meta.content = theme === "dark" ? "#020205" : "#F6F3EE";
 }
 
 type ThemeListener = (theme: Theme) => void;

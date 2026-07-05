@@ -1,56 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
   <title id="title">Muster social preview</title>
-  <desc id="desc">Governed agent harness for production AI systems.</desc>
-  <defs>
-    <radialGradient id="glow1" cx="18%" cy="8%" r="70%">
-      <stop offset="0" stop-color="#C4B5FD" stop-opacity="0.95"/>
-      <stop offset="0.42" stop-color="#ECFEFF" stop-opacity="0.8"/>
-      <stop offset="1" stop-color="#F8F7F2"/>
-    </radialGradient>
-    <radialGradient id="glow2" cx="86%" cy="16%" r="72%">
-      <stop offset="0" stop-color="#67E8F9" stop-opacity="0.92"/>
-      <stop offset="0.42" stop-color="#F8F5FF" stop-opacity="0.72"/>
-      <stop offset="1" stop-color="#F8F7F2" stop-opacity="0"/>
-    </radialGradient>
-    <linearGradient id="accent" x1="688" y1="144" x2="1052" y2="500" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#A78BFA"/>
-      <stop offset="0.55" stop-color="#06B6D4"/>
-      <stop offset="1" stop-color="#14B8A6"/>
-    </linearGradient>
-    <filter id="shadow" x="-20%" y="-20%" width="150%" height="150%">
-      <feDropShadow dx="0" dy="24" stdDeviation="26" flood-color="#0F172A" flood-opacity="0.18"/>
-    </filter>
-  </defs>
-  <rect width="1200" height="630" rx="0" fill="#F8F7F2"/>
-  <rect width="1200" height="630" fill="url(#glow1)"/>
-  <rect width="1200" height="630" fill="url(#glow2)"/>
-  <g opacity="0.34" stroke="#0F172A" stroke-width="1">
-    <path d="M0 560H1200"/>
-    <path d="M0 492H1200"/>
-    <path d="M0 424H1200"/>
-    <path d="M0 356H1200"/>
-    <path d="M0 288H1200"/>
-    <path d="M0 220H1200"/>
-    <path d="M0 152H1200"/>
-  </g>
-  <g transform="translate(78 84)">
-    <text x="0" y="52" fill="#475569" font-family="JetBrains Mono, Menlo, monospace" font-size="27" font-weight="700">OPEN-SOURCE · TYPESCRIPT · MIT</text>
-    <text x="0" y="168" fill="#0F172A" font-family="Hanken Grotesk, Inter, Arial, sans-serif" font-size="76" font-weight="850">Governed agent</text>
-    <text x="0" y="250" fill="#0F172A" font-family="Hanken Grotesk, Inter, Arial, sans-serif" font-size="76" font-weight="850">harness for</text>
-    <text x="0" y="332" fill="#0F172A" font-family="Hanken Grotesk, Inter, Arial, sans-serif" font-size="76" font-weight="850">production AI systems.</text>
-    <text x="0" y="432" fill="#334155" font-family="Hanken Grotesk, Inter, Arial, sans-serif" font-size="31" font-weight="550">Scoped memory · token ledger · eval gates · MCP · Frappe / ERPNext</text>
-  </g>
-  <g transform="translate(848 132) scale(0.82)" filter="url(#shadow)">
-    <rect x="0" y="0" width="318" height="318" rx="74" fill="#FFFFFF" fill-opacity="0.54"/>
-    <path d="M58 228V90c0-18 13-31 31-31h10c14 0 25 7 32 19l28 50 28-50c7-12 18-19 32-19h10c18 0 31 13 31 31v138" fill="none" stroke="#0F172A" stroke-opacity="0.12" stroke-width="66" stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M58 228V90c0-18 13-31 31-31h10c14 0 25 7 32 19l28 50 28-50c7-12 18-19 32-19h10c18 0 31 13 31 31v138" fill="none" stroke="url(#accent)" stroke-width="40" stroke-linecap="round" stroke-linejoin="round"/>
-    <g fill="url(#accent)" stroke="#FFFFFF" stroke-width="9">
-      <circle cx="58" cy="228" r="34"/>
-      <circle cx="98" cy="60" r="34"/>
-      <circle cx="220" cy="60" r="34"/>
-      <circle cx="260" cy="228" r="34"/>
-    </g>
-    <circle cx="159" cy="128" r="24" fill="#0F172A" fill-opacity="0.9"/>
-    <circle cx="159" cy="128" r="11" fill="#67E8F9"/>
-  </g>
+  <desc id="desc">Muster control layer for AI agents.</desc>
+  <image href="muster-og.png" width="1200" height="630" preserveAspectRatio="xMidYMid slice"/>
 </svg>

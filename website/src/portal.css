@@ -113,7 +113,22 @@ a { color: inherit; text-decoration: none; }
   backdrop-filter: blur(18px) saturate(180%);
   -webkit-backdrop-filter: blur(18px) saturate(180%);
 }
-.brand { font-family: var(--display); font-weight: 700; font-size: 18px; letter-spacing: -0.02em; }
+.brand {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: clamp(112px, 14vw, 148px);
+  height: 32px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: #020205;
+}
+.brand img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
 .brand-dot { color: var(--accent); }
 .chip {
   font-family: var(--mono);
