@@ -221,7 +221,7 @@ import { createServer } from "node:http";
 import { createInterface, emitKeypressEvents, type Interface } from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
 import type { CapabilityPluginPolicy, ChatMessage, EvidenceRecord, FeedbackValue, FlowRunEvent, FlowRunState, FlowToolRegistry, McpServerConfig, MemoryScope, MessageRow, MigrationSource, RunOutcome } from "@musterhq/core";
-import type { GatewayConfig } from "@musterhq/gateway";
+import type { GatewayConfig, PairedIdentity } from "@musterhq/gateway";
 
 const originalEmitWarning = process.emitWarning.bind(process);
 process.emitWarning = ((warning: string | Error, ...warningArgs: Parameters<typeof process.emitWarning> extends [string | Error, ...infer Rest] ? Rest : never[]) => {
@@ -508,7 +508,7 @@ Usage:
   muster gateway daemon start|stop|status|restart [--with-telegram-poll] [--with-slack-socket]
   muster gateway webhook telegram --public-url https://your-domain.example
   muster gateway poll                 # local Telegram long-poll fallback; daemonize with gateway daemon start --with-telegram-poll
-  muster pairing list | approve <code>
+  muster pairing list | approve <code> [--frappe-site URL --frappe-token-env ENV | --frappe-user USER] [--employee EMP --role ROLE]
   muster flow replay <run-id> [--live-agents]
   muster flow diff <run-id-a> <run-id-b>
   muster flow loop <flow-id> --cron "0 9 * * 1"
@@ -702,6 +702,8 @@ const CHAT_COMMANDS: readonly ChatCommandDef[] = [
   { name: "scope", usage: "/scope <kind:id...|add kind:id|clear>", description: "set or inspect memory recall scopes" },
   { name: "scopes", usage: "/scopes", description: "show active memory recall scopes" },
   { name: "tools", usage: "/tools [toolset]", description: "list built-in toolsets and tools" },
+  { name: "whoami", usage: "/whoami", description: "show current local and connected identity context" },
+  { name: "reports", usage: "/reports", description: "show report, table, filter, and export workflows" },
   { name: "capabilities", usage: "/capabilities [query]", description: "find matching skills, plugins, and MCPs", aliases: ["capability", "caps"] },
   { name: "skills", usage: "/skills [id]", description: "show or enable built-in skills", aliases: ["skill"] },
   { name: "plugins", usage: "/plugins [id|reuse provider]", description: "show, enable, or reuse provider-authenticated plugins", aliases: ["plugin"] },
@@ -709,6 +711,11 @@ const CHAT_COMMANDS: readonly ChatCommandDef[] = [
   { name: "integrations", usage: "/integrations [id]", description: "guided channel/plugin/MCP setup workflow", aliases: ["integration"] },
   { name: "agents", usage: "/agents", description: "list configured runtimes and @agent ids" },
   { name: "tokens", usage: "/tokens [limit]", description: "show token ledger", aliases: ["usage", "ledger"] },
+  { name: "limits", usage: "/limits", description: "show rate-limit and token-budget control surfaces" },
+  { name: "security", usage: "/security", description: "show permission, approval, and audit controls" },
+  { name: "evals", usage: "/evals", description: "show eval gates for agents, tools, reports, and writes" },
+  { name: "index", usage: "/index", description: "show Frappe/read-model indexing controls" },
+  { name: "settings", usage: "/settings", description: "show response-style and assistant behavior controls" },
   { name: "goal", usage: "/goal [status]", description: "show active goal-loop retrieval and memory ledger" },
   { name: "receipt", usage: "/receipt [limit]", description: "show recent retrieval receipts and memory write decisions" },
   { name: "new", usage: "/new [name]", description: "start/switch to a fresh named chat and clear provider handles" },
@@ -1314,6 +1321,28 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
     case "tools":
       printChatTools(args);
       return true;
+    case "whoami":
+      printChatControlView("Identity", [
+        ["Profile", activeProfile()],
+        ["Session", state.sessionName],
+        ["Runtime", state.runtime ?? "default"],
+        ["Memory scopes", state.scopes.length ? state.scopes.map((scope) => `${scope.kind}:${scope.id}`).join(", ") : "session only"],
+      ], [
+        "When this chat is paired through a channel, Frappe User and Employee identity are resolved at the gateway.",
+        "Frappe-aware tools use that identity to decide which records, reports, and actions are visible.",
+      ]);
+      return true;
+    case "reports":
+      printChatControlView("Reports", [
+        ["Table controls", "filter, group, sort, drill down, export"],
+        ["Output types", "summary, table, Excel, PDF, report pack"],
+        ["Frappe links", "record links are attached after read/write actions"],
+        ["Follow-ups", "date range, department, employee, status, owner, company, branch"],
+      ], [
+        "Reports should start with the smallest allowed dataset, then let the user deep-dive without repeating context.",
+        "For channel users, managers and HRBPs see team/hierarchy reports only when their resolved Frappe permissions allow it.",
+      ]);
+      return true;
     case "capabilities":
     case "capability":
     case "caps":
@@ -1341,6 +1370,44 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
     case "usage":
     case "ledger":
       console.log(renderTokenTable(await listTokenRecords(), args ? Number(args) || 20 : 20));
+      return true;
+    case "limits":
+      printChatControlView("Limits", [
+        ["Scopes", "user, role, channel, department, agent, tenant"],
+        ["Budgets", "requests, tokens, artifacts, tool calls"],
+        ["Workflow", "preview impact before applying changes"],
+      ], ["Use this for enterprise controls; exact mutation should be gated by role and approval in connected channels."]);
+      return true;
+    case "security":
+      printChatControlView("Security", [
+        ["Pairing", "required before channel runs"],
+        ["Frappe RBAC", "Frappe remains the authorization authority"],
+        ["Writes", "permission preflight, preview, approval, verification"],
+        ["Audit", "token ledger, run ledger, document links, denied actions"],
+      ], ["If an action is not possible, the response should explain the exact reason and offer safe next steps."]);
+      return true;
+    case "evals":
+      printChatControlView("Evals", [
+        ["Permissions", "record visibility and hierarchy scope"],
+        ["CRUD", "mandatory fields, property setters, workflow transitions"],
+        ["Reports", "filters, totals, exports, document links"],
+        ["Security", "blocked prompts, leakage checks, approval gates"],
+      ], ["Promote department assistants and response profiles only after evals pass."]);
+      return true;
+    case "index":
+      printChatControlView("Index", [
+        ["Hot sync", "recent operational changes"],
+        ["Metadata", "DocTypes, fields, property setters, workflows"],
+        ["Permissions", "roles, employees, reporting hierarchy"],
+        ["Deep sync", "attachments, policies, SOPs"],
+      ], ["The fast path should use indexed/read-model answers first and call Frappe live only when needed."]);
+      return true;
+    case "settings":
+      printChatControlView("Settings", [
+        ["Response style", "concise, table-first, manager summary, audit-heavy"],
+        ["Default format", "direct answer, table, report pack, artifact"],
+        ["Safety level", "strict, balanced, read-only, approval-required"],
+      ], ["Department/team settings should preview impact before saving and stay permission-gated."]);
       return true;
     case "goal":
     case "receipt":
@@ -1382,6 +1449,17 @@ function printChatShortcuts(): void {
     `${color("@agent <task>".padEnd(18), "highlight")} route a turn with an agent id`,
     `${color("\\ at line end".padEnd(18), "highlight")} continue multiline input`,
     `${color("Ctrl+D".padEnd(18), "highlight")} exit on an empty line`,
+  ]);
+}
+
+function printChatControlView(
+  title: string,
+  rows: readonly (readonly [string, string])[],
+  notes: readonly string[] = [],
+): void {
+  printChatPanel(title, [
+    ...rows.map(([label, value]) => `${color(label.padEnd(18), "highlight")} ${value}`),
+    ...(notes.length ? ["", ...notes.map((note) => color(note, "dim"))] : []),
   ]);
 }
 
@@ -10281,18 +10359,133 @@ async function pairingCommand(commandArgs: string[]): Promise<void> {
       console.log(`pending code=${pending.code} surface=${pending.surfaceId} sender=${pending.senderId} requested=${pending.requestedAt}`);
     }
     for (const paired of store.paired) {
-      console.log(`paired  id=${paired.pairingId} surface=${paired.surfaceId} sender=${paired.senderId} approved=${paired.approvedAt}`);
+      const identity = paired.identity?.provider === "frappe"
+        ? ` frappe_user=${paired.identity.user} employee=${paired.identity.employee ?? "-"} roles=${paired.identity.roles.join(",") || "-"} site=${paired.identity.site}`
+        : "";
+      console.log(`paired  id=${paired.pairingId} surface=${paired.surfaceId} sender=${paired.senderId} approved=${paired.approvedAt}${identity}`);
     }
     return;
   }
   if (action === "approve" && code) {
-    const paired = await approvePairing(code);
+    const frappeUser = readFlag(commandArgs, "--frappe-user");
+    const frappeSite = readFlag(commandArgs, "--frappe-site");
+    const frappeTokenEnv = readFlag(commandArgs, "--frappe-token-env") ?? readFlag(commandArgs, "--frappe-api-token-env");
+    const employee = readFlag(commandArgs, "--employee");
+    const employeeName = readFlag(commandArgs, "--employee-name");
+    const department = readFlag(commandArgs, "--department");
+    const company = readFlag(commandArgs, "--company");
+    const roles = readFlags(commandArgs, "--role").flatMap((role) => role.split(",")).map((role) => role.trim()).filter(Boolean);
+    if (!frappeSite && (frappeUser || frappeTokenEnv)) {
+      throw new Error("Frappe identity pairing requires --frappe-site with --frappe-token-env or --frappe-user.");
+    }
+    const identity = frappeTokenEnv && frappeSite
+      ? await resolveFrappePairingIdentityFromTokenEnv(frappeSite, frappeTokenEnv)
+      : frappeUser && frappeSite
+        ? buildOperatorAssertedFrappeIdentity({ site: frappeSite, user: frappeUser, employee, employeeName, roles, department, company })
+        : undefined;
+    const paired = await approvePairing(code, process.cwd(), identity);
     console.log(`paired=${paired.pairingId}`);
     console.log(`surface=${paired.surfaceId}`);
     console.log(`sender=${paired.senderId}`);
+    if (paired.identity?.provider === "frappe") {
+      console.log(`frappe_user=${paired.identity.user}`);
+      console.log(`employee=${paired.identity.employee ?? "-"}`);
+      console.log(`roles=${paired.identity.roles.join(",") || "-"}`);
+      console.log(`site=${paired.identity.site}`);
+      console.log(`identity_proof=${paired.identity.authMode}`);
+    }
     return;
   }
-  throw new Error("Usage: muster pairing list | approve <code>");
+  throw new Error("Usage: muster pairing list | approve <code> [--frappe-site URL --frappe-token-env ENV | --frappe-user USER] [--employee EMP --role ROLE]");
+}
+
+function buildOperatorAssertedFrappeIdentity(input: {
+  readonly site: string;
+  readonly user: string;
+  readonly employee?: string;
+  readonly employeeName?: string;
+  readonly roles: readonly string[];
+  readonly department?: string;
+  readonly company?: string;
+}): Omit<PairedIdentity, "resolvedAt"> {
+  return withoutUndefined({
+    provider: "frappe" as const,
+    site: input.site,
+    user: input.user,
+    employee: input.employee,
+    employeeName: input.employeeName,
+    roles: input.roles,
+    department: input.department,
+    company: input.company,
+    authMode: "operator_asserted" as const,
+  });
+}
+
+async function resolveFrappePairingIdentityFromTokenEnv(site: string, envName: string): Promise<Omit<PairedIdentity, "resolvedAt">> {
+  const token = process.env[envName];
+  if (!token) throw new Error(`Missing ${envName}. Set it to a Frappe OAuth bearer token or API key:secret; the token will not be printed or stored.`);
+  const authHeader = token.includes(":") ? `token ${token}` : `Bearer ${token}`;
+  const request = async (path: string): Promise<Record<string, unknown>> => {
+    const response = await fetch(`${site.replace(/\/$/, "")}${path}`, {
+      headers: { Authorization: authHeader, Accept: "application/json" },
+    });
+    const text = await response.text();
+    let parsed: unknown = {};
+    try { parsed = text ? JSON.parse(text) : {}; } catch { parsed = {}; }
+    if (!response.ok) throw new Error(`Frappe identity request failed: HTTP ${response.status} ${extractCliFrappeMessage(parsed, text)}`);
+    return typeof parsed === "object" && parsed !== null ? parsed as Record<string, unknown> : {};
+  };
+  const userPayload = await request("/api/method/frappe.auth.get_logged_user");
+  const user = typeof userPayload.message === "string" && userPayload.message.trim() ? userPayload.message.trim() : "";
+  if (!user) throw new Error("Frappe get_logged_user returned no user for this token.");
+  const employeePayload = await request(`/api/resource/Employee?${new URLSearchParams({
+    fields: JSON.stringify(["name", "employee_name", "department", "company", "designation", "status"]),
+    filters: JSON.stringify([["user_id", "=", user]]),
+    limit_page_length: "1",
+  }).toString()}`).catch(() => ({}));
+  const employeeRows = getArrayField(employeePayload, "data");
+  const employeeRow = typeof employeeRows[0] === "object" && employeeRows[0] !== null
+    ? employeeRows[0] as Record<string, unknown>
+    : undefined;
+  const rolesPayload = await request(`/api/method/frappe.core.doctype.user.user.get_roles?${new URLSearchParams({ user }).toString()}`).catch(async () => {
+    const rows = await request(`/api/resource/Has%20Role?${new URLSearchParams({
+      fields: JSON.stringify(["role"]),
+      filters: JSON.stringify([["parent", "=", user]]),
+      limit_page_length: "200",
+    }).toString()}`).catch(() => ({}));
+    return { message: getArrayField(rows, "data").map((row: unknown) => typeof row === "object" && row !== null ? (row as Record<string, unknown>).role : undefined).filter(Boolean) };
+  });
+  const roles = Array.isArray(rolesPayload.message) ? [...new Set(rolesPayload.message.map(String).filter(Boolean))].sort() : [];
+  return withoutUndefined({
+    provider: "frappe" as const,
+    site,
+    user,
+    employee: typeof employeeRow?.name === "string" ? employeeRow.name : undefined,
+    employeeName: typeof employeeRow?.employee_name === "string" ? employeeRow.employee_name : undefined,
+    roles,
+    department: typeof employeeRow?.department === "string" ? employeeRow.department : undefined,
+    company: typeof employeeRow?.company === "string" ? employeeRow.company : undefined,
+    authMode: token.includes(":") ? "api_token" as const : "oauth_bearer" as const,
+  });
+}
+
+function extractCliFrappeMessage(body: unknown, rawText: string): string {
+  if (typeof body === "object" && body !== null) {
+    const record = body as Record<string, unknown>;
+    if (typeof record.exception === "string") return record.exception;
+    if (typeof record.message === "string") return record.message;
+  }
+  return rawText.slice(0, 200);
+}
+
+function getArrayField(value: unknown, key: string): unknown[] {
+  return typeof value === "object" && value !== null && Array.isArray((value as Record<string, unknown>)[key])
+    ? (value as Record<string, unknown>)[key] as unknown[]
+    : [];
+}
+
+function withoutUndefined<T extends Record<string, unknown>>(input: T): T {
+  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)) as T;
 }
 
 

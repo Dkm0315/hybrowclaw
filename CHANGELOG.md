@@ -6,6 +6,44 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-07-08
+
+Muster 0.1.11 is the Frappe-aware interaction release. It adds a lightweight,
+permission-sensitive chat command layer for enterprise channels and a Frappe
+interaction planner that guides CRUD/report workflows without sending every
+control question through the provider.
+
+### Added
+- Added gateway-level interaction cards for `/help`, `/start`, `/status`,
+  `/whoami`, `/tools`, `/reports`, `/tokens`, `/limits`, `/security`, `/evals`,
+  `/index`, and `/settings`, all without a `/muster` prefix.
+- Added Frappe User/Employee/role-aware command rendering so paired Slack,
+  Telegram, Google Chat, Teams, Discord, WhatsApp, and web senders see identity,
+  tool, report, security, and governance controls scoped to their resolved
+  Frappe context.
+- Added `frappe_chat_interaction_plan` to the Frappe capability pack for humane
+  guided CRUD/report UX: mandatory-field prompts, property-setter awareness,
+  preview-before-write safety, table/report next actions, and Frappe document
+  links.
+- Added CLI control views for the new enterprise surfaces so terminal users can
+  inspect identity, reports, rate limits, security, eval, indexing, and response
+  settings without knowing implementation details.
+
+### Changed
+- Moved channel built-in help/status UX from product-branded command lists to
+  generic enterprise controls that can be used naturally inside each connected
+  chat surface.
+- Kept Frappe as the authorization authority: the new interaction planner
+  prepares and explains actions, while permission checks and writes remain gated
+  by the existing Frappe safe-write flow.
+
+### Fixed
+- Prevented channel slash-command UX from implying a separate `/muster` command
+  namespace where the connected Frappe/channel context already determines which
+  tools and controls are available.
+- Added regression coverage for gateway command rendering, Frappe interaction
+  planning, and TUI command/control surfaces.
+
 ## [0.1.10] - 2026-07-05
 
 Muster 0.1.10 is the roster and integration-depth patch release. It turns the

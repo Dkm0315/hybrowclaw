@@ -22,7 +22,8 @@ export default defineConfig({
         guideMcpAgentHarness: resolve(__dirname, "guide-mcp-agent-harness.html"),
         guideFrappeAi: resolve(__dirname, "guide-frappe-ai.html"),
         guideGovernedMemory: resolve(__dirname, "guide-governed-memory.html"),
-        onboarding: resolve(__dirname, "onboarding.html")
+        onboarding: resolve(__dirname, "onboarding.html"),
+        spatial: resolve(__dirname, "spatial.html")
       }
     }
   }

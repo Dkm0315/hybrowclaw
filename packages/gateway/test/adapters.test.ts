@@ -403,7 +403,8 @@ test("telegram polling restart skips an already handled queued update", async ()
   await pollTelegram({ config: defaultConfig(), gateway, cwd, fetcher, log: () => {}, maxIterations: 1 });
 
   assert.equal(sends.length, 1, "a queued update already handled before restart is not replayed into the chat");
-  assert.match(sends[0], /muster commands:/);
+  assert.match(sends[0], /Commands/);
+  assert.match(sends[0], /\/tools/);
 });
 
 test("slack webhook answers url_verification with the challenge", async () => {

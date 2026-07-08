@@ -258,7 +258,8 @@ test("a paired sender's /help is answered by the gateway dispatcher, never the m
     const challenge = await (await send("hi")).json() as PairingChallenge;
     await approvePairing(challenge.code, cwd);
     const reply = await (await send("/help")).json() as SurfaceReply;
-    assert.match(reply.text, /\/start/, "builtin command list returned");
+    assert.match(reply.text, /\/tools/, "builtin command list returned");
+    assert.match(reply.text, /\/whoami/);
     assert.doesNotMatch(reply.text, /MODEL_WAS_CALLED/, "the model must NOT be invoked for a builtin command");
   } finally {
     await gw.close();
@@ -300,7 +301,7 @@ test("a paired sender's /new clears provider session handles without invoking th
     await approvePairing(challenge.code, cwd);
     const reply = await (await send("/new")).json() as SurfaceReply;
     assert.equal(modelCalls, 0);
-    assert.match(reply.text, /fresh muster thread/i);
+    assert.match(reply.text, /fresh thread/i);
     assert.equal(await loadSessionHandle("web:demo:c1", "codex", cwd), undefined);
     assert.equal(await loadSessionHandle("web:demo:c1", "claude", cwd), undefined);
   } finally {

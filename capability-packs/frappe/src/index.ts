@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * Frappe/ERPNext capability pack v0 — three real tools ported from the
  * production patterns in ../FRAPPE_SURFACE_SPEC.md and the
@@ -19,6 +21,8 @@
  *   FRAPPE_API_TOKEN api_key:api_secret ("token ..." auth) or a bare OAuth
  *                    bearer token ("Bearer ..." auth)
  */
+
+import { frappeFastRoute, frappeReadModelPlan } from "./read-model.js";
 
 export interface FrappeToolContext {
   readonly fetch?: typeof globalThis.fetch;
@@ -43,6 +47,61 @@ type FrappeHttpMethod = "GET" | "POST" | "PUT";
 type FrappeAuth =
   | { readonly kind: "token"; readonly value: string }
   | { readonly kind: "cookie"; readonly value: string };
+
+interface FrappeResolvedIdentity {
+  readonly site: string;
+  readonly authMode: "oauth_bearer" | "api_token" | "admin_login";
+  readonly user: string;
+  readonly employee?: {
+    readonly name: string;
+    readonly employeeName?: string;
+    readonly department?: string;
+    readonly company?: string;
+    readonly designation?: string;
+    readonly status?: string;
+  };
+  readonly roles: readonly string[];
+  readonly permissionScope: {
+    readonly user: string;
+    readonly employee?: string;
+    readonly roles: readonly string[];
+    readonly permissionHash: string;
+    readonly rolesHash: string;
+  };
+  readonly pairing: {
+    readonly recommendedScopeIds: readonly string[];
+    readonly channelSafe: boolean;
+    readonly proof: readonly string[];
+  };
+}
+
+type FrappeInteractionKind = "direct_answer" | "table_result" | "guided_crud" | "blocked" | "setup_required";
+
+interface FrappeInteractionPlan {
+  readonly kind: FrappeInteractionKind;
+  readonly title: string;
+  readonly message: string;
+  readonly reason?: string;
+  readonly doctype?: string;
+  readonly operation?: "read" | "create" | "update" | "submit" | "approve" | "reject";
+  readonly requiredFields: Array<{ readonly fieldname: string; readonly label: string; readonly reason: string; readonly options?: readonly string[] }>;
+  readonly table?: {
+    readonly columns: readonly string[];
+    readonly rows: readonly string[][];
+  };
+  readonly documentLinks: Array<{ readonly label: string; readonly doctype: string; readonly name: string; readonly url: string }>;
+  readonly next: Array<{ readonly label: string; readonly detail: string }>;
+  readonly renderHints: {
+    readonly phone: "numbered_actions" | "native_buttons_when_available";
+    readonly desktop: "clickable_table" | "side_panel_form";
+    readonly tui: "arrow_selectable";
+  };
+  readonly safety: {
+    readonly permissionCheckRequired: boolean;
+    readonly previewBeforeWrite: boolean;
+    readonly approvalRequired: boolean;
+  };
+}
 
 interface FrappeDocSource {
   readonly label: string;
@@ -378,6 +437,54 @@ export async function frappe_identity_resolve(
     return { error: `Frappe get_logged_user returned no user: ${JSON.stringify(result.data).slice(0, 200)}` };
   }
   return { user, site: context.config.FRAPPE_SITE_URL as string };
+}
+
+export async function frappe_user_identity_resolve(
+  args: Record<string, unknown>,
+  context: FrappeToolContext,
+): Promise<FrappeResolvedIdentity | FrappeError> {
+  const auth = await resolveRuntimeAuth(args, context);
+  if ("error" in auth) return auth;
+  const userResult = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", "/api/method/frappe.auth.get_logged_user");
+  if (!userResult.ok) return userResult;
+  const user = typeof userResult.data.message === "string" ? userResult.data.message : "";
+  if (!user) return { error: `Frappe get_logged_user returned no user: ${JSON.stringify(userResult.data).slice(0, 200)}` };
+
+  const employee = await resolveEmployeeForUser(auth, context, user);
+  if ("error" in employee) return employee;
+  const roles = await resolveRolesForUser(auth, context, user);
+  if ("error" in roles) return roles;
+  const employeeId = employee?.name;
+  const roleList = roles.roles;
+  const rolesHash = stableHash(roleList.join("|"));
+  const permissionHash = stableHash([auth.siteUrl, user, employeeId ?? "", ...roleList].join("|"));
+  return {
+    site: auth.siteUrl,
+    authMode: auth.mode === "api_token" && auth.auth.kind === "token" && !auth.auth.value.includes(":") ? "oauth_bearer" : auth.mode,
+    user,
+    ...(employee ? { employee } : {}),
+    roles: roleList,
+    permissionScope: {
+      user,
+      ...(employeeId ? { employee: employeeId } : {}),
+      roles: roleList,
+      permissionHash,
+      rolesHash,
+    },
+    pairing: {
+      recommendedScopeIds: [
+        `frappe-user:${user}`,
+        ...(employeeId ? [`frappe-employee:${employeeId}`] : []),
+        ...roleList.map((role) => `frappe-role:${role}`),
+      ],
+      channelSafe: true,
+      proof: [
+        "frappe.auth.get_logged_user",
+        employee ? "Employee.user_id lookup" : "Employee lookup returned no linked employee",
+        "frappe.core.doctype.user.user.get_roles",
+      ],
+    },
+  };
 }
 
 /**
@@ -1038,9 +1145,134 @@ export async function frappe_artifact_brief(
   };
 }
 
+export async function frappe_read_model_plan(
+  args: Record<string, unknown>,
+  _context: FrappeToolContext,
+): Promise<ReturnType<typeof frappeReadModelPlan>> {
+  return frappeReadModelPlan(args);
+}
+
+export async function frappe_fast_route(
+  args: Record<string, unknown>,
+  _context: FrappeToolContext,
+): Promise<ReturnType<typeof frappeFastRoute> | FrappeError> {
+  const prompt = argString(args, "prompt") ?? argString(args, "query");
+  if (!prompt) return { error: 'frappe_fast_route requires a "prompt" or "query" argument.' };
+  return frappeFastRoute({
+    prompt,
+    site: argString(args, "site") ?? argString(args, "siteUrl"),
+    user: argString(args, "user"),
+    roles: stringList(args.roles),
+    department: argString(args, "department"),
+    channel: argString(args, "channel"),
+    installedApps: stringList(args.installedApps),
+    heavyLifterApps: stringList(args.heavyLifterApps),
+    hasFreshIndex: args.hasFreshIndex === undefined ? undefined : booleanArg(args.hasFreshIndex),
+    hasLiveCredentials: booleanArg(args.hasLiveCredentials),
+  });
+}
+
+export async function frappe_chat_interaction_plan(
+  args: Record<string, unknown>,
+  _context: FrappeToolContext,
+): Promise<FrappeInteractionPlan | FrappeError> {
+  const prompt = argString(args, "prompt") ?? argString(args, "query") ?? "";
+  if (!prompt) return { error: 'frappe_chat_interaction_plan requires a "prompt" or "query" argument.' };
+  const siteUrl = argString(args, "site") ?? argString(args, "siteUrl") ?? argString(args, "frappeSiteUrl") ?? "";
+  const doctype = inferDoctype(prompt, args);
+  const operation = inferOperation(prompt);
+  const supplied = recordObject(args.values) ?? recordObject(args.doc) ?? {};
+  const requiredFields = requiredFieldsForInteraction(doctype, operation, args)
+    .filter((field) => !hasMeaningfulValue(supplied[field.fieldname]));
+  const documentLinks = documentLinksForInteraction(siteUrl, args);
+
+  if (booleanArg(args.blocked)) {
+    return {
+      kind: "blocked",
+      title: `Cannot ${operationLabel(operation)} ${doctype}`,
+      message: "I cannot move forward with this request yet.",
+      reason: argString(args.reason) ?? "The current Frappe permission, workflow, or validation state does not allow this action.",
+      doctype,
+      operation,
+      requiredFields: [],
+      documentLinks,
+      next: [
+        { label: "Show reason", detail: "Explain the permission, workflow, or validation blocker" },
+        { label: "Open related document", detail: "Open the Frappe record if you have access" },
+        { label: "Choose another action", detail: "Try a read-only summary, export, or request approval" },
+      ],
+      renderHints: defaultRenderHints(),
+      safety: safetyFor(operation),
+    };
+  }
+
+  if (operation !== "read" && requiredFields.length) {
+    return {
+      kind: "guided_crud",
+      title: `${operationTitle(operation)} ${doctype}`,
+      message: `I can help with this. To move forward with your request, I need the details Frappe requires before it will accept the ${doctype} ${operationLabel(operation)}.`,
+      doctype,
+      operation,
+      requiredFields,
+      documentLinks,
+      next: [
+        { label: "Provide missing details", detail: requiredFields.map((field) => field.label).join(", ") },
+        { label: "Preview before submitting", detail: "I will show the exact document fields before any write action" },
+        { label: "Cancel", detail: "Stop this request without changing Frappe" },
+      ],
+      renderHints: defaultRenderHints(),
+      safety: safetyFor(operation),
+    };
+  }
+
+  if (operation !== "read") {
+    return {
+      kind: "guided_crud",
+      title: `Review ${doctype}`,
+      message: `I have the required details. Before changing Frappe, I should show a preview and ask for confirmation.`,
+      doctype,
+      operation,
+      requiredFields: [],
+      table: {
+        columns: ["Field", "Value"],
+        rows: Object.entries(supplied).map(([key, value]) => [humanizeField(key), String(value)]),
+      },
+      documentLinks,
+      next: [
+        { label: "Submit", detail: "Run the permission preflight, then create or update the document" },
+        { label: "Edit details", detail: "Change one of the fields before submitting" },
+        { label: "Cancel", detail: "Stop this request without changing Frappe" },
+      ],
+      renderHints: defaultRenderHints(),
+      safety: safetyFor(operation),
+    };
+  }
+
+  return {
+    kind: "table_result",
+    title: reportTitleFor(prompt, doctype),
+    message: "I can show this as a table with filters, drilldowns, exports, and Frappe document links where records are available.",
+    doctype,
+    operation,
+    requiredFields: [],
+    table: sampleOrProvidedTable(args),
+    documentLinks,
+    next: [
+      { label: "Filter", detail: "Date range, department, employee, status, owner, company, branch" },
+      { label: "Group", detail: "Department, manager, status, month, workflow state" },
+      { label: "Sort", detail: "Newest, oldest, highest amount, pending first, exception first" },
+      { label: "Export", detail: "Excel, PDF, or report pack when allowed" },
+      { label: "Open in Frappe", detail: "Open the underlying document or list view" },
+    ],
+    renderHints: defaultRenderHints(),
+    safety: safetyFor(operation),
+  };
+}
+
 /** Loader entrypoint contract: tools record, registered as frappe-federated-bridge__<name>. */
 export const tools = {
   frappe_identity_resolve,
+  frappe_user_identity_resolve,
   frappe_semantic_data_resolve_lite,
   frappe_records_create,
   frappe_docs_context,
@@ -1051,10 +1283,173 @@ export const tools = {
   frappe_site_induction,
   frappe_query_classify,
   frappe_hybrid_retrieve,
+  frappe_read_model_plan,
+  frappe_fast_route,
+  frappe_chat_interaction_plan,
   frappe_permission_check,
   frappe_safe_write,
   frappe_artifact_brief,
 };
+
+function inferDoctype(prompt: string, args: Record<string, unknown>): string {
+  const explicit = argString(args, "doctype");
+  if (explicit) return explicit;
+  const lower = prompt.toLowerCase();
+  if (lower.includes("leave")) return "Leave Application";
+  if (lower.includes("attendance") || lower.includes("regularization") || lower.includes("regularisation")) return "Attendance Request";
+  if (lower.includes("expense")) return "Expense Claim";
+  if (lower.includes("ticket") || lower.includes("helpdesk")) return "HD Ticket";
+  if (lower.includes("task")) return "Task";
+  if (lower.includes("employee")) return "Employee";
+  return "Frappe Document";
+}
+
+function inferOperation(prompt: string): FrappeInteractionPlan["operation"] {
+  const lower = prompt.toLowerCase();
+  if (/\b(apply|create|raise|make|add|submit)\b/.test(lower)) return "create";
+  if (/\b(update|change|modify|edit)\b/.test(lower)) return "update";
+  if (/\bapprove\b/.test(lower)) return "approve";
+  if (/\breject\b/.test(lower)) return "reject";
+  return "read";
+}
+
+function requiredFieldsForInteraction(
+  doctype: string,
+  operation: FrappeInteractionPlan["operation"],
+  args: Record<string, unknown>,
+): Array<{ fieldname: string; label: string; reason: string; options?: readonly string[] }> {
+  if (operation === "read") return [];
+  const fromMeta = metadataRequiredFields(args);
+  const fromPropertySetters = propertySetterRequiredFields(args);
+  const fields = [...fromMeta, ...fromPropertySetters];
+  if (!fields.length && doctype === "Leave Application") {
+    fields.push(
+      { fieldname: "leave_type", label: "Leave type", reason: "Frappe needs the leave type to check balance and policy.", options: stringList(args.leaveTypes).length ? stringList(args.leaveTypes) : ["Casual Leave", "Sick Leave", "Earned Leave", "Leave Without Pay"] },
+      { fieldname: "from_date", label: "From date", reason: "Frappe needs the start date to calculate the leave duration." },
+      { fieldname: "to_date", label: "To date", reason: "Frappe needs the end date to calculate the leave duration." },
+      { fieldname: "description", label: "Reason", reason: "Your setup requires a reason before submission." },
+    );
+  }
+  if (!fields.length) {
+    fields.push({ fieldname: "name_or_subject", label: "Document details", reason: "Frappe needs the required fields for this DocType before it can save the document." });
+  }
+  return uniqueRequiredFields(fields);
+}
+
+function metadataRequiredFields(args: Record<string, unknown>): Array<{ fieldname: string; label: string; reason: string; options?: readonly string[] }> {
+  const fields = Array.isArray(args.fields) ? args.fields : Array.isArray(args.metaFields) ? args.metaFields : [];
+  return fields.flatMap((field) => {
+    const row = recordObject(field);
+    if (!row || !booleanish(row.reqd)) return [];
+    const fieldname = recordString(row, "fieldname");
+    if (!fieldname) return [];
+    return [{
+      fieldname,
+      label: recordString(row, "label") ?? humanizeField(fieldname),
+      reason: `Frappe marks ${recordString(row, "label") ?? fieldname} as mandatory for this DocType.`,
+      ...(recordString(row, "options") ? { options: recordString(row, "options")!.split("\n").map((item) => item.trim()).filter(Boolean) } : {}),
+    }];
+  });
+}
+
+function propertySetterRequiredFields(args: Record<string, unknown>): Array<{ fieldname: string; label: string; reason: string }> {
+  const setters = Array.isArray(args.propertySetters) ? args.propertySetters : [];
+  return setters.flatMap((setter) => {
+    const row = recordObject(setter);
+    if (!row) return [];
+    if (recordString(row, "property") !== "reqd" || !booleanish(row.value)) return [];
+    const fieldname = recordString(row, "field_name") ?? recordString(row, "fieldname");
+    if (!fieldname) return [];
+    return [{ fieldname, label: humanizeField(fieldname), reason: "This field is mandatory because of a Frappe Property Setter customization." }];
+  });
+}
+
+function uniqueRequiredFields(fields: Array<{ fieldname: string; label: string; reason: string; options?: readonly string[] }>): Array<{ fieldname: string; label: string; reason: string; options?: readonly string[] }> {
+  return [...new Map(fields.map((field) => [field.fieldname, field])).values()];
+}
+
+function documentLinksForInteraction(siteUrl: string, args: Record<string, unknown>): Array<{ label: string; doctype: string; name: string; url: string }> {
+  const docs = Array.isArray(args.documents) ? args.documents : [];
+  const fromDocs = docs.flatMap((doc) => {
+    const row = recordObject(doc);
+    if (!row) return [];
+    const doctype = recordString(row, "doctype") ?? recordString(row, "docType");
+    const name = recordString(row, "name") ?? recordString(row, "docname");
+    if (!siteUrl || !doctype || !name) return [];
+    return [{ label: `${doctype} ${name}`, doctype, name, url: frappeDeskUrl(siteUrl, doctype, name) }];
+  });
+  const doctype = argString(args, "doctype");
+  const docname = argString(args, "docname") ?? argString(args, "name");
+  if (siteUrl && doctype && docname) return [...fromDocs, { label: `${doctype} ${docname}`, doctype, name: docname, url: frappeDeskUrl(siteUrl, doctype, docname) }];
+  return fromDocs;
+}
+
+function frappeDeskUrl(siteUrl: string, doctype: string, name: string): string {
+  return `${siteUrl.replace(/\/$/, "")}/app/${slugifyDoctype(doctype)}/${encodeURIComponent(name)}`;
+}
+
+function slugifyDoctype(doctype: string): string {
+  return doctype.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+function operationLabel(operation: FrappeInteractionPlan["operation"]): string {
+  switch (operation) {
+    case "create": return "create";
+    case "update": return "update";
+    case "submit": return "submit";
+    case "approve": return "approve";
+    case "reject": return "reject";
+    case "read": return "read";
+  }
+}
+
+function operationTitle(operation: FrappeInteractionPlan["operation"]): string {
+  return operation === "create" ? "Create" : operation === "update" ? "Update" : operation === "approve" ? "Approve" : operation === "reject" ? "Reject" : "Open";
+}
+
+function safetyFor(operation: FrappeInteractionPlan["operation"]): FrappeInteractionPlan["safety"] {
+  const write = operation !== "read";
+  return { permissionCheckRequired: true, previewBeforeWrite: write, approvalRequired: write };
+}
+
+function defaultRenderHints(): FrappeInteractionPlan["renderHints"] {
+  return {
+    phone: "native_buttons_when_available",
+    desktop: "clickable_table",
+    tui: "arrow_selectable",
+  };
+}
+
+function sampleOrProvidedTable(args: Record<string, unknown>): FrappeInteractionPlan["table"] {
+  const table = recordObject(args.table);
+  const columns = Array.isArray(table?.columns) ? table.columns.map(String) : ["No", "Item", "Action"];
+  const rows = Array.isArray(table?.rows)
+    ? table.rows.map((row) => Array.isArray(row) ? row.map(String) : [String(row)])
+    : [["1", "Matching records", "Filter, open, export, or ask a follow-up"]];
+  return { columns, rows };
+}
+
+function reportTitleFor(prompt: string, doctype: string): string {
+  const lower = prompt.toLowerCase();
+  if (lower.includes("pending")) return `Pending ${doctype}`;
+  if (lower.includes("usage")) return `${doctype} Usage`;
+  if (lower.includes("summary")) return `${doctype} Summary`;
+  return `${doctype} Results`;
+}
+
+function humanizeField(fieldname: string): string {
+  return fieldname.replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function booleanish(value: unknown): boolean {
+  return value === true || value === 1 || value === "1" || value === "true" || value === "Yes" || value === "yes";
+}
+
+function hasMeaningfulValue(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value === "string") return value.trim().length > 0;
+  return true;
+}
 
 function modulePrior(module: string, apps: string[], doctypes: string[], concepts: string[]): FrappeModuleContext {
   const slug = module.toLowerCase().replace(/\s+/g, "-");
@@ -1076,6 +1471,77 @@ function stringList(value: unknown): string[] {
   if (Array.isArray(value)) return value.map(String).map((item) => item.trim()).filter(Boolean);
   if (typeof value === "string") return value.split(",").map((item) => item.trim()).filter(Boolean);
   return [];
+}
+
+async function resolveEmployeeForUser(
+  auth: { readonly siteUrl: string; readonly auth: FrappeAuth },
+  context: FrappeToolContext,
+  user: string,
+): Promise<FrappeResolvedIdentity["employee"] | FrappeError | undefined> {
+  const fields = ["name", "employee_name", "department", "company", "designation", "status"];
+  const query = new URLSearchParams({
+    fields: JSON.stringify(fields),
+    filters: JSON.stringify([["user_id", "=", user]]),
+    limit_page_length: "1",
+  });
+  const result = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", `/api/resource/Employee?${query.toString()}`);
+  if (!result.ok) {
+    if (result.status === 403) return undefined;
+    return result;
+  }
+  const rows = Array.isArray(result.data.data) ? result.data.data : [];
+  const first = recordObject(rows[0]);
+  if (!first) return undefined;
+  const name = recordString(first, "name");
+  if (!name) return undefined;
+  return {
+    name,
+    employeeName: recordString(first, "employee_name"),
+    department: recordString(first, "department"),
+    company: recordString(first, "company"),
+    designation: recordString(first, "designation"),
+    status: recordString(first, "status"),
+  };
+}
+
+async function resolveRolesForUser(
+  auth: { readonly siteUrl: string; readonly auth: FrappeAuth },
+  context: FrappeToolContext,
+  user: string,
+): Promise<{ roles: string[] } | FrappeError> {
+  const direct = await frappeAuthedRequest(
+    context.fetch!,
+    auth.siteUrl,
+    auth.auth,
+    "GET",
+    `/api/method/frappe.core.doctype.user.user.get_roles?${new URLSearchParams({ user }).toString()}`,
+  );
+  if (direct.ok) {
+    const message = direct.data.message;
+    const roles = Array.isArray(message) ? uniqueSorted(message.map(String)) : [];
+    if (roles.length) return { roles };
+  } else if (direct.status !== 403 && direct.status !== 404) {
+    return direct;
+  }
+
+  const childQuery = new URLSearchParams({
+    fields: JSON.stringify(["role"]),
+    filters: JSON.stringify([["parent", "=", user]]),
+    limit_page_length: "200",
+  });
+  const childRows = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", `/api/resource/Has%20Role?${childQuery.toString()}`);
+  if (!childRows.ok) {
+    if (childRows.status === 403 || childRows.status === 404) return { roles: [] };
+    return childRows;
+  }
+  const roles = Array.isArray(childRows.data.data)
+    ? uniqueSorted(childRows.data.data.map((row) => recordString(row, "role") ?? "").filter(Boolean))
+    : [];
+  return { roles };
+}
+
+function stableHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }
 
 function selectModulePriors(input: { readonly apps: readonly string[]; readonly modules: readonly string[]; readonly query: string }): FrappeModuleContext[] {

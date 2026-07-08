@@ -18,10 +18,11 @@
     "evals/identity-resolution.json",
     "evals/permission-scoping.json"
   ],
-  "digest": "sha256:7b99179983fa209b9f4acce67d4d08c007163be2efa7917f7c67296a8a4c17ea",
+  "digest": "sha256:4c5f0eb8d4db0d9a89a2661796bcb05363a69fd2b1dec702c9f98268f6480b72",
   "description": "Permission-scoped Frappe/ERPNext tools with federated OAuth identity. Every read and write executes as the paired Frappe user; Frappe remains the only authorization authority. The pack owns Frappe context induction so the main Muster binary stays light: site URL plus API token, or one-time admin login credentials, can discover installed apps/modules and combine live metadata with Frappe, ERPNext, and Frappe Suite docs.",
   "implementedTools": [
     "frappe_identity_resolve",
+    "frappe_user_identity_resolve",
     "frappe_semantic_data_resolve_lite",
     "frappe_records_create",
     "frappe_docs_context",
@@ -32,6 +33,9 @@
     "frappe_site_induction",
     "frappe_query_classify",
     "frappe_hybrid_retrieve",
+    "frappe_read_model_plan",
+    "frappe_fast_route",
+    "frappe_chat_interaction_plan",
     "frappe_permission_check",
     "frappe_safe_write",
     "frappe_artifact_brief"
@@ -42,7 +46,7 @@
     "frappe_records_update",
     "frappe_dataset_fetch_for_artifact"
   ],
-  "status": "v0.2: loads through the capability-pack loader (HC-012). The pack now includes site induction, query classification, hybrid graph/docs retrieval, permission checks, gated safe writes, and Frappe artifact briefs as pure {fetch, config}-context tools with exact Frappe error passthrough. Frappe remains the authorization authority; mutation execution requires explicit approval through frappe_safe_write.",
+  "status": "v0.5: loads through the capability-pack loader (HC-012). The pack now includes OAuth/API-token Frappe user identity plus Employee/role resolution, site induction, query classification, hybrid graph/docs retrieval, a sub-3s Frappe read-model plan, fast-route intent decisions, humane chat interaction plans for guided CRUD/report UX, permission checks, gated safe writes, and Frappe artifact briefs as pure {fetch, config}-context tools with exact Frappe error passthrough. Frappe remains the authorization authority; mutation execution requires explicit approval through frappe_safe_write.",
   "readiness": {
     "level": "verified",
     "status": "beta",
@@ -68,7 +72,7 @@
     "diagnostics": {
       "doctorCommand": "muster plugins check frappe-federated-bridge",
       "smokeCommand": "muster capability inspect capability-packs/frappe",
-      "latencyBudgetMs": 1000,
+      "latencyBudgetMs": 3000,
       "requiresLiveCredentials": true
     },
     "safety": {

@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Muster Control Atlas Prototype</title>
+  <meta name="description" content="A spatial control-atlas prototype for Muster, the governed agent harness for production AI systems." />
+  <meta name="robots" content="noindex, nofollow" />
+  <meta name="theme-color" content="#020205" />
+  <link rel="icon" href="/assets/brand/muster-mark.svg" />
+  <link rel="preconnect" href="https://api.fontshare.com" crossorigin />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=clash-display@600,700&f[]=hanken-grotesk@400,500,600,700&display=swap" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" />
+  <script type="module" src="/src/spatial.ts"></script>
+</head>
+<body class="spatial-body">
+  <canvas id="atlas-canvas" aria-hidden="true"></canvas>
+  <div class="cursor-light" aria-hidden="true"></div>
+  <div class="noise" aria-hidden="true"></div>
+
+  <header class="spatial-nav" aria-label="Prototype navigation">
+    <a class="spatial-brand" href="/" aria-label="Muster home">
+      <img src="/assets/brand/muster-logo.png" alt="Muster" />
+    </a>
+    <nav aria-label="Atlas stops">
+      <a href="#frappe">Frappe</a>
+      <a href="#memory">Memory</a>
+      <a href="#channels">Channels</a>
+      <a href="#artifacts">Artifacts</a>
+      <a href="#proof">Proof</a>
+    </nav>
+    <a class="nav-cta" href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+  </header>
+
+  <aside class="atlas-rail" aria-label="Journey progress">
+    <a href="#start"><span>00</span> Core</a>
+    <a href="#frappe"><span>01</span> Frappe</a>
+    <a href="#memory"><span>02</span> Memory</a>
+    <a href="#channels"><span>03</span> Channels</a>
+    <a href="#artifacts"><span>04</span> Artifacts</a>
+    <a href="#proof"><span>05</span> Evidence</a>
+  </aside>
+
+  <main>
+    <section class="journey-section hero-spatial" id="start" data-stop="core">
+      <div class="hero-copy panel-lift">
+        <p class="terminal-line">$ muster connect frappe</p>
+        <h1>The control atlas for production AI agents.</h1>
+        <p class="lead">
+          A spatial journey through the parts that matter: Frappe context, scoped memory,
+          channels, artifacts, policies, token visibility, and audit evidence.
+        </p>
+        <div class="hero-actions">
+          <a class="primary-action" href="#frappe">Take the tour</a>
+          <a class="secondary-action" href="/">Current site</a>
+        </div>
+      </div>
+
+      <div class="command-deck panel-lift" aria-label="Muster control deck preview">
+        <div class="deck-top">
+          <span>control core</span>
+          <span>live governance map</span>
+        </div>
+        <div class="deck-grid">
+          <div>
+            <small>scope</small>
+            <strong>site / role / user</strong>
+          </div>
+          <div>
+            <small>memory</small>
+            <strong>bounded recall</strong>
+          </div>
+          <div>
+            <small>channels</small>
+            <strong>paired surfaces</strong>
+          </div>
+          <div>
+            <small>ledger</small>
+            <strong>token receipt</strong>
+          </div>
+        </div>
+      </div>
+
+      <div class="scroll-cue">scroll to enter the atlas</div>
+    </section>
+
+    <section class="journey-section chapter chapter-left" id="frappe" data-stop="frappe">
+      <article class="journey-card panel-lift">
+        <span class="index">01 / Frappe</span>
+        <h2>Frappe becomes a permission map.</h2>
+        <p>
+          Muster should discover a site, understand installed apps, map DocTypes, roles,
+          reports, workflows, files, and custom fields, then answer through the same boundaries
+          the business already trusts.
+        </p>
+        <div class="feature-list">
+          <span>DocType-aware retrieval</span>
+          <span>Role-backed context</span>
+          <span>Workflow and report discovery</span>
+        </div>
+      </article>
+      <div class="site-panel panel-lift" aria-label="Frappe site status">
+        <div class="panel-head">
+          <strong>site status</strong>
+          <span>permission-aware</span>
+        </div>
+        <dl>
+          <div><dt>DocTypes</dt><dd>indexed by role</dd></div>
+          <div><dt>Fields</dt><dd>typed and searchable</dd></div>
+          <div><dt>Reports</dt><dd>linked to workflows</dd></div>
+          <div><dt>Files</dt><dd>scoped before recall</dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <section class="journey-section chapter chapter-right" id="memory" data-stop="memory">
+      <article class="journey-card panel-lift">
+        <span class="index">02 / Memory</span>
+        <h2>Memory gets useful only after it gets bounded.</h2>
+        <p>
+          Personal, project, department, and enterprise memory can coexist, but every recall
+          needs scope columns, provenance, age, source, and policy checks before it enters the prompt.
+        </p>
+        <div class="feature-list">
+          <span>Workspace and user scope</span>
+          <span>Session continuity</span>
+          <span>Leakage checks</span>
+        </div>
+      </article>
+      <div class="memory-stack panel-lift" aria-label="Memory stack">
+        <div><span>private</span><strong>personal recall</strong></div>
+        <div><span>team</span><strong>shared project context</strong></div>
+        <div><span>enterprise</span><strong>policy approved memory</strong></div>
+      </div>
+    </section>
+
+    <section class="journey-section chapter chapter-left" id="channels" data-stop="channels">
+      <article class="journey-card panel-lift">
+        <span class="index">03 / Channels</span>
+        <h2>One assistant, many governed surfaces.</h2>
+        <p>
+          Slack, Telegram, WhatsApp, Google Chat, Desk, CLI, and web embeds should inherit
+          identity, permissions, progress states, token limits, and artifact delivery.
+        </p>
+        <div class="channel-grid">
+          <span>Slack</span>
+          <span>Telegram</span>
+          <span>Google Chat</span>
+          <span>WhatsApp</span>
+          <span>Desk</span>
+          <span>CLI / TUI</span>
+        </div>
+      </article>
+    </section>
+
+    <section class="journey-section chapter chapter-right" id="artifacts" data-stop="artifacts">
+      <article class="journey-card panel-lift">
+        <span class="index">04 / Artifacts</span>
+        <h2>Artifacts should carry their receipt.</h2>
+        <p>
+          Documents, decks, spreadsheets, and PDFs become enterprise-safe when the output includes
+          the prompt, source context, permission boundary, token cost, and delivery trail.
+        </p>
+        <div class="artifact-shelf" aria-label="Artifact formats">
+          <span>PDF</span>
+          <span>DOCX</span>
+          <span>XLSX</span>
+          <span>PPTX</span>
+        </div>
+      </article>
+    </section>
+
+    <section class="journey-section proof" id="proof" data-stop="proof">
+      <div class="proof-panel panel-lift">
+        <span class="index">05 / Evidence</span>
+        <h2>Every run leaves evidence.</h2>
+        <p>
+          The differentiator is not “another agent.” It is a governed run: who asked, what was used,
+          which memory entered context, how many tokens were spent, what policy applied, and where
+          the artifact was delivered.
+        </p>
+        <div class="ledger">
+          <div><span>identity</span><strong>user and channel paired</strong></div>
+          <div><span>scope</span><strong>role-aware context</strong></div>
+          <div><span>tokens</span><strong>ledgered per run</strong></div>
+          <div><span>policy</span><strong>validated before action</strong></div>
+          <div><span>artifact</span><strong>delivered with receipt</strong></div>
+        </div>
+        <a class="big-cta" href="/">Back to current site</a>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

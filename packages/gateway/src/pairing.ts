@@ -23,6 +23,22 @@ export interface PairedSender {
   readonly surfaceId: string;
   readonly senderId: string;
   readonly approvedAt: string;
+  readonly identity?: PairedIdentity;
+}
+
+export interface PairedIdentity {
+  readonly provider: "frappe";
+  readonly site: string;
+  readonly user: string;
+  readonly employee?: string;
+  readonly employeeName?: string;
+  readonly roles: readonly string[];
+  readonly department?: string;
+  readonly company?: string;
+  readonly permissionHash?: string;
+  readonly rolesHash?: string;
+  readonly authMode?: "oauth_bearer" | "api_token" | "admin_login" | "operator_asserted";
+  readonly resolvedAt: string;
 }
 
 export interface PairingStore {
@@ -89,7 +105,7 @@ export async function requestPairing(surfaceId: string, senderId: string, cwd = 
 }
 
 /** Operator approval: move a pending pairing to paired and mint a pairingId. */
-export async function approvePairing(code: string, cwd = process.cwd()): Promise<PairedSender> {
+export async function approvePairing(code: string, cwd = process.cwd(), identity?: Omit<PairedIdentity, "resolvedAt"> & { readonly resolvedAt?: string }): Promise<PairedSender> {
   const store = await loadPairings(cwd);
   const pending = store.pending.find((entry) => entry.code === code.trim().toUpperCase());
   if (!pending) {
@@ -100,6 +116,7 @@ export async function approvePairing(code: string, cwd = process.cwd()): Promise
     surfaceId: pending.surfaceId,
     senderId: pending.senderId,
     approvedAt: new Date().toISOString(),
+    ...(identity ? { identity: { ...identity, roles: [...identity.roles].sort(), resolvedAt: identity.resolvedAt ?? new Date().toISOString() } } : {}),
   };
   await savePairings({
     pending: store.pending.filter((entry) => entry.code !== pending.code),
@@ -118,5 +135,15 @@ export function pairingScopes(paired: PairedSender): MemoryScope[] {
   return [
     { kind: "pairing", id: senderKey(paired.surfaceId, paired.senderId) },
     { kind: "user", id: paired.pairingId },
+    ...(paired.identity?.provider === "frappe" ? frappeIdentityScopes(paired.identity) : []),
+  ];
+}
+
+function frappeIdentityScopes(identity: PairedIdentity): MemoryScope[] {
+  return [
+    { kind: "tenant", id: identity.site },
+    { kind: "user", id: `frappe:${identity.user}` },
+    ...(identity.employee ? [{ kind: "user" as const, id: `frappe-employee:${identity.employee}` }] : []),
+    ...identity.roles.map((role) => ({ kind: "role" as const, id: `frappe:${identity.site}:${role}` })),
   ];
 }
