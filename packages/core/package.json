@@ -1,6 +1,6 @@
 {
   "name": "@musterhq/core",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "type": "module",
   "engines": {
     "node": ">=24"

@@ -58,3 +58,35 @@ test("pairingScopes grants exactly the pairing lane and the resolved user lane",
     { kind: "user", id: "pair_abcd1234" },
   ]);
 });
+
+test("approved pairings can carry Frappe user and employee identity scopes", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-pairing-frappe-"));
+  const pending = await requestPairing("slack:T024", "U1", cwd);
+  const paired = await approvePairing(pending.code, cwd, {
+    provider: "frappe",
+    site: "https://erp.example.test",
+    user: "dhairya@example.test",
+    employee: "EMP-0001",
+    employeeName: "Dhairya",
+    roles: ["HR User", "Employee"],
+    department: "People",
+    company: "Example",
+    permissionHash: "permhash",
+    rolesHash: "roleshash",
+    authMode: "oauth_bearer",
+  });
+  assert.equal(paired.identity?.provider, "frappe");
+  assert.equal(paired.identity?.user, "dhairya@example.test");
+  assert.deepEqual(paired.identity?.roles, ["Employee", "HR User"]);
+
+  const scopes = pairingScopes(paired);
+  assert.deepEqual(scopes, [
+    { kind: "pairing", id: "slack:T024:U1" },
+    { kind: "user", id: paired.pairingId },
+    { kind: "tenant", id: "https://erp.example.test" },
+    { kind: "user", id: "frappe:dhairya@example.test" },
+    { kind: "user", id: "frappe-employee:EMP-0001" },
+    { kind: "role", id: "frappe:https://erp.example.test:Employee" },
+    { kind: "role", id: "frappe:https://erp.example.test:HR User" },
+  ]);
+});

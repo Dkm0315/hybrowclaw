@@ -3,8 +3,96 @@
 The Frappe pack is not "a chatbot for ERPNext". It is an AI operating layer that
 sees what the user sees, knows how the site was customized, and remembers each
 employee separately — enforced by Muster's trust kernel, not by prompt hope.
-Reference deployment: Oxygen HR (uat-erp.pwhr.in) — thousands of employees,
-2,000+ custom fields, 926 property setters, custom workflows per module.
+
+Oxygen HR (uat-erp.pwhr.in) is a reference deployment and stress-test shape,
+not the boundary of the product. The pack must work for any Frappe bench:
+ERPNext, HRMS, Helpdesk, Raven, Gameplan, NextAI, ChatNext, and arbitrary
+custom apps that carry the real business logic. If a custom app is the heavy
+lifter, Muster should discover it, index it, respect its permissions, and route
+work to it instead of pretending every site is vanilla ERPNext.
+
+## 0. Speed Contract: Sub-3s or It Is Not Good Enough
+
+The user-facing SLA is hard:
+
+- deterministic greetings/help/status: target 250ms
+- indexed metadata/data answers: target 800ms
+- live Frappe reads or write preflights: target 2.5s
+- provider-backed reasoning: target 3s with a tiny context packet
+
+No "thinking" or progress text should appear before 1.2s, and it must never be
+used to hide a slow answer. The answer is the product.
+
+This requires a Frappe read model, not prompt stuffing:
+
+1. **Structure index**: DocTypes, DocFields, custom fields, property setters,
+   workflows, reports, print formats, dashboards, installed apps, app modules,
+   hooks/events, whitelisted methods, background jobs, and integration points.
+2. **Permission index**: roles, user permissions, field permlevels, workflow
+   action roles, shares, company/department/employee scoping.
+3. **Operational data index**: bounded summaries and facts for records users
+   commonly ask about: their tasks, approvals, tickets, leave, attendance,
+   expense claims, reports, and recent failures.
+4. **Semantic business index**: department vocabulary, custom app vocabulary,
+   and site-specific aliases:
+   "cab claim" -> Expense Claim, "holiday" -> Leave Application, "payslip" ->
+   Salary Slip, "ask nextai" -> the installed NextAI endpoint/tooling, plus
+   aliases learned from field labels, report names, workflow names, custom app
+   pages, whitelisted methods, and safe usage patterns.
+
+The data index is not a global answer cache. It is a Postgres-backed, scoped
+read model. Every candidate answer still checks the current Frappe permission
+hash before revealing records or fields.
+
+### Postgres Read Model
+
+Use Postgres for the low-latency operational read path:
+
+- `muster_frappe.site_index`: metadata and customization graph
+- `muster_frappe.permission_snapshot`: role/user permission hashes
+- `muster_frappe.operational_fact`: permission-scoped business facts
+- `muster_frappe.semantic_alias`: site and department vocabulary
+- `muster_frappe.query_plan_cache`: safe query/action plans, not private raw
+  answers
+
+Recommended indexes:
+
+- GIN full-text indexes for metadata/alias/fact search
+- `(site, owner_user, department, doctype, valid_until)` for hot user queries
+- `(site, permission_hash, roles_hash)` for permission cache invalidation
+- `(site, scope_hash, query_signature)` for query-plan reuse
+
+### Cron + Delta Sync
+
+Cron is a safety net; Frappe document events keep the read model fresh.
+
+- every minute: roles, user permissions, shares, workflows, custom fields,
+  property setters
+- every two minutes: hot operational records for paired users/departments
+- every five minutes: aliases from usage, fields, reports, workflows
+- nightly: full site induction, leakage evals, p95 report, stale index repair
+
+Delta events should enqueue small updates for DocType, Custom Field, Property
+Setter, Workflow, Report, Print Format, Role, Has Role, User Permission,
+DocShare, installed-app metadata, scheduled jobs, whitelisted methods, custom
+page routes, and indexed business DocTypes.
+
+### Fast Answer Router
+
+Before any provider call:
+
+1. classify the prompt
+2. resolve department language to candidate DocTypes/actions
+3. check index freshness and permission hashes
+4. choose one path:
+   - deterministic answer
+   - indexed data answer
+   - live Frappe query/preflight
+   - provider with tiny context
+
+Provider calls are the last mile, not the default path. The provider receives a
+small packet containing intent, candidate DocTypes, allowed fields, missing
+inputs, exact Frappe errors, and the answer goal.
 
 ## 1. Screen Context Protocol (the "it picks up the current screen" layer)
 
@@ -35,9 +123,37 @@ Key properties: session-scoped + short TTL (screen context is perishable),
 redacted client-side, and the agent receives it through normal recall — so
 "why can't I save this?" is answered from the user's ACTUAL screen state.
 
-## 2. Customization Core (proven in production, being ported)
+## 1A. User and Employee Identity
 
-The `frappe_customization_context` engine already running on Oxygen HR:
+Channel users are not trusted just because Slack, Telegram, Google Chat, or
+WhatsApp delivered a message. The identity chain is:
+
+1. channel sender creates a pending Muster pairing
+2. operator approves the pairing
+3. Frappe identity is resolved through OAuth bearer token or API token using
+   `frappe.auth.get_logged_user`
+4. linked Employee is resolved through `Employee.user_id`
+5. roles are resolved from Frappe
+6. permission/role hashes become the cache invalidation keys for the read model
+
+This gives each channel turn a concrete business identity:
+
+- `pairing:<surface>:<sender>` for channel continuity
+- `user:<pairing-id>` for legacy Muster continuity
+- `tenant:<site>` for site-scoped approved knowledge
+- `user:frappe:<frappe-user>` for Frappe user memory
+- `user:frappe-employee:<employee-id>` for employee-specific memory
+- `role:frappe:<site>:<role>` for role-scoped memory and budget reports
+
+OAuth is preferred because the token proves the Frappe user without storing a
+password. API tokens are supported for service/admin setups. Manual operator
+assertion is allowed for controlled demos and air-gapped deployments, but it is
+marked as `operator_asserted`, not as OAuth proof.
+
+## 2. Customization Core (bench-wide, not app-specific)
+
+The `frappe_customization_context` engine shape from Oxygen HR becomes a generic
+bench induction layer:
 - Read-only, permission-scoped map of custom fields, property setters,
   workflows, server/client scripts, print formats, reports, DocPerms,
   assignment rules — by doctype, module, app, or free-text flow.
@@ -45,6 +161,10 @@ The `frappe_customization_context` engine already running on Oxygen HR:
   Salary Slip only if that doctype exists on THIS site).
 - Error-aware fetch diagnostics: the agent reports the exact blocker
   ("Expense Claim Type Cab/Taxi has no default account") — never "malformed data".
+- Custom app handoff: if apps such as NextAI, ChatNext, OxygenHR, or an
+  industry-specific app own the right endpoint, report, method, workflow, or
+  DocType, Muster routes through that app's exposed surface with the same
+  permission checks instead of duplicating its business logic.
 
 ## 3. Per-employee memory lanes (thousands of users, zero leaks)
 

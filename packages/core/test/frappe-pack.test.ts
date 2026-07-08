@@ -7,7 +7,11 @@ import { test } from "node:test";
 import { defaultConfig, loadCapabilityPack, parseFlow, runFlow } from "../src/index.js";
 import type { FlowToolRegistry } from "../src/index.js";
 import {
+  frappe_chat_interaction_plan,
+  frappe_fast_route,
   frappe_identity_resolve,
+  frappe_read_model_plan,
+  frappe_user_identity_resolve,
   frappe_records_create,
   frappe_semantic_data_resolve_lite,
   tools as frappeTools,
@@ -50,6 +54,19 @@ function startFrappeStub(): Promise<{ url: string; requests: RecordedRequest[]; 
         }
         if (url.startsWith("/api/method/frappe.auth.get_logged_user")) {
           return respond(200, { message: "dhairya@hybrowlabs.com" });
+        }
+        if (url.startsWith("/api/method/frappe.core.doctype.user.user.get_roles")) {
+          return respond(200, { message: ["Employee", "HR User"] });
+        }
+        if (url.startsWith("/api/resource/Employee")) {
+          return respond(200, { data: [{
+            name: "EMP-0001",
+            employee_name: "Dhairya Marwaha",
+            department: "People",
+            company: "HyBrowLabs",
+            designation: "Founder",
+            status: "Active",
+          }] });
         }
         if (url.startsWith("/api/method/frappe.utils.change_log.get_versions")) {
           return respond(200, { message: { frappe: { version: "15.42.0" }, erpnext: { version: "15.38.1" }, hrms: { version: "16.0.0" } } });
@@ -211,6 +228,108 @@ test("frappe_identity_resolve returns the logged user with token auth", async ()
   } finally {
     site.close();
   }
+});
+
+test("frappe_user_identity_resolve proves OAuth/API identity and maps Employee plus roles", async () => {
+  const site = await startFrappeStub();
+  try {
+    const result = await frappe_user_identity_resolve({}, {
+      fetch,
+      config: { FRAPPE_SITE_URL: site.url, FRAPPE_API_TOKEN: "oauth-access-token" },
+    });
+    assert.equal("error" in result, false);
+    if ("error" in result) return;
+    assert.equal(result.authMode, "oauth_bearer");
+    assert.equal(result.user, "dhairya@hybrowlabs.com");
+    assert.equal(result.employee?.name, "EMP-0001");
+    assert.equal(result.employee?.department, "People");
+    assert.deepEqual(result.roles, ["Employee", "HR User"]);
+    assert.equal(result.permissionScope.employee, "EMP-0001");
+    assert.match(result.permissionScope.permissionHash, /^[0-9a-f]{16}$/);
+    assert.deepEqual(result.pairing.recommendedScopeIds, [
+      "frappe-user:dhairya@hybrowlabs.com",
+      "frappe-employee:EMP-0001",
+      "frappe-role:Employee",
+      "frappe-role:HR User",
+    ]);
+    assert.doesNotMatch(JSON.stringify(result), /oauth-access-token/);
+    assert.equal(site.requests.some((request) => request.authorization === "Bearer oauth-access-token"), true);
+  } finally {
+    site.close();
+  }
+});
+
+test("frappe_fast_route keeps greetings off the provider path", async () => {
+  const result = await frappe_fast_route(
+    { prompt: "hi", site: "https://uat-erp.pwhr.in", user: "pradip.irkar@pw.live", hasFreshIndex: true },
+    contextFor("http://127.0.0.1:9"),
+  );
+  assert.equal("error" in result, false);
+  if ("error" in result) return;
+  assert.equal(result.intent, "greeting");
+  assert.equal(result.answerPath, "deterministic");
+  assert.equal(result.invokeProvider, false);
+  assert.equal(result.showProgress, false);
+  assert.equal(result.targetLatencyMs <= 250, true);
+});
+
+test("frappe_fast_route maps department language to Frappe actions without hardcoded answers", async () => {
+  const result = await frappe_fast_route(
+    {
+      prompt: "Put in a cab reimbursement claim for yesterday for 850 rupees",
+      site: "https://uat-erp.pwhr.in",
+      user: "employee@example.test",
+      roles: ["Employee"],
+      department: "Finance",
+      hasFreshIndex: true,
+      hasLiveCredentials: true,
+    },
+    contextFor("http://127.0.0.1:9"),
+  );
+  assert.equal("error" in result, false);
+  if ("error" in result) return;
+  assert.equal(result.intent, "record_create");
+  assert.equal(result.invokeProvider, false);
+  assert.equal(result.answerPath, "live_frappe");
+  assert.deepEqual(result.candidateDoctypes, ["Expense Claim"]);
+  assert.match(result.requiredChecks.join(","), /write_preflight/);
+  assert.equal(result.targetLatencyMs <= 3000, true);
+});
+
+test("frappe_read_model_plan defines Postgres-backed operational indexes and cron", async () => {
+  const plan = await frappe_read_model_plan({ site: "https://uat-erp.pwhr.in" }, contextFor("http://127.0.0.1:9"));
+  assert.equal(plan.goal, "sub_3s_permission_backed_operational_answers");
+  assert.equal(plan.latencyBudgetMs.providerTinyContext, 3000);
+  assert.equal(plan.stores.some((store) => store.id === "operational_data_index"), true);
+  assert.equal(plan.stores.some((store) => store.id === "semantic_business_index"), true);
+  assert.equal(plan.stores.some((store) => store.examples.some((example) => example.includes("installed apps"))), true);
+  assert.equal(plan.cron.some((job) => job.id === "frappe_operational_hot_sync"), true);
+  assert.equal(plan.cron.some((job) => job.target.includes("whitelisted methods")), true);
+  assert.equal(plan.postgres.ddl.some((sql) => sql.includes("muster_frappe.operational_fact")), true);
+  assert.equal(plan.postgres.indexes.some((sql) => sql.includes("using gin")), true);
+  assert.match(plan.safetyInvariants.join("\n"), /Every candidate record is filtered by current Frappe permission/);
+});
+
+test("frappe_fast_route treats custom apps like NextAI as available Frappe surfaces, not product boundaries", async () => {
+  const result = await frappe_fast_route(
+    {
+      prompt: "Ask NextAI to summarize the payroll exception pattern",
+      site: "https://erp.example.test",
+      user: "ops@example.test",
+      roles: ["System Manager"],
+      installedApps: ["erpnext", "nextai", "oxygenhr"],
+      heavyLifterApps: ["nextai"],
+      hasFreshIndex: true,
+      hasLiveCredentials: true,
+    },
+    contextFor("http://127.0.0.1:9"),
+  );
+  assert.equal("error" in result, false);
+  if ("error" in result) return;
+  assert.equal(result.invokeProvider, false);
+  assert.deepEqual(result.minimalContext.installedApps, ["erpnext", "nextai", "oxygenhr"]);
+  assert.deepEqual(result.minimalContext.heavyLifterApps, ["nextai"]);
+  assert.match(JSON.stringify(result.minimalContext.matchedAliases), /NextAI/);
 });
 
 test("frappe_semantic_data_resolve_lite lists resources with fields/filters/limit", async () => {
@@ -487,6 +606,53 @@ test("frappe_artifact_brief emits fixture/live metadata linking site, user, DocT
   assert.match(String(artifact.content), /HR Manager can read and write Leave Application/);
 });
 
+test("frappe_chat_interaction_plan asks humane missing-field questions for leave CRUD", async () => {
+  const plan = await frappe_chat_interaction_plan({
+    prompt: "I want to apply leave for 9th",
+    siteUrl: "https://erp.example.test",
+    values: { from_date: "2026-07-09", to_date: "2026-07-09" },
+    leaveTypes: ["Casual Leave", "Sick Leave"],
+  }, { config: {} });
+
+  assert.equal(plan.kind, "guided_crud");
+  assert.equal(plan.doctype, "Leave Application");
+  assert.equal(plan.operation, "create");
+  assert.match(plan.message, /To move forward with your request/);
+  assert.deepEqual(plan.requiredFields.map((field) => field.fieldname), ["leave_type", "description"]);
+  assert.deepEqual(plan.requiredFields[0].options, ["Casual Leave", "Sick Leave"]);
+  assert.equal(plan.safety.previewBeforeWrite, true);
+  assert.equal(plan.renderHints.phone, "native_buttons_when_available");
+});
+
+test("frappe_chat_interaction_plan respects metadata and property-setter mandatory fields", async () => {
+  const plan = await frappe_chat_interaction_plan({
+    prompt: "create a leave request",
+    doctype: "Leave Application",
+    values: { leave_type: "Casual Leave", from_date: "2026-07-09", to_date: "2026-07-09", description: "Personal work" },
+    fields: [{ fieldname: "employee", label: "Employee", reqd: 1 }],
+    propertySetters: [{ field_name: "backup_person", property: "reqd", value: "1" }],
+  }, { config: {} });
+
+  assert.equal(plan.kind, "guided_crud");
+  assert.deepEqual(plan.requiredFields.map((field) => field.fieldname), ["employee", "backup_person"]);
+  assert.match(plan.requiredFields[1].reason, /Property Setter/);
+});
+
+test("frappe_chat_interaction_plan attaches Frappe document links and report next steps", async () => {
+  const plan = await frappe_chat_interaction_plan({
+    prompt: "show pending leaves for my team",
+    siteUrl: "https://erp.example.test",
+    documents: [{ doctype: "Leave Application", name: "HR-LAP-0001" }],
+    table: { columns: ["Employee", "Status"], rows: [["Amit Sharma", "Pending"]] },
+  }, { config: {} });
+
+  assert.equal(plan.kind, "table_result");
+  assert.equal(plan.documentLinks[0].url, "https://erp.example.test/app/leave-application/HR-LAP-0001");
+  assert.ok(plan.next.some((action) => action.label === "Filter"));
+  assert.ok(plan.next.some((action) => action.label === "Export"));
+  assert.deepEqual(plan.table?.rows, [["Amit Sharma", "Pending"]]);
+});
+
 test("the frappe pack loads through loadCapabilityPack and runs inside a flow", async () => {
   const site = await startFrappeStub();
   try {
@@ -501,19 +667,23 @@ test("the frappe pack loads through loadCapabilityPack and runs inside a flow", 
       [...loaded.toolNames].sort(),
       [
         "frappe-federated-bridge__frappe_artifact_brief",
+        "frappe-federated-bridge__frappe_chat_interaction_plan",
         "frappe-federated-bridge__frappe_context_build",
         "frappe-federated-bridge__frappe_context_setup_plan",
         "frappe-federated-bridge__frappe_docs_context",
+        "frappe-federated-bridge__frappe_fast_route",
         "frappe-federated-bridge__frappe_hybrid_retrieve",
         "frappe-federated-bridge__frappe_identity_resolve",
         "frappe-federated-bridge__frappe_installed_context",
         "frappe-federated-bridge__frappe_module_context",
         "frappe-federated-bridge__frappe_permission_check",
         "frappe-federated-bridge__frappe_query_classify",
+        "frappe-federated-bridge__frappe_read_model_plan",
         "frappe-federated-bridge__frappe_records_create",
         "frappe-federated-bridge__frappe_safe_write",
         "frappe-federated-bridge__frappe_semantic_data_resolve_lite",
         "frappe-federated-bridge__frappe_site_induction",
+        "frappe-federated-bridge__frappe_user_identity_resolve",
       ].sort(),
     );
 

@@ -404,7 +404,7 @@ export async function handleSurfaceMessage(
   // with NO model call; prompt-dispatch skills rewrite the prompt, and unknown
   // commands fall through to the native provider CLI.
   const sessionKey = conversationSessionId(message);
-  const command = await dispatchCommand(message, { config: options.config, profile, paired, cwd, conversationKey: sessionKey });
+  const command = await dispatchCommand(message, { config: options.config, profile, paired, gateway: options.gateway, cwd, conversationKey: sessionKey });
   if (command) return command;
   const governanceReply = gatewayGovernancePreflight(message, paired, options.gateway);
   if (governanceReply) return governanceReply;

@@ -1739,6 +1739,56 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(gchatSetup.stdout, /webhook_url=https:\/\/chat\.example\.test\/v1\/adapters\/gchat/);
   assert.match(gchatSetup.stdout, /setup_url=https:\/\/console\.cloud\.google\.com\/apis\/library\/chat\.googleapis\.com/);
 
+  const frappeIdentityStub = await new Promise<{ url: string; close: () => Promise<void> }>((resolvePromise) => {
+    const server = createServer((request, response) => {
+      const auth = request.headers.authorization;
+      const respond = (payload: unknown) => {
+        response.writeHead(auth === "Bearer test-oauth-token" ? 200 : 401, { "content-type": "application/json" });
+        response.end(JSON.stringify(auth === "Bearer test-oauth-token" ? payload : { exception: "AuthenticationError" }));
+      };
+      const url = request.url ?? "";
+      if (url.startsWith("/api/method/frappe.auth.get_logged_user")) return respond({ message: "dhairya@example.test" });
+      if (url.startsWith("/api/resource/Employee")) return respond({ data: [{ name: "EMP-0001", employee_name: "Dhairya", department: "People", company: "Example" }] });
+      if (url.startsWith("/api/method/frappe.core.doctype.user.user.get_roles")) return respond({ message: ["HR User", "Employee"] });
+      return respond({ data: [] });
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      assert.equal(typeof address, "object");
+      assert.ok(address);
+      resolvePromise({
+        url: `http://127.0.0.1:${address.port}`,
+        close: () => new Promise((resolveClose) => server.close(() => resolveClose())),
+      });
+    });
+  });
+  try {
+    await mkdir(join(cwd, ".muster", "data"), { recursive: true });
+    await writeFile(join(cwd, ".muster", "data", "pairings.json"), JSON.stringify({
+      pending: [{ code: "ABCD2345", surfaceId: "slack:T024", senderId: "U123", requestedAt: "2026-07-07T00:00:00.000Z" }],
+      paired: [],
+    }, null, 2), "utf8");
+    const pairedFrappe = await runCli([
+      "pairing",
+      "approve",
+      "ABCD2345",
+      "--frappe-site",
+      frappeIdentityStub.url,
+      "--frappe-token-env",
+      "MUSTER_TEST_FRAPPE_TOKEN",
+    ], cwd, { MUSTER_TEST_FRAPPE_TOKEN: "test-oauth-token" });
+    assert.match(pairedFrappe.stdout, /paired=pair_[0-9a-f]{8}/);
+    assert.match(pairedFrappe.stdout, /frappe_user=dhairya@example\.test/);
+    assert.match(pairedFrappe.stdout, /employee=EMP-0001/);
+    assert.match(pairedFrappe.stdout, /roles=Employee,HR User/);
+    assert.match(pairedFrappe.stdout, /identity_proof=oauth_bearer/);
+    assert.doesNotMatch(pairedFrappe.stdout, /test-oauth-token/);
+    const pairingsList = await runCli(["pairing", "list"], cwd);
+    assert.match(pairingsList.stdout, /frappe_user=dhairya@example\.test employee=EMP-0001 roles=Employee,HR User site=http:\/\/127\.0\.0\.1:\d+/);
+  } finally {
+    await frappeIdentityStub.close();
+  }
+
   const integrationGuide = await runCli(["integrations"], cwd);
   assert.match(integrationGuide.stdout, /Muster integrations/);
   assert.match(integrationGuide.stdout, /channel\tgchat\tneeds setup\tmuster channels ready gchat/);

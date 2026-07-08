@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Muster Roadmap Control - evidence-based release planning</title>
+  <meta name="description" content="Muster Roadmap Control is an evidence-based release cockpit for tracking epics, stories, tasks, QA gates, risks, dependencies, and changelog claims." />
+  <meta name="robots" content="index, follow, max-image-preview:large" />
+  <meta name="theme-color" content="#F0EEE9" />
+  <link rel="canonical" href="https://themuster.dev/roadmap.html" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23F0EEE9'/%3E%3Ccircle cx='10' cy='10' r='3' fill='%23A78BFA'/%3E%3Ccircle cx='22' cy='10' r='3' fill='%2306B6D4'/%3E%3Ccircle cx='10' cy='22' r='3' fill='%2306B6D4'/%3E%3Ccircle cx='22' cy='22' r='3' fill='%23A78BFA'/%3E%3C/svg%3E" />
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem("muster-theme");
+        var dark = saved ? saved === "dark"
+          : matchMedia("(prefers-color-scheme: dark)").matches;
+        if (dark) document.documentElement.setAttribute("data-theme", "dark");
+      } catch (e) {}
+    })();
+  </script>
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Muster Roadmap Control" />
+  <meta property="og:description" content="Evidence-based release planning for Muster: epics, stories, QA gates, risks, dependencies, and changelog claims." />
+  <meta property="og:url" content="https://themuster.dev/roadmap.html" />
+  <meta property="og:image" content="https://themuster.dev/assets/brand/muster-og.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Muster Roadmap Control" />
+  <meta name="twitter:description" content="A release cockpit for proof-driven roadmap execution." />
+  <meta name="twitter:image" content="https://themuster.dev/assets/brand/muster-og.png" />
+  <link rel="preconnect" href="https://api.fontshare.com" crossorigin />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=clash-display@600,700&f[]=hanken-grotesk@400,500,600,700&display=swap" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" />
+  <script type="module" src="/src/roadmap.ts"></script>
+</head>
+<body class="roadmap-body">
+  <div class="roadmap-app">
+    <header class="roadmap-top">
+      <a class="brand" href="/">muster<span class="brand-dot">_</span></a>
+      <nav class="roadmap-nav" aria-label="Site">
+        <a href="/">Home</a>
+        <a href="/roadmap.html" class="active" aria-current="page">Roadmap</a>
+        <a href="/portal.html">Portal</a>
+        <a href="/docs.html">Docs</a>
+        <a href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+      </nav>
+      <button class="theme-toggle" data-theme-toggle type="button" aria-label="Toggle dark mode" title="Toggle dark mode">
+        <svg class="ico-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.2" fill="currentColor"/><g stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 2.4v2.6M12 19v2.6M4.6 4.6l1.9 1.9M17.5 17.5l1.9 1.9M2.4 12h2.6M19 12h2.6M4.6 19.4l1.9-1.9M17.5 6.5l1.9-1.9"/></g></svg>
+        <svg class="ico-moon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20.5 14.3A8.4 8.4 0 0 1 9.7 3.5a.7.7 0 0 0-.93-.86A9.4 9.4 0 1 0 21.4 15.2a.7.7 0 0 0-.9-.9z"/></svg>
+      </button>
+      <span class="top-status mono">control room · draft v0</span>
+    </header>
+
+    <section class="roadmap-brief" aria-label="Roadmap brief">
+      <div>
+        <p class="brief-kicker mono">Release Control Room</p>
+        <h1>Evidence-based roadmap execution for Muster.</h1>
+        <p>Track every quarter, epic, story, task, QA gate, risk, dependency, and changelog claim from one operating surface.</p>
+      </div>
+      <div class="brief-actions">
+        <button class="action-btn primary" id="copy-summary">Copy executive summary</button>
+        <button class="action-btn" id="focus-release">Focus current release</button>
+      </div>
+    </section>
+
+    <main class="roadmap-shell">
+      <aside class="release-rail" aria-label="Releases">
+        <div class="rail-title">
+          <span class="mono">quarters</span>
+          <strong id="release-count"></strong>
+        </div>
+        <div id="release-list"></div>
+        <div class="sites-note">
+          <span class="mono">Sites-ready seam</span>
+          <p>Static data today. D1 records and R2 evidence files later.</p>
+        </div>
+      </aside>
+
+      <section class="workbench">
+        <div class="workbench-top">
+          <div>
+            <p class="mono surface-label" id="current-release-label"></p>
+            <h2 id="current-view-title">Board</h2>
+          </div>
+          <div class="filters" aria-label="Roadmap filters">
+            <label>
+              <span class="mono">search</span>
+              <input id="search-input" type="search" placeholder="epic, task, owner, evidence" />
+            </label>
+            <label>
+              <span class="mono">owner</span>
+              <select id="owner-filter"></select>
+            </label>
+            <label>
+              <span class="mono">proof</span>
+              <select id="proof-filter">
+                <option value="all">all proof states</option>
+                <option value="strong">strong</option>
+                <option value="partial">partial</option>
+                <option value="missing">missing</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="metric-strip" id="metric-strip" aria-label="Roadmap metrics"></div>
+
+        <nav class="view-tabs" aria-label="Roadmap views">
+          <button class="active" data-view="board">Board</button>
+          <button data-view="releases">Releases</button>
+          <button data-view="evidence">Evidence</button>
+          <button data-view="risks">Risks</button>
+          <button data-view="metrics">Metrics</button>
+          <button data-view="dependencies">Dependencies</button>
+          <button data-view="changelog">Changelog</button>
+        </nav>
+
+        <div class="view-surface" id="view-surface" aria-live="polite"></div>
+      </section>
+
+      <aside class="inspector" id="inspector" aria-label="Selected work item"></aside>
+    </main>
+  </div>
+
+  <noscript>
+    <p style="padding:24px;font-family:monospace">Muster Roadmap Control needs JavaScript to render the interactive board.</p>
+  </noscript>
+</body>
+</html>

@@ -6,6 +6,21 @@ import type { SurfaceMessage } from "../src/envelope.js";
 import type { PairedSender } from "../src/pairing.js";
 
 const PAIRED: PairedSender = { pairingId: "pair_abc", surfaceId: "telegram:bot", senderId: "555", approvedAt: "2026-06-15T00:00:00Z" };
+const FRAPPE_PAIRED: PairedSender = {
+  ...PAIRED,
+  identity: {
+    provider: "frappe",
+    site: "https://erp.example.test",
+    user: "dhairya@example.test",
+    employee: "EMP-0001",
+    employeeName: "Dhairya Marwaha",
+    roles: ["Employee", "HR Manager", "System Manager"],
+    department: "People",
+    company: "HyBrowLabs",
+    authMode: "oauth_bearer",
+    resolvedAt: "2026-07-08T00:00:00.000Z",
+  },
+};
 const msg = (text: string): SurfaceMessage => ({ surfaceId: "telegram:bot", conversationId: "c1", senderId: "555", text });
 const ctx = { config: defaultConfig(), profile: "tg", paired: PAIRED, conversationKey: "telegram:bot:c1" };
 
@@ -24,20 +39,40 @@ test("parseCommand: a path-like prompt is NOT a command (passes through)", () =>
 test("dispatchCommand: /help is answered in-gateway with the command list", async () => {
   const reply = await dispatchCommand(msg("/help"), ctx);
   assert.ok(reply, "expected a reply");
-  assert.match(reply.text, /\/start/);
   assert.match(reply.text, /\/status/);
-  assert.match(reply.text, /\/pair/);
-  assert.match(reply.text, /\/new/);
-  assert.match(reply.text, /\/reset/);
-  assert.match(reply.text, /\/stop/);
+  assert.match(reply.text, /\/whoami/);
+  assert.match(reply.text, /\/tools/);
+  assert.match(reply.text, /\/tokens/);
+  assert.doesNotMatch(reply.text, /\/muster/);
 });
 
 test("dispatchCommand: /status reports profile, runtime, model, pairing", async () => {
   const reply = await dispatchCommand(msg("/status"), ctx);
   assert.ok(reply);
-  assert.match(reply.text, /profile: tg/);
+  assert.match(reply.text, /Profile\s+│ tg/);
   assert.match(reply.text, new RegExp(ctx.config.routing.defaultRuntime));
   assert.match(reply.text, /pair_abc/);
+});
+
+test("dispatchCommand: /whoami reports Frappe user and employee identity when paired", async () => {
+  const reply = await dispatchCommand(msg("/whoami"), { ...ctx, paired: FRAPPE_PAIRED });
+  assert.ok(reply);
+  assert.match(reply.text, /Frappe User/);
+  assert.match(reply.text, /dhairya@example\.test/);
+  assert.match(reply.text, /EMP-0001/);
+  assert.match(reply.text, /HR Manager/);
+});
+
+test("dispatchCommand: /tools is role-aware and exposes system controls only to eligible identities", async () => {
+  const plain = await dispatchCommand(msg("/tools"), ctx);
+  assert.ok(plain);
+  assert.doesNotMatch(plain.text, /System controls/);
+
+  const frappe = await dispatchCommand(msg("/tools"), { ...ctx, paired: FRAPPE_PAIRED });
+  assert.ok(frappe);
+  assert.match(frappe.text, /Frappe lookup/);
+  assert.match(frappe.text, /HRBP tools/);
+  assert.match(frappe.text, /System controls/);
 });
 
 test("dispatchCommand: /pair tells an already-paired chat there is nothing to do", async () => {

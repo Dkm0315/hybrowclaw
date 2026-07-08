@@ -3,6 +3,7 @@ import type { MusterConfig } from "@musterhq/core";
 import type { GatewayConfig, GatewayCustomCommand } from "./gateway-config.js";
 import type { PairedSender } from "./pairing.js";
 import type { SurfaceMessage, SurfaceReply } from "./envelope.js";
+import { isInteractionCommand, renderInteractionCommand } from "./interaction.js";
 
 /**
  * A leading /command, requiring the name to end at whitespace or string end so
@@ -65,8 +66,8 @@ export function resolveCustomCommand(message: SurfaceMessage, gateway: GatewayCo
   };
 }
 
-/** muster builtin commands answered in-gateway with no model call. */
-const BUILTINS = ["start", "help", "status", "pair", "new", "reset", "stop"] as const;
+/** Builtin commands answered in-gateway with no model call. */
+const BUILTINS = ["start", "help", "status", "pair", "new", "reset", "stop", "whoami", "tools", "reports", "tokens", "usage", "limits", "security", "evals", "index", "settings"] as const;
 type BuiltinName = (typeof BUILTINS)[number];
 
 export function isBuiltinCommand(name: string): name is BuiltinName {
@@ -77,6 +78,7 @@ export interface CommandContext {
   readonly config: MusterConfig;
   readonly profile: string;
   readonly paired: PairedSender;
+  readonly gateway?: GatewayConfig;
   readonly cwd?: string;
   readonly conversationKey: string;
 }
@@ -90,7 +92,7 @@ function activeModel(config: MusterConfig, runtime: string): string {
 }
 
 /**
- * Surface-level slash-command dispatch. muster builtins (/start /pair /status
+ * Surface-level slash-command dispatch. Builtins (/start /pair /status
  * /help) are answered here directly — they never reach the model. ANY other
  * /command returns null so the caller can resolve per-surface custom commands,
  * user-invocable skills, then fall through to the native provider CLI.
@@ -100,43 +102,35 @@ export async function dispatchCommand(message: SurfaceMessage, ctx: CommandConte
   if (!parsed || !isBuiltinCommand(parsed.name)) return null;
   const runtime = ctx.config.routing?.defaultRuntime ?? "native";
   const model = activeModel(ctx.config, runtime);
+  if (isInteractionCommand(parsed.name)) {
+    return renderInteractionCommand({
+      command: parsed.name,
+      profile: ctx.profile,
+      runtime,
+      model,
+      paired: ctx.paired,
+      message,
+      gateway: ctx.gateway,
+    });
+  }
   switch (parsed.name) {
-    case "start":
-      return {
-        text: `You're connected to muster — profile "${ctx.profile}", running ${model} via the ${runtime} runtime. Send a message to work with the agent, or /help for commands.`,
-      };
-    case "status":
-      return {
-        text: [
-          "muster status",
-          `• profile: ${ctx.profile}`,
-          `• runtime: ${runtime}`,
-          `• model: ${model}`,
-          `• surface: ${message.surfaceId}`,
-          `• paired: yes (${ctx.paired.pairingId})`,
-        ].join("\n"),
-      };
     case "pair":
-      return { text: `This chat is already paired with muster (pairing ${ctx.paired.pairingId}). Nothing to do.` };
-    case "help":
       return {
         text: [
-          "muster commands:",
-          "/start — connection + identity",
-          "/status — active profile, runtime, model",
-          "/pair — pairing status",
-          "/new — start a fresh provider thread for this chat",
-          "/reset — clear this chat's provider thread handles",
-          "/stop — stop/acknowledge the current command lane",
-          "/help — this list",
+          "Pairing",
           "",
-          "Skill commands and provider-native slash commands (e.g. /review) are resolved after builtins.",
+          `This chat is already paired (${ctx.paired.pairingId}). Nothing else is needed for this sender.`,
+          "",
+          "What can be done next:",
+          "1. /whoami — show resolved identity",
+          "2. /tools — show available tools",
+          "3. /status — check runtime and connection",
         ].join("\n"),
       };
     case "new": {
       const removed = await clearConversationSessionHandles(ctx.conversationKey, ctx.cwd);
       return {
-        text: `Started a fresh muster thread for this chat. Cleared ${removed} provider session handle${removed === 1 ? "" : "s"}.`,
+        text: `Started a fresh thread for this chat. Cleared ${removed} provider session handle${removed === 1 ? "" : "s"}.`,
       };
     }
     case "reset": {
