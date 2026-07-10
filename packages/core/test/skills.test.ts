@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
   applySkillEnvForRun,
+  clearSkillCatalogSnapshots,
   curateSkills,
   exportClaudeSkillSnapshot,
   listSkills,
@@ -374,7 +375,7 @@ test("layered local discovery is grouped, explicit, and profile-first", async ()
   assert.deepEqual(selected.included.sort(), ["docs-search", "web-research"]);
 });
 
-test("skill catalog snapshots refresh when discovered SKILL.md content changes", async () => {
+test("skill catalog snapshots refresh external mutations after explicit invalidation", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-skills-snapshot-"));
   const skillPath = join(cwd, "skills", "live", "fast-skill", "SKILL.md");
   await mkdir(join(cwd, "skills", "live", "fast-skill"), { recursive: true });
@@ -389,6 +390,8 @@ test("skill catalog snapshots refresh when discovered SKILL.md content changes",
     skillPath,
     "---\nname: fast-skill\ndescription: Fast skill v2\n---\n\nBody v2 with same snapshot root.\n",
   );
+  assert.equal((await listSkills(cwd, ["active"])).find((skill) => skill.name === "fast-skill")?.description, "Fast skill v1");
+  clearSkillCatalogSnapshots();
   assert.equal((await listSkills(cwd, ["active"])).find((skill) => skill.name === "fast-skill")?.description, "Fast skill v2");
 });
 
@@ -546,6 +549,7 @@ test("promoted skills are hash-pinned and tampering blocks load and injection", 
 
   await writeFile(join(skillsDir(cwd), "audit-frappe", "SKILL.md"), "---\nname: audit-frappe\ndescription: Audit Frappe deployments\nmetadata:\n  muster: {\"version\":\"0.1.0\",\"tags\":[],\"status\":\"active\",\"provenance\":{\"createdBy\":\"user\",\"createdAt\":\"2026-06-19T00:00:00.000Z\"}}\n---\n\nTampered body.\n");
 
+  clearSkillCatalogSnapshots();
   await assert.rejects(() => listSkills(cwd, ["active"]), /Skill digest mismatch/);
   await assert.rejects(() => selectSkills("audit frappe deploy", 500, cwd), /Skill digest mismatch/);
 });
