@@ -1,6 +1,7 @@
 import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { isPairingChallenge } from "../envelope.js";
 import type { PairingChallenge, SurfaceMessage, SurfaceReply } from "../envelope.js";
+import { bindSurfaceAction, parseSurfaceAction, presentationActions, renderPresentationText, sanitizePresentationForAudience } from "../presentation.js";
 
 /**
  * Discord Interactions adapter: PURE mappers (no network) plus the ed25519
@@ -91,7 +92,22 @@ export function discordInteractionToInbound(payload: unknown): DiscordInbound {
   const interaction = payload as DiscordInteraction;
   if (interaction.type === INTERACTION_PING) return { kind: "pong" };
   if (interaction.type === INTERACTION_MESSAGE_COMPONENT) {
-    return { kind: "ignored", reason: "component interactions are resumed via the flows API, not as messages" };
+    const command = parseSurfaceAction(interaction.data?.custom_id);
+    const sender = interaction.member?.user ?? interaction.user;
+    if (!command || !sender?.id || !interaction.channel_id) {
+      return { kind: "ignored", reason: "component is not a bound command or is missing sender/channel" };
+    }
+    return {
+      kind: "message",
+      message: {
+        surfaceId: `discord:${interaction.guild_id ?? "dm"}`,
+        conversationId: interaction.channel_id,
+        senderId: sender.id,
+        text: command,
+        replyTo: interaction.message?.id,
+        raw: payload,
+      },
+    };
   }
   if (interaction.type !== INTERACTION_APPLICATION_COMMAND || !interaction.data) {
     return { kind: "ignored", reason: `unsupported interaction type: ${String(interaction.type)}` };
@@ -101,12 +117,15 @@ export function discordInteractionToInbound(payload: unknown): DiscordInbound {
   if (!sender?.id || !interaction.channel_id) {
     return { kind: "ignored", reason: "interaction is missing sender or channel" };
   }
-  const text = (interaction.data.options ?? [])
+  const argumentsText = (interaction.data.options ?? [])
     .map((option) => option.value)
     .filter((value): value is string => typeof value === "string")
     .join(" ")
     .trim();
-  if (!text) return { kind: "ignored", reason: "command carries no text option" };
+  const text = interaction.data.name === "muster"
+    ? argumentsText
+    : `/${interaction.data.name ?? ""}${argumentsText ? ` ${argumentsText}` : ""}`;
+  if (!text || text === "/") return { kind: "ignored", reason: "command carries no name or text option" };
   return {
     kind: "message",
     message: {
@@ -157,6 +176,28 @@ function replyContent(reply: SurfaceReply | PairingChallenge): { content: string
     return {
       content: `${reply.text ? `${reply.text}\n\n` : ""}Approval required (gate \`${gateId}\`):\n\`\`\`${shown}\`\`\``,
       components: approvalComponents(runId),
+    };
+  }
+  if (reply.presentation) {
+    const presentation = sanitizePresentationForAudience(reply.presentation);
+    const allActions = presentationActions(presentation);
+    const actions = allActions
+      .map((action) => ({ action, binding: bindSurfaceAction(action) }))
+      .filter((entry) => entry.binding !== undefined)
+      .slice(0, 5);
+    return {
+      content: renderPresentationText(presentation, { maxRowsPerTable: 7, maxCellWidth: 22, includeActions: actions.length !== allActions.length }).slice(0, 2000),
+      ...(actions.length ? {
+        components: [{
+          type: 1,
+          components: actions.map(({ action, binding }) => ({
+            type: 2 as const,
+            style: action.style === "primary" ? 3 : action.style === "danger" ? 4 : 2,
+            label: action.label.slice(0, 80),
+            custom_id: binding!,
+          })),
+        }],
+      } : {}),
     };
   }
   return { content: reply.text };

@@ -67,7 +67,10 @@ export function resolveCustomCommand(message: SurfaceMessage, gateway: GatewayCo
 }
 
 /** Builtin commands answered in-gateway with no model call. */
-const BUILTINS = ["start", "help", "status", "pair", "new", "reset", "stop", "whoami", "tools", "reports", "tokens", "usage", "limits", "security", "evals", "index", "settings"] as const;
+const BUILTINS = [
+  "start", "help", "status", "pair", "new", "reset", "stop", "whoami", "tools", "reports", "tokens", "usage", "limits", "security", "evals", "index", "settings",
+  "approvals", "audit", "incidents", "providers", "models", "plugins", "skills", "mcp", "channels", "agents", "artifacts", "sessions", "memory",
+] as const;
 type BuiltinName = (typeof BUILTINS)[number];
 
 export function isBuiltinCommand(name: string): name is BuiltinName {
@@ -105,6 +108,8 @@ export async function dispatchCommand(message: SurfaceMessage, ctx: CommandConte
   if (isInteractionCommand(parsed.name)) {
     return renderInteractionCommand({
       command: parsed.name,
+      args: parsed.args,
+      config: ctx.config,
       profile: ctx.profile,
       runtime,
       model,

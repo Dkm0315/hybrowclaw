@@ -1,4 +1,7 @@
 export * from "./envelope.js";
+export * from "./presentation.js";
+export * from "./interaction.js";
+export * from "./commands.js";
 export * from "./pairing.js";
 export * from "./gateway-config.js";
 export * from "./server.js";

@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { isPairingChallenge } from "../envelope.js";
 import type { PairingChallenge, SurfaceMessage, SurfaceReply } from "../envelope.js";
+import { bindSurfaceAction, parseSurfaceAction, presentationActions, renderPresentationText, sanitizePresentationForAudience } from "../presentation.js";
 
 /**
  * Slack Events API adapter: PURE mappers only (no network). The gateway
@@ -59,16 +60,74 @@ interface SlackEnvelope {
   };
 }
 
+interface SlackActionEnvelope {
+  readonly type?: "block_actions";
+  readonly trigger_id?: string;
+  readonly team?: { readonly id?: string };
+  readonly user?: { readonly id?: string };
+  readonly channel?: { readonly id?: string };
+  readonly container?: { readonly channel_id?: string; readonly message_ts?: string; readonly thread_ts?: string };
+  readonly actions?: ReadonlyArray<{ readonly action_id?: string; readonly action_ts?: string; readonly value?: string }>;
+}
+
+interface SlackSlashCommand {
+  readonly command?: string;
+  readonly text?: string;
+  readonly trigger_id?: string;
+  readonly team_id?: string;
+  readonly user_id?: string;
+  readonly channel_id?: string;
+}
+
 export function slackDeliveryId(payload: unknown): string | undefined {
   if (typeof payload !== "object" || payload === null) return undefined;
   const eventId = (payload as SlackEnvelope).event_id;
-  return typeof eventId === "string" && eventId ? eventId : undefined;
+  if (typeof eventId === "string" && eventId) return eventId;
+  const action = payload as SlackActionEnvelope;
+  if (action.type === "block_actions") {
+    const selected = action.actions?.[0];
+    return action.trigger_id || [action.container?.message_ts, selected?.action_ts, selected?.action_id].filter(Boolean).join(":") || undefined;
+  }
+  const slash = payload as SlackSlashCommand;
+  return slash.trigger_id || undefined;
 }
 
 /** Map a Slack Events API request body to the gateway envelope. */
 export function slackEventToSurfaceMessage(payload: unknown): SlackInbound {
   if (typeof payload !== "object" || payload === null) {
     return { kind: "ignored", reason: "payload is not an object" };
+  }
+  const action = payload as SlackActionEnvelope;
+  if (action.type === "block_actions") {
+    const selected = action.actions?.[0];
+    const command = parseSurfaceAction(selected?.value);
+    const channel = action.channel?.id ?? action.container?.channel_id;
+    if (!command || !action.user?.id || !channel) return { kind: "ignored", reason: "block action is missing a bound command, user, or channel" };
+    return {
+      kind: "message",
+      message: {
+        surfaceId: `slack:${action.team?.id ?? "unknown-team"}`,
+        conversationId: channel,
+        senderId: action.user.id,
+        text: command,
+        replyTo: action.container?.thread_ts ?? action.container?.message_ts,
+        raw: payload,
+      },
+    };
+  }
+  const slash = payload as SlackSlashCommand;
+  if (typeof slash.command === "string" && slash.command.startsWith("/") && slash.user_id && slash.channel_id) {
+    const text = `${slash.command}${slash.text?.trim() ? ` ${slash.text.trim()}` : ""}`;
+    return {
+      kind: "message",
+      message: {
+        surfaceId: `slack:${slash.team_id ?? "unknown-team"}`,
+        conversationId: slash.channel_id,
+        senderId: slash.user_id,
+        text,
+        raw: payload,
+      },
+    };
   }
   const envelope = payload as SlackEnvelope;
   if (envelope.type === "url_verification") {
@@ -143,5 +202,55 @@ export function surfaceReplyToSlackPost(
       ],
     };
   }
+  if (reply.presentation) {
+    const presentation = sanitizePresentationForAudience(reply.presentation);
+    const blocks: unknown[] = [
+      { type: "header", text: { type: "plain_text", text: presentation.title.slice(0, 150) } },
+      { type: "section", text: { type: "mrkdwn", text: escapeSlack(presentation.summary) } },
+    ];
+    if (presentation.kpis?.length) {
+      blocks.push({
+        type: "section",
+        fields: presentation.kpis.slice(0, 10).map((kpi) => ({ type: "mrkdwn", text: `*${escapeSlack(kpi.label)}*\n${escapeSlack(kpi.value)}${kpi.detail ? `\n_${escapeSlack(kpi.detail)}_` : ""}` })),
+      });
+    }
+    for (const trend of presentation.trends ?? []) {
+      blocks.push({
+        type: "section",
+        text: { type: "mrkdwn", text: `*${escapeSlack(trend.label)}*\n${trend.points.map((point) => `${escapeSlack(point.label)}: ${point.value}${trend.unit ?? ""}`).join(" · ")}` },
+      });
+    }
+    for (const table of presentation.tables ?? []) {
+      const compact = renderPresentationText({ kind: "report", title: table.title ?? "Details", summary: "", tables: [table] }, { maxRowsPerTable: 8, maxCellWidth: 28, includeActions: false });
+      blocks.push({ type: "section", text: { type: "mrkdwn", text: `\`\`\`${escapeSlack(compact).slice(0, 2800)}\`\`\`` } });
+    }
+    const actions = presentationActions(presentation)
+      .map((action) => ({ action, binding: bindSurfaceAction(action) }))
+      .filter((entry) => entry.binding !== undefined);
+    for (let index = 0; index < actions.length; index += 5) {
+      blocks.push({
+        type: "actions",
+        elements: actions.slice(index, index + 5).map(({ action, binding }) => ({
+          type: "button",
+          text: { type: "plain_text", text: action.label.slice(0, 75) },
+          action_id: action.id.slice(0, 255),
+          value: binding,
+          ...(action.style === "primary" || action.style === "danger" ? { style: action.style } : {}),
+        })),
+      });
+    }
+    if (presentation.filters?.length) {
+      blocks.push({
+        type: "context",
+        elements: [{ type: "mrkdwn", text: `Filters: ${presentation.filters.map((filter) => `${escapeSlack(filter.label)}${filter.selected ? `=${escapeSlack(filter.selected)}` : ""}`).join(" · ")}` }],
+      });
+    }
+    if (presentation.privacy?.note) blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: escapeSlack(presentation.privacy.note) }] });
+    return { channel, thread_ts: threadTs, text: renderPresentationText(presentation, { maxRowsPerTable: 8, maxCellWidth: 28 }), blocks };
+  }
   return { channel, thread_ts: threadTs, text: reply.text };
+}
+
+function escapeSlack(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }

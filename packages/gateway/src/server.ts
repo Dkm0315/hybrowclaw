@@ -10,11 +10,12 @@ import { conversationSessionId, isPairingChallenge, parseSurfaceMessage } from "
 import type { PairingChallenge, SurfaceArtifact, SurfaceMessage, SurfaceReply } from "./envelope.js";
 import { pairingScopes, requestPairing, resolvePairing } from "./pairing.js";
 import type { GatewayConfig, GatewayGovernanceAssignment, GatewayGovernanceRateLimit, GatewayGovernanceRateWindow, GatewayGovernanceSubject } from "./gateway-config.js";
-import { surfaceReplyToTelegramSend, telegramUpdateToSurfaceMessage } from "./adapters/telegram.js";
+import { surfaceReplyToTelegramSend, telegramCallbackQueryId, telegramUpdateToSurfaceMessage } from "./adapters/telegram.js";
 import { slackDeliveryId, slackEventToSurfaceMessage, slackSignatureIsValid, surfaceReplyToSlackPost } from "./adapters/slack.js";
 import { DISCORD_PONG, discordInteractionToInbound, discordSignatureIsValid, surfaceReplyToDiscordInteractionResponse } from "./adapters/discord.js";
 import { surfaceReplyToWhatsAppSend, whatsAppMessageIds, whatsAppVerifyChallenge, whatsAppWebhookToSurfaceMessages } from "./adapters/whatsapp.js";
-import { gchatEventToken, gchatEventToSurfaceMessage, surfaceReplyToGchatResponse } from "./adapters/gchat.js";
+import { gchatDeliveryId, gchatEventToken, gchatEventToSurfaceMessage, surfaceReplyToGchatResponse } from "./adapters/gchat.js";
+import type { GchatRequestVerifier } from "./adapters/gchat.js";
 import { surfaceReplyToTeamsActivity, teamsActivityToSurfaceMessage, teamsHmacIsValid } from "./adapters/teams.js";
 import { createOutboundQueue, createSlackDraftSink, createTelegramDraftSink } from "./streaming.js";
 import type { OutboundQueue } from "./streaming.js";
@@ -33,6 +34,8 @@ export interface GatewayServerOptions {
   /** Outbound HTTP for adapter sends; injectable for tests. */
   readonly fetcher?: typeof fetch;
   readonly log?: (line: string) => void;
+  /** Host-provided Google OIDC/JWT verifier. Required when gchat.verification.mode=bearer. */
+  readonly gchatVerifier?: GchatRequestVerifier;
 }
 
 export interface RunningGateway {
@@ -519,6 +522,7 @@ interface AdapterContext {
   /** Shared per-chat outbound queue (retry_after backoff) for draft streaming. */
   readonly queue: OutboundQueue;
   readonly registry?: FlowToolRegistry;
+  readonly gchatVerifier?: GchatRequestVerifier;
 }
 
 function conversationLane(message: Pick<SurfaceMessage, "surfaceId" | "conversationId">): string {
@@ -867,10 +871,13 @@ async function handleTelegramWebhook(body: string, context: AdapterContext): Pro
   } else {
     warnUnauthenticatedOnce("telegram", context.log);
   }
+  const payload = JSON.parse(body);
+  const callbackQueryId = telegramCallbackQueryId(payload);
+  if (callbackQueryId) await sendTelegramPayload(botToken, { callback_query_id: callbackQueryId }, context, "answerCallbackQuery");
   const deliveryKey = adapterDeliveryKey("telegram", body);
   const cached = deliveryLookup(deliveryKey);
   if (cached !== undefined) return cached;
-  const mapped = telegramUpdateToSurfaceMessage(JSON.parse(body));
+  const mapped = telegramUpdateToSurfaceMessage(payload);
   if (!mapped) return { ok: true, ignored: "not a text message update" };
   if (context.gateway.telegram?.stream === "draft") {
     const message: SurfaceMessage = { ...mapped, stream: "draft" };
@@ -1060,10 +1067,22 @@ async function handleSlackWebhook(body: string, context: AdapterContext): Promis
   } else {
     warnUnauthenticatedOnce("slack", context.log);
   }
-  const deliveryKey = adapterDeliveryKey("slack", body);
+  const payload = parseSlackWebhookBody(body);
+  const deliveryId = slackDeliveryId(payload);
+  const deliveryKey = deliveryId ? `slack:${deliveryId}` : undefined;
   const cached = deliveryLookup(deliveryKey);
   if (cached !== undefined) return cached;
-  return handleSlackPayload(JSON.parse(body), context, botToken, deliveryKey);
+  return handleSlackPayload(payload, context, botToken, deliveryKey);
+}
+
+function parseSlackWebhookBody(body: string): unknown {
+  try {
+    return JSON.parse(body);
+  } catch {
+    const fields = Object.fromEntries(new URLSearchParams(body));
+    if (typeof fields.payload === "string") return JSON.parse(fields.payload);
+    return fields;
+  }
 }
 
 async function handleSlackPayload(payload: unknown, context: AdapterContext, botToken: string, deliveryKey?: string): Promise<unknown> {
@@ -1337,14 +1356,28 @@ async function handleGchatWebhook(body: string, context: AdapterContext): Promis
     throw new Error("Google Chat adapter not configured. Add a gchat section to .muster/gateway.json.");
   }
   const payload = JSON.parse(body);
-  const expectedToken = context.gateway.gchat.verificationToken;
-  if (expectedToken && gchatEventToken(payload) !== expectedToken) {
-    throw new GatewayHttpError(401, "Google Chat verification token mismatch.");
+  const modern = context.gateway.gchat.verification;
+  if (modern?.mode === "bearer") {
+    if (!context.gchatVerifier) throw new GatewayHttpError(401, "Google Chat bearer verification is configured but no verifier is available.");
+    const authorization = context.headers.authorization;
+    const valid = await context.gchatVerifier.verify({
+      authorization: typeof authorization === "string" ? authorization : undefined,
+      rawBody: body,
+      payload,
+      audience: modern.audience,
+    });
+    if (!valid) throw new GatewayHttpError(401, "Google Chat bearer verification failed.");
+  } else {
+    const expectedToken = context.gateway.gchat.verificationToken;
+    if (expectedToken && gchatEventToken(payload) !== expectedToken) {
+      throw new GatewayHttpError(401, "Google Chat verification token mismatch.");
+    }
   }
-  const deliveryKey = adapterDeliveryKey("gchat", body);
+  const eventId = gchatDeliveryId(payload);
+  const deliveryKey = eventId ? `gchat:${eventId}` : undefined;
   const cached = deliveryLookup(deliveryKey);
   if (cached !== undefined) return cached;
-  const inbound = gchatEventToSurfaceMessage(payload);
+  const inbound = gchatEventToSurfaceMessage(payload, { commands: context.gateway.gchat.commands });
   if (inbound.kind === "ignored") return { ok: true, ignored: inbound.reason };
   const reply = await handleSurfaceMessage(inbound.message, context);
   const result = surfaceReplyToGchatResponse(reply, inbound.message.replyTo);
@@ -1477,6 +1510,7 @@ async function route(request: IncomingMessage, response: ServerResponse, options
       headers: request.headers,
       queue,
       registry: options.registry,
+      gchatVerifier: options.gchatVerifier,
     });
     sendJson(response, 200, result ?? { ok: true });
     return;
@@ -1534,7 +1568,7 @@ function adapterHasPlatformAuth(adapterId: string, gateway: GatewayConfig): bool
     case "discord":
       return Boolean(gateway.discord?.publicKey);
     case "gchat":
-      return Boolean(gateway.gchat?.verificationToken);
+      return Boolean(gateway.gchat?.verificationToken || gateway.gchat?.verification?.mode === "bearer");
     case "teams":
       return Boolean(gateway.teams?.hmacSecret);
     case "whatsapp":

@@ -1,5 +1,6 @@
 import { isPairingChallenge } from "../envelope.js";
 import type { PairingChallenge, SurfaceMessage, SurfaceReply } from "../envelope.js";
+import { bindSurfaceAction, parseSurfaceAction, presentationActions, renderPresentationText, sanitizePresentationForAudience } from "../presentation.js";
 
 /**
  * WhatsApp Cloud API adapter: PURE mappers only (no network). The gateway
@@ -37,6 +38,7 @@ interface WhatsAppWebhook {
           readonly type?: string;
           readonly text?: { readonly body?: string };
           readonly button?: { readonly text?: string; readonly payload?: string };
+          readonly interactive?: { readonly button_reply?: { readonly id?: string; readonly title?: string } };
           readonly context?: { readonly id?: string };
         }>;
       };
@@ -69,7 +71,9 @@ export function whatsAppWebhookToSurfaceMessages(payload: unknown): readonly Sur
       if (change.field !== "messages" || !change.value) continue;
       const phoneNumberId = change.value.metadata?.phone_number_id ?? "unknown-number";
       for (const message of change.value.messages ?? []) {
-        const text = message.type === "text" ? message.text?.body : undefined;
+        const text = message.type === "text"
+          ? message.text?.body
+          : parseSurfaceAction(message.interactive?.button_reply?.id ?? message.button?.payload);
         if (!message.from || typeof text !== "string" || !text.trim()) continue;
         messages.push({
           surfaceId: `whatsapp:${phoneNumberId}`,
@@ -130,6 +134,34 @@ export function surfaceReplyToWhatsAppSend(reply: SurfaceReply | PairingChalleng
         },
       },
     };
+  }
+  if (reply.presentation) {
+    const presentation = sanitizePresentationForAudience(reply.presentation);
+    const allActions = presentationActions(presentation);
+    const actions = allActions
+      .map((action) => ({ action, binding: bindSurfaceAction(action) }))
+      .filter((entry) => entry.binding !== undefined)
+      .slice(0, 3);
+    const body = renderPresentationText(presentation, { maxRowsPerTable: 5, maxCellWidth: 18, includeActions: actions.length !== allActions.length });
+    if (actions.length) {
+      return {
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to,
+        type: "interactive",
+        interactive: {
+          type: "button",
+          body: { text: body.slice(0, 1024) },
+          action: {
+            buttons: actions.map(({ action, binding }) => ({
+              type: "reply" as const,
+              reply: { id: binding!, title: action.label.slice(0, 20) },
+            })),
+          },
+        },
+      };
+    }
+    return { messaging_product: "whatsapp", recipient_type: "individual", to, type: "text", text: { body: body.slice(0, 4096) } };
   }
   return { messaging_product: "whatsapp", recipient_type: "individual", to, type: "text", text: { body: reply.text } };
 }

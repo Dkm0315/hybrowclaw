@@ -75,7 +75,14 @@ export interface GatewayConfig {
     /** Graph API version segment; defaults to v19.0. */
     readonly apiVersion?: string;
   };
-  readonly gchat?: { readonly verificationToken?: string };
+  readonly gchat?: {
+    /** Legacy payload token retained for existing installations. */
+    readonly verificationToken?: string;
+    /** Modern bearer verification is performed by an injected verifier. */
+    readonly verification?: { readonly mode: "bearer"; readonly audience: string };
+    /** Google command id -> Muster slash command. */
+    readonly commands?: Readonly<Record<string, string>>;
+  };
   readonly teams?: { readonly hmacSecret?: string };
   readonly devices?: {
     readonly entries?: Record<string, GatewayDeviceRecord>;
@@ -108,6 +115,8 @@ export interface GatewayGovernanceAssignment {
   readonly workspaceId?: string;
   readonly allowedSurfaces?: readonly string[];
   readonly allowedChannels?: readonly string[];
+  /** Optional command-capability allowlist used by menus and actions. */
+  readonly capabilities?: readonly string[];
 }
 
 export interface GatewayGovernanceValidationConfig {

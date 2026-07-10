@@ -1,6 +1,18 @@
 import type { GatewayConfig, GatewayGovernanceAssignment, GatewayGovernanceRateLimit } from "./gateway-config.js";
 import type { PairedIdentity, PairedSender } from "./pairing.js";
 import type { SurfaceMessage, SurfaceReply } from "./envelope.js";
+import type { MusterConfig } from "@musterhq/core";
+import { commandPage, paginateRows, renderPresentationText } from "./presentation.js";
+import type {
+  PresentationAudience,
+  PresentationFilter,
+  PresentationKpi,
+  PresentationPagination,
+  PresentationTrend,
+  SurfaceAction,
+  SurfacePresentation,
+  SurfaceWorkStatus,
+} from "./presentation.js";
 
 export type InteractionCommandName =
   | "help"
@@ -15,10 +27,25 @@ export type InteractionCommandName =
   | "security"
   | "evals"
   | "index"
-  | "settings";
+  | "settings"
+  | "approvals"
+  | "audit"
+  | "incidents"
+  | "providers"
+  | "models"
+  | "plugins"
+  | "skills"
+  | "mcp"
+  | "channels"
+  | "agents"
+  | "artifacts"
+  | "sessions"
+  | "memory";
 
 interface InteractionContext {
   readonly command: InteractionCommandName;
+  readonly args: string;
+  readonly config: MusterConfig;
   readonly profile: string;
   readonly runtime: string;
   readonly model: string;
@@ -30,44 +57,159 @@ interface InteractionContext {
 interface InteractionAction {
   readonly label: string;
   readonly detail?: string;
+  readonly command?: string;
+  readonly style?: "default" | "primary" | "danger";
+  readonly kind?: SurfaceAction["kind"];
 }
 
 interface InteractionTable {
+  readonly id?: string;
+  readonly title?: string;
   readonly columns: readonly string[];
   readonly rows: readonly (readonly string[])[];
+  readonly pagination?: PresentationPagination;
 }
 
 interface InteractionCard {
+  readonly kind?: SurfacePresentation["kind"];
   readonly title: string;
   readonly lead: string;
+  readonly audience?: PresentationAudience;
   readonly body?: readonly string[];
   readonly table?: InteractionTable;
+  readonly tables?: readonly InteractionTable[];
+  readonly kpis?: readonly PresentationKpi[];
+  readonly trends?: readonly PresentationTrend[];
+  readonly filters?: readonly PresentationFilter[];
+  readonly drilldowns?: readonly InteractionAction[];
+  readonly work?: SurfaceWorkStatus;
+  readonly privacy?: SurfacePresentation["privacy"];
   readonly next?: readonly InteractionAction[];
   readonly note?: string;
 }
 
-const CONTEXT_COMMANDS: readonly InteractionCommandName[] = [
-  "start",
-  "status",
-  "whoami",
-  "tools",
-  "reports",
-  "tokens",
-  "usage",
-  "limits",
-  "security",
-  "evals",
-  "index",
-  "settings",
-  "help",
+export interface InteractionCommandDescriptor {
+  readonly name: InteractionCommandName;
+  readonly summary: string;
+  readonly capability?: string;
+  readonly minimumRole?: "manager" | "system";
+}
+
+export const INTERACTION_COMMANDS: readonly InteractionCommandDescriptor[] = [
+  { name: "start", summary: "Open the role-aware home view" },
+  { name: "status", summary: "Connection, runtime, and session" },
+  { name: "whoami", summary: "Resolved user and employee identity" },
+  { name: "tools", summary: "Tools available to this identity" },
+  { name: "reports", summary: "Reports, filters, exports, and drill-downs" },
+  { name: "tokens", summary: "Token ledger and usage controls", capability: "tokens" },
+  { name: "usage", summary: "Personal or team usage", capability: "tokens" },
+  { name: "limits", summary: "Rate and token limits", capability: "governance" },
+  { name: "security", summary: "Permissions and safety controls", capability: "governance" },
+  { name: "evals", summary: "Eval gates and quality checks", capability: "evals" },
+  { name: "index", summary: "Index freshness and controls", capability: "index" },
+  { name: "settings", summary: "Response and workflow preferences" },
+  { name: "approvals", summary: "Pending and recent approvals", capability: "approvals" },
+  { name: "audit", summary: "Governance events and exports", capability: "audit", minimumRole: "manager" },
+  { name: "incidents", summary: "Failures, denials, and response actions", capability: "incidents", minimumRole: "manager" },
+  { name: "providers", summary: "Configured provider routes", capability: "providers" },
+  { name: "models", summary: "Configured models and routing", capability: "providers" },
+  { name: "plugins", summary: "Configured plugins", capability: "plugins" },
+  { name: "skills", summary: "Configured skills", capability: "skills" },
+  { name: "mcp", summary: "Configured MCP servers", capability: "mcp" },
+  { name: "channels", summary: "Configured operator channels", capability: "channels" },
+  { name: "agents", summary: "Configured agent profiles", capability: "agents" },
+  { name: "artifacts", summary: "Artifact creation and delivery", capability: "artifacts" },
+  { name: "sessions", summary: "Conversation continuity and reset" },
+  { name: "memory", summary: "Scoped memory controls", capability: "memory" },
+  { name: "help", summary: "Show commands available to this identity" },
 ];
+
+const CONTEXT_COMMANDS = INTERACTION_COMMANDS.map((descriptor) => descriptor.name);
 
 export function isInteractionCommand(name: string): name is InteractionCommandName {
   return (CONTEXT_COMMANDS as readonly string[]).includes(name);
 }
 
 export function renderInteractionCommand(ctx: InteractionContext): SurfaceReply {
-  return { text: renderCard(cardForCommand(ctx)) };
+  const descriptor = INTERACTION_COMMANDS.find((candidate) => candidate.name === ctx.command);
+  const card = descriptor && !descriptorVisible(descriptor, ctx)
+    ? restrictedCard(descriptor)
+    : cardForCommand(ctx);
+  const presentation = presentationForCard(card);
+  return { text: renderPresentationText(presentation), presentation };
+}
+
+function descriptorVisible(descriptor: InteractionCommandDescriptor, ctx: InteractionContext): boolean {
+  if (descriptor.name === "help") return true;
+  const identity = ctx.paired.identity?.provider === "frappe" ? ctx.paired.identity : undefined;
+  const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
+  const tier = roleTier(identity, assignment?.roles);
+  if (descriptor.minimumRole === "system" && !tier.system) return false;
+  if (descriptor.minimumRole === "manager" && !tier.manager && !tier.hrbp && !tier.system) return false;
+  const capabilities = assignment?.capabilities;
+  if (capabilities !== undefined && descriptor.capability && !capabilities.includes("*") && !capabilities.includes(descriptor.capability)) return false;
+  return true;
+}
+
+function restrictedCard(descriptor: InteractionCommandDescriptor): InteractionCard {
+  return {
+    kind: "status",
+    title: "Command unavailable",
+    lead: `/${descriptor.name} is not visible for this identity or capability assignment.`,
+    table: {
+      id: "access",
+      columns: ["Requirement", "Value"],
+      rows: compactRows([
+        ["Role", descriptor.minimumRole],
+        ["Capability", descriptor.capability],
+      ]),
+    },
+    next: [
+      { label: "/whoami", detail: "Check the resolved identity" },
+      { label: "/help", detail: "Show commands available now" },
+    ],
+  };
+}
+
+function presentationForCard(card: InteractionCard): SurfacePresentation {
+  const tables = [...(card.table ? [card.table] : []), ...(card.tables ?? [])].map((table, index) => ({
+    id: table.id ?? `table-${index + 1}`,
+    ...(table.title ? { title: table.title } : {}),
+    columns: table.columns,
+    rows: table.rows,
+    ...(table.pagination ? { pagination: table.pagination } : {}),
+  }));
+  const actions = (card.next ?? []).map(normalizeInteractionAction).filter((action): action is SurfaceAction => action !== undefined);
+  const drilldowns = (card.drilldowns ?? []).map(normalizeInteractionAction).filter((action): action is SurfaceAction => action !== undefined);
+  const notice = compact([...(card.body ?? []), card.note]).join("\n");
+  return {
+    kind: card.kind ?? (tables.length ? "report" : "status"),
+    title: card.title,
+    summary: card.lead,
+    ...(card.audience ? { audience: card.audience } : {}),
+    ...(card.kpis?.length ? { kpis: card.kpis } : {}),
+    ...(card.trends?.length ? { trends: card.trends } : {}),
+    ...(tables.length ? { tables } : {}),
+    ...(card.filters?.length ? { filters: card.filters } : {}),
+    ...(drilldowns.length ? { drilldowns } : {}),
+    ...(actions.length ? { actions } : {}),
+    ...(card.work ? { work: card.work } : {}),
+    ...(notice ? { notice } : {}),
+    ...(card.privacy ? { privacy: card.privacy } : {}),
+  };
+}
+
+function normalizeInteractionAction(action: InteractionAction, index: number): SurfaceAction | undefined {
+  const command = action.command ?? (action.label.startsWith("/") ? action.label.split(/\s+/, 1)[0] : undefined);
+  if (!command) return undefined;
+  return {
+    id: `action-${index + 1}-${command.slice(1).replace(/[^a-z0-9]+/gi, "-")}`,
+    label: action.label,
+    command,
+    ...(action.detail ? { detail: action.detail } : {}),
+    ...(action.style ? { style: action.style } : {}),
+    ...(action.kind ? { kind: action.kind } : {}),
+  };
 }
 
 function cardForCommand(ctx: InteractionContext): InteractionCard {
@@ -80,24 +222,50 @@ function cardForCommand(ctx: InteractionContext): InteractionCard {
     case "whoami":
       return whoamiCard(ctx, identity);
     case "tools":
-      return toolsCard(identity);
+      return toolsCard(ctx, identity);
     case "reports":
-      return reportsCard(identity);
+      return reportsCard(ctx, identity);
     case "tokens":
     case "usage":
       return usageCard(ctx, identity);
     case "limits":
       return limitsCard(ctx, identity);
     case "security":
-      return securityCard(identity);
+      return securityCard(ctx, identity);
     case "evals":
-      return evalsCard(identity);
+      return evalsCard(ctx, identity);
     case "index":
       return indexCard(identity);
     case "settings":
-      return settingsCard(identity);
+      return settingsCard(ctx, identity);
+    case "approvals":
+      return governanceQueueCard(ctx, "Approvals", "Review pending and recent approval decisions for the scopes you are allowed to see.", identity, "/approvals");
+    case "audit":
+      return governanceQueueCard(ctx, "Audit", "Inspect governed actions, denials, configuration changes, and exports without exposing raw prompts by default.", identity, "/audit");
+    case "incidents":
+      return governanceQueueCard(ctx, "Incidents", "Inspect failed runs, policy denials, delivery failures, and recovery actions.", identity, "/incidents");
+    case "providers":
+      return providersCard(ctx);
+    case "models":
+      return modelsCard(ctx);
+    case "plugins":
+      return configuredEntriesCard("Plugins", ctx.config.plugins?.entries, "/plugins", "plugin policy");
+    case "skills":
+      return configuredEntriesCard("Skills", ctx.config.skills?.entries, "/skills", "skill runtime");
+    case "mcp":
+      return configuredEntriesCard("MCP servers", ctx.config.tools?.mcp?.servers, "/mcp", "MCP server");
+    case "channels":
+      return channelsCard(ctx);
+    case "agents":
+      return agentsCard(ctx);
+    case "artifacts":
+      return artifactsCard(ctx);
+    case "sessions":
+      return sessionsCard(ctx);
+    case "memory":
+      return memoryCard(ctx, identity);
     case "help":
-      return helpCard(identity);
+      return helpCard(ctx, identity);
   }
 }
 
@@ -192,8 +360,9 @@ function whoamiCard(_ctx: InteractionContext, identity: PairedIdentity | undefin
   };
 }
 
-function toolsCard(identity: PairedIdentity | undefined): InteractionCard {
-  const tools = visibleTools(identity);
+function toolsCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
+  const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
+  const tools = visibleTools(identity, assignment?.roles);
   return {
     title: "Tools",
     lead: identity
@@ -211,8 +380,10 @@ function toolsCard(identity: PairedIdentity | undefined): InteractionCard {
   };
 }
 
-function reportsCard(identity: PairedIdentity | undefined): InteractionCard {
-  const role = roleTier(identity);
+function reportsCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
+  const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
+  const role = roleTier(identity, assignment?.roles);
+  const audience: PresentationAudience = role.system ? "admin" : role.manager || role.hrbp ? "manager" : "self";
   const rows: string[][] = [
     ["1", "Personal usage", "Your requests, artifacts, and token use"],
     ["2", "My documents", "Records and documents you recently worked on"],
@@ -221,37 +392,72 @@ function reportsCard(identity: PairedIdentity | undefined): InteractionCard {
   if (role.hrbp || role.system) rows.push(["4", "HR reports", "Leave, attendance, employee lifecycle, and policy reports"]);
   if (role.system) rows.push(["5", "System governance", "Token spend, rate limits, denied requests, provider usage"]);
   return {
+    kind: "report",
     title: "Reports",
     lead: "Choose the report area. I will ask follow-up questions only when the report needs a date range, department, employee, or export format.",
+    audience,
     table: { columns: ["No", "Report area", "Includes"], rows },
-    next: [
-      { label: "Filter options", detail: "Date range, department, employee, status, owner, company, branch" },
-      { label: "Output options", detail: "Table, summary, Excel, PDF, or open linked Frappe records" },
-      { label: "/tokens", detail: "View usage and token reports" },
+    filters: [
+      { id: "period", label: "Period", options: [{ label: "Today", value: "today" }, { label: "7 days", value: "7d" }, { label: "30 days", value: "30d" }] },
+      { id: "department", label: "Department" },
+      { id: "status", label: "Status" },
+      { id: "provider", label: "Provider" },
     ],
+    drilldowns: [
+      { label: "Usage report", detail: "Open token and latency dimensions", command: "/usage", kind: "drilldown" },
+      { label: "Audit report", detail: "Open governed event dimensions", command: "/audit", kind: "drilldown" },
+    ],
+    next: [
+      { label: "Refresh", detail: "Refresh authorized report data", command: "/reports", style: "primary" },
+      { label: "/tokens", detail: "View usage and token reports" },
+      { label: "/artifacts", detail: "Review export delivery" },
+    ],
+    privacy: { rawPromptsIncluded: false, note: "Manager reports omit raw prompts unless a separately audited incident workflow authorizes them." },
   };
 }
 
 function usageCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
   const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
   const limits = visibleRateLimits(ctx.gateway, assignment, identity);
+  const role = roleTier(identity, assignment?.roles);
+  const audience: PresentationAudience = role.system ? "admin" : role.manager || role.hrbp ? "manager" : "self";
   return {
+    kind: "report",
     title: "Usage",
     lead: "I can show token and usage controls for this scope. Detailed ledgers depend on the gateway token ledger being enabled for this deployment.",
+    audience,
+    kpis: [
+      { label: "Configured limits", value: String(limits.length) },
+      { label: "Ledger", value: "Deployment-backed", detail: "no synthetic totals" },
+      { label: "Prompt visibility", value: "Hidden", detail: "manager default" },
+    ],
     table: {
+      id: "usage-limits",
       columns: ["Scope", "Limit"],
       rows: limits.length ? limits : [["Current sender", "No explicit rate limit configured"]],
     },
-    next: [
-      { label: "Show personal usage", detail: "Requests, estimated tokens, artifacts" },
-      { label: "Show team usage", detail: "Available to managers/HRBP/system roles" },
-      { label: "Set a limit", detail: "Available only where policy allows" },
+    filters: [
+      { id: "period", label: "Period", options: [{ label: "Today", value: "today" }, { label: "7 days", value: "7d" }, { label: "30 days", value: "30d" }] },
+      { id: "user", label: audience === "self" ? "Current user" : "User or hierarchy" },
+      { id: "provider", label: "Provider" },
+      { id: "channel", label: "Channel" },
     ],
+    drilldowns: [
+      { label: "Limits", command: "/limits", kind: "drilldown" },
+      { label: "Security", command: "/security", kind: "drilldown" },
+    ],
+    next: [
+      { label: "Refresh personal usage", detail: "Requests, tokens, latency, cache, and artifacts", command: "/usage scope=self", style: "primary" },
+      ...(audience === "self" ? [] : [{ label: "Team usage", detail: "Authorized reporting hierarchy", command: "/usage scope=team", kind: "drilldown" as const }]),
+      { label: "/limits", detail: "Review rate and token limits" },
+    ],
+    privacy: { rawPromptsIncluded: false, note: "Manager views expose categories, consumption, latency, and outcomes—not raw prompt text." },
   };
 }
 
 function limitsCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
-  const role = roleTier(identity);
+  const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
+  const role = roleTier(identity, assignment?.roles);
   if (!role.manager && !role.hrbp && !role.system) {
     return {
       title: "Limits",
@@ -283,8 +489,9 @@ function limitsCard(ctx: InteractionContext, identity: PairedIdentity | undefine
   };
 }
 
-function securityCard(identity: PairedIdentity | undefined): InteractionCard {
-  const role = roleTier(identity);
+function securityCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
+  const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
+  const role = roleTier(identity, assignment?.roles);
   return {
     title: "Security",
     lead: "Security controls are based on pairing, channel scope, Frappe permissions, and write approval gates.",
@@ -306,8 +513,9 @@ function securityCard(identity: PairedIdentity | undefined): InteractionCard {
   };
 }
 
-function evalsCard(identity: PairedIdentity | undefined): InteractionCard {
-  const role = roleTier(identity);
+function evalsCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
+  const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
+  const role = roleTier(identity, assignment?.roles);
   return {
     title: "Evals",
     lead: role.manager || role.hrbp || role.system
@@ -353,8 +561,9 @@ function indexCard(identity: PairedIdentity | undefined): InteractionCard {
   };
 }
 
-function settingsCard(identity: PairedIdentity | undefined): InteractionCard {
-  const role = roleTier(identity);
+function settingsCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
+  const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
+  const role = roleTier(identity, assignment?.roles);
   return {
     title: "Settings",
     lead: role.manager || role.hrbp || role.system
@@ -377,64 +586,259 @@ function settingsCard(identity: PairedIdentity | undefined): InteractionCard {
   };
 }
 
-function helpCard(identity: PairedIdentity | undefined): InteractionCard {
-  const rows = CONTEXT_COMMANDS
-    .filter((name) => name !== "start")
-    .map((name, index) => [String(index + 1), `/${name}`, helpText(name, identity)]);
+function governanceQueueCard(
+  ctx: InteractionContext,
+  title: "Approvals" | "Audit" | "Incidents",
+  lead: string,
+  identity: PairedIdentity | undefined,
+  command: string,
+): InteractionCard {
+  const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
+  const role = roleTier(identity, assignment?.roles);
+  const audience: PresentationAudience = role.system ? "admin" : role.manager || role.hrbp ? "manager" : "self";
   return {
-    title: "Commands",
-    lead: "Use these generic commands. I will adapt them to the connected site, your role, and this channel.",
-    table: { columns: ["No", "Command", "Use"], rows },
+    kind: "report",
+    title,
+    lead,
+    audience,
+    kpis: [
+      { label: "Visible scope", value: audience === "self" ? "Personal" : audience === "manager" ? "Assigned hierarchy" : "Authorized system scope" },
+      { label: "Raw prompts", value: "Hidden", detail: "default manager privacy" },
+      { label: "Data source", value: "Deployment ledger", detail: "no sample values shown" },
+    ],
+    table: {
+      id: title.toLowerCase(),
+      columns: ["View", "Availability"],
+      rows: [
+        ["Personal", "Available when the deployment ledger is connected"],
+        ["Team", role.manager || role.hrbp || role.system ? "Filtered to authorized hierarchy" : "Requires manager scope"],
+        ["Export", role.manager || role.hrbp || role.system ? "Requires an authorized export action" : "Requires manager scope"],
+      ],
+    },
+    filters: [
+      { id: "period", label: "Period", options: [{ label: "Today", value: "today" }, { label: "7 days", value: "7d" }, { label: "30 days", value: "30d" }] },
+      { id: "status", label: "Status" },
+      ...(audience === "self" ? [] : [{ id: "scope", label: "Department or user" }]),
+    ],
     next: [
-      { label: "Reply with a command", detail: "For example: /tools or /reports" },
-      { label: "Ask normally", detail: "For example: apply leave for 9th" },
+      { label: "Refresh", detail: "Query the connected ledger", command, style: "primary" },
+      { label: "/reports", detail: "Open report workflows" },
+      { label: "/security", detail: "Review visibility rules" },
+    ],
+    privacy: { rawPromptsIncluded: false, note: "Manager views show categories and outcomes, not raw prompts." },
+  };
+}
+
+function providersCard(ctx: InteractionContext): InteractionCard {
+  const rows = Object.values(ctx.config.providers).map((provider) => [provider.id, provider.kind, provider.defaultModel]);
+  return {
+    kind: "menu",
+    title: "Providers",
+    lead: "These provider routes are configured for this Muster deployment. Secrets are never rendered here.",
+    table: { id: "providers", columns: ["Provider", "Kind", "Default model"], rows: rows.length ? rows : [["None", "—", "—"]] },
+    next: [
+      { label: "/models", detail: "Inspect configured model routes" },
+      { label: "/settings", detail: "Review selection preferences" },
     ],
   };
 }
 
-function helpText(name: InteractionCommandName, identity: PairedIdentity | undefined): string {
-  switch (name) {
-    case "help": return "Show commands";
-    case "status": return "Connection and runtime";
-    case "whoami": return "Resolved user/employee identity";
-    case "tools": return "Tools available to you";
-    case "reports": return "Reports and exports";
-    case "tokens":
-    case "usage": return "Token and request usage";
-    case "limits": return "Rate and token limits";
-    case "security": return "Permissions and safety controls";
-    case "evals": return "Eval gates and quality checks";
-    case "index": return identity ? "Frappe index controls" : "Frappe indexing setup";
-    case "settings": return "Response style and behavior";
-    case "start": return "Start";
+function modelsCard(ctx: InteractionContext): InteractionCard {
+  const rows: string[][] = [];
+  for (const runtime of Object.values(ctx.config.runtimes)) {
+    const provider = ctx.config.providers[runtime.provider];
+    rows.push([runtime.id, "default", provider?.defaultModel ?? "unset", runtime.enabled ? "enabled" : "disabled"]);
+    for (const [task, route] of Object.entries(runtime.routes ?? {})) {
+      if (route) rows.push([runtime.id, task, route.model, runtime.enabled ? "enabled" : "disabled"]);
+    }
   }
+  return {
+    kind: "menu",
+    title: "Models",
+    lead: "Model choices are read from configured runtimes and routes; this view does not guess provider catalog names.",
+    table: { id: "models", columns: ["Runtime", "Route", "Model", "State"], rows: rows.length ? rows : [["None", "—", "—", "—"]] },
+    next: [
+      { label: "/providers", detail: "Inspect provider routes" },
+      { label: "/settings", detail: "Review answer and routing preferences" },
+    ],
+  };
 }
 
-function visibleTools(identity: PairedIdentity | undefined): Array<{ label: string; detail: string }> {
+function configuredEntriesCard(
+  title: string,
+  entries: Readonly<Record<string, unknown>> | undefined,
+  command: string,
+  noun: string,
+): InteractionCard {
+  const rows = Object.entries(entries ?? {}).map(([id, value]) => {
+    const enabled = typeof value === "object" && value !== null && "enabled" in value
+      ? (value as { enabled?: unknown }).enabled !== false
+      : true;
+    return [id, enabled ? "enabled" : "disabled"];
+  });
+  return {
+    kind: "menu",
+    title,
+    lead: rows.length ? `Configured ${noun} entries for this deployment.` : `No ${noun} entries are configured in this deployment.`,
+    table: { id: command.slice(1), columns: ["Name", "State"], rows: rows.length ? rows : [["None configured", "—"]] },
+    next: [
+      { label: "Refresh", detail: "Read the current configuration", command, style: "primary" },
+      { label: "/tools", detail: "Return to available tools" },
+    ],
+  };
+}
+
+function channelsCard(ctx: InteractionContext): InteractionCard {
+  const channels: Array<[string, boolean, string]> = [
+    ["Telegram", Boolean(ctx.gateway?.telegram), "inline keyboard + text/document delivery"],
+    ["Slack", Boolean(ctx.gateway?.slack), "Block Kit + file delivery"],
+    ["Google Chat", Boolean(ctx.gateway?.gchat), "cards + command/action events"],
+    ["Discord", Boolean(ctx.gateway?.discord), "components + text"],
+    ["WhatsApp", Boolean(ctx.gateway?.whatsapp), "interactive buttons + text fallback"],
+    ["Teams", Boolean(ctx.gateway?.teams), "Adaptive Cards + text"],
+  ];
+  return {
+    kind: "status",
+    title: "Channels",
+    lead: "Channel state reflects this gateway configuration, not a simulated catalog.",
+    table: { id: "channels", columns: ["Channel", "Configured", "Interaction"], rows: channels.map(([name, enabled, mode]) => [name, enabled ? "yes" : "no", mode]) },
+    next: [
+      { label: "/status", detail: "Check this conversation" },
+      { label: "/security", detail: "Review channel verification" },
+    ],
+  };
+}
+
+function agentsCard(ctx: InteractionContext): InteractionCard {
+  const rows = (ctx.config.agents?.list ?? []).map((agent) => [agent.id, agent.skills?.join(", ") || "inherited defaults"]);
+  return {
+    kind: "menu",
+    title: "Agents",
+    lead: rows.length ? "Configured agent profiles and their declared skill sets." : "No named agent profiles are configured; the active profile uses deployment defaults.",
+    table: { id: "agents", columns: ["Agent", "Skills"], rows: rows.length ? rows : [[ctx.profile, "deployment defaults"]] },
+    next: [
+      { label: "/skills", detail: "Inspect configured skills" },
+      { label: "/tools", detail: "Inspect available tools" },
+    ],
+  };
+}
+
+function artifactsCard(ctx: InteractionContext): InteractionCard {
+  const surface = ctx.message.surfaceId.split(":", 1)[0];
+  const native = surface === "slack" || surface === "telegram";
+  return {
+    kind: "status",
+    title: "Artifacts",
+    lead: "Artifact creation is provider/tool-driven; the gateway verifies declared local files before delivery.",
+    kpis: [
+      { label: "Current channel", value: surface },
+      { label: "Native attachment", value: native ? "Supported" : "Text/link fallback", tone: native ? "positive" : "warning" },
+    ],
+    table: {
+      id: "artifact-formats",
+      columns: ["Format", "Delivery contract"],
+      rows: [
+        ["DOCX", "verified file or explicit delivery failure"],
+        ["PDF", "verified file or explicit delivery failure"],
+        ["PPTX", "verified file or explicit delivery failure"],
+        ["XLSX", "verified file or explicit delivery failure"],
+      ],
+    },
+    next: [
+      { label: "/tools", detail: "Check artifact-capable tools" },
+      { label: "/reports", detail: "Create an export through a report workflow" },
+    ],
+  };
+}
+
+function sessionsCard(ctx: InteractionContext): InteractionCard {
+  return {
+    kind: "status",
+    title: "Sessions",
+    lead: "This channel conversation keeps one provider-session lane until you start fresh or reset it.",
+    table: {
+      id: "session",
+      columns: ["Field", "Value"],
+      rows: [
+        ["Conversation", `${ctx.message.surfaceId}:${ctx.message.conversationId}`],
+        ["Profile", ctx.profile],
+        ["Continuity", "enabled for this conversation lane"],
+      ],
+    },
+    next: [
+      { label: "/new", detail: "Start fresh and clear provider handles", command: "/new", style: "primary" },
+      { label: "/reset", detail: "Reset provider handles", command: "/reset", style: "danger" },
+      { label: "/memory", detail: "Review scoped memory behavior" },
+    ],
+  };
+}
+
+function memoryCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
+  return {
+    kind: "status",
+    title: "Memory",
+    lead: "Memory is scoped to this pairing and conversation. Channel runs recall it only when the request asks for prior context.",
+    table: {
+      id: "memory-scopes",
+      columns: ["Scope", "State"],
+      rows: [
+        ["Pairing", ctx.paired.pairingId],
+        ["Conversation", `${ctx.message.surfaceId}:${ctx.message.conversationId}`],
+        ["Frappe user", identity?.user ?? "not connected"],
+        ["Tenant", identity?.site ?? "not connected"],
+      ],
+    },
+    next: [
+      { label: "/sessions", detail: "Review conversation continuity" },
+      { label: "/security", detail: "Review scope boundaries" },
+    ],
+  };
+}
+
+function helpCard(ctx: InteractionContext, _identity: PairedIdentity | undefined): InteractionCard {
+  const allRows = INTERACTION_COMMANDS
+    .filter((descriptor) => descriptor.name !== "start" && descriptorVisible(descriptor, ctx))
+    .map((descriptor, index) => [String(index + 1), `/${descriptor.name}`, descriptor.summary]);
+  const page = paginateRows(allRows, commandPage(ctx.args), 10);
+  const pageCount = Math.max(1, Math.ceil(page.pagination.totalRows / page.pagination.pageSize));
+  return {
+    kind: "menu",
+    title: "Commands",
+    lead: "Use these generic commands. I will adapt them to the connected site, your role, and this channel.",
+    table: { id: "commands", columns: ["No", "Command", "Use"], rows: page.rows, pagination: page.pagination },
+    next: compact([
+      page.pagination.page > 1 ? { label: "Previous", detail: "Previous command page", command: `/help page=${page.pagination.page - 1}`, kind: "page" as const } : undefined,
+      page.pagination.page < pageCount ? { label: "Next", detail: "Next command page", command: `/help page=${page.pagination.page + 1}`, kind: "page" as const } : undefined,
+      { label: "/tools", detail: "Show tools available now" },
+      { label: "/reports", detail: "Open report workflows" },
+    ]),
+  };
+}
+
+function visibleTools(identity: PairedIdentity | undefined, assignedRoles: readonly string[] = []): Array<{ label: string; detail: string }> {
   const base = [
     { label: "Ask the agent", detail: "Normal task, code, research, or document prompt" },
     { label: "Create artifacts", detail: "PDF, DOCX, PPTX, Excel where office tools are enabled" },
   ];
-  if (!identity) return base;
-  const role = roleTier(identity);
-  const tools = [
+  const role = roleTier(identity, assignedRoles);
+  const tools = identity ? [
     { label: "Frappe lookup", detail: "Find records you can read" },
     { label: "Frappe create/update", detail: "Guided forms with mandatory fields, preview, and approval" },
     { label: "Open documents", detail: "Return Frappe links for records used or changed" },
     ...base,
-  ];
+  ] : [...base];
   if (role.manager || role.hrbp || role.system) tools.push({ label: "Team reports", detail: "Tables, filters, exports, and drilldowns for allowed people" });
   if (role.hrbp || role.system) tools.push({ label: "HRBP tools", detail: "Employee lifecycle, leave, attendance, hierarchy-aware reports" });
   if (role.system) tools.push({ label: "System controls", detail: "Limits, security policy, evals, index controls" });
   return tools;
 }
 
-function roleTier(identity: PairedIdentity | undefined): { employee: boolean; manager: boolean; hrbp: boolean; system: boolean } {
-  const roles = new Set((identity?.roles ?? []).map((role) => role.toLowerCase()));
+function roleTier(identity: PairedIdentity | undefined, assignedRoles: readonly string[] = []): { employee: boolean; manager: boolean; hrbp: boolean; system: boolean } {
+  const roles = new Set([...(identity?.roles ?? []), ...assignedRoles].map((role) => role.trim().toLowerCase()));
   return {
-    employee: !!identity,
+    employee: !!identity || roles.size > 0,
     manager: [...roles].some((role) => role.includes("manager") || role.includes("reports manager")),
-    hrbp: [...roles].some((role) => role.includes("hr") || role.includes("people")),
+    hrbp: [...roles].some((role) => role === "hr user" || role === "hr manager" || role.includes("hrbp") || role.includes("human resources") || role.includes("people")),
     system: roles.has("system manager") || roles.has("administrator") || roles.has("admin"),
   };
 }
@@ -468,42 +872,6 @@ function limitMatches(limit: GatewayGovernanceRateLimit, assignment: GatewayGove
   if (limit.subject.kind === "tenant") return assignment?.tenantId === limit.subject.id || identity?.site === limit.subject.id;
   if (limit.subject.kind === "user") return assignment?.userId === limit.subject.id || identity?.user === limit.subject.id || identity?.employee === limit.subject.id;
   return true;
-}
-
-function renderCard(card: InteractionCard): string {
-  return compact([
-    card.title,
-    "",
-    card.lead,
-    ...(card.body?.length ? ["", ...card.body] : []),
-    card.table ? `\n${renderTable(card.table)}` : undefined,
-    card.next?.length ? `\nWhat can be done next:\n${card.next.map((action, index) => `${index + 1}. ${action.label}${action.detail ? ` — ${action.detail}` : ""}`).join("\n")}` : undefined,
-    card.note ? `\n${card.note}` : undefined,
-  ]).join("\n");
-}
-
-function renderTable(table: InteractionTable): string {
-  const widths = table.columns.map((column, index) => Math.min(36, Math.max(
-    displayLength(column),
-    ...table.rows.map((row) => displayLength(row[index] ?? "")),
-  )));
-  const border = (left: string, mid: string, right: string) => `${left}${widths.map((width) => "─".repeat(width + 2)).join(mid)}${right}`;
-  const row = (cells: readonly string[]) => `│${widths.map((width, index) => ` ${truncate(cells[index] ?? "", width).padEnd(width)} `).join("│")}│`;
-  return [
-    border("┌", "┬", "┐"),
-    row(table.columns),
-    border("├", "┼", "┤"),
-    ...table.rows.map(row),
-    border("└", "┴", "┘"),
-  ].join("\n");
-}
-
-function truncate(value: string, width: number): string {
-  return displayLength(value) <= width ? value : `${value.slice(0, Math.max(0, width - 1))}…`;
-}
-
-function displayLength(value: string): number {
-  return value.length;
 }
 
 function compact<T>(items: readonly (T | undefined | false | null)[]): T[] {

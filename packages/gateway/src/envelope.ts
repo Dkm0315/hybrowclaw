@@ -51,6 +51,8 @@ export interface SurfaceReply {
   readonly text: string;
   readonly artifacts?: readonly SurfaceArtifact[];
   readonly approvalRequest?: ApprovalRequest;
+  /** Optional rich interaction; text remains the canonical accessible fallback. */
+  readonly presentation?: import("./presentation.js").SurfacePresentation;
 }
 
 /** Returned instead of a reply when the sender has not been paired yet. */
