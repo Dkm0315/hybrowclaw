@@ -16,6 +16,7 @@ export * from "./eval.js";
 export * from "./evolve.js";
 export * from "./enterprise-governance.js";
 export * from "./enterprise-reporting.js";
+export * from "./enterprise-sqlite.js";
 export * from "./feedback.js";
 export * from "./goal-loop.js";
 export * from "./governance.js";
