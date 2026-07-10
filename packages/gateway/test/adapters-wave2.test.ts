@@ -129,7 +129,7 @@ test("discord component interactions and textless commands are ignored", () => {
   assert.equal(discordInteractionToInbound("nope").kind, "ignored");
 });
 
-test("discord reply maps to interaction response; approvals render button components", () => {
+test("discord reply maps to interaction response; unbound approvals fail closed to text", () => {
   const plain = surfaceReplyToDiscordInteractionResponse({ text: "deploy v42 shipped" });
   assert.deepEqual(plain, { type: 4, data: { content: "deploy v42 shipped" } });
 
@@ -141,15 +141,15 @@ test("discord reply maps to interaction response; approvals render button compon
     approvalRequest: { runId: "flowrun_1a2b3c4d", gateId: "publish", show: "ship it?", options: ["approve", "reject"] },
   });
   assert.equal(approval.type, 4);
-  const buttons = approval.data!.components![0].components;
-  assert.deepEqual(buttons.map((button) => button.custom_id), ["muster:approve:flowrun_1a2b3c4d", "muster:reject:flowrun_1a2b3c4d"]);
+  assert.equal(approval.data!.components, undefined);
+  assert.match(approval.data!.content, /Authenticated approval controls are unavailable/);
 
   // REST channel-message payload mirrors the same content/components.
   const channelMessage = surfaceReplyToDiscordChannelMessage({
     text: "",
     approvalRequest: { runId: "flowrun_1a2b3c4d", gateId: "publish", show: "ship it?", options: ["approve", "reject"] },
   });
-  assert.equal(channelMessage.components![0].components[0].custom_id, "muster:approve:flowrun_1a2b3c4d");
+  assert.equal(channelMessage.components, undefined);
 });
 
 // --- Discord ed25519 signature verification (real keypair, no mocks) ---
@@ -217,7 +217,7 @@ test("whatsapp status-only notifications map to no messages", () => {
   assert.deepEqual(whatsAppWebhookToSurfaceMessages({ object: "page" }), []);
 });
 
-test("whatsapp reply maps to /messages payload; approvals render interactive buttons", () => {
+test("whatsapp reply maps to /messages payload; unbound approvals fail closed to text", () => {
   const plain = surfaceReplyToWhatsAppSend({ text: "12 episodes today" }, "919812345678");
   assert.deepEqual(plain, {
     messaging_product: "whatsapp",
@@ -231,11 +231,8 @@ test("whatsapp reply maps to /messages payload; approvals render interactive but
     text: "draft ready",
     approvalRequest: { runId: "flowrun_9z8y7x6w", gateId: "send", show: "send invoice?", options: ["approve", "reject"] },
   }, "919812345678");
-  assert.equal(approval.type, "interactive");
-  assert.deepEqual(approval.interactive!.action.buttons.map((button) => button.reply.id), [
-    "muster:approve:flowrun_9z8y7x6w",
-    "muster:reject:flowrun_9z8y7x6w",
-  ]);
+  assert.equal(approval.type, "text");
+  assert.match(approval.text!.body, /Authenticated approval controls are unavailable/);
 
   const pairing = surfaceReplyToWhatsAppSend({ status: "pairing_required", code: "QR45ST67" }, "919812345678");
   assert.match(pairing.text!.body, /muster pairing approve QR45ST67/);
@@ -263,7 +260,7 @@ test("gchat non-message and bot events are ignored", () => {
   }).kind, "ignored");
 });
 
-test("gchat reply maps to sync response; approvals render cardsV2 buttons", () => {
+test("gchat reply maps to sync response; unbound approvals fail closed to text", () => {
   const plain = surfaceReplyToGchatResponse({ text: "2 flows pending" }, "spaces/A/threads/B");
   assert.deepEqual(plain, { text: "2 flows pending", thread: { name: "spaces/A/threads/B" } });
 
@@ -271,11 +268,8 @@ test("gchat reply maps to sync response; approvals render cardsV2 buttons", () =
     text: "",
     approvalRequest: { runId: "flowrun_5e6f7g8h", gateId: "deploy", show: { target: "prod" }, options: ["approve", "reject"] },
   });
-  const buttons = approval.cardsV2![0].card.sections[0].widgets[0].buttonList.buttons;
-  assert.deepEqual(buttons.map((button) => [button.onClick.action.function, button.onClick.action.parameters[0].value]), [
-    ["muster_approve", "flowrun_5e6f7g8h"],
-    ["muster_reject", "flowrun_5e6f7g8h"],
-  ]);
+  assert.equal(approval.cardsV2, undefined);
+  assert.match(approval.text, /Authenticated approval controls are unavailable/);
 });
 
 // --- Teams mapper ---
@@ -301,7 +295,7 @@ test("teams non-message activities are ignored; HMAC validates raw body", () => 
   assert.equal(teamsHmacIsValid(body, undefined, secret), false);
 });
 
-test("teams reply maps to message activity; approvals render an Adaptive Card", () => {
+test("teams reply maps to message activity; unbound approvals fail closed to text", () => {
   const plain = surfaceReplyToTeamsActivity({ text: "ledger: 48,112 tokens today" });
   assert.deepEqual(plain, { type: "message", text: "ledger: 48,112 tokens today" });
 
@@ -311,10 +305,8 @@ test("teams reply maps to message activity; approvals render an Adaptive Card", 
   });
   const card = approval.attachments![0];
   assert.equal(card.contentType, "application/vnd.microsoft.card.adaptive");
-  assert.deepEqual(card.content.actions.map((action) => action.data.musterAction), [
-    "muster:approve:flowrun_a1b2c3d4",
-    "muster:reject:flowrun_a1b2c3d4",
-  ]);
+  assert.deepEqual(card.content.actions, []);
+  assert.match(JSON.stringify(card.content.body), /Authenticated approval controls are unavailable/);
 
   const pairing = surfaceReplyToTeamsActivity({ status: "pairing_required", code: "ZX98WV76" });
   assert.match(pairing.text!, /muster pairing approve ZX98WV76/);

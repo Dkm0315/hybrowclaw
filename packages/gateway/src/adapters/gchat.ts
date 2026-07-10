@@ -1,6 +1,16 @@
 import { isPairingChallenge } from "../envelope.js";
 import type { PairingChallenge, SurfaceMessage, SurfaceReply } from "../envelope.js";
-import { bindSurfaceAction, parseSurfaceAction, presentationActions, renderPresentationText, sanitizePresentationForAudience } from "../presentation.js";
+import {
+  approvalFallbackText,
+  bindSurfaceAction,
+  issueApprovalActions,
+  parseSurfaceAction,
+  parseVerifiedApprovalSurfaceFields,
+  presentationActions,
+  renderPresentationText,
+  sanitizePresentationForAudience,
+} from "../presentation.js";
+import type { ApprovalActionParser, ApprovalActionRenderContext } from "../presentation.js";
 
 /** Pure Google Chat event mapping plus an injectable modern request verifier. */
 
@@ -17,6 +27,11 @@ export interface GchatRequestVerifier {
 
 export interface GchatMappingOptions {
   readonly commands?: Readonly<Record<string, string>>;
+  readonly approvalActions?: ApprovalActionParser;
+}
+
+export interface GchatRenderOptions {
+  readonly approvalAction?: ApprovalActionRenderContext;
 }
 
 export type GchatInbound =
@@ -80,7 +95,15 @@ export function gchatEventToSurfaceMessage(payload: unknown, options: GchatMappi
   const sender = event.message?.sender ?? event.user ?? event.common?.user;
   if (sender?.type === "BOT") return { kind: "ignored", reason: "bot messages are not surfaced (echo guard)" };
 
-  const text = gchatEventText(event, options);
+  const candidate = gchatActionCandidate(event);
+  const approval = sender?.name && event.space?.name && candidate
+    ? parseVerifiedApprovalSurfaceFields(options.approvalActions, candidate, {
+      actorId: sender.name,
+      surfaceId: "gchat:app",
+      conversationId: event.space.name,
+    }, payload)
+    : undefined;
+  const text = approval?.text ?? gchatEventText(event, options);
   if (!sender?.name || !event.space?.name || !text) {
     return { kind: "ignored", reason: `event ${String(event.type)} is missing a supported command, sender, or space` };
   }
@@ -92,7 +115,7 @@ export function gchatEventToSurfaceMessage(payload: unknown, options: GchatMappi
       senderId: sender.name,
       text,
       replyTo: event.message?.thread?.name,
-      raw: payload,
+      raw: approval?.raw ?? payload,
     },
   };
 }
@@ -100,10 +123,7 @@ export function gchatEventToSurfaceMessage(payload: unknown, options: GchatMappi
 function gchatEventText(event: GchatEvent, options: GchatMappingOptions): string | undefined {
   if (event.type === "APP_HOME") return "/start";
   if (event.type === "CARD_CLICKED" || event.type === "SUBMIT_FORM") {
-    const parameters = {
-      ...(event.common?.parameters ?? {}),
-      ...Object.fromEntries((event.action?.parameters ?? []).flatMap((parameter) => parameter.key && parameter.value ? [[parameter.key, parameter.value]] : [])),
-    };
+    const parameters = gchatActionParameters(event);
     const candidate = parameters.command ?? parameters.value ?? event.common?.invokedFunction ?? event.action?.actionMethodName;
     const command = parseSurfaceAction(candidate) ?? (candidate === "muster_command" && parameters.command?.startsWith("/") ? parameters.command : undefined);
     return command ? appendFormInputs(command, event.common?.formInputs) : undefined;
@@ -119,6 +139,19 @@ function gchatEventText(event: GchatEvent, options: GchatMappingOptions): string
   }
   const text = (event.message?.argumentText ?? event.message?.text ?? "").trim();
   return text || undefined;
+}
+
+function gchatActionParameters(event: GchatEvent): Readonly<Record<string, string>> {
+  return {
+    ...(event.common?.parameters ?? {}),
+    ...Object.fromEntries((event.action?.parameters ?? []).flatMap((parameter) => parameter.key && parameter.value ? [[parameter.key, parameter.value]] : [])),
+  };
+}
+
+function gchatActionCandidate(event: GchatEvent): string | undefined {
+  if (event.type !== "CARD_CLICKED" && event.type !== "SUBMIT_FORM") return undefined;
+  const parameters = gchatActionParameters(event);
+  return parameters.command ?? parameters.value;
 }
 
 function appendFormInputs(
@@ -176,7 +209,11 @@ export interface GchatResponsePayload {
 }
 
 /** Map a gateway reply to a synchronous Chat response. */
-export function surfaceReplyToGchatResponse(reply: SurfaceReply | PairingChallenge, threadName?: string): GchatResponsePayload {
+export function surfaceReplyToGchatResponse(
+  reply: SurfaceReply | PairingChallenge,
+  threadName?: string,
+  options: GchatRenderOptions = {},
+): GchatResponsePayload {
   const thread = threadName ? { name: threadName } : undefined;
   if (isPairingChallenge(reply)) {
     return { text: `This sender is not paired with Muster yet. Ask an operator to run: muster pairing approve ${reply.code}`, thread };
@@ -184,13 +221,14 @@ export function surfaceReplyToGchatResponse(reply: SurfaceReply | PairingChallen
   if (reply.approvalRequest) {
     const { runId, gateId, show } = reply.approvalRequest;
     const shown = typeof show === "string" ? show : JSON.stringify(show, null, 2);
+    const actions = issueApprovalActions(reply.approvalRequest, options.approvalAction, 64);
     return {
-      text: `${reply.text ? `${reply.text}\n\n` : ""}Approval required (gate "${gateId}"):\n${shown}`,
+      text: `${reply.text ? `${reply.text}\n\n` : ""}Approval required (gate "${gateId}", run ${runId}):\n${shown}\n\n${approvalFallbackText(Boolean(actions))}`,
       thread,
-      cardsV2: [{
+      ...(actions ? { cardsV2: [{
         cardId: `muster-approval-${runId}`,
-        card: { sections: [{ widgets: [{ buttonList: { buttons: [approvalButton("Approve", "muster_approve", runId), approvalButton("Reject", "muster_reject", runId)] } }] }] },
-      }],
+        card: { sections: [{ widgets: [{ buttonList: { buttons: [approvalButton("Approve", actions.approve), approvalButton("Reject", actions.reject)] } }] }] },
+      }] } : {}),
     };
   }
   if (reply.presentation) {
@@ -263,8 +301,8 @@ export function surfaceReplyToGchatResponse(reply: SurfaceReply | PairingChallen
   return { text: reply.text, thread };
 }
 
-function approvalButton(text: string, fn: string, runId: string): GchatButton {
-  return { text, onClick: { action: { function: fn, parameters: [{ key: "runId", value: runId }] } } };
+function approvalButton(text: string, token: string): GchatButton {
+  return { text, onClick: { action: { function: "muster_approval", parameters: [{ key: "command", value: token }] } } };
 }
 
 function escapeGchat(value: string): string {

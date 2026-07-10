@@ -93,7 +93,7 @@ test("telegram non-text updates map to undefined", () => {
   assert.equal(telegramUpdateToSurfaceMessage("not json object"), undefined);
 });
 
-test("telegram reply maps to sendMessage; approvals render inline keyboard buttons", () => {
+test("telegram reply maps to sendMessage; unbound approvals fail closed to text", () => {
   const plain = surfaceReplyToTelegramSend({ text: "deploy is green" }, "-100123");
   assert.deepEqual(plain, { chat_id: "-100123", text: "deploy is green" });
 
@@ -106,11 +106,8 @@ test("telegram reply maps to sendMessage; approvals render inline keyboard butto
     approvalRequest: { runId: "flowrun_1a2b3c4d", gateId: "gate", show: "ship it?", options: ["approve", "reject"] },
   }, "-100123");
   assert.match(approval.text, /Approval required/);
-  const buttons = approval.reply_markup?.inline_keyboard[0];
-  assert.deepEqual(buttons?.map((button) => button.callback_data), [
-    "muster:approve:flowrun_1a2b3c4d",
-    "muster:reject:flowrun_1a2b3c4d",
-  ]);
+  assert.match(approval.text, /Authenticated approval controls are unavailable/);
+  assert.equal(approval.reply_markup, undefined);
 });
 
 // --- Slack mapper ---
@@ -147,7 +144,7 @@ test("slack bot echoes and unsupported events are ignored", () => {
   assert.equal(reaction.kind, "ignored");
 });
 
-test("slack reply maps to chat.postMessage; approvals render Block Kit buttons", () => {
+test("slack reply maps to chat.postMessage; unbound approvals fail closed to text", () => {
   const plain = surfaceReplyToSlackPost({ text: "3 open tickets" }, "C1", "1765432000.000200");
   assert.deepEqual(plain, { channel: "C1", thread_ts: "1765432000.000200", text: "3 open tickets" });
 
@@ -156,13 +153,9 @@ test("slack reply maps to chat.postMessage; approvals render Block Kit buttons",
     approvalRequest: { runId: "flowrun_9z8y7x6w", gateId: "publish", show: { title: "Q2 report" }, options: ["approve", "reject"] },
   }, "C1");
   assert.ok(approval.blocks);
-  const actions = approval.blocks!.find((block) => (block as { type: string }).type === "actions") as {
-    elements: Array<{ action_id: string; value: string }>;
-  };
-  assert.deepEqual(actions.elements.map((element) => [element.action_id, element.value]), [
-    ["muster_approve", "flowrun_9z8y7x6w"],
-    ["muster_reject", "flowrun_9z8y7x6w"],
-  ]);
+  const actions = approval.blocks!.find((block) => (block as { type: string }).type === "actions");
+  assert.equal(actions, undefined);
+  assert.match(approval.text, /Authenticated approval controls are unavailable/);
 
   const pairing = surfaceReplyToSlackPost({ status: "pairing_required", code: "QR45ST67" }, "C1");
   assert.match(pairing.text, /muster pairing approve QR45ST67/);

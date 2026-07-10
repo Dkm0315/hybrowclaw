@@ -1,6 +1,16 @@
 import { isPairingChallenge } from "../envelope.js";
 import type { PairingChallenge, SurfaceMessage, SurfaceReply } from "../envelope.js";
-import { bindSurfaceAction, parseSurfaceAction, presentationActions, renderPresentationText, sanitizePresentationForAudience } from "../presentation.js";
+import {
+  approvalFallbackText,
+  bindSurfaceAction,
+  issueApprovalActions,
+  parseSurfaceAction,
+  parseVerifiedApprovalSurfaceFields,
+  presentationActions,
+  renderPresentationText,
+  sanitizePresentationForAudience,
+} from "../presentation.js";
+import type { ApprovalActionParser, ApprovalActionRenderContext } from "../presentation.js";
 
 /**
  * WhatsApp Cloud API adapter: PURE mappers only (no network). The gateway
@@ -60,8 +70,16 @@ export function whatsAppMessageIds(payload: unknown): readonly string[] {
   return ids;
 }
 
+export interface WhatsAppMappingOptions {
+  readonly approvalActions?: ApprovalActionParser;
+}
+
+export interface WhatsAppRenderOptions {
+  readonly approvalAction?: ApprovalActionRenderContext;
+}
+
 /** Map a Cloud API webhook (entry[].changes[].value.messages[]) to SurfaceMessages. */
-export function whatsAppWebhookToSurfaceMessages(payload: unknown): readonly SurfaceMessage[] {
+export function whatsAppWebhookToSurfaceMessages(payload: unknown, options: WhatsAppMappingOptions = {}): readonly SurfaceMessage[] {
   if (typeof payload !== "object" || payload === null) return [];
   const webhook = payload as WhatsAppWebhook;
   if (webhook.object !== "whatsapp_business_account") return [];
@@ -71,17 +89,26 @@ export function whatsAppWebhookToSurfaceMessages(payload: unknown): readonly Sur
       if (change.field !== "messages" || !change.value) continue;
       const phoneNumberId = change.value.metadata?.phone_number_id ?? "unknown-number";
       for (const message of change.value.messages ?? []) {
+        const callback = message.interactive?.button_reply?.id ?? message.button?.payload;
+        const surfaceId = `whatsapp:${phoneNumberId}`;
+        const approval = message.from
+          ? parseVerifiedApprovalSurfaceFields(options.approvalActions, callback, {
+            actorId: message.from,
+            surfaceId,
+            conversationId: message.from,
+          }, payload)
+          : undefined;
         const text = message.type === "text"
           ? message.text?.body
-          : parseSurfaceAction(message.interactive?.button_reply?.id ?? message.button?.payload);
+          : approval?.text ?? parseSurfaceAction(callback);
         if (!message.from || typeof text !== "string" || !text.trim()) continue;
         messages.push({
-          surfaceId: `whatsapp:${phoneNumberId}`,
+          surfaceId,
           conversationId: message.from,
           senderId: message.from,
           text,
           replyTo: message.context?.id,
-          raw: payload,
+          raw: approval?.raw ?? payload,
         });
       }
     }
@@ -105,7 +132,11 @@ export interface WhatsAppSendPayload {
 }
 
 /** Map a gateway reply (or pairing challenge) to a Cloud API /messages payload. */
-export function surfaceReplyToWhatsAppSend(reply: SurfaceReply | PairingChallenge, to: string): WhatsAppSendPayload {
+export function surfaceReplyToWhatsAppSend(
+  reply: SurfaceReply | PairingChallenge,
+  to: string,
+  options: WhatsAppRenderOptions = {},
+): WhatsAppSendPayload {
   if (isPairingChallenge(reply)) {
     return {
       messaging_product: "whatsapp",
@@ -118,6 +149,16 @@ export function surfaceReplyToWhatsAppSend(reply: SurfaceReply | PairingChalleng
   if (reply.approvalRequest) {
     const { runId, gateId, show } = reply.approvalRequest;
     const shown = typeof show === "string" ? show : JSON.stringify(show, null, 2);
+    const actions = issueApprovalActions(reply.approvalRequest, options.approvalAction, 64);
+    if (!actions) {
+      return {
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to,
+        type: "text",
+        text: { body: `${reply.text ? `${reply.text}\n\n` : ""}Approval required (gate "${gateId}", run ${runId}):\n${shown}\n\n${approvalFallbackText(false)}`.slice(0, 4096) },
+      };
+    }
     return {
       messaging_product: "whatsapp",
       recipient_type: "individual",
@@ -125,11 +166,11 @@ export function surfaceReplyToWhatsAppSend(reply: SurfaceReply | PairingChalleng
       type: "interactive",
       interactive: {
         type: "button",
-        body: { text: `${reply.text ? `${reply.text}\n\n` : ""}Approval required (gate "${gateId}"):\n${shown}` },
+        body: { text: `${reply.text ? `${reply.text}\n\n` : ""}Approval required (gate "${gateId}", run ${runId}):\n${shown}\n\n${approvalFallbackText(true)}`.slice(0, 1024) },
         action: {
           buttons: [
-            { type: "reply", reply: { id: `muster:approve:${runId}`, title: "Approve" } },
-            { type: "reply", reply: { id: `muster:reject:${runId}`, title: "Reject" } },
+            { type: "reply", reply: { id: actions.approve, title: "Approve" } },
+            { type: "reply", reply: { id: actions.reject, title: "Reject" } },
           ],
         },
       },

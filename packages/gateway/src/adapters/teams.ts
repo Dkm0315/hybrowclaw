@@ -1,7 +1,17 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { isPairingChallenge } from "../envelope.js";
 import type { PairingChallenge, SurfaceMessage, SurfaceReply } from "../envelope.js";
-import { bindSurfaceAction, parseSurfaceAction, presentationActions, renderPresentationText, sanitizePresentationForAudience } from "../presentation.js";
+import {
+  approvalFallbackText,
+  bindSurfaceAction,
+  issueApprovalActions,
+  parseSurfaceAction,
+  parseVerifiedApprovalSurfaceFields,
+  presentationActions,
+  renderPresentationText,
+  sanitizePresentationForAudience,
+} from "../presentation.js";
+import type { ApprovalActionParser, ApprovalActionRenderContext } from "../presentation.js";
 
 /**
  * Microsoft Teams outgoing-webhook adapter: PURE mappers only (no network).
@@ -13,6 +23,14 @@ import { bindSurfaceAction, parseSurfaceAction, presentationActions, renderPrese
 export type TeamsInbound =
   | { readonly kind: "message"; readonly message: SurfaceMessage }
   | { readonly kind: "ignored"; readonly reason: string };
+
+export interface TeamsMappingOptions {
+  readonly approvalActions?: ApprovalActionParser;
+}
+
+export interface TeamsRenderOptions {
+  readonly approvalAction?: ApprovalActionRenderContext;
+}
 
 interface TeamsActivity {
   readonly type?: string;
@@ -30,7 +48,7 @@ function stripMentions(text: string): string {
 }
 
 /** Map a Teams message activity to the gateway envelope. */
-export function teamsActivityToSurfaceMessage(payload: unknown): TeamsInbound {
+export function teamsActivityToSurfaceMessage(payload: unknown, options: TeamsMappingOptions = {}): TeamsInbound {
   if (typeof payload !== "object" || payload === null) {
     return { kind: "ignored", reason: "payload is not an object" };
   }
@@ -38,7 +56,15 @@ export function teamsActivityToSurfaceMessage(payload: unknown): TeamsInbound {
   if (activity.type !== "message") {
     return { kind: "ignored", reason: `unsupported activity type: ${String(activity.type)}` };
   }
-  const text = parseSurfaceAction(activity.value?.musterAction ?? activity.value?.command)
+  const surfaceId = `teams:${activity.channelData?.tenant?.id ?? "tenant"}`;
+  const approval = activity.from?.id && activity.conversation?.id
+    ? parseVerifiedApprovalSurfaceFields(options.approvalActions, activity.value?.musterAction ?? activity.value?.command, {
+      actorId: activity.from.id,
+      surfaceId,
+      conversationId: activity.conversation.id,
+    }, payload)
+    : undefined;
+  const text = approval?.text ?? parseSurfaceAction(activity.value?.musterAction ?? activity.value?.command)
     ?? (typeof activity.text === "string" ? stripMentions(activity.text) : "");
   if (!activity.from?.id || !activity.conversation?.id || !text) {
     return { kind: "ignored", reason: "activity is missing from.id, conversation.id, or text" };
@@ -46,12 +72,12 @@ export function teamsActivityToSurfaceMessage(payload: unknown): TeamsInbound {
   return {
     kind: "message",
     message: {
-      surfaceId: `teams:${activity.channelData?.tenant?.id ?? "tenant"}`,
+      surfaceId,
       conversationId: activity.conversation.id,
       senderId: activity.from.id,
       text,
       replyTo: activity.id,
-      raw: payload,
+      raw: approval?.raw ?? payload,
     },
   };
 }
@@ -86,7 +112,10 @@ export interface TeamsResponseActivity {
 }
 
 /** Map a gateway reply to the synchronous Teams response (Adaptive Card for approvals). */
-export function surfaceReplyToTeamsActivity(reply: SurfaceReply | PairingChallenge): TeamsResponseActivity {
+export function surfaceReplyToTeamsActivity(
+  reply: SurfaceReply | PairingChallenge,
+  options: TeamsRenderOptions = {},
+): TeamsResponseActivity {
   if (isPairingChallenge(reply)) {
     return {
       type: "message",
@@ -96,6 +125,7 @@ export function surfaceReplyToTeamsActivity(reply: SurfaceReply | PairingChallen
   if (reply.approvalRequest) {
     const { runId, gateId, show } = reply.approvalRequest;
     const shown = typeof show === "string" ? show : JSON.stringify(show, null, 2);
+    const actions = issueApprovalActions(reply.approvalRequest, options.approvalAction, 64);
     return {
       type: "message",
       attachments: [{
@@ -104,13 +134,14 @@ export function surfaceReplyToTeamsActivity(reply: SurfaceReply | PairingChallen
           type: "AdaptiveCard",
           version: "1.5",
           body: [
-            { type: "TextBlock", text: `${reply.text ? `${reply.text}\n\n` : ""}Approval required (gate "${gateId}")`, wrap: true },
+            { type: "TextBlock", text: `${reply.text ? `${reply.text}\n\n` : ""}Approval required (gate "${gateId}", run ${runId})`, wrap: true },
             { type: "TextBlock", text: shown, wrap: true },
+            { type: "TextBlock", text: approvalFallbackText(Boolean(actions)), wrap: true },
           ],
-          actions: [
-            { type: "Action.Submit", title: "Approve", data: { musterAction: `muster:approve:${runId}` } },
-            { type: "Action.Submit", title: "Reject", data: { musterAction: `muster:reject:${runId}` } },
-          ],
+          actions: actions ? [
+            { type: "Action.Submit", title: "Approve", data: { musterAction: actions.approve }, style: "positive" },
+            { type: "Action.Submit", title: "Reject", data: { musterAction: actions.reject }, style: "destructive" },
+          ] : [],
         },
       }],
     };

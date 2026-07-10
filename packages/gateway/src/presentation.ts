@@ -1,3 +1,5 @@
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+
 /** Channel-neutral interaction data. Adapters render this without changing command semantics. */
 
 export type PresentationTone = "neutral" | "positive" | "warning" | "critical";
@@ -109,7 +111,294 @@ export function createAsyncAcknowledgement(input: AsyncAcknowledgementInput): { 
 }
 
 const ACTION_PREFIX = "muster:cmd:";
+const APPROVAL_ACTION_PREFIX = "ma1";
+const APPROVAL_ACTION_ID_BYTES = 12;
+const APPROVAL_ACTION_SIGNATURE_BYTES = 12;
 const SENSITIVE_MANAGER_COLUMN = /^(?:raw\s+)?(?:prompt|message|input|content|query|request)(?:\s+text)?$/i;
+const VERIFIED_APPROVAL_RAW = new WeakSet<object>();
+
+export type ApprovalDecision = "approve" | "reject";
+export type ApprovalActionFailureReason =
+  | "invalid"
+  | "not_found"
+  | "tampered"
+  | "expired"
+  | "wrong_actor"
+  | "wrong_surface"
+  | "wrong_conversation"
+  | "replay"
+  | "conflict";
+
+export interface ApprovalActionBinding {
+  readonly id: string;
+  readonly actorId: string;
+  readonly surfaceId: string;
+  readonly conversationId: string;
+  readonly runId: string;
+  readonly gateId: string;
+  readonly revision: string;
+  readonly issuedAt: number;
+  readonly expiresAt: number;
+}
+
+export interface ApprovalActionIssueInput {
+  readonly actorId: string;
+  readonly surfaceId: string;
+  readonly conversationId: string;
+  readonly runId: string;
+  readonly gateId: string;
+  readonly revision: string;
+  readonly expiresAt: number;
+}
+
+export interface ApprovalActionAttempt {
+  readonly actorId: string;
+  readonly surfaceId: string;
+  readonly conversationId: string;
+}
+
+export type ApprovalActionResult =
+  | { readonly ok: true; readonly decision: ApprovalDecision; readonly binding: ApprovalActionBinding }
+  | { readonly ok: false; readonly reason: ApprovalActionFailureReason };
+
+export interface ApprovalActionTokens {
+  readonly approve: string;
+  readonly reject: string;
+}
+
+export type ApprovalActionConsumeResult = "consumed" | "missing" | "replay" | "conflict";
+
+/**
+ * The store owns the atomic one-shot transition. A durable implementation can
+ * back this interface with SQLite/Postgres without changing channel adapters.
+ */
+export interface ApprovalActionStore {
+  create(binding: ApprovalActionBinding): boolean;
+  read(id: string): ApprovalActionBinding | undefined;
+  consume(id: string, expectedFingerprint: string, decision: ApprovalDecision, consumedAt: number): ApprovalActionConsumeResult;
+}
+
+export interface ApprovalActionIssuer {
+  issue(input: ApprovalActionIssueInput, maxBytes?: number): ApprovalActionTokens | undefined;
+}
+
+export interface ApprovalActionParser {
+  parse(value: unknown, attempt: ApprovalActionAttempt): ApprovalActionResult;
+}
+
+export interface ApprovalActionCodec extends ApprovalActionIssuer, ApprovalActionParser {}
+
+export interface ApprovalActionRenderContext extends ApprovalActionIssueInput {
+  readonly codec: ApprovalActionIssuer;
+}
+
+export interface ApprovalActionCodecOptions {
+  readonly secret: string | Uint8Array;
+  readonly store?: ApprovalActionStore;
+  readonly now?: () => number;
+  readonly idFactory?: () => string;
+  /** Optional live gate check for revision/revocation beyond the signed binding. */
+  readonly validate?: (binding: ApprovalActionBinding, attempt: ApprovalActionAttempt) => ApprovalActionFailureReason | undefined;
+}
+
+interface MutableApprovalRecord {
+  readonly binding: ApprovalActionBinding;
+  readonly fingerprint: string;
+  consumedAt?: number;
+  decision?: ApprovalDecision;
+}
+
+/** Process-local test/development store. Production can inject a durable store. */
+export class InMemoryApprovalActionStore implements ApprovalActionStore {
+  readonly #records = new Map<string, MutableApprovalRecord>();
+
+  create(binding: ApprovalActionBinding): boolean {
+    if (this.#records.has(binding.id)) return false;
+    this.#records.set(binding.id, { binding, fingerprint: approvalBindingFingerprint(binding) });
+    return true;
+  }
+
+  read(id: string): ApprovalActionBinding | undefined {
+    return this.#records.get(id)?.binding;
+  }
+
+  consume(id: string, expectedFingerprint: string, decision: ApprovalDecision, consumedAt: number): ApprovalActionConsumeResult {
+    const record = this.#records.get(id);
+    if (!record) return "missing";
+    if (record.fingerprint !== expectedFingerprint) return "conflict";
+    if (record.consumedAt !== undefined) return "replay";
+    record.consumedAt = consumedAt;
+    record.decision = decision;
+    return "consumed";
+  }
+}
+
+/**
+ * Compact opaque approval codec. The callback contains only a random id,
+ * decision bit, and truncated HMAC; all identity and gate claims remain in the
+ * injected store. Tokens are 39 bytes with the default sizes (Telegram: 64).
+ */
+export function createApprovalActionCodec(options: ApprovalActionCodecOptions): ApprovalActionCodec {
+  const secret = Buffer.from(options.secret);
+  if (secret.byteLength < 32) throw new Error("Approval action signing secret must contain at least 32 bytes.");
+  const store = options.store ?? new InMemoryApprovalActionStore();
+  const now = options.now ?? Date.now;
+  const idFactory = options.idFactory ?? (() => randomBytes(APPROVAL_ACTION_ID_BYTES).toString("base64url"));
+
+  return {
+    issue(input, maxBytes = Number.POSITIVE_INFINITY) {
+      validateApprovalIssueInput(input, now());
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const binding: ApprovalActionBinding = { ...input, id: idFactory(), issuedAt: now() };
+        if (!/^[A-Za-z0-9_-]{8,32}$/.test(binding.id)) throw new Error("Approval action ids must be 8-32 base64url characters.");
+        const approve = approvalToken(binding, "approve", secret);
+        const reject = approvalToken(binding, "reject", secret);
+        if (Buffer.byteLength(approve, "utf8") > maxBytes || Buffer.byteLength(reject, "utf8") > maxBytes) return undefined;
+        if (store.create(binding)) return { approve, reject };
+      }
+      throw new Error("Could not allocate a unique approval action id.");
+    },
+
+    parse(value, attempt) {
+      const token = parseApprovalToken(value);
+      if (!token) return { ok: false, reason: "invalid" };
+      const binding = store.read(token.id);
+      if (!binding) return { ok: false, reason: "not_found" };
+      const expected = approvalToken(binding, token.decision, secret);
+      if (!constantTimeTextEqual(expected, token.value)) return { ok: false, reason: "tampered" };
+      const currentTime = now();
+      if (binding.expiresAt <= currentTime) return { ok: false, reason: "expired" };
+      if (binding.actorId !== attempt.actorId) return { ok: false, reason: "wrong_actor" };
+      if (binding.surfaceId !== attempt.surfaceId) return { ok: false, reason: "wrong_surface" };
+      if (binding.conversationId !== attempt.conversationId) return { ok: false, reason: "wrong_conversation" };
+      const invalid = options.validate?.(binding, attempt);
+      if (invalid) return { ok: false, reason: invalid };
+      const consumed = store.consume(binding.id, approvalBindingFingerprint(binding), token.decision, currentTime);
+      if (consumed !== "consumed") {
+        return { ok: false, reason: consumed === "missing" ? "not_found" : consumed };
+      }
+      return { ok: true, decision: token.decision, binding };
+    },
+  };
+}
+
+/** Internal dispatcher marker; the verified claims live in raw metadata. */
+export const VERIFIED_APPROVAL_COMMAND = "/approvals decide";
+
+export interface VerifiedApprovalActionRaw {
+  readonly platformPayload: unknown;
+  readonly verifiedApprovalAction: {
+    readonly decision: ApprovalDecision;
+    readonly binding: ApprovalActionBinding;
+  };
+}
+
+export function verifiedApprovalRaw(platformPayload: unknown, result: Extract<ApprovalActionResult, { ok: true }>): VerifiedApprovalActionRaw {
+  const raw: VerifiedApprovalActionRaw = { platformPayload, verifiedApprovalAction: { decision: result.decision, binding: result.binding } };
+  VERIFIED_APPROVAL_RAW.add(raw);
+  return raw;
+}
+
+export function verifiedApprovalFromRaw(raw: unknown): VerifiedApprovalActionRaw["verifiedApprovalAction"] | undefined {
+  if (typeof raw !== "object" || raw === null || !VERIFIED_APPROVAL_RAW.has(raw)) return undefined;
+  const value = (raw as Partial<VerifiedApprovalActionRaw>).verifiedApprovalAction;
+  if (!value || (value.decision !== "approve" && value.decision !== "reject")) return undefined;
+  return value;
+}
+
+export function parseVerifiedApprovalSurfaceFields(
+  parser: ApprovalActionParser | undefined,
+  value: unknown,
+  attempt: ApprovalActionAttempt,
+  platformPayload: unknown,
+): { readonly text: string; readonly raw: VerifiedApprovalActionRaw } | undefined {
+  if (!parser) return undefined;
+  const result = parser.parse(value, attempt);
+  return result.ok ? { text: VERIFIED_APPROVAL_COMMAND, raw: verifiedApprovalRaw(platformPayload, result) } : undefined;
+}
+
+export function approvalFallbackText(hasActions: boolean): string {
+  return hasActions
+    ? "Approve or reject with the authenticated controls below."
+    : "Authenticated approval controls are unavailable in this response. Ask an operator to reopen the approval.";
+}
+
+export function issueApprovalActions(
+  request: { readonly runId: string; readonly gateId: string },
+  context: ApprovalActionRenderContext | undefined,
+  maxBytes: number,
+): ApprovalActionTokens | undefined {
+  if (!context) return undefined;
+  if (context.runId !== request.runId || context.gateId !== request.gateId) return undefined;
+  try {
+    return context.codec.issue(context, maxBytes);
+  } catch {
+    return undefined;
+  }
+}
+
+function validateApprovalIssueInput(input: ApprovalActionIssueInput, currentTime: number): void {
+  for (const [name, value] of Object.entries({
+    actorId: input.actorId,
+    surfaceId: input.surfaceId,
+    conversationId: input.conversationId,
+    runId: input.runId,
+    gateId: input.gateId,
+    revision: input.revision,
+  })) {
+    if (typeof value !== "string" || !value.trim() || value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)) {
+      throw new Error(`Approval action ${name} must be a non-empty safe string up to 512 characters.`);
+    }
+  }
+  if (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= currentTime) {
+    throw new Error("Approval action expiry must be a future integer timestamp in milliseconds.");
+  }
+}
+
+function approvalToken(binding: ApprovalActionBinding, decision: ApprovalDecision, secret: Buffer): string {
+  const bit = decision === "approve" ? "a" : "r";
+  const unsigned = `${APPROVAL_ACTION_PREFIX}.${binding.id}.${bit}`;
+  const signature = createHmac("sha256", secret)
+    .update(approvalBindingCanonical(binding))
+    .update("\n")
+    .update(bit)
+    .digest()
+    .subarray(0, APPROVAL_ACTION_SIGNATURE_BYTES)
+    .toString("base64url");
+  return `${unsigned}.${signature}`;
+}
+
+function parseApprovalToken(value: unknown): { readonly value: string; readonly id: string; readonly decision: ApprovalDecision } | undefined {
+  if (typeof value !== "string") return undefined;
+  const match = /^ma1\.([A-Za-z0-9_-]{8,32})\.([ar])\.([A-Za-z0-9_-]{16})$/.exec(value);
+  if (!match) return undefined;
+  return { value, id: match[1], decision: match[2] === "a" ? "approve" : "reject" };
+}
+
+function approvalBindingCanonical(binding: ApprovalActionBinding): string {
+  return JSON.stringify([
+    APPROVAL_ACTION_PREFIX,
+    binding.id,
+    binding.actorId,
+    binding.surfaceId,
+    binding.conversationId,
+    binding.runId,
+    binding.gateId,
+    binding.revision,
+    binding.issuedAt,
+    binding.expiresAt,
+  ]);
+}
+
+function approvalBindingFingerprint(binding: ApprovalActionBinding): string {
+  return createHmac("sha256", "muster-approval-store-fingerprint-v1").update(approvalBindingCanonical(binding)).digest("base64url");
+}
+
+function constantTimeTextEqual(left: string, right: string): boolean {
+  const leftBytes = Buffer.from(left);
+  const rightBytes = Buffer.from(right);
+  return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
+}
 
 /**
  * Bind an action to a compact, stateless callback. Telegram limits callback_data

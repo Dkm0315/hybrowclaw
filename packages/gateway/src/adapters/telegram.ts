@@ -1,6 +1,16 @@
 import { isPairingChallenge } from "../envelope.js";
 import type { PairingChallenge, SurfaceMessage, SurfaceReply } from "../envelope.js";
-import { bindSurfaceAction, parseSurfaceAction, presentationActions, renderPresentationText, sanitizePresentationForAudience } from "../presentation.js";
+import {
+  approvalFallbackText,
+  bindSurfaceAction,
+  issueApprovalActions,
+  parseSurfaceAction,
+  parseVerifiedApprovalSurfaceFields,
+  presentationActions,
+  renderPresentationText,
+  sanitizePresentationForAudience,
+} from "../presentation.js";
+import type { ApprovalActionParser, ApprovalActionRenderContext } from "../presentation.js";
 
 /**
  * Telegram Bot API adapter: PURE mappers only (no network). The gateway
@@ -9,6 +19,14 @@ import { bindSurfaceAction, parseSurfaceAction, presentationActions, renderPrese
  */
 
 export const TELEGRAM_SURFACE_ID = "telegram:bot";
+
+export interface TelegramMappingOptions {
+  readonly approvalActions?: ApprovalActionParser;
+}
+
+export interface TelegramRenderOptions {
+  readonly approvalAction?: ApprovalActionRenderContext;
+}
 
 interface TelegramUpdate {
   readonly update_id?: number;
@@ -32,11 +50,18 @@ interface TelegramUpdate {
 }
 
 /** Map a Telegram update to the gateway envelope. Non-text updates map to undefined. */
-export function telegramUpdateToSurfaceMessage(update: unknown): SurfaceMessage | undefined {
+export function telegramUpdateToSurfaceMessage(update: unknown, options: TelegramMappingOptions = {}): SurfaceMessage | undefined {
   if (typeof update !== "object" || update === null) return undefined;
   const typed = update as TelegramUpdate;
   const callback = typed.callback_query;
-  const command = parseSurfaceAction(callback?.data);
+  const approval = callback?.message?.chat?.id && callback.from?.id
+    ? parseVerifiedApprovalSurfaceFields(options.approvalActions, callback.data, {
+      actorId: String(callback.from.id),
+      surfaceId: TELEGRAM_SURFACE_ID,
+      conversationId: String(callback.message.chat.id),
+    }, update)
+    : undefined;
+  const command = approval?.text ?? parseSurfaceAction(callback?.data);
   if (callback?.message?.chat?.id && callback.from?.id && command) {
     return {
       surfaceId: TELEGRAM_SURFACE_ID,
@@ -44,7 +69,7 @@ export function telegramUpdateToSurfaceMessage(update: unknown): SurfaceMessage 
       senderId: String(callback.from.id),
       text: command,
       replyTo: callback.message.message_id === undefined ? undefined : String(callback.message.message_id),
-      raw: update,
+      raw: approval?.raw ?? update,
     };
   }
   const message = typed.message;
@@ -76,7 +101,11 @@ export function telegramCallbackQueryId(update: unknown): string | undefined {
 }
 
 /** Map a gateway reply (or pairing challenge) to a Bot API sendMessage payload. */
-export function surfaceReplyToTelegramSend(reply: SurfaceReply | PairingChallenge, chatId: string): TelegramSendMessagePayload {
+export function surfaceReplyToTelegramSend(
+  reply: SurfaceReply | PairingChallenge,
+  chatId: string,
+  options: TelegramRenderOptions = {},
+): TelegramSendMessagePayload {
   if (isPairingChallenge(reply)) {
     return {
       chat_id: chatId,
@@ -86,15 +115,16 @@ export function surfaceReplyToTelegramSend(reply: SurfaceReply | PairingChalleng
   if (reply.approvalRequest) {
     const { runId, gateId, show } = reply.approvalRequest;
     const shown = typeof show === "string" ? show : JSON.stringify(show, null, 2);
+    const actions = issueApprovalActions(reply.approvalRequest, options.approvalAction, 64);
     return {
       chat_id: chatId,
-      text: `${reply.text ? `${reply.text}\n\n` : ""}Approval required (gate "${gateId}"):\n${shown}`,
-      reply_markup: {
+      text: `${reply.text ? `${reply.text}\n\n` : ""}Approval required (gate "${gateId}", run ${runId}):\n${shown}\n\n${approvalFallbackText(Boolean(actions))}`,
+      ...(actions ? { reply_markup: {
         inline_keyboard: [[
-          { text: "Approve", callback_data: `muster:approve:${runId}` },
-          { text: "Reject", callback_data: `muster:reject:${runId}` },
+          { text: "Approve", callback_data: actions.approve },
+          { text: "Reject", callback_data: actions.reject },
         ]],
-      },
+      } } : {}),
     };
   }
   if (reply.presentation) {

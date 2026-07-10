@@ -1,7 +1,17 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { isPairingChallenge } from "../envelope.js";
 import type { PairingChallenge, SurfaceMessage, SurfaceReply } from "../envelope.js";
-import { bindSurfaceAction, parseSurfaceAction, presentationActions, renderPresentationText, sanitizePresentationForAudience } from "../presentation.js";
+import {
+  approvalFallbackText,
+  bindSurfaceAction,
+  issueApprovalActions,
+  parseSurfaceAction,
+  parseVerifiedApprovalSurfaceFields,
+  presentationActions,
+  renderPresentationText,
+  sanitizePresentationForAudience,
+} from "../presentation.js";
+import type { ApprovalActionParser, ApprovalActionRenderContext } from "../presentation.js";
 
 /**
  * Slack Events API adapter: PURE mappers only (no network). The gateway
@@ -42,6 +52,14 @@ export type SlackInbound =
   | { readonly kind: "url_verification"; readonly challenge: string }
   | { readonly kind: "message"; readonly message: SurfaceMessage }
   | { readonly kind: "ignored"; readonly reason: string };
+
+export interface SlackMappingOptions {
+  readonly approvalActions?: ApprovalActionParser;
+}
+
+export interface SlackRenderOptions {
+  readonly approvalAction?: ApprovalActionRenderContext;
+}
 
 interface SlackEnvelope {
   readonly type?: string;
@@ -93,15 +111,22 @@ export function slackDeliveryId(payload: unknown): string | undefined {
 }
 
 /** Map a Slack Events API request body to the gateway envelope. */
-export function slackEventToSurfaceMessage(payload: unknown): SlackInbound {
+export function slackEventToSurfaceMessage(payload: unknown, options: SlackMappingOptions = {}): SlackInbound {
   if (typeof payload !== "object" || payload === null) {
     return { kind: "ignored", reason: "payload is not an object" };
   }
   const action = payload as SlackActionEnvelope;
   if (action.type === "block_actions") {
     const selected = action.actions?.[0];
-    const command = parseSurfaceAction(selected?.value);
     const channel = action.channel?.id ?? action.container?.channel_id;
+    const approval = action.user?.id && channel
+      ? parseVerifiedApprovalSurfaceFields(options.approvalActions, selected?.value, {
+        actorId: action.user.id,
+        surfaceId: `slack:${action.team?.id ?? "unknown-team"}`,
+        conversationId: channel,
+      }, payload)
+      : undefined;
+    const command = approval?.text ?? parseSurfaceAction(selected?.value);
     if (!command || !action.user?.id || !channel) return { kind: "ignored", reason: "block action is missing a bound command, user, or channel" };
     return {
       kind: "message",
@@ -111,7 +136,7 @@ export function slackEventToSurfaceMessage(payload: unknown): SlackInbound {
         senderId: action.user.id,
         text: command,
         replyTo: action.container?.thread_ts ?? action.container?.message_ts,
-        raw: payload,
+        raw: approval?.raw ?? payload,
       },
     };
   }
@@ -172,6 +197,7 @@ export function surfaceReplyToSlackPost(
   reply: SurfaceReply | PairingChallenge,
   channel: string,
   threadTs?: string,
+  options: SlackRenderOptions = {},
 ): SlackPostMessagePayload {
   if (isPairingChallenge(reply)) {
     return {
@@ -183,22 +209,23 @@ export function surfaceReplyToSlackPost(
   if (reply.approvalRequest) {
     const { runId, gateId, show } = reply.approvalRequest;
     const shown = typeof show === "string" ? show : JSON.stringify(show, null, 2);
+    const actions = issueApprovalActions(reply.approvalRequest, options.approvalAction, 64);
     return {
       channel,
       thread_ts: threadTs,
-      text: `Approval required (gate "${gateId}", run ${runId})`,
+      text: `Approval required (gate "${gateId}", run ${runId}). ${approvalFallbackText(Boolean(actions))}`,
       blocks: [
         {
           type: "section",
-          text: { type: "mrkdwn", text: `${reply.text ? `${reply.text}\n\n` : ""}*Approval required* (gate \`${gateId}\`):\n\`\`\`${shown}\`\`\`` },
+          text: { type: "mrkdwn", text: `${reply.text ? `${reply.text}\n\n` : ""}*Approval required* (gate \`${gateId}\`, run \`${runId}\`):\n\`\`\`${shown}\`\`\`\n${approvalFallbackText(Boolean(actions))}` },
         },
-        {
+        ...(actions ? [{
           type: "actions",
           elements: [
-            { type: "button", text: { type: "plain_text", text: "Approve" }, style: "primary", action_id: "muster_approve", value: runId },
-            { type: "button", text: { type: "plain_text", text: "Reject" }, style: "danger", action_id: "muster_reject", value: runId },
+            { type: "button", text: { type: "plain_text", text: "Approve" }, style: "primary", action_id: "muster_approval_approve", value: actions.approve },
+            { type: "button", text: { type: "plain_text", text: "Reject" }, style: "danger", action_id: "muster_approval_reject", value: actions.reject },
           ],
-        },
+        }] : []),
       ],
     };
   }

@@ -1,7 +1,17 @@
 import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { isPairingChallenge } from "../envelope.js";
 import type { PairingChallenge, SurfaceMessage, SurfaceReply } from "../envelope.js";
-import { bindSurfaceAction, parseSurfaceAction, presentationActions, renderPresentationText, sanitizePresentationForAudience } from "../presentation.js";
+import {
+  approvalFallbackText,
+  bindSurfaceAction,
+  issueApprovalActions,
+  parseSurfaceAction,
+  parseVerifiedApprovalSurfaceFields,
+  presentationActions,
+  renderPresentationText,
+  sanitizePresentationForAudience,
+} from "../presentation.js";
+import type { ApprovalActionParser, ApprovalActionRenderContext, ApprovalActionTokens } from "../presentation.js";
 
 /**
  * Discord Interactions adapter: PURE mappers (no network) plus the ed25519
@@ -69,6 +79,14 @@ export type DiscordInbound =
   | { readonly kind: "message"; readonly message: SurfaceMessage }
   | { readonly kind: "ignored"; readonly reason: string };
 
+export interface DiscordMappingOptions {
+  readonly approvalActions?: ApprovalActionParser;
+}
+
+export interface DiscordRenderOptions {
+  readonly approvalAction?: ApprovalActionRenderContext;
+}
+
 interface DiscordInteraction {
   readonly type?: number;
   readonly id?: string;
@@ -85,15 +103,22 @@ interface DiscordInteraction {
 }
 
 /** Map a Discord interaction to the gateway envelope. PING maps to "pong". */
-export function discordInteractionToInbound(payload: unknown): DiscordInbound {
+export function discordInteractionToInbound(payload: unknown, options: DiscordMappingOptions = {}): DiscordInbound {
   if (typeof payload !== "object" || payload === null) {
     return { kind: "ignored", reason: "payload is not an object" };
   }
   const interaction = payload as DiscordInteraction;
   if (interaction.type === INTERACTION_PING) return { kind: "pong" };
   if (interaction.type === INTERACTION_MESSAGE_COMPONENT) {
-    const command = parseSurfaceAction(interaction.data?.custom_id);
     const sender = interaction.member?.user ?? interaction.user;
+    const approval = sender?.id && interaction.channel_id
+      ? parseVerifiedApprovalSurfaceFields(options.approvalActions, interaction.data?.custom_id, {
+        actorId: sender.id,
+        surfaceId: `discord:${interaction.guild_id ?? "dm"}`,
+        conversationId: interaction.channel_id,
+      }, payload)
+      : undefined;
+    const command = approval?.text ?? parseSurfaceAction(interaction.data?.custom_id);
     if (!command || !sender?.id || !interaction.channel_id) {
       return { kind: "ignored", reason: "component is not a bound command or is missing sender/channel" };
     }
@@ -105,7 +130,7 @@ export function discordInteractionToInbound(payload: unknown): DiscordInbound {
         senderId: sender.id,
         text: command,
         replyTo: interaction.message?.id,
-        raw: payload,
+        raw: approval?.raw ?? payload,
       },
     };
   }
@@ -156,26 +181,27 @@ export interface DiscordInteractionResponse {
 
 export const DISCORD_PONG: DiscordInteractionResponse = { type: RESPONSE_PONG };
 
-function approvalComponents(runId: string): readonly DiscordComponentRow[] {
+function approvalComponents(actions: ApprovalActionTokens): readonly DiscordComponentRow[] {
   return [{
     type: 1,
     components: [
-      { type: 2, style: 3, label: "Approve", custom_id: `muster:approve:${runId}` },
-      { type: 2, style: 4, label: "Reject", custom_id: `muster:reject:${runId}` },
+      { type: 2, style: 3, label: "Approve", custom_id: actions.approve },
+      { type: 2, style: 4, label: "Reject", custom_id: actions.reject },
     ],
   }];
 }
 
-function replyContent(reply: SurfaceReply | PairingChallenge): { content: string; components?: readonly DiscordComponentRow[] } {
+function replyContent(reply: SurfaceReply | PairingChallenge, options: DiscordRenderOptions): { content: string; components?: readonly DiscordComponentRow[] } {
   if (isPairingChallenge(reply)) {
     return { content: `This sender is not paired with Muster yet. Ask an operator to run: \`muster pairing approve ${reply.code}\`` };
   }
   if (reply.approvalRequest) {
     const { runId, gateId, show } = reply.approvalRequest;
     const shown = typeof show === "string" ? show : JSON.stringify(show, null, 2);
+    const actions = issueApprovalActions(reply.approvalRequest, options.approvalAction, 100);
     return {
-      content: `${reply.text ? `${reply.text}\n\n` : ""}Approval required (gate \`${gateId}\`):\n\`\`\`${shown}\`\`\``,
-      components: approvalComponents(runId),
+      content: `${reply.text ? `${reply.text}\n\n` : ""}Approval required (gate \`${gateId}\`, run \`${runId}\`):\n\`\`\`${shown}\`\`\`\n${approvalFallbackText(Boolean(actions))}`,
+      ...(actions ? { components: approvalComponents(actions) } : {}),
     };
   }
   if (reply.presentation) {
@@ -204,8 +230,11 @@ function replyContent(reply: SurfaceReply | PairingChallenge): { content: string
 }
 
 /** Map a gateway reply (or pairing challenge) to a synchronous interaction response. */
-export function surfaceReplyToDiscordInteractionResponse(reply: SurfaceReply | PairingChallenge): DiscordInteractionResponse {
-  return { type: RESPONSE_CHANNEL_MESSAGE_WITH_SOURCE, data: replyContent(reply) };
+export function surfaceReplyToDiscordInteractionResponse(
+  reply: SurfaceReply | PairingChallenge,
+  options: DiscordRenderOptions = {},
+): DiscordInteractionResponse {
+  return { type: RESPONSE_CHANNEL_MESSAGE_WITH_SOURCE, data: replyContent(reply, options) };
 }
 
 export interface DiscordChannelMessagePayload {
@@ -214,6 +243,9 @@ export interface DiscordChannelMessagePayload {
 }
 
 /** Map a gateway reply to a REST channel-message payload (POST /channels/{id}/messages). */
-export function surfaceReplyToDiscordChannelMessage(reply: SurfaceReply | PairingChallenge): DiscordChannelMessagePayload {
-  return replyContent(reply);
+export function surfaceReplyToDiscordChannelMessage(
+  reply: SurfaceReply | PairingChallenge,
+  options: DiscordRenderOptions = {},
+): DiscordChannelMessagePayload {
+  return replyContent(reply, options);
 }
