@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { dataDir } from "@musterhq/core";
 import type { MemoryScope } from "@musterhq/core";
@@ -63,8 +63,40 @@ export async function loadPairings(cwd = process.cwd()): Promise<PairingStore> {
 
 async function savePairings(store: PairingStore, cwd: string): Promise<void> {
   const path = pairingsPath(cwd);
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(store, null, 2)}\n`, "utf8");
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  await chmod(dirname(path), 0o700).catch(() => undefined);
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(store, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await rename(temporary, path);
+  await chmod(path, 0o600).catch(() => undefined);
+}
+
+async function withPairingLock<T>(cwd: string, operation: () => Promise<T>): Promise<T> {
+  const path = `${pairingsPath(cwd)}.lock`;
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const deadline = Date.now() + 5_000;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  while (!handle) {
+    try {
+      handle = await open(path, "wx", 0o600);
+      await handle.writeFile(`${process.pid}\n`, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const stale = await stat(path).then((value) => Date.now() - value.mtimeMs > 30_000).catch(() => false);
+      if (stale) {
+        await unlink(path).catch(() => undefined);
+        continue;
+      }
+      if (Date.now() >= deadline) throw new Error("Pairing store is busy; retry the operation.");
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+    }
+  }
+  try {
+    return await operation();
+  } finally {
+    await handle.close().catch(() => undefined);
+    await unlink(path).catch(() => undefined);
+  }
 }
 
 function senderKey(surfaceId: string, senderId: string): string {
@@ -91,38 +123,46 @@ export async function resolvePairing(surfaceId: string, senderId: string, cwd = 
  * Idempotent: repeated messages from the same sender reuse the same code.
  */
 export async function requestPairing(surfaceId: string, senderId: string, cwd = process.cwd()): Promise<PendingPairing> {
-  const store = await loadPairings(cwd);
-  const existing = store.pending.find((entry) => entry.surfaceId === surfaceId && entry.senderId === senderId);
-  if (existing) return existing;
-  const pending: PendingPairing = {
-    code: newPairingCode(),
-    surfaceId,
-    senderId,
-    requestedAt: new Date().toISOString(),
-  };
-  await savePairings({ pending: [...store.pending, pending], paired: store.paired }, cwd);
-  return pending;
+  return withPairingLock(cwd, async () => {
+    const store = await loadPairings(cwd);
+    const paired = store.paired.find((entry) => entry.surfaceId === surfaceId && entry.senderId === senderId);
+    if (paired) throw new Error("This sender is already paired.");
+    const existing = store.pending.find((entry) => entry.surfaceId === surfaceId && entry.senderId === senderId);
+    if (existing) return existing;
+    const pending: PendingPairing = {
+      code: newPairingCode(),
+      surfaceId,
+      senderId,
+      requestedAt: new Date().toISOString(),
+    };
+    await savePairings({ pending: [...store.pending, pending], paired: store.paired }, cwd);
+    return pending;
+  });
 }
 
 /** Operator approval: move a pending pairing to paired and mint a pairingId. */
 export async function approvePairing(code: string, cwd = process.cwd(), identity?: Omit<PairedIdentity, "resolvedAt"> & { readonly resolvedAt?: string }): Promise<PairedSender> {
-  const store = await loadPairings(cwd);
-  const pending = store.pending.find((entry) => entry.code === code.trim().toUpperCase());
-  if (!pending) {
-    throw new Error(`No pending pairing with code ${code}. List pending pairings with: muster pairing list`);
-  }
-  const paired: PairedSender = {
-    pairingId: `pair_${randomUUID().slice(0, 8)}`,
-    surfaceId: pending.surfaceId,
-    senderId: pending.senderId,
-    approvedAt: new Date().toISOString(),
-    ...(identity ? { identity: { ...identity, roles: [...identity.roles].sort(), resolvedAt: identity.resolvedAt ?? new Date().toISOString() } } : {}),
-  };
-  await savePairings({
-    pending: store.pending.filter((entry) => entry.code !== pending.code),
-    paired: [...store.paired, paired],
-  }, cwd);
-  return paired;
+  return withPairingLock(cwd, async () => {
+    const store = await loadPairings(cwd);
+    const pending = store.pending.find((entry) => entry.code === code.trim().toUpperCase());
+    if (!pending) {
+      throw new Error(`No pending pairing with code ${code}. List pending pairings with: muster pairing list`);
+    }
+    const existing = store.paired.find((entry) => entry.surfaceId === pending.surfaceId && entry.senderId === pending.senderId);
+    if (existing) return existing;
+    const paired: PairedSender = {
+      pairingId: `pair_${randomUUID().slice(0, 8)}`,
+      surfaceId: pending.surfaceId,
+      senderId: pending.senderId,
+      approvedAt: new Date().toISOString(),
+      ...(identity ? { identity: { ...identity, roles: [...identity.roles].sort(), resolvedAt: identity.resolvedAt ?? new Date().toISOString() } } : {}),
+    };
+    await savePairings({
+      pending: store.pending.filter((entry) => entry.code !== pending.code),
+      paired: [...store.paired, paired],
+    }, cwd);
+    return paired;
+  });
 }
 
 /**

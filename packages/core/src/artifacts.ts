@@ -556,6 +556,33 @@ async function appendArtifactManifestEntry(workspace: ArtifactWorkspace, entry: 
   }
 }
 
+export async function updateArtifactDelivery(
+  workspace: ArtifactWorkspace,
+  artifactId: string,
+  delivery: Partial<ArtifactDeliveryReceipt>,
+): Promise<ArtifactManifestEntry> {
+  const release = await acquireManifestLock(workspace.manifestPath);
+  try {
+    const manifest = await readArtifactManifest(workspace);
+    const index = manifest.artifacts.findIndex((artifact) => artifact.artifactId === artifactId);
+    if (index < 0) throw new Error(`Artifact id does not exist in this run: ${artifactId}`);
+    const current = manifest.artifacts[index];
+    const updatedEntry: ArtifactManifestEntry = {
+      ...current,
+      delivery: normalizeDeliveryReceipt(delivery, current.sourceChannel, current.verification.status === "passed"),
+    };
+    const artifacts = manifest.artifacts.slice();
+    artifacts[index] = updatedEntry;
+    const updated: ArtifactManifest = { ...manifest, updatedAt: new Date().toISOString(), artifacts };
+    const temporary = `${workspace.manifestPath}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(updated, null, 2)}\n`, { mode: 0o600 });
+    await rename(temporary, workspace.manifestPath);
+    return updatedEntry;
+  } finally {
+    await release();
+  }
+}
+
 function normalizeDeliveryReceipt(
   value: Partial<ArtifactDeliveryReceipt> | undefined,
   sourceChannel: string,

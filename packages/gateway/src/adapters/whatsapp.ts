@@ -5,7 +5,7 @@ import {
   bindSurfaceAction,
   issueApprovalActions,
   parseSurfaceAction,
-  parseVerifiedApprovalSurfaceFields,
+  pendingApprovalSurfaceFields,
   presentationActions,
   renderPresentationText,
   sanitizePresentationForAudience,
@@ -92,7 +92,7 @@ export function whatsAppWebhookToSurfaceMessages(payload: unknown, options: What
         const callback = message.interactive?.button_reply?.id ?? message.button?.payload;
         const surfaceId = `whatsapp:${phoneNumberId}`;
         const approval = message.from
-          ? parseVerifiedApprovalSurfaceFields(options.approvalActions, callback, {
+          ? pendingApprovalSurfaceFields(options.approvalActions, callback, {
             actorId: message.from,
             surfaceId,
             conversationId: message.from,

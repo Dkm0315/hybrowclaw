@@ -17,7 +17,15 @@ export interface GatewayCustomCommand {
 export interface GatewayConfig {
   readonly token: string;
   readonly port?: number;
+  readonly security?: {
+    readonly deployment?: "development" | "production";
+    readonly allowLegacyGchatToken?: boolean;
+  };
   readonly governance?: GatewayGovernanceConfig;
+  readonly approvals?: {
+    /** Lifetime of channel approval buttons. Defaults to 10 minutes. */
+    readonly ttlSeconds?: number;
+  };
   readonly commands?: {
     readonly entries?: Record<string, GatewayCustomCommand>;
   };
@@ -111,12 +119,21 @@ export interface GatewayGovernanceAssignment {
   /** Friendly user id used in reports; defaults to the surface sender id. */
   readonly userId?: string;
   readonly roles?: readonly string[];
+  /** Department memberships attached to this user for scoped usage and reporting. */
+  readonly departmentIds?: readonly string[];
   readonly tenantId?: string;
   readonly workspaceId?: string;
   readonly allowedSurfaces?: readonly string[];
   readonly allowedChannels?: readonly string[];
   /** Optional command-capability allowlist used by menus and actions. */
   readonly capabilities?: readonly string[];
+  /** Explicit reporting hierarchy. Manager roles alone never grant access to other users' usage. */
+  readonly managedUserIds?: readonly string[];
+  readonly managedDepartmentIds?: readonly string[];
+  /** Tenant-wide reporting is opt-in even for system roles. */
+  readonly canViewTenantUsage?: boolean;
+  /** Identified user rows are opt-in; the default manager view is pseudonymous. */
+  readonly canViewIdentifiedUsage?: boolean;
 }
 
 export interface GatewayGovernanceValidationConfig {
@@ -148,6 +165,28 @@ export interface GatewayGovernanceConfig {
 }
 
 export const DEFAULT_GATEWAY_PORT = 7460;
+
+/**
+ * Google Chat supports either the exact HTTPS interaction endpoint or a Google
+ * Cloud project number as the signed bearer audience. URL audiences must point
+ * at Muster's Google Chat ingress route so a typo cannot look production-ready.
+ */
+export function googleChatAudienceIsValid(value: string | undefined): boolean {
+  const audience = value?.trim();
+  if (!audience) return false;
+  if (/^[1-9]\d{5,29}$/.test(audience)) return true;
+  try {
+    const url = new URL(audience);
+    return url.protocol === "https:"
+      && !url.username
+      && !url.password
+      && !url.search
+      && !url.hash
+      && url.pathname === "/v1/adapters/gchat";
+  } catch {
+    return false;
+  }
+}
 
 export function gatewayConfigPath(cwd = process.cwd()): string {
   return join(cwd, ".muster", "gateway.json");

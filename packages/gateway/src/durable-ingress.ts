@@ -5,6 +5,7 @@ import type {
 } from "@musterhq/core";
 
 const DEFAULT_LEASE_MS = 120_000;
+const DEFAULT_REPLAY_RETENTION_MS = 7 * 24 * 60 * 60_000;
 const MIN_LEASE_MS = 100;
 const MAX_LEASE_MS = 15 * 60_000;
 const DEFAULT_MAX_TRANSITIONS = 32;
@@ -13,7 +14,7 @@ const DEFAULT_MAX_RUN_ATTEMPTS = 8;
 const DEFAULT_MAX_DELIVERY_ATTEMPTS = 8;
 const FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const SAFE_RESULT_REF_PATTERN = /^(run|receipt|artifact|delivery):[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const DELIVERY_RESULT_PATTERN = /^delivery:(accepted|running|generated|delivering|delivered|failed)\.(\d+)\.(\d+)\.(accepted|running|generated|delivering|delivered)$/;
+const DELIVERY_RESULT_PATTERN = /^delivery:(accepted|running|generated|delivering|delivered|unknown|failed)\.(\d+)\.(\d+)\.(accepted|running|generated|delivering|delivered|unknown)$/;
 
 declare const ingressFingerprintBrand: unique symbol;
 declare const safeResultRefBrand: unique symbol;
@@ -23,7 +24,7 @@ export type GatewaySafeResultRef = string & { readonly [safeResultRefBrand]: tru
 export type GatewayIngressClaimStatus = "claimed" | "replay" | "conflict" | "in-flight";
 export type GatewayIngressCompletionStatus = "completed" | "replay";
 export type GatewayDeliveryTransitionStatus = "transitioned" | "replay" | "conflict" | "in-flight";
-export type GatewayDeliveryState = "accepted" | "running" | "generated" | "delivering" | "delivered" | "failed";
+export type GatewayDeliveryState = "accepted" | "running" | "generated" | "delivering" | "delivered" | "unknown" | "failed";
 type GatewayOperationalState = Exclude<GatewayDeliveryState, "failed">;
 
 export interface GatewayIngressIdentity {
@@ -40,12 +41,17 @@ export interface GatewayIngressClaimInput extends GatewayIngressIdentity {
   readonly leaseMs?: number;
 }
 
-export interface GatewayIngressCompleteInput extends GatewayIngressIdentity {
+export interface GatewayIngressOwnership extends GatewayIngressIdentity {
+  /** Unique generation token returned only to the worker that successfully claimed the delivery. */
+  readonly claimToken: string;
+}
+
+export interface GatewayIngressCompleteInput extends GatewayIngressOwnership {
   readonly resultRef: GatewaySafeResultRef;
   readonly nowMs?: number;
 }
 
-export interface GatewayDeliveryTransitionInput extends GatewayIngressIdentity {
+export interface GatewayDeliveryTransitionInput extends GatewayIngressOwnership {
   readonly to: GatewayDeliveryState;
   readonly nowMs?: number;
 }
@@ -66,6 +72,7 @@ export interface GatewayIngressClaimResult {
   readonly status: GatewayIngressClaimStatus;
   readonly claimedAt: string;
   readonly leaseExpiresAt: string;
+  readonly claimToken?: string;
   readonly resultRef?: GatewaySafeResultRef;
   readonly lifecycle?: GatewayDeliveryLifecycle;
 }
@@ -86,6 +93,8 @@ export interface GatewayIngressCompletionResult {
 export interface DurableGatewayIngressOptions {
   readonly namespacePrefix?: string;
   readonly defaultLeaseMs?: number;
+  /** How long a completed platform delivery remains replay-protected. */
+  readonly replayRetentionMs?: number;
   readonly maxTransitions?: number;
   readonly maxRunAttempts?: number;
   readonly maxDeliveryAttempts?: number;
@@ -95,6 +104,7 @@ export interface DurableGatewayIngressOptions {
 interface DurableGatewayIngressConfig {
   readonly namespacePrefix: string;
   readonly defaultLeaseMs: number;
+  readonly replayRetentionMs: number;
   readonly maxTransitions: number;
   readonly maxRunAttempts: number;
   readonly maxDeliveryAttempts: number;
@@ -165,6 +175,12 @@ export class DurableGatewayIngress {
     this.#config = Object.freeze({
       namespacePrefix,
       defaultLeaseMs: validateLeaseMs(options.defaultLeaseMs ?? DEFAULT_LEASE_MS),
+      replayRetentionMs: boundedInteger(
+        options.replayRetentionMs ?? DEFAULT_REPLAY_RETENTION_MS,
+        60_000,
+        30 * 24 * 60 * 60_000,
+        "replayRetentionMs",
+      ),
       maxTransitions: boundedInteger(options.maxTransitions ?? DEFAULT_MAX_TRANSITIONS, 1, MAX_TRANSITIONS_LIMIT, "maxTransitions"),
       maxRunAttempts: boundedInteger(options.maxRunAttempts ?? DEFAULT_MAX_RUN_ATTEMPTS, 1, 100, "maxRunAttempts"),
       maxDeliveryAttempts: boundedInteger(
@@ -211,12 +227,12 @@ export class DurableGatewayIngress {
   }
 
   async transition(input: GatewayDeliveryTransitionInput): Promise<GatewayDeliveryTransitionResult> {
-    const identity = validateIdentity(input);
+    const identity = validateOwnership(input);
     const nowMs = resolveNow(input.nowMs, this.#config.clock);
     const address = ingressAddress(this.#config.namespacePrefix, identity.scope, identity.deliveryId);
     const ingress = await this.#store.readIdempotency(address.namespace, address.key, nowMs);
     if (!ingress) throw new Error("Gateway ingress claim is missing or its lease expired.");
-    assertFingerprint(ingress, identity.fingerprint);
+    assertOwnership(ingress, identity);
 
     const current = await this.#readLifecycle(address, identity.fingerprint, nowMs);
     if (current.pending) {
@@ -256,8 +272,10 @@ export class DurableGatewayIngress {
       namespace: address.lifecycleNamespace,
       key,
       fingerprint: transitionFingerprint,
+      claimToken: claim.record.claimToken,
       resultRef: lifecycleResultRef(next),
       nowMs,
+      ttlMs: this.#config.replayRetentionMs,
     });
     return {
       status: "transitioned",
@@ -266,23 +284,25 @@ export class DurableGatewayIngress {
   }
 
   async complete(input: GatewayIngressCompleteInput): Promise<GatewayIngressCompletionResult> {
-    const identity = validateIdentity(input);
+    const identity = validateOwnership(input);
     const resultRef = parseGatewaySafeResultRef(input.resultRef);
     const nowMs = resolveNow(input.nowMs, this.#config.clock);
     const address = ingressAddress(this.#config.namespacePrefix, identity.scope, identity.deliveryId);
     const ingress = await this.#store.readIdempotency(address.namespace, address.key, nowMs);
     if (!ingress) throw new Error("Gateway ingress claim is missing or its lease expired.");
-    assertFingerprint(ingress, identity.fingerprint);
+    assertOwnership(ingress, identity);
     const lifecycle = (await this.#readLifecycle(address, identity.fingerprint, nowMs)).lifecycle;
-    if (!(["generated", "delivering", "delivered"] as GatewayDeliveryState[]).includes(lifecycle.state)) {
+    if (!(["generated", "delivering", "delivered", "unknown"] as GatewayDeliveryState[]).includes(lifecycle.state)) {
       throw new Error(`Gateway ingress cannot complete while delivery state is ${lifecycle.state}.`);
     }
     const completed = await this.#store.completeIdempotency({
       namespace: address.namespace,
       key: address.key,
       fingerprint: identity.fingerprint,
+      claimToken: identity.claimToken,
       resultRef,
       nowMs,
+      ttlMs: this.#config.replayRetentionMs,
     });
     return Object.freeze({
       status: ingress.state === "completed" ? "replay" : "completed",
@@ -290,6 +310,38 @@ export class DurableGatewayIngress {
       leaseExpiresAt: completed.expiresAt,
       resultRef: parseGatewaySafeResultRef(completed.resultRef ?? ""),
       lifecycle,
+    });
+  }
+
+  async renew(input: GatewayIngressOwnership & { readonly nowMs?: number; readonly leaseMs?: number }): Promise<GatewayIngressClaimResult> {
+    const identity = validateOwnership(input);
+    const nowMs = resolveNow(input.nowMs, this.#config.clock);
+    const leaseMs = validateLeaseMs(input.leaseMs ?? this.#config.defaultLeaseMs);
+    const address = ingressAddress(this.#config.namespacePrefix, identity.scope, identity.deliveryId);
+    const renewed = await this.#store.renewIdempotency({
+      namespace: address.namespace,
+      key: address.key,
+      fingerprint: identity.fingerprint,
+      claimToken: identity.claimToken,
+      ttlMs: leaseMs,
+      nowMs,
+    });
+    const lifecycle = (await this.#readLifecycle(address, identity.fingerprint, nowMs)).lifecycle;
+    return claimResult("claimed", renewed, lifecycle);
+  }
+
+  /** Mark the lifecycle failed and release its pending ingress claim for an immediate retry. */
+  async fail(input: GatewayIngressOwnership & { readonly nowMs?: number }): Promise<boolean> {
+    const identity = validateOwnership(input);
+    const nowMs = resolveNow(input.nowMs, this.#config.clock);
+    const address = ingressAddress(this.#config.namespacePrefix, identity.scope, identity.deliveryId);
+    await this.transition({ ...identity, to: "failed", nowMs });
+    return this.#store.releaseIdempotency({
+      namespace: address.namespace,
+      key: address.key,
+      fingerprint: identity.fingerprint,
+      claimToken: identity.claimToken,
+      nowMs,
     });
   }
 
@@ -348,15 +400,15 @@ function isLegalTransition(current: GatewayDeliveryLifecycle, to: GatewayDeliver
   if (current.state === "accepted") return to === "running" || to === "failed";
   if (current.state === "running") return to === "generated" || to === "failed";
   if (current.state === "generated") return to === "delivering" || to === "failed";
-  if (current.state === "delivering") return to === "delivered" || to === "failed";
-  if (current.state === "delivered") return false;
+  if (current.state === "delivering") return to === "delivered" || to === "unknown" || to === "failed";
+  if (current.state === "delivered" || current.state === "unknown") return false;
   return current.lastOperationalState === "generated" || current.lastOperationalState === "delivering"
     ? to === "delivering"
     : to === "running";
 }
 
 function legalTargets(current: GatewayDeliveryLifecycle): readonly GatewayDeliveryState[] {
-  const states: readonly GatewayDeliveryState[] = ["accepted", "running", "generated", "delivering", "delivered", "failed"];
+  const states: readonly GatewayDeliveryState[] = ["accepted", "running", "generated", "delivering", "delivered", "unknown", "failed"];
   return states.filter((state) => isLegalTransition(current, state));
 }
 
@@ -382,6 +434,7 @@ function applyCompletedTransition(
   const calculated = nextLifecycle(current, next.state, {
     namespacePrefix: "verify",
     defaultLeaseMs: DEFAULT_LEASE_MS,
+    replayRetentionMs: DEFAULT_REPLAY_RETENTION_MS,
     maxTransitions: MAX_TRANSITIONS_LIMIT,
     maxRunAttempts: 100,
     maxDeliveryAttempts: 100,
@@ -451,6 +504,7 @@ function claimResult(
     status,
     claimedAt: record.claimedAt,
     leaseExpiresAt: record.expiresAt,
+    ...(status === "claimed" ? { claimToken: record.claimToken } : {}),
     ...(resultRef ? { resultRef } : {}),
     ...(lifecycle ? { lifecycle } : {}),
   });
@@ -489,6 +543,19 @@ function validateIdentity(input: GatewayIngressIdentity): Readonly<{
   });
 }
 
+function validateOwnership(input: GatewayIngressOwnership): Readonly<{
+  scope: string;
+  deliveryId: string;
+  fingerprint: GatewayIngressFingerprint;
+  claimToken: string;
+}> {
+  const identity = validateIdentity(input);
+  if (typeof input.claimToken !== "string" || !input.claimToken.trim() || input.claimToken.length > 256) {
+    throw new Error("Gateway ingress claim token must be a non-empty value of at most 256 characters.");
+  }
+  return Object.freeze({ ...identity, claimToken: input.claimToken });
+}
+
 function validatePrivateIdentifier(value: string, label: string): void {
   if (typeof value !== "string" || value.length === 0 || value.length > 1_024 || /[\u0000-\u001f\u007f]/.test(value)) {
     throw new Error(`${label} must be a non-empty identifier of at most 1024 characters.`);
@@ -517,4 +584,9 @@ function resolveNow(input: number | undefined, clock: () => number): number {
 
 function assertFingerprint(record: EnterpriseIdempotencyRecord, fingerprint: GatewayIngressFingerprint): void {
   if (record.fingerprint !== fingerprint) throw new Error("Gateway ingress fingerprint conflict.");
+}
+
+function assertOwnership(record: EnterpriseIdempotencyRecord, ownership: GatewayIngressOwnership): void {
+  assertFingerprint(record, ownership.fingerprint);
+  if (record.claimToken !== ownership.claimToken) throw new Error("Gateway ingress claim generation conflict.");
 }

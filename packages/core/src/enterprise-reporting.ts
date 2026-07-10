@@ -30,6 +30,8 @@ export interface EnterpriseUsageQuery {
   readonly from?: string;
   readonly to?: string;
   readonly subjects?: readonly EnterpriseSubject[];
+  /** At least one of these subjects must match, in addition to every required subject above. */
+  readonly subjectAny?: readonly EnterpriseSubject[];
   readonly limit?: number;
 }
 
@@ -339,7 +341,9 @@ function usageMatchesQuery(event: EnterpriseUsageEvent, query: EnterpriseUsageQu
   const occurredAt = Date.parse(event.occurredAt);
   if (query.from && occurredAt < Date.parse(query.from)) return false;
   if (query.to && occurredAt >= Date.parse(query.to)) return false;
-  return !query.subjects?.length || enterpriseScopeMatches(event.subjects, query.subjects);
+  if (query.subjects?.length && !enterpriseScopeMatches(event.subjects, query.subjects)) return false;
+  return !query.subjectAny?.length || query.subjectAny.some((subject) =>
+    event.subjects.some((candidate) => candidate.kind === subject.kind && candidate.id === subject.id));
 }
 
 function validateUsageQuery(query: EnterpriseUsageQuery): void {
@@ -347,6 +351,7 @@ function validateUsageQuery(query: EnterpriseUsageQuery): void {
   const toMs = parseOptionalTimestamp(query.to, "Usage query to");
   if (fromMs !== undefined && toMs !== undefined && fromMs >= toMs) throw new Error("Usage query to must be after from.");
   if (query.subjects) normalizeEnterpriseSubjects(query.subjects);
+  if (query.subjectAny) normalizeEnterpriseSubjects(query.subjectAny);
   if (query.limit !== undefined && (!Number.isSafeInteger(query.limit) || query.limit <= 0)) {
     throw new Error("Usage query limit must be a positive safe integer.");
   }

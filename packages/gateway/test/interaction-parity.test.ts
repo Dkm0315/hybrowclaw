@@ -11,6 +11,7 @@ import {
   createAsyncAcknowledgement,
   discordInteractionToInbound,
   dispatchCommand,
+  createInMemoryGatewayEnterpriseRuntime,
   gchatDeliveryId,
   gchatEventToSurfaceMessage,
   idempotencyLookup,
@@ -109,6 +110,89 @@ test("role and capability visibility fail closed without sending commands to the
   const genericManager: GatewayConfig = { token: "test", governance: { assignments: { default: { roles: ["Operations Manager"] } } } };
   const managerWithoutFrappe = await dispatchCommand(message("/audit"), commandContext(BASE_PAIRED, genericManager));
   assert.equal(managerWithoutFrappe?.presentation?.title, "Audit", "manager visibility must not be hardcoded to Frappe identities");
+});
+
+test("tenant-wide usage fails closed when an authorized system role has no tenant binding", async () => {
+  const enterprise = createInMemoryGatewayEnterpriseRuntime();
+  await enterprise.usageStore.appendUsage({
+    eventId: "tenant-a-run",
+    occurredAt: "2026-07-10T01:00:00.000Z",
+    subjects: [{ kind: "tenant", id: "tenant-a" }, { kind: "user", id: "user-a" }],
+    outcome: "success",
+    latencyMs: 10,
+    inputTokens: 10,
+    outputTokens: 2,
+    cachedInputTokens: 0,
+    costMicrousd: 0,
+    cacheStatus: "bypass",
+  });
+  await enterprise.usageStore.appendUsage({
+    eventId: "tenant-b-run",
+    occurredAt: "2026-07-10T01:01:00.000Z",
+    subjects: [{ kind: "tenant", id: "tenant-b" }, { kind: "user", id: "user-b" }],
+    outcome: "success",
+    latencyMs: 20,
+    inputTokens: 20,
+    outputTokens: 4,
+    cachedInputTokens: 0,
+    costMicrousd: 0,
+    cacheStatus: "bypass",
+  });
+  const unboundGateway: GatewayConfig = {
+    token: "test",
+    governance: { assignments: { default: { roles: ["System Manager"], canViewTenantUsage: true } } },
+  };
+  const unbound = await dispatchCommand(message("/usage scope=team"), { ...commandContext(BASE_PAIRED, unboundGateway), enterprise });
+  assert.equal(unbound?.presentation?.kpis?.find((kpi) => kpi.label === "Runs")?.value, "0");
+
+  const boundGateway: GatewayConfig = {
+    token: "test",
+    governance: { assignments: { default: { roles: ["System Manager"], canViewTenantUsage: true, tenantId: "tenant-a" } } },
+  };
+  const bound = await dispatchCommand(message("/usage scope=team"), { ...commandContext(BASE_PAIRED, boundGateway), enterprise });
+  assert.equal(bound?.presentation?.kpis?.find((kpi) => kpi.label === "Runs")?.value, "1");
+});
+
+test("self and department reports require the caller tenant boundary", async () => {
+  const enterprise = createInMemoryGatewayEnterpriseRuntime();
+  for (const tenant of ["tenant-a", "tenant-b"] as const) {
+    await enterprise.usageStore.appendUsage({
+      eventId: `${tenant}-shared-user`,
+      occurredAt: tenant === "tenant-a" ? "2026-07-10T02:00:00.000Z" : "2026-07-10T02:01:00.000Z",
+      subjects: [
+        { kind: "tenant", id: tenant },
+        { kind: "department", id: "HR" },
+        { kind: "user", id: "shared@example.test" },
+      ],
+      outcome: "success",
+      latencyMs: 10,
+      inputTokens: 10,
+      outputTokens: 2,
+      cachedInputTokens: 0,
+      costMicrousd: 0,
+      cacheStatus: "bypass",
+    });
+  }
+  const selfGateway: GatewayConfig = {
+    token: "test",
+    governance: { assignments: { default: { tenantId: "tenant-a", userId: "shared@example.test" } } },
+  };
+  const self = await dispatchCommand(message("/usage scope=self"), { ...commandContext(BASE_PAIRED, selfGateway), enterprise });
+  assert.equal(self?.presentation?.kpis?.find((kpi) => kpi.label === "Runs")?.value, "1");
+
+  const managerGateway: GatewayConfig = {
+    token: "test",
+    governance: { assignments: { default: { tenantId: "tenant-a", roles: ["HR Manager"], managedDepartmentIds: ["HR"] } } },
+  };
+  const team = await dispatchCommand(message("/usage scope=team"), { ...commandContext(BASE_PAIRED, managerGateway), enterprise });
+  assert.equal(team?.presentation?.kpis?.find((kpi) => kpi.label === "Runs")?.value, "1");
+
+  const unboundManager: GatewayConfig = {
+    token: "test",
+    governance: { assignments: { default: { roles: ["HR Manager"], managedDepartmentIds: ["HR"] } } },
+  };
+  const denied = await dispatchCommand(message("/usage scope=team"), { ...commandContext(BASE_PAIRED, unboundManager), enterprise });
+  assert.equal(denied?.presentation?.kpis?.find((kpi) => kpi.label === "Runs")?.value, "0");
 });
 
 test("help pagination actions persist and execute as direct commands", async () => {
@@ -370,6 +454,7 @@ test("Slack form callbacks execute through the gateway once and replay safely", 
   });
   try {
     assert.equal((await post()).status, 200);
+    await running.waitForIdle();
     assert.equal(outbound.length, 1);
     assert.match(JSON.stringify(outbound[0]), /Status/);
     assert.equal((await post()).status, 200);
@@ -407,6 +492,7 @@ test("Telegram callbacks clear the spinner, execute once, and acknowledge replay
   try {
     assert.equal((await post()).status, 200);
     assert.equal((await post()).status, 200);
+    await running.waitForIdle();
     assert.equal(methods.filter((method) => method === "answerCallbackQuery").length, 2, "every callback delivery should clear the client spinner");
     assert.equal(methods.filter((method) => method === "sendMessage").length, 1, "replay must not rerun or redeliver the command");
   } finally {
@@ -417,7 +503,8 @@ test("Telegram callbacks clear the spinner, execute once, and acknowledge replay
 test("Google Chat bearer verification fails closed and accepts only verifier-approved requests", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-gchat-verifier-"));
   await mkdir(join(cwd, ".muster"), { recursive: true });
-  const gateway: GatewayConfig = { token: "gateway-token", gchat: { verification: { mode: "bearer", audience: "chat-app-123" } } };
+  const audience = "https://chat.example.test/v1/adapters/gchat";
+  const gateway: GatewayConfig = { token: "gateway-token", gchat: { verification: { mode: "bearer", audience } } };
   const payload = {
     type: "APP_HOME",
     eventTime: "2026-07-10T10:00:00Z",
@@ -454,7 +541,7 @@ test("Google Chat bearer verification fails closed and accepts only verifier-app
   try {
     const response = await post(accepted.port);
     assert.equal(response.status, 200);
-    assert.equal(inspectedAudience, "chat-app-123");
+    assert.equal(inspectedAudience, audience);
     assert.match(JSON.stringify(await response.json()), /muster pairing approve/);
   } finally {
     await accepted.close();

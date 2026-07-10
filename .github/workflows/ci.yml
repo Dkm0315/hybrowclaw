@@ -30,6 +30,9 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      - name: Install PTY test runtime
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
       - name: Typecheck
         run: pnpm typecheck
 

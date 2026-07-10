@@ -135,17 +135,40 @@ test("idempotency claims distinguish first execution, replay, conflict, completi
   })));
   assert.equal(claims.filter((claim) => claim.status === "claimed").length, 1);
   assert.equal(claims.filter((claim) => claim.status === "replay").length, 31);
+  const claimToken = claims.find((claim) => claim.status === "claimed")?.record.claimToken;
+  assert.ok(claimToken);
 
   const conflict = await store.claimIdempotency({ namespace: "gchat", key: "event-42", fingerprint: "sha256:different", ttlMs: 1_000, nowMs: now });
   assert.equal(conflict.status, "conflict");
 
-  const completed = await store.completeIdempotency({ namespace: "gchat", key: "event-42", fingerprint: "sha256:abc", resultRef: "receipt-1", nowMs: now + 10 });
+  const completed = await store.completeIdempotency({ namespace: "gchat", key: "event-42", fingerprint: "sha256:abc", claimToken, resultRef: "receipt-1", nowMs: now + 10 });
   assert.equal(completed.state, "completed");
   assert.equal((await store.claimIdempotency({ namespace: "gchat", key: "event-42", fingerprint: "sha256:abc", ttlMs: 1_000, nowMs: now + 20 })).record.resultRef, "receipt-1");
-  await assert.rejects(store.completeIdempotency({ namespace: "gchat", key: "event-42", fingerprint: "sha256:abc", resultRef: "receipt-2", nowMs: now + 30 }), /another result/);
+  await assert.rejects(store.completeIdempotency({ namespace: "gchat", key: "event-42", fingerprint: "sha256:abc", claimToken, resultRef: "receipt-2", nowMs: now + 30 }), /another result/);
 
   const afterExpiry = await store.claimIdempotency({ namespace: "gchat", key: "event-42", fingerprint: "sha256:new", ttlMs: 1_000, nowMs: now + 1_000 });
   assert.equal(afterExpiry.status, "claimed");
+});
+
+test("idempotency generation tokens reject stale completion and renewal extends only the current owner", async () => {
+  const store = new InMemoryEnterpriseGovernanceStore();
+  const first = await store.claimIdempotency({ namespace: "slack", key: "event-aba", fingerprint: "sha256:same", ttlMs: 100, nowMs: now });
+  const second = await store.claimIdempotency({ namespace: "slack", key: "event-aba", fingerprint: "sha256:same", ttlMs: 100, nowMs: now + 100 });
+  assert.equal(second.status, "claimed");
+  assert.notEqual(first.record.claimToken, second.record.claimToken);
+  await assert.rejects(store.completeIdempotency({
+    namespace: "slack", key: "event-aba", fingerprint: "sha256:same", claimToken: first.record.claimToken,
+    resultRef: "stale-result", nowMs: now + 101,
+  }), /generation conflict/);
+  assert.equal(await store.releaseIdempotency({
+    namespace: "slack", key: "event-aba", fingerprint: "sha256:same", claimToken: first.record.claimToken, nowMs: now + 101,
+  }), false);
+  const renewed = await store.renewIdempotency({
+    namespace: "slack", key: "event-aba", fingerprint: "sha256:same", claimToken: second.record.claimToken,
+    ttlMs: 500, nowMs: now + 150,
+  });
+  assert.equal(Date.parse(renewed.expiresAt), now + 650);
+  assert.equal((await store.claimIdempotency({ namespace: "slack", key: "event-aba", fingerprint: "sha256:same", ttlMs: 100, nowMs: now + 649 })).status, "replay");
 });
 
 test("policy counter decisions expose every enforcement action without hiding proceed semantics", () => {

@@ -131,10 +131,29 @@ if (isMainThread) {
     recoveryStore.close();
   });
 
+  test("claim generations prevent stale workers from completing a reclaimed delivery and leases renew", async (t) => {
+    const store = new EnterpriseSqliteStore(databasePath(t));
+    const ingress = new DurableGatewayIngress(store, { defaultLeaseMs: 100 });
+    const event = identity("event-generation");
+    const first = await ingress.claim({ ...event, nowMs: NOW });
+    assert.ok(first.claimToken);
+    const firstOwned = { ...event, claimToken: first.claimToken };
+    await ingress.transition({ ...firstOwned, to: "running", nowMs: NOW + 1 });
+    const second = await ingress.claim({ ...event, nowMs: NOW + 100 });
+    assert.equal(second.status, "claimed");
+    assert.ok(second.claimToken);
+    await assert.rejects(ingress.transition({ ...firstOwned, to: "generated", nowMs: NOW + 101 }), /generation conflict/);
+    const secondOwned = { ...event, claimToken: second.claimToken };
+    const renewed = await ingress.renew({ ...secondOwned, nowMs: NOW + 150, leaseMs: 500 });
+    assert.equal(Date.parse(renewed.leaseExpiresAt), NOW + 650);
+    assert.equal((await ingress.claim({ ...event, nowMs: NOW + 649 })).status, "in-flight");
+    store.close();
+  });
+
   test("completion stores only an opaque result reference and is duplicate-safe", async (t) => {
     const filename = databasePath(t);
     const store = new EnterpriseSqliteStore(filename);
-    const ingress = new DurableGatewayIngress(store, { defaultLeaseMs: 30_000 });
+    const ingress = new DurableGatewayIngress(store, { defaultLeaseMs: 30_000, replayRetentionMs: 120_000 });
     const privatePrompt = "Summarize acquisition target ALPHA using secret sk-live-never-persist";
     const event = {
       scope: "telegram:bot-secret-account",
@@ -142,22 +161,24 @@ if (isMainThread) {
       fingerprint: createGatewayIngressFingerprint(["telegram", "991", privatePrompt]),
     } as const;
 
-    await ingress.claim({ ...event, nowMs: NOW });
-    await ingress.transition({ ...event, to: "running", nowMs: NOW + 1 });
-    await ingress.transition({ ...event, to: "generated", nowMs: NOW + 2 });
+    const claim = await ingress.claim({ ...event, nowMs: NOW });
+    assert.ok(claim.claimToken);
+    const owned = { ...event, claimToken: claim.claimToken };
+    await ingress.transition({ ...owned, to: "running", nowMs: NOW + 1 });
+    await ingress.transition({ ...owned, to: "generated", nowMs: NOW + 2 });
     await assert.rejects(
-      ingress.complete({ ...event, resultRef: privatePrompt as GatewaySafeResultRef, nowMs: NOW + 3 }),
+      ingress.complete({ ...owned, resultRef: privatePrompt as GatewaySafeResultRef, nowMs: NOW + 3 }),
       /opaque run, receipt, artifact, or delivery reference/,
     );
 
     const resultRef = createGatewaySafeResultRef("run", "01J2Y9A6WXR5N8P3C4Q7T1V0ZZ");
-    const completed = await ingress.complete({ ...event, resultRef, nowMs: NOW + 4 });
+    const completed = await ingress.complete({ ...owned, resultRef, nowMs: NOW + 4 });
     assert.equal(completed.status, "completed");
     assert.equal(completed.resultRef, resultRef);
-    assert.equal((await ingress.complete({ ...event, resultRef, nowMs: NOW + 5 })).status, "replay");
+    assert.equal((await ingress.complete({ ...owned, resultRef, nowMs: NOW + 5 })).status, "replay");
     await assert.rejects(
       ingress.complete({
-        ...event,
+        ...owned,
         resultRef: createGatewaySafeResultRef("run", "different-result"),
         nowMs: NOW + 6,
       }),
@@ -166,10 +187,29 @@ if (isMainThread) {
     const replay = await ingress.claim({ ...event, nowMs: NOW + 7 });
     assert.equal(replay.status, "replay");
     assert.equal(replay.resultRef, resultRef);
+    assert.equal((await ingress.claim({ ...event, nowMs: NOW + 30_001 })).status, "replay", "completion extends replay protection beyond the processing lease");
     store.close();
 
     const databaseBytes = readFileSync(filename).toString("utf8");
     assert.doesNotMatch(databaseBytes, /Summarize acquisition target|sk-live-never-persist|bot-secret-account|private-update-991/);
+  });
+
+  test("failed ingress releases its pending claim and can retry immediately", async (t) => {
+    const store = new EnterpriseSqliteStore(databasePath(t));
+    const ingress = new DurableGatewayIngress(store, { defaultLeaseMs: 60_000 });
+    const event = identity("event-retry-after-failure");
+    const firstClaim = await ingress.claim({ ...event, nowMs: NOW });
+    assert.ok(firstClaim.claimToken);
+    const firstOwned = { ...event, claimToken: firstClaim.claimToken };
+    await ingress.transition({ ...firstOwned, to: "running", nowMs: NOW + 1 });
+    assert.equal(await ingress.fail({ ...firstOwned, nowMs: NOW + 2 }), true);
+
+    const retry = await ingress.claim({ ...event, nowMs: NOW + 3 });
+    assert.equal(retry.status, "claimed");
+    assert.ok(retry.claimToken);
+    assert.equal(retry.lifecycle?.state, "failed");
+    assert.equal((await ingress.transition({ ...event, claimToken: retry.claimToken, to: "running", nowMs: NOW + 4 })).lifecycle.runAttempts, 2);
+    store.close();
   });
 
   test("delivery lifecycle enforces ordering, survives restart, and counts run and delivery attempts", async (t) => {
@@ -182,7 +222,9 @@ if (isMainThread) {
       maxDeliveryAttempts: 2,
     });
 
-    await ingress.claim({ ...event, nowMs: NOW });
+    const claim = await ingress.claim({ ...event, nowMs: NOW });
+    assert.ok(claim.claimToken);
+    const owned = { ...event, claimToken: claim.claimToken };
     assert.deepEqual(await ingress.readLifecycle({ ...event, nowMs: NOW }), {
       state: "accepted",
       runAttempts: 0,
@@ -190,39 +232,39 @@ if (isMainThread) {
       transitionCount: 0,
       lastOperationalState: "accepted",
     });
-    await assert.rejects(ingress.transition({ ...event, to: "generated", nowMs: NOW + 1 }), /Illegal.*accepted -> generated/);
+    await assert.rejects(ingress.transition({ ...owned, to: "generated", nowMs: NOW + 1 }), /Illegal.*accepted -> generated/);
     await assert.rejects(
-      ingress.complete({ ...event, resultRef: createGatewaySafeResultRef("run", "too-early"), nowMs: NOW + 1 }),
+      ingress.complete({ ...owned, resultRef: createGatewaySafeResultRef("run", "too-early"), nowMs: NOW + 1 }),
       /cannot complete.*accepted/,
     );
 
-    const running = await ingress.transition({ ...event, to: "running", nowMs: NOW + 2 });
+    const running = await ingress.transition({ ...owned, to: "running", nowMs: NOW + 2 });
     assert.deepEqual(
       { state: running.lifecycle.state, runs: running.lifecycle.runAttempts, deliveries: running.lifecycle.deliveryAttempts },
       { state: "running", runs: 1, deliveries: 0 },
     );
-    const duplicateRunning = await ingress.transition({ ...event, to: "running", nowMs: NOW + 3 });
+    const duplicateRunning = await ingress.transition({ ...owned, to: "running", nowMs: NOW + 3 });
     assert.equal(duplicateRunning.status, "replay");
     assert.equal(duplicateRunning.lifecycle.transitionCount, 1);
 
-    await ingress.transition({ ...event, to: "failed", nowMs: NOW + 4 });
-    const retriedRun = await ingress.transition({ ...event, to: "running", nowMs: NOW + 5 });
+    await ingress.transition({ ...owned, to: "failed", nowMs: NOW + 4 });
+    const retriedRun = await ingress.transition({ ...owned, to: "running", nowMs: NOW + 5 });
     assert.equal(retriedRun.lifecycle.runAttempts, 2);
-    const generated = await ingress.transition({ ...event, to: "generated", nowMs: NOW + 6 });
+    const generated = await ingress.transition({ ...owned, to: "generated", nowMs: NOW + 6 });
     assert.equal(generated.lifecycle.state, "generated");
     await ingress.complete({
-      ...event,
+      ...owned,
       resultRef: createGatewaySafeResultRef("receipt", "generation-9f2a"),
       nowMs: NOW + 7,
     });
-    const delivering = await ingress.transition({ ...event, to: "delivering", nowMs: NOW + 8 });
+    const delivering = await ingress.transition({ ...owned, to: "delivering", nowMs: NOW + 8 });
     assert.equal(delivering.lifecycle.deliveryAttempts, 1);
-    const failedDelivery = await ingress.transition({ ...event, to: "failed", nowMs: NOW + 9 });
+    const failedDelivery = await ingress.transition({ ...owned, to: "failed", nowMs: NOW + 9 });
     assert.equal(failedDelivery.lifecycle.lastOperationalState, "delivering");
-    await assert.rejects(ingress.transition({ ...event, to: "delivered", nowMs: NOW + 10 }), /Illegal.*failed -> delivered/);
-    const deliveryRetry = await ingress.transition({ ...event, to: "delivering", nowMs: NOW + 11 });
+    await assert.rejects(ingress.transition({ ...owned, to: "delivered", nowMs: NOW + 10 }), /Illegal.*failed -> delivered/);
+    const deliveryRetry = await ingress.transition({ ...owned, to: "delivering", nowMs: NOW + 11 });
     assert.equal(deliveryRetry.lifecycle.deliveryAttempts, 2);
-    const delivered = await ingress.transition({ ...event, to: "delivered", nowMs: NOW + 12 });
+    const delivered = await ingress.transition({ ...owned, to: "delivered", nowMs: NOW + 12 });
     assert.deepEqual(
       {
         state: delivered.lifecycle.state,
@@ -232,7 +274,7 @@ if (isMainThread) {
       },
       { state: "delivered", runs: 2, deliveries: 2, transitions: 8 },
     );
-    await assert.rejects(ingress.transition({ ...event, to: "failed", nowMs: NOW + 13 }), /Illegal.*delivered -> failed/);
+    await assert.rejects(ingress.transition({ ...owned, to: "failed", nowMs: NOW + 13 }), /Illegal.*delivered -> failed/);
     store.close();
 
     store = new EnterpriseSqliteStore(filename);
@@ -247,10 +289,12 @@ if (isMainThread) {
     const store = new EnterpriseSqliteStore(filename);
     const ingress = new DurableGatewayIngress(store, { maxRunAttempts: 1, defaultLeaseMs: 30_000 });
     const event = identity("event-attempt-cap");
-    await ingress.claim({ ...event, nowMs: NOW });
-    await ingress.transition({ ...event, to: "running", nowMs: NOW + 1 });
-    await ingress.transition({ ...event, to: "failed", nowMs: NOW + 2 });
-    await assert.rejects(ingress.transition({ ...event, to: "running", nowMs: NOW + 3 }), /run attempts exceeded 1/);
+    const claim = await ingress.claim({ ...event, nowMs: NOW });
+    assert.ok(claim.claimToken);
+    const owned = { ...event, claimToken: claim.claimToken };
+    await ingress.transition({ ...owned, to: "running", nowMs: NOW + 1 });
+    await ingress.transition({ ...owned, to: "failed", nowMs: NOW + 2 });
+    await assert.rejects(ingress.transition({ ...owned, to: "running", nowMs: NOW + 3 }), /run attempts exceeded 1/);
     assert.throws(() => createGatewaySafeResultRef("artifact", "../../etc/passwd"), /opaque run, receipt, artifact, or delivery/);
     assert.throws(() => createGatewaySafeResultRef("run", "id with secret text"), /opaque run, receipt, artifact, or delivery/);
     store.close();

@@ -5,7 +5,7 @@ import {
   bindSurfaceAction,
   issueApprovalActions,
   parseSurfaceAction,
-  parseVerifiedApprovalSurfaceFields,
+  pendingApprovalSurfaceFields,
   presentationActions,
   renderPresentationText,
   sanitizePresentationForAudience,
@@ -97,7 +97,7 @@ export function gchatEventToSurfaceMessage(payload: unknown, options: GchatMappi
 
   const candidate = gchatActionCandidate(event);
   const approval = sender?.name && event.space?.name && candidate
-    ? parseVerifiedApprovalSurfaceFields(options.approvalActions, candidate, {
+    ? pendingApprovalSurfaceFields(options.approvalActions, candidate, {
       actorId: sender.name,
       surfaceId: "gchat:app",
       conversationId: event.space.name,

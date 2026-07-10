@@ -1575,7 +1575,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   const channelCatalog = await runCli(["channels", "list"], cwd);
   assert.match(channelCatalog.stdout, /telegram\t--bot-token-env\tmuster channels ready telegram/);
   assert.match(channelCatalog.stdout, /slack\t--bot-token-env,--app-token-env\tmuster channels ready slack/);
-  assert.match(channelCatalog.stdout, /gchat\t--verification-token-env\tmuster channels ready gchat/);
+  assert.match(channelCatalog.stdout, /gchat\t--audience\tmuster channels ready gchat/);
 
   const coldChannelStatus = await runCli(["channels", "status"], cwd);
   assert.match(coldChannelStatus.stdout, /gateway_config=missing next="muster gateway init"/);
@@ -1730,7 +1730,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(channelDoctorAfterSetup.stdout, /channel_doctor=all status=needs_setup ready=3\/7/);
   assert.match(channelDoctorAfterSetup.stdout, /channel=telegram status=warning missing=- warnings=telegram\.live_check_available auth=secret-token-header-recommended reply=draft_stream next="muster channels doctor telegram --live"/);
   assert.match(channelDoctorAfterSetup.stdout, /channel=slack status=warning missing=- warnings=slack\.live_check_available,slack\.files_write_live_check_available auth=slack-socket-app-token reply=draft_stream next="muster channels doctor slack --live"/);
-  assert.match(channelDoctorAfterSetup.stdout, /channel=gchat status=needs_setup missing=gchat\.verificationToken/);
+  assert.match(channelDoctorAfterSetup.stdout, /channel=gchat status=needs_setup missing=gchat\.verification\.audience/);
   assert.match(channelDoctorAfterSetup.stdout, /next=muster channels ready gchat/);
   assert.doesNotMatch(channelDoctorAfterSetup.stdout, /123456:telegram-secret-token|telegram-webhook-secret|xoxb-secret|xapp-secret/);
 
@@ -1738,6 +1738,13 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(gchatSetup.stdout, /channel=gchat .*ready=false/);
   assert.match(gchatSetup.stdout, /webhook_url=https:\/\/chat\.example\.test\/v1\/adapters\/gchat/);
   assert.match(gchatSetup.stdout, /setup_url=https:\/\/console\.cloud\.google\.com\/apis\/library\/chat\.googleapis\.com/);
+  const invalidGchat = await runCliAllowFailure(["channels", "setup", "gchat", "--audience", "https://chat.example.test/wrong-route"], cwd);
+  assert.notEqual(invalidGchat.code, 0);
+  assert.match(invalidGchat.stderr, /exact HTTPS URL ending \/v1\/adapters\/gchat/);
+  const gchatReady = await runCli(["channels", "setup", "gchat", "--audience", "https://chat.example.test/v1/adapters/gchat"], cwd);
+  assert.match(gchatReady.stdout, /channel=gchat .*ready=true/);
+  const gchatStatus = await runCli(["channels", "status", "gchat"], cwd);
+  assert.match(gchatStatus.stdout, /auth=bearer audience=https:\/\/chat\.example\.test\/v1\/adapters\/gchat/);
 
   const frappeIdentityStub = await new Promise<{ url: string; close: () => Promise<void> }>((resolvePromise) => {
     const server = createServer((request, response) => {
@@ -1791,7 +1798,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
 
   const integrationGuide = await runCli(["integrations"], cwd);
   assert.match(integrationGuide.stdout, /Muster integrations/);
-  assert.match(integrationGuide.stdout, /channel\tgchat\tneeds setup\tmuster channels ready gchat/);
+  assert.match(integrationGuide.stdout, /channel\tgchat\tready\tmuster gateway daemon start/);
   assert.match(integrationGuide.stdout, /channel\ttelegram\tready\tmuster gateway daemon start/);
   assert.match(integrationGuide.stdout, /channel\tslack\tready\tmuster gateway daemon start/);
   assert.match(integrationGuide.stdout, /plugin\tweb-search\tavailable\tmuster plugins enable web-search/);
@@ -1815,7 +1822,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(integrationStatus.stdout, /mcp=github missing=GITHUB_PERSONAL_ACCESS_TOKEN\|GITHUB_TOKEN/);
   assert.match(integrationStatus.stdout, /channels_optional/);
   assert.match(integrationStatus.stdout, /telegram\tready\tmuster gateway daemon start/);
-  assert.match(integrationStatus.stdout, /gchat\tneeds_setup\tmuster channels ready gchat/);
+  assert.match(integrationStatus.stdout, /gchat\tready\tmuster gateway daemon start/);
   assert.match(integrationStatus.stdout, /1\. channel ready; add another surface only when you need it/);
   assert.match(integrationStatus.stdout, /guardrails=draft_first_for_channels, scoped_memory, explicit_mcp_auth, no_secret_echo/);
 
@@ -1830,9 +1837,8 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.doesNotMatch(telegramWorkflow.stdout, /123456:telegram-secret-token|telegram-webhook-secret/);
 
   const gchatWorkflow = await runCli(["integrations", "workflow", "gchat"], cwd);
-  assert.match(gchatWorkflow.stdout, /integration_workflow=gchat kind=channel ready=false/);
-  assert.match(gchatWorkflow.stdout, /auth=verification-token-required missing=gchat\.verificationToken/);
-  assert.match(gchatWorkflow.stdout, /failure_behavior=blocked until required setup is present; local simulation still works/);
+  assert.match(gchatWorkflow.stdout, /integration_workflow=gchat kind=channel ready=true/);
+  assert.match(gchatWorkflow.stdout, /auth=google-signed-oidc-or-jwt missing=-/);
 
   const githubPluginWorkflow = await runCli(["integrations", "workflow", "github"], cwd);
   assert.match(githubPluginWorkflow.stdout, /integration_workflow=github kind=plugin enabled=false/);
@@ -1851,13 +1857,12 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
 
   const gchatIntegrationVerify = await runCli(["integrations", "verify", "gchat"], cwd);
   assert.match(gchatIntegrationVerify.stdout, /integration_action=verify target=gchat kind=channel/);
-  assert.match(gchatIntegrationVerify.stdout, /channel_doctor=gchat status=needs_setup/);
-  assert.match(gchatIntegrationVerify.stdout, /integration_next=muster integrations setup gchat/);
+  assert.match(gchatIntegrationVerify.stdout, /channel_doctor=gchat status=ready/);
 
   const gchatIntegrationSample = await runCli(["integrations", "sample", "gchat"], cwd);
   assert.match(gchatIntegrationSample.stdout, /integration_action=sample target=gchat kind=channel/);
   assert.match(gchatIntegrationSample.stdout, /channel_simulation=gchat normalized=true/);
-  assert.match(gchatIntegrationSample.stdout, /integration_next=muster integrations setup gchat/);
+  assert.match(gchatIntegrationSample.stdout, /integration_next=muster integrations enable gchat/);
 
   const githubIntegrationVerify = await runCli(["integrations", "verify", "github"], cwd);
   assert.match(githubIntegrationVerify.stdout, /integration_action=verify target=github kind=plugin/);
@@ -3529,10 +3534,11 @@ test("CLI codex doctor and QA scorecard expose runtime maturity without false po
   assert.match(ptyRun.stdout, /case=prompt_visible_after_output status=passed/);
   assert.match(ptyRun.stdout, /case=selected_row_contrast status=passed/);
   assert.match(ptyRun.stdout, /case=responsive_widths status=passed/);
+  assert.match(ptyRun.stdout, /case=real_pty_interaction status=passed/);
   const ptyManifest = JSON.parse(await readFile(join(ptyRunArtifact, "manifest.json"), "utf8")) as { status: string; suite: string; caseCount: number };
   assert.equal(ptyManifest.suite, "pty_tui");
   assert.equal(ptyManifest.status, "passed");
-  assert.ok(ptyManifest.caseCount >= 11);
+  assert.ok(ptyManifest.caseCount >= 12);
   const ptyScreen = await readFile(join(ptyRunArtifact, "screens", "slash_overlay_stable.txt"), "utf8");
   assert.match(ptyScreen, /suggestions/);
   assert.match(ptyScreen, /╰─+╯/);

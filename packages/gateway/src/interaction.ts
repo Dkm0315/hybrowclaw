@@ -1,8 +1,9 @@
 import type { GatewayConfig, GatewayGovernanceAssignment, GatewayGovernanceRateLimit } from "./gateway-config.js";
 import type { PairedIdentity, PairedSender } from "./pairing.js";
 import type { SurfaceMessage, SurfaceReply } from "./envelope.js";
-import type { MusterConfig } from "@musterhq/core";
+import { aggregateEnterpriseUsage, type EnterpriseActionReceipt, type EnterpriseSubject, type EnterpriseUsageEvent, type MusterConfig } from "@musterhq/core";
 import { commandPage, paginateRows, renderPresentationText } from "./presentation.js";
+import { gatewayEnterpriseSubjects, usageEventsForSubjects, type GatewayEnterpriseRuntime } from "./enterprise-runtime.js";
 import type {
   PresentationAudience,
   PresentationFilter,
@@ -52,6 +53,7 @@ interface InteractionContext {
   readonly paired: PairedSender;
   readonly message: SurfaceMessage;
   readonly gateway?: GatewayConfig;
+  readonly enterprise?: GatewayEnterpriseRuntime;
 }
 
 interface InteractionAction {
@@ -130,11 +132,11 @@ export function isInteractionCommand(name: string): name is InteractionCommandNa
   return (CONTEXT_COMMANDS as readonly string[]).includes(name);
 }
 
-export function renderInteractionCommand(ctx: InteractionContext): SurfaceReply {
+export async function renderInteractionCommand(ctx: InteractionContext): Promise<SurfaceReply> {
   const descriptor = INTERACTION_COMMANDS.find((candidate) => candidate.name === ctx.command);
   const card = descriptor && !descriptorVisible(descriptor, ctx)
     ? restrictedCard(descriptor)
-    : cardForCommand(ctx);
+    : await cardForCommand(ctx);
   const presentation = presentationForCard(card);
   return { text: renderPresentationText(presentation), presentation };
 }
@@ -212,7 +214,7 @@ function normalizeInteractionAction(action: InteractionAction, index: number): S
   };
 }
 
-function cardForCommand(ctx: InteractionContext): InteractionCard {
+async function cardForCommand(ctx: InteractionContext): Promise<InteractionCard> {
   const identity = ctx.paired.identity?.provider === "frappe" ? ctx.paired.identity : undefined;
   switch (ctx.command) {
     case "start":
@@ -416,26 +418,76 @@ function reportsCard(ctx: InteractionContext, identity: PairedIdentity | undefin
   };
 }
 
-function usageCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
+async function usageCard(ctx: InteractionContext, identity: PairedIdentity | undefined): Promise<InteractionCard> {
   const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
   const limits = visibleRateLimits(ctx.gateway, assignment, identity);
   const role = roleTier(identity, assignment?.roles);
   const audience: PresentationAudience = role.system ? "admin" : role.manager || role.hrbp ? "manager" : "self";
+  const requestedScope = argumentValue(ctx.args, "scope") ?? "self";
+  const querySubjects = usageQuerySubjects(ctx, assignment, requestedScope);
+  const querySubjectAny = usageQueryAnySubjects(assignment, requestedScope);
+  const events = ctx.enterprise && (requestedScope === "self" || querySubjects.length > 0)
+    ? await ctx.enterprise.usageStore.queryUsage({
+      from: periodStart(argumentValue(ctx.args, "period")),
+      subjects: querySubjects,
+      subjectAny: querySubjectAny,
+    })
+    : [];
+  const visibleEvents = filterUsageEvents(events, ctx, assignment, requestedScope);
+  const aggregation = aggregateEnterpriseUsage(visibleEvents, ["request_category", "provider", "outcome"]);
+  const page = commandPage(ctx.args);
+  const rows = aggregation.groups.map((group) => [
+    group.dimensions.request_category ?? "uncategorized",
+    group.dimensions.provider ?? "none",
+    group.dimensions.outcome ?? "unknown",
+    String(group.metrics.runs),
+    String(group.metrics.totalTokens),
+    formatDuration(group.metrics.p95LatencyMs),
+  ]);
+  const paged = paginateRows(rows, page, 8);
+  const scopeDenied = requestedScope !== "self" && visibleEvents.length === 0 && !reportingScopeConfigured(assignment, role, identity);
   return {
     kind: "report",
     title: "Usage",
-    lead: "I can show token and usage controls for this scope. Detailed ledgers depend on the gateway token ledger being enabled for this deployment.",
+    lead: scopeDenied
+      ? "Team usage is not available until an explicit reporting hierarchy or tenant reporting scope is assigned. Manager titles alone do not expose other users."
+      : ctx.enterprise
+        ? `Live gateway usage for the authorized ${requestedScope === "self" ? "personal" : "reporting"} scope.`
+        : "Usage reporting needs an enterprise ledger runtime; no synthetic totals are shown.",
     audience,
     kpis: [
-      { label: "Configured limits", value: String(limits.length) },
-      { label: "Ledger", value: "Deployment-backed", detail: "no synthetic totals" },
-      { label: "Prompt visibility", value: "Hidden", detail: "manager default" },
+      { label: "Runs", value: String(aggregation.totals.runs) },
+      { label: "Tokens", value: String(aggregation.totals.totalTokens) },
+      { label: "p50", value: formatDuration(aggregation.totals.p50LatencyMs) },
+      { label: "p95", value: formatDuration(aggregation.totals.p95LatencyMs) },
+      { label: "p99", value: formatDuration(aggregation.totals.p99LatencyMs) },
+      { label: "Cache hit", value: `${aggregation.totals.cacheHitRate}%` },
     ],
-    table: {
-      id: "usage-limits",
-      columns: ["Scope", "Limit"],
-      rows: limits.length ? limits : [["Current sender", "No explicit rate limit configured"]],
-    },
+    tables: [
+      {
+        id: "usage",
+        title: "Observed usage",
+        columns: ["Category", "Provider", "Outcome", "Runs", "Tokens", "p95"],
+        rows: paged.rows.length ? paged.rows : [["No observed runs", "—", "—", "0", "0", "0ms"]],
+        pagination: paged.pagination,
+      },
+      {
+        id: "usage-limits",
+        title: "Configured limits",
+        columns: ["Scope", "Limit"],
+        rows: limits.length ? limits : [["Current sender", "No explicit rate limit configured"]],
+      },
+    ],
+    trends: [{
+      id: "latency-percentiles",
+      label: "Latency",
+      unit: "ms",
+      points: [
+        { label: "p50", value: aggregation.totals.p50LatencyMs },
+        { label: "p95", value: aggregation.totals.p95LatencyMs },
+        { label: "p99", value: aggregation.totals.p99LatencyMs },
+      ],
+    }],
     filters: [
       { id: "period", label: "Period", options: [{ label: "Today", value: "today" }, { label: "7 days", value: "7d" }, { label: "30 days", value: "30d" }] },
       { id: "user", label: audience === "self" ? "Current user" : "User or hierarchy" },
@@ -448,7 +500,7 @@ function usageCard(ctx: InteractionContext, identity: PairedIdentity | undefined
     ],
     next: [
       { label: "Refresh personal usage", detail: "Requests, tokens, latency, cache, and artifacts", command: "/usage scope=self", style: "primary" },
-      ...(audience === "self" ? [] : [{ label: "Team usage", detail: "Authorized reporting hierarchy", command: "/usage scope=team", kind: "drilldown" as const }]),
+      ...(audience === "self" ? [] : [{ label: "Team usage", detail: "Explicitly assigned reporting hierarchy", command: "/usage scope=team", kind: "drilldown" as const }]),
       { label: "/limits", detail: "Review rate and token limits" },
     ],
     privacy: { rawPromptsIncluded: false, note: "Manager views expose categories, consumption, latency, and outcomes—not raw prompt text." },
@@ -586,34 +638,51 @@ function settingsCard(ctx: InteractionContext, identity: PairedIdentity | undefi
   };
 }
 
-function governanceQueueCard(
+async function governanceQueueCard(
   ctx: InteractionContext,
   title: "Approvals" | "Audit" | "Incidents",
   lead: string,
   identity: PairedIdentity | undefined,
   command: string,
-): InteractionCard {
+): Promise<InteractionCard> {
   const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
   const role = roleTier(identity, assignment?.roles);
   const audience: PresentationAudience = role.system ? "admin" : role.manager || role.hrbp ? "manager" : "self";
+  const receiptScope = receiptQueryScope(ctx, assignment, role);
+  const allReceipts = ctx.enterprise && receiptScope.subjects.length && (role.system && assignment?.canViewTenantUsage || receiptScope.subjectAny.length)
+    ? await ctx.enterprise.receiptStore.listReceipts({
+      from: periodStart(argumentValue(ctx.args, "period")),
+      subjects: receiptScope.subjects,
+      subjectAny: receiptScope.subjectAny,
+    })
+    : [];
+  const visible = filterReceipts(allReceipts, ctx, assignment, role);
+  const matching = visible.filter((receipt) => title === "Audit"
+    || (title === "Incidents" ? receipt.outcome === "blocked" || receipt.outcome === "failed" : /approval/i.test(receipt.action)));
+  const page = commandPage(ctx.args);
+  const rows = matching.slice().reverse().map((receipt) => [
+    receipt.occurredAt,
+    receipt.action,
+    receipt.outcome,
+    receipt.policyIds.join(", ") || "—",
+  ]);
+  const paged = paginateRows(rows, page, 8);
   return {
     kind: "report",
     title,
     lead,
     audience,
     kpis: [
-      { label: "Visible scope", value: audience === "self" ? "Personal" : audience === "manager" ? "Assigned hierarchy" : "Authorized system scope" },
-      { label: "Raw prompts", value: "Hidden", detail: "default manager privacy" },
-      { label: "Data source", value: "Deployment ledger", detail: "no sample values shown" },
+      { label: "Events", value: String(matching.length) },
+      { label: "Visible scope", value: audience === "self" ? "Personal" : audience === "manager" ? "Explicit hierarchy" : "Authorized system scope" },
+      { label: "Raw prompts", value: "Hidden", detail: "request fingerprints only" },
+      { label: "Data source", value: ctx.enterprise?.backend ?? "Not connected", detail: "no sample values" },
     ],
     table: {
       id: title.toLowerCase(),
-      columns: ["View", "Availability"],
-      rows: [
-        ["Personal", "Available when the deployment ledger is connected"],
-        ["Team", role.manager || role.hrbp || role.system ? "Filtered to authorized hierarchy" : "Requires manager scope"],
-        ["Export", role.manager || role.hrbp || role.system ? "Requires an authorized export action" : "Requires manager scope"],
-      ],
+      columns: ["Time", "Action", "Outcome", "Policy"],
+      rows: paged.rows.length ? paged.rows : [["No matching events", "—", "—", "—"]],
+      pagination: paged.pagination,
     },
     filters: [
       { id: "period", label: "Period", options: [{ label: "Today", value: "today" }, { label: "7 days", value: "7d" }, { label: "30 days", value: "30d" }] },
@@ -627,6 +696,146 @@ function governanceQueueCard(
     ],
     privacy: { rawPromptsIncluded: false, note: "Manager views show categories and outcomes, not raw prompts." },
   };
+}
+
+function filterUsageEvents(
+  events: readonly EnterpriseUsageEvent[],
+  ctx: InteractionContext,
+  assignment: GatewayGovernanceAssignment | undefined,
+  requestedScope: string,
+): readonly EnterpriseUsageEvent[] {
+  const role = roleTier(ctx.paired.identity?.provider === "frappe" ? ctx.paired.identity : undefined, assignment?.roles);
+  const boundary = reportingBoundary(ctx, assignment);
+  if (requestedScope === "self") {
+    const user = gatewayEnterpriseSubjects(ctx.message, ctx.paired, assignment).find((subject) => subject.kind === "user");
+    const fallback = gatewayEnterpriseSubjects(ctx.message, ctx.paired, assignment).find((subject) => subject.kind === "channel");
+    const scope = [user, boundary ?? fallback].filter((subject): subject is EnterpriseSubject => Boolean(subject));
+    return user ? usageEventsForSubjects(events, scope) : [];
+  }
+  if (role.system && assignment?.canViewTenantUsage) {
+    return boundary ? usageEventsForSubjects(events, [boundary]) : [];
+  }
+  if (!boundary) return [];
+  const managedUsers = new Set(assignment?.managedUserIds ?? []);
+  const managedDepartments = new Set(assignment?.managedDepartmentIds ?? []);
+  if (!managedUsers.size && !managedDepartments.size) return [];
+  return events.filter((event) => enterpriseEventHasSubject(event.subjects, boundary)
+    && event.subjects.some((subject) =>
+      (subject.kind === "user" && managedUsers.has(subject.id))
+        || (subject.kind === "department" && managedDepartments.has(subject.id))));
+}
+
+function usageQuerySubjects(
+  ctx: InteractionContext,
+  assignment: GatewayGovernanceAssignment | undefined,
+  requestedScope: string,
+): readonly EnterpriseSubject[] {
+  const subjects = gatewayEnterpriseSubjects(ctx.message, ctx.paired, assignment);
+  const boundary = reportingBoundary(ctx, assignment);
+  if (requestedScope !== "self") return boundary ? [boundary] : [];
+  const user = subjects.find((subject) => subject.kind === "user");
+  const fallback = subjects.find((subject) => subject.kind === "channel");
+  return [user, boundary ?? fallback].filter((subject): subject is EnterpriseSubject => Boolean(subject));
+}
+
+function usageQueryAnySubjects(
+  assignment: GatewayGovernanceAssignment | undefined,
+  requestedScope: string,
+): readonly EnterpriseSubject[] {
+  if (requestedScope === "self" || assignment?.canViewTenantUsage) return [];
+  return [
+    ...(assignment?.managedUserIds ?? []).map((id) => ({ kind: "user" as const, id })),
+    ...(assignment?.managedDepartmentIds ?? []).map((id) => ({ kind: "department" as const, id })),
+  ];
+}
+
+function filterReceipts(
+  receipts: readonly EnterpriseActionReceipt[],
+  ctx: InteractionContext,
+  assignment: GatewayGovernanceAssignment | undefined,
+  role: ReturnType<typeof roleTier>,
+): readonly EnterpriseActionReceipt[] {
+  const self = gatewayEnterpriseSubjects(ctx.message, ctx.paired, assignment).find((subject) => subject.kind === "user")?.id;
+  const boundary = reportingBoundary(ctx, assignment);
+  if (role.system && assignment?.canViewTenantUsage) {
+    return boundary ? receipts.filter((receipt) => enterpriseEventHasSubject([...receipt.actor, ...receipt.target], boundary)) : [];
+  }
+  const users = new Set([...(self ? [self] : []), ...(assignment?.managedUserIds ?? [])]);
+  const departments = new Set(assignment?.managedDepartmentIds ?? []);
+  const fallback = gatewayEnterpriseSubjects(ctx.message, ctx.paired, assignment).find((subject) => subject.kind === "channel");
+  const scope = boundary ?? fallback;
+  return scope ? receipts.filter((receipt) => {
+    const subjects = [...receipt.actor, ...receipt.target];
+    return enterpriseEventHasSubject(subjects, scope) && subjects.some((subject) =>
+      (subject.kind === "user" && users.has(subject.id))
+        || (subject.kind === "department" && departments.has(subject.id)));
+  }) : [];
+}
+
+function receiptQueryScope(
+  ctx: InteractionContext,
+  assignment: GatewayGovernanceAssignment | undefined,
+  role: ReturnType<typeof roleTier>,
+): { readonly subjects: readonly EnterpriseSubject[]; readonly subjectAny: readonly EnterpriseSubject[] } {
+  const self = gatewayEnterpriseSubjects(ctx.message, ctx.paired, assignment).find((subject) => subject.kind === "user");
+  const boundary = reportingBoundary(ctx, assignment);
+  const fallback = gatewayEnterpriseSubjects(ctx.message, ctx.paired, assignment).find((subject) => subject.kind === "channel");
+  const required = boundary ?? fallback;
+  if (!required) return { subjects: [], subjectAny: [] };
+  if (role.system && assignment?.canViewTenantUsage) return { subjects: [required], subjectAny: [] };
+  return {
+    subjects: [required],
+    subjectAny: [
+      ...(self ? [self] : []),
+      ...(assignment?.managedUserIds ?? []).map((id) => ({ kind: "user" as const, id })),
+      ...(assignment?.managedDepartmentIds ?? []).map((id) => ({ kind: "department" as const, id })),
+    ],
+  };
+}
+
+function reportingBoundary(
+  ctx: InteractionContext,
+  assignment: GatewayGovernanceAssignment | undefined,
+): EnterpriseSubject | undefined {
+  if (assignment?.tenantId) return { kind: "tenant", id: assignment.tenantId };
+  if (ctx.paired.identity?.provider === "frappe") return { kind: "site", id: ctx.paired.identity.site };
+  if (assignment?.workspaceId) return { kind: "workspace", id: assignment.workspaceId };
+  return undefined;
+}
+
+function enterpriseEventHasSubject(
+  subjects: readonly EnterpriseSubject[],
+  expected: EnterpriseSubject,
+): boolean {
+  return subjects.some((subject) => subject.kind === expected.kind && subject.id === expected.id);
+}
+
+function reportingScopeConfigured(
+  assignment: GatewayGovernanceAssignment | undefined,
+  role: ReturnType<typeof roleTier>,
+  identity: PairedIdentity | undefined,
+): boolean {
+  const boundary = assignment?.tenantId || identity?.site || assignment?.workspaceId;
+  return Boolean(boundary && ((role.system && assignment?.canViewTenantUsage)
+    || assignment?.managedUserIds?.length
+    || assignment?.managedDepartmentIds?.length));
+}
+
+function argumentValue(args: string, key: string): string | undefined {
+  for (const token of args.split(/\s+/)) {
+    const separator = token.indexOf("=");
+    if (separator > 0 && token.slice(0, separator) === key) return decodeURIComponent(token.slice(separator + 1));
+  }
+  return undefined;
+}
+
+function periodStart(period: string | undefined): string | undefined {
+  const duration = period === "today" ? 24 * 60 * 60_000 : period === "7d" ? 7 * 24 * 60 * 60_000 : period === "30d" ? 30 * 24 * 60 * 60_000 : undefined;
+  return duration ? new Date(Date.now() - duration).toISOString() : undefined;
+}
+
+function formatDuration(milliseconds: number): string {
+  return milliseconds >= 1000 ? `${Math.round(milliseconds / 100) / 10}s` : `${milliseconds}ms`;
 }
 
 function providersCard(ctx: InteractionContext): InteractionCard {

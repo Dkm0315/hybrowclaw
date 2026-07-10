@@ -6,7 +6,7 @@ import {
   bindSurfaceAction,
   issueApprovalActions,
   parseSurfaceAction,
-  parseVerifiedApprovalSurfaceFields,
+  pendingApprovalSurfaceFields,
   presentationActions,
   renderPresentationText,
   sanitizePresentationForAudience,
@@ -120,7 +120,7 @@ export function slackEventToSurfaceMessage(payload: unknown, options: SlackMappi
     const selected = action.actions?.[0];
     const channel = action.channel?.id ?? action.container?.channel_id;
     const approval = action.user?.id && channel
-      ? parseVerifiedApprovalSurfaceFields(options.approvalActions, selected?.value, {
+      ? pendingApprovalSurfaceFields(options.approvalActions, selected?.value, {
         actorId: action.user.id,
         surfaceId: `slack:${action.team?.id ?? "unknown-team"}`,
         conversationId: channel,

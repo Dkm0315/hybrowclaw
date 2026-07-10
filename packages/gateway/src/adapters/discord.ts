@@ -6,7 +6,7 @@ import {
   bindSurfaceAction,
   issueApprovalActions,
   parseSurfaceAction,
-  parseVerifiedApprovalSurfaceFields,
+  pendingApprovalSurfaceFields,
   presentationActions,
   renderPresentationText,
   sanitizePresentationForAudience,
@@ -112,7 +112,7 @@ export function discordInteractionToInbound(payload: unknown, options: DiscordMa
   if (interaction.type === INTERACTION_MESSAGE_COMPONENT) {
     const sender = interaction.member?.user ?? interaction.user;
     const approval = sender?.id && interaction.channel_id
-      ? parseVerifiedApprovalSurfaceFields(options.approvalActions, interaction.data?.custom_id, {
+      ? pendingApprovalSurfaceFields(options.approvalActions, interaction.data?.custom_id, {
         actorId: sender.id,
         surfaceId: `discord:${interaction.guild_id ?? "dm"}`,
         conversationId: interaction.channel_id,

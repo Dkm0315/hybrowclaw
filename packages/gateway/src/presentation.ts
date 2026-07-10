@@ -116,6 +116,7 @@ const APPROVAL_ACTION_ID_BYTES = 12;
 const APPROVAL_ACTION_SIGNATURE_BYTES = 12;
 const SENSITIVE_MANAGER_COLUMN = /^(?:raw\s+)?(?:prompt|message|input|content|query|request)(?:\s+text)?$/i;
 const VERIFIED_APPROVAL_RAW = new WeakSet<object>();
+const PENDING_APPROVAL_RAW = new WeakSet<object>();
 
 export type ApprovalDecision = "approve" | "reject";
 export type ApprovalActionFailureReason =
@@ -293,6 +294,14 @@ export interface VerifiedApprovalActionRaw {
   };
 }
 
+export interface PendingApprovalActionRaw {
+  readonly platformPayload: unknown;
+  readonly pendingApprovalAction: {
+    readonly value: unknown;
+    readonly attempt: ApprovalActionAttempt;
+  };
+}
+
 export function verifiedApprovalRaw(platformPayload: unknown, result: Extract<ApprovalActionResult, { ok: true }>): VerifiedApprovalActionRaw {
   const raw: VerifiedApprovalActionRaw = { platformPayload, verifiedApprovalAction: { decision: result.decision, binding: result.binding } };
   VERIFIED_APPROVAL_RAW.add(raw);
@@ -304,6 +313,32 @@ export function verifiedApprovalFromRaw(raw: unknown): VerifiedApprovalActionRaw
   const value = (raw as Partial<VerifiedApprovalActionRaw>).verifiedApprovalAction;
   if (!value || (value.decision !== "approve" && value.decision !== "reject")) return undefined;
   return value;
+}
+
+export function pendingApprovalRaw(
+  platformPayload: unknown,
+  value: unknown,
+  attempt: ApprovalActionAttempt,
+): PendingApprovalActionRaw {
+  const raw: PendingApprovalActionRaw = { platformPayload, pendingApprovalAction: { value, attempt } };
+  PENDING_APPROVAL_RAW.add(raw);
+  return raw;
+}
+
+export function pendingApprovalFromRaw(raw: unknown): PendingApprovalActionRaw["pendingApprovalAction"] | undefined {
+  if (typeof raw !== "object" || raw === null || !PENDING_APPROVAL_RAW.has(raw)) return undefined;
+  return (raw as Partial<PendingApprovalActionRaw>).pendingApprovalAction;
+}
+
+export function pendingApprovalSurfaceFields(
+  parser: ApprovalActionParser | undefined,
+  value: unknown,
+  attempt: ApprovalActionAttempt,
+  platformPayload: unknown,
+): { readonly text: string; readonly raw: PendingApprovalActionRaw } | undefined {
+  return parser && parseApprovalToken(value)
+    ? { text: VERIFIED_APPROVAL_COMMAND, raw: pendingApprovalRaw(platformPayload, value, attempt) }
+    : undefined;
 }
 
 export function parseVerifiedApprovalSurfaceFields(

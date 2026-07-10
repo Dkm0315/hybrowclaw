@@ -6,7 +6,7 @@ import {
   bindSurfaceAction,
   issueApprovalActions,
   parseSurfaceAction,
-  parseVerifiedApprovalSurfaceFields,
+  pendingApprovalSurfaceFields,
   presentationActions,
   renderPresentationText,
   sanitizePresentationForAudience,
@@ -58,7 +58,7 @@ export function teamsActivityToSurfaceMessage(payload: unknown, options: TeamsMa
   }
   const surfaceId = `teams:${activity.channelData?.tenant?.id ?? "tenant"}`;
   const approval = activity.from?.id && activity.conversation?.id
-    ? parseVerifiedApprovalSurfaceFields(options.approvalActions, activity.value?.musterAction ?? activity.value?.command, {
+    ? pendingApprovalSurfaceFields(options.approvalActions, activity.value?.musterAction ?? activity.value?.command, {
       actorId: activity.from.id,
       surfaceId,
       conversationId: activity.conversation.id,

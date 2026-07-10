@@ -220,6 +220,43 @@ rl.on("line", (line) => {
   }
 });
 
+test("runCodexAppServer: warm session cache evicts the least-recent idle process", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "muster-codex-app-server-lru-"));
+  const fake = join(dir, "codex-fake.mjs");
+  await writeFile(fake, `#!/usr/bin/env node
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+const threadId = "thread-" + process.pid;
+function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ id: msg.id, result: { userAgent: "fake" } });
+  else if (msg.method === "thread/start") send({ id: msg.id, result: { thread: { id: threadId } } });
+  else if (msg.method === "turn/start") {
+    send({ id: msg.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
+    send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m", text: threadId }, threadId, turnId: "turn-1" } });
+    send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  const previous = process.env.MUSTER_NATIVE_SESSION_CACHE_SIZE;
+  process.env.MUSTER_NATIVE_SESSION_CACHE_SIZE = "2";
+  try {
+    clearCodexAppServerSessions();
+    const firstA = await runCodexAppServer({ prompt: "A1", cwd: dir, command: fake, cacheKey: "A" });
+    await runCodexAppServer({ prompt: "B", cwd: dir, command: fake, cacheKey: "B" });
+    await runCodexAppServer({ prompt: "C", cwd: dir, command: fake, cacheKey: "C" });
+    const secondA = await runCodexAppServer({ prompt: "A2", cwd: dir, command: fake, cacheKey: "A" });
+    assert.notEqual(secondA.threadId, firstA.threadId, "the oldest idle session is replaced after the cache reaches its bound");
+  } finally {
+    if (previous === undefined) delete process.env.MUSTER_NATIVE_SESSION_CACHE_SIZE;
+    else process.env.MUSTER_NATIVE_SESSION_CACHE_SIZE = previous;
+    clearCodexAppServerSessions();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("runCodexAppServer: keepAlive=false closes the app-server instead of caching it", async () => {
   const dir = await mkdtemp(join(tmpdir(), "muster-codex-app-server-no-cache-"));
   const fake = join(dir, "codex-fake.mjs");

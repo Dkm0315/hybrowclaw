@@ -4,6 +4,7 @@ import type { GatewayConfig, GatewayCustomCommand } from "./gateway-config.js";
 import type { PairedSender } from "./pairing.js";
 import type { SurfaceMessage, SurfaceReply } from "./envelope.js";
 import { isInteractionCommand, renderInteractionCommand } from "./interaction.js";
+import type { GatewayEnterpriseRuntime } from "./enterprise-runtime.js";
 
 /**
  * A leading /command, requiring the name to end at whitespace or string end so
@@ -84,6 +85,9 @@ export interface CommandContext {
   readonly gateway?: GatewayConfig;
   readonly cwd?: string;
   readonly conversationKey: string;
+  /** Legacy pre-user-isolation lane, cleared on reset/new during migration. */
+  readonly legacyConversationKey?: string;
+  readonly enterprise?: GatewayEnterpriseRuntime;
 }
 
 /** A representative model for the active runtime, for /status and /start. */
@@ -106,7 +110,7 @@ export async function dispatchCommand(message: SurfaceMessage, ctx: CommandConte
   const runtime = ctx.config.routing?.defaultRuntime ?? "native";
   const model = activeModel(ctx.config, runtime);
   if (isInteractionCommand(parsed.name)) {
-    return renderInteractionCommand({
+    return await renderInteractionCommand({
       command: parsed.name,
       args: parsed.args,
       config: ctx.config,
@@ -116,6 +120,7 @@ export async function dispatchCommand(message: SurfaceMessage, ctx: CommandConte
       paired: ctx.paired,
       message,
       gateway: ctx.gateway,
+      enterprise: ctx.enterprise,
     });
   }
   switch (parsed.name) {
@@ -133,13 +138,13 @@ export async function dispatchCommand(message: SurfaceMessage, ctx: CommandConte
         ].join("\n"),
       };
     case "new": {
-      const removed = await clearConversationSessionHandles(ctx.conversationKey, ctx.cwd);
+      const removed = await clearCommandSessionHandles(ctx);
       return {
         text: `Started a fresh thread for this chat. Cleared ${removed} provider session handle${removed === 1 ? "" : "s"}.`,
       };
     }
     case "reset": {
-      const removed = await clearConversationSessionHandles(ctx.conversationKey, ctx.cwd);
+      const removed = await clearCommandSessionHandles(ctx);
       return {
         text: `Reset this chat's provider session handles (${removed} cleared). Pairing, memory, and run history were left intact.`,
       };
@@ -150,4 +155,11 @@ export async function dispatchCommand(message: SurfaceMessage, ctx: CommandConte
       };
   }
   return null;
+}
+
+async function clearCommandSessionHandles(ctx: CommandContext): Promise<number> {
+  const keys = [...new Set([ctx.conversationKey, ctx.legacyConversationKey].filter((key): key is string => Boolean(key)))];
+  let removed = 0;
+  for (const key of keys) removed += await clearConversationSessionHandles(key, ctx.cwd);
+  return removed;
 }

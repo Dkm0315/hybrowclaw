@@ -5,7 +5,7 @@ import {
   bindSurfaceAction,
   issueApprovalActions,
   parseSurfaceAction,
-  parseVerifiedApprovalSurfaceFields,
+  pendingApprovalSurfaceFields,
   presentationActions,
   renderPresentationText,
   sanitizePresentationForAudience,
@@ -55,7 +55,7 @@ export function telegramUpdateToSurfaceMessage(update: unknown, options: Telegra
   const typed = update as TelegramUpdate;
   const callback = typed.callback_query;
   const approval = callback?.message?.chat?.id && callback.from?.id
-    ? parseVerifiedApprovalSurfaceFields(options.approvalActions, callback.data, {
+    ? pendingApprovalSurfaceFields(options.approvalActions, callback.data, {
       actorId: String(callback.from.id),
       surfaceId: TELEGRAM_SURFACE_ID,
       conversationId: String(callback.message.chat.id),

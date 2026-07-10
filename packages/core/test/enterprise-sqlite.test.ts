@@ -65,7 +65,7 @@ if (!isMainThread && isWorkerJob(workerData)) {
           ttlMs: 60_000,
           nowMs: now,
         });
-        parentPort?.postMessage({ status: claim.status, fingerprint: claim.record.fingerprint });
+        parentPort?.postMessage({ status: claim.status, fingerprint: claim.record.fingerprint, claimToken: claim.record.claimToken });
       }
     } finally {
       store.close();
@@ -155,6 +155,22 @@ if (isMainThread) {
     store.close();
   });
 
+  test("multi-dimensional rate batches roll back every counter when one dimension rejects", async (t) => {
+    const store = new EnterpriseSqliteStore(databasePath(t));
+    const window = enterpriseWindowBounds("minute", now);
+    const runs = { key: "user:u-1:runs", windowStartMs: window.startMs, windowEndMs: window.endMs, amount: 1, limit: 2 };
+    const tokens = { key: "user:u-1:tokens", windowStartMs: window.startMs, windowEndMs: window.endMs, amount: 80, limit: 100 };
+
+    const first = await store.consumeRateLimitsAtomically([runs, tokens]);
+    const rejected = await store.consumeRateLimitsAtomically([runs, tokens]);
+
+    assert.equal(first.accepted, true);
+    assert.equal(rejected.accepted, false);
+    assert.equal(await store.readRateLimit({ key: runs.key, windowStartMs: window.startMs, nowMs: now }), 1, "run counter must roll back with the rejected token counter");
+    assert.equal(await store.readRateLimit({ key: tokens.key, windowStartMs: window.startMs, nowMs: now }), 80);
+    store.close();
+  });
+
   test("BEGIN IMMEDIATE admits exactly the limit under simultaneous multi-connection writes", async (t) => {
     const filename = databasePath(t);
     const window = enterpriseWindowBounds("minute", now);
@@ -187,21 +203,23 @@ if (isMainThread) {
     }));
     const results = await runWorkers(jobs);
     assert.equal(results.filter((result) => result.status === "claimed").length, 1);
-    const winner = String(results.find((result) => result.status === "claimed")?.fingerprint);
+    const winningClaim = results.find((result) => result.status === "claimed");
+    const winner = String(winningClaim?.fingerprint);
+    const claimToken = String(winningClaim?.claimToken);
     assert.ok(winner === "sha256:alpha" || winner === "sha256:beta");
     assert.equal(results.filter((result) => result.status === "replay").length, 4);
     assert.equal(results.filter((result) => result.status === "conflict").length, 5);
 
     let store = new EnterpriseSqliteStore(filename);
     const completed = await store.completeIdempotency({
-      namespace: "slack", key: "event-race", fingerprint: winner, resultRef: "receipt-1", nowMs: now + 1,
+      namespace: "slack", key: "event-race", fingerprint: winner, claimToken, resultRef: "receipt-1", nowMs: now + 1,
     });
     assert.equal(completed.state, "completed");
     assert.equal((await store.completeIdempotency({
-      namespace: "slack", key: "event-race", fingerprint: winner, resultRef: "receipt-1", nowMs: now + 2,
+      namespace: "slack", key: "event-race", fingerprint: winner, claimToken, resultRef: "receipt-1", nowMs: now + 2,
     })).resultRef, "receipt-1");
     await assert.rejects(store.completeIdempotency({
-      namespace: "slack", key: "event-race", fingerprint: winner, resultRef: "receipt-2", nowMs: now + 3,
+      namespace: "slack", key: "event-race", fingerprint: winner, claimToken, resultRef: "receipt-2", nowMs: now + 3,
     }), /another result/);
     store.close();
 
@@ -212,7 +230,7 @@ if (isMainThread) {
     });
     assert.equal(reclaimed.status, "claimed");
     await assert.rejects(store.completeIdempotency({
-      namespace: "missing", key: "event", fingerprint: "sha256:x", resultRef: "r", nowMs: now,
+      namespace: "missing", key: "event", fingerprint: "sha256:x", claimToken: "missing-generation", resultRef: "r", nowMs: now,
     }), /missing or expired/);
     store.close();
   });

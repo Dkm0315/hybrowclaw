@@ -1,5 +1,8 @@
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import {
   createMusterAutocompleteProvider,
   createMusterChatEditor,
@@ -11,6 +14,8 @@ import {
   type MusterAutocompleteOptions,
 } from "./chat-tui.js";
 import type { RuntimeDoctorStatus } from "@musterhq/core";
+
+const execFileAsync = promisify(execFile);
 
 export interface QaPtyTuiCase {
   readonly id: string;
@@ -76,6 +81,7 @@ const CATALOG: MusterAutocompleteOptions = {
 
 export async function runPtyTuiQa(input: {
   readonly artifactDir: string;
+  readonly cliEntry?: string;
 }): Promise<QaPtyTuiResult> {
   const artifactDir = input.artifactDir;
   const screensDir = join(artifactDir, "screens");
@@ -93,6 +99,7 @@ export async function runPtyTuiQa(input: {
   cases.push(caseCrampedTranscriptReceipts());
   cases.push(caseKeyClassifier());
   cases.push(await caseResponsiveWidths());
+  cases.push(await caseRealPtyInteraction(artifactDir, input.cliEntry ?? process.argv[1]));
 
   for (const testCase of cases) {
     if (testCase.screen) await writeFile(join(screensDir, `${testCase.id}.txt`), `${testCase.screen}\n`, "utf8");
@@ -100,8 +107,8 @@ export async function runPtyTuiQa(input: {
 
   const status: RuntimeDoctorStatus = cases.every((testCase) => testCase.status === "passed") ? "passed" : "failed";
   const summary = status === "passed"
-    ? "PTY/TUI hostile interaction checks passed for stable overlays, history, escape, prompt persistence, contrast, provider workflow, and responsive rails"
-    : "PTY/TUI hostile interaction checks found unstable overlays, rails, history, contrast, provider workflow, or prompt persistence";
+    ? "PTY/TUI hostile interaction checks passed in the render harness and a real OS pseudo-terminal"
+    : "PTY/TUI hostile interaction checks found unstable overlays, rails, history, contrast, provider workflow, prompt persistence, or real PTY behavior";
   const manifestPath = join(artifactDir, "manifest.json");
   const casesPath = join(artifactDir, "cases.jsonl");
   await writeFile(casesPath, `${cases.map((testCase) => JSON.stringify(withoutScreen(testCase))).join("\n")}\n`, "utf8");
@@ -315,6 +322,154 @@ async function caseResponsiveWidths(): Promise<QaPtyTuiCase> {
   }
   const passed = checks.every((entry) => entry.hasTopRail && entry.hasBottomRail && entry.hasSuggestions && Number(entry.maxLineWidth) <= Number(entry.width));
   return makeCase("responsive_widths", passed, "composer rails and suggestions survive 80, 120, and 200 column widths", checks.map((entry) => JSON.stringify(entry)).join("\n"), { checks });
+}
+
+async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Promise<QaPtyTuiCase> {
+  const session = `muster-qa-${process.pid}-${randomUUID().slice(0, 8)}`;
+  const workspace = join(artifactDir, "real-pty-workspace");
+  await mkdir(workspace, { recursive: true });
+  const evidence: Record<string, unknown> = { backend: "tmux", cliEntry };
+  const screens: string[] = [];
+  try {
+    const version = (await execFileAsync("tmux", ["-V"], { timeout: 5_000 })).stdout.trim();
+    evidence.backendVersion = version;
+    const command = [
+      "env",
+      `HOME=${shellQuote(workspace)}`,
+      "MUSTER_SKIP_ONBOARDING=1",
+      "TERM=xterm-256color",
+      shellQuote(process.execPath),
+      ...process.execArgv.map(shellQuote),
+      shellQuote(cliEntry),
+      "--skip-onboarding",
+    ].join(" ");
+    await tmux(["new-session", "-d", "-s", session, "-x", "120", "-y", "40", "-c", workspace, command]);
+    const baseline = await waitForPtyScreen(session, (screen) => screen.includes("╭─ chat") && screen.includes("│ ›"));
+    screens.push(`baseline\n${stripAnsi(baseline)}`);
+
+    await tmux(["send-keys", "-t", session, "-l", "/"]);
+    const overlay = await waitForPtyScreen(session, (screen) => screen.includes("suggestions") && screen.includes("/help"));
+    await delay(250);
+    const persistentOverlay = await capturePtyScreen(session);
+    for (let index = 0; index < 5; index += 1) await tmux(["send-keys", "-t", session, "Down"]);
+    const navigated = await waitForPtyScreen(session, (screen) => {
+      const selected = selectedSuggestion(screen);
+      return Boolean(selected && selected !== "/help");
+    });
+    screens.push(`overlay\n${stripAnsi(overlay)}`, `navigated\n${stripAnsi(navigated)}`);
+
+    await tmux(["send-keys", "-t", session, "Escape"]);
+    const escaped = await waitForPtyScreen(session, (screen) => !screen.includes("suggestions") && composerValue(screen) === "");
+    screens.push(`escaped\n${stripAnsi(escaped)}`);
+
+    await submitPtyText(session, "/status");
+    await waitForPtyScreen(session, (screen) => stripAnsi(screen).includes("› /status") && composerValue(screen) === "");
+    await submitPtyText(session, "/help");
+    await waitForPtyScreen(session, (screen) => stripAnsi(screen).includes("› /help") && composerValue(screen) === "");
+    await tmux(["send-keys", "-t", session, "Up"]);
+    const historyLatest = await waitForPtyScreen(session, (screen) => composerValue(screen) === "/help");
+    await tmux(["send-keys", "-t", session, "Up"]);
+    const historyOlder = await waitForPtyScreen(session, (screen) => composerValue(screen) === "/status");
+    await tmux(["send-keys", "-t", session, "Down"]);
+    const historyForward = await waitForPtyScreen(session, (screen) => composerValue(screen) === "/help");
+    screens.push(`history\n${stripAnsi(historyForward)}`);
+
+    Object.assign(evidence, {
+      overlayCount: count(stripAnsi(persistentOverlay), "suggestions"),
+      overlayPersisted: persistentOverlay.includes("suggestions"),
+      selectedBefore: selectedSuggestion(overlay),
+      selectedAfter: selectedSuggestion(navigated),
+      escapedComposer: composerValue(escaped),
+      historyLatest: composerValue(historyLatest),
+      historyOlder: composerValue(historyOlder),
+      historyForward: composerValue(historyForward),
+      bottomRailVisible: /╰─+╯/.test(stripAnsi(navigated)),
+    });
+    const passed = evidence.overlayCount === 1
+      && evidence.overlayPersisted === true
+      && evidence.selectedBefore === "/help"
+      && typeof evidence.selectedAfter === "string"
+      && evidence.selectedAfter !== "/help"
+      && evidence.escapedComposer === ""
+      && evidence.historyLatest === "/help"
+      && evidence.historyOlder === "/status"
+      && evidence.historyForward === "/help"
+      && evidence.bottomRailVisible === true;
+    return makeCase(
+      "real_pty_interaction",
+      passed,
+      "real tmux PTY keeps one overlay, navigates selection, closes on Escape, and replays command history",
+      screens.join("\n\n---\n\n"),
+      evidence,
+    );
+  } catch (error) {
+    evidence.error = error instanceof Error ? error.message : String(error);
+    return makeCase(
+      "real_pty_interaction",
+      false,
+      "real OS pseudo-terminal interaction could not be verified",
+      screens.join("\n\n---\n\n") || undefined,
+      evidence,
+    );
+  } finally {
+    await execFileAsync("tmux", ["kill-session", "-t", session], { timeout: 5_000 }).catch(() => undefined);
+  }
+}
+
+async function submitPtyText(session: string, value: string): Promise<void> {
+  await tmux(["send-keys", "-t", session, "C-u"]);
+  await tmux(["send-keys", "-t", session, "-l", value]);
+  await tmux(["send-keys", "-t", session, "Enter"]);
+}
+
+async function waitForPtyScreen(session: string, predicate: (screen: string) => boolean, timeoutMs = 5_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  let latest = "";
+  do {
+    latest = await capturePtyScreen(session);
+    if (predicate(latest)) return latest;
+    await delay(50);
+  } while (Date.now() < deadline);
+  throw new Error(`Timed out waiting for terminal state. Last composer=${JSON.stringify(composerValue(latest))}`);
+}
+
+async function capturePtyScreen(session: string): Promise<string> {
+  return (await execFileAsync("tmux", ["capture-pane", "-p", "-e", "-t", session], {
+    timeout: 5_000,
+    maxBuffer: 2 * 1024 * 1024,
+  })).stdout;
+}
+
+async function tmux(args: readonly string[]): Promise<void> {
+  await execFileAsync("tmux", [...args], { timeout: 5_000, maxBuffer: 2 * 1024 * 1024 });
+}
+
+function composerValue(screen: string): string | undefined {
+  const lines = stripAnsi(screen).split("\n");
+  let line: string | undefined;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (lines[index].includes("│ ›")) {
+      line = lines[index];
+      break;
+    }
+  }
+  if (!line) return undefined;
+  const start = line.indexOf("│ ›") + 3;
+  const end = line.lastIndexOf("│");
+  return line.slice(start, end > start ? end : undefined).trim();
+}
+
+function selectedSuggestion(screen: string): string | undefined {
+  const selected = screen.split("\n").find((line) => line.includes("\u001b[48;2;41;211;255m"));
+  return stripAnsi(selected ?? "").match(/→\s+(\/[^\s]+)/)?.[1];
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+async function delay(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function makeCase(id: string, passed: boolean, summary: string, screen: string | undefined, evidence: Record<string, unknown>): QaPtyTuiCase {

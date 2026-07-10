@@ -29,6 +29,14 @@ test("parseSurfaceMessage rejects missing or empty required fields", () => {
 
 test("conversationSessionId and isPairingChallenge helpers", () => {
   assert.equal(conversationSessionId({ surfaceId: "telegram:bot", conversationId: "42" }), "telegram:bot:42");
+  assert.equal(
+    conversationSessionId({ surfaceId: "slack:T1", conversationId: "C1", senderId: "U1" }),
+    "slack:T1:C1:sender:U1",
+  );
+  assert.notEqual(
+    conversationSessionId({ surfaceId: "slack:T1", conversationId: "C1", senderId: "U1" }),
+    conversationSessionId({ surfaceId: "slack:T1", conversationId: "C1", senderId: "U2" }),
+  );
   assert.equal(isPairingChallenge({ status: "pairing_required", code: "ABCD2345" }), true);
   assert.equal(isPairingChallenge({ text: "hi" }), false);
 });

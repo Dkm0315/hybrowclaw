@@ -13,6 +13,7 @@ import {
   surfaceReplyToWhatsAppSend,
   teamsActivityToSurfaceMessage,
   telegramUpdateToSurfaceMessage,
+  pendingApprovalFromRaw,
   verifiedApprovalFromRaw,
   whatsAppWebhookToSurfaceMessages,
 } from "../src/index.js";
@@ -84,6 +85,11 @@ function renderContext(channel: ChannelHarness, actions: ApprovalActionCodec, cl
 function requireMessage(value: unknown): SurfaceMessage | undefined {
   if (typeof value !== "object" || value === null || (value as { kind?: string }).kind !== "message") return undefined;
   return (value as { message: SurfaceMessage }).message;
+}
+
+function consumePending(actions: ApprovalActionCodec, message: SurfaceMessage | undefined) {
+  const pending = pendingApprovalFromRaw(message?.raw);
+  return pending ? actions.parse(pending.value, pending.attempt) : undefined;
 }
 
 const CHANNELS: readonly ChannelHarness[] = [
@@ -232,15 +238,17 @@ for (const channel of CHANNELS) {
 
     const message = channel.parse(actions, tokens.approve);
     assert.equal(message?.text, "/approvals decide");
-    const verified = verifiedApprovalFromRaw(message?.raw);
-    assert.equal(verified?.decision, "approve");
+    const verified = consumePending(actions, message);
+    assert.equal(verified?.ok, true);
+    if (!verified?.ok) throw new Error("approval should verify after pairing-stage consumption");
+    assert.equal(verified.decision, "approve");
     assert.deepEqual({
-      actorId: verified?.binding.actorId,
-      surfaceId: verified?.binding.surfaceId,
-      conversationId: verified?.binding.conversationId,
-      runId: verified?.binding.runId,
-      gateId: verified?.binding.gateId,
-      revision: verified?.binding.revision,
+      actorId: verified.binding.actorId,
+      surfaceId: verified.binding.surfaceId,
+      conversationId: verified.binding.conversationId,
+      runId: verified.binding.runId,
+      gateId: verified.binding.gateId,
+      revision: verified.binding.revision,
     }, {
       actorId: channel.actorId,
       surfaceId: channel.surfaceId,
@@ -250,8 +258,8 @@ for (const channel of CHANNELS) {
       revision: REVISION,
     });
 
-    assert.equal(channel.parse(actions, tokens.approve), undefined, "same callback must be rejected as replay");
-    assert.equal(channel.parse(actions, tokens.reject), undefined, "opposite decision must also be rejected after consumption");
+    assert.deepEqual(consumePending(actions, channel.parse(actions, tokens.approve)), { ok: false, reason: "replay" });
+    assert.deepEqual(consumePending(actions, channel.parse(actions, tokens.reject)), { ok: false, reason: "replay" });
   });
 
   test(`${channel.name} rejects tampering and a wrong actor without burning the valid action`, () => {
@@ -260,9 +268,9 @@ for (const channel of CHANNELS) {
     const tokens = channel.render(actions, clock);
     const replacement = tokens.approve.endsWith("A") ? "B" : "A";
     const tampered = `${tokens.approve.slice(0, -1)}${replacement}`;
-    assert.equal(channel.parse(actions, tampered), undefined);
-    assert.equal(channel.parse(actions, tokens.approve, `${channel.actorId}-intruder`), undefined);
-    assert.ok(channel.parse(actions, tokens.approve), "failed attacks must not consume the legitimate action");
+    assert.deepEqual(consumePending(actions, channel.parse(actions, tampered)), { ok: false, reason: "tampered" });
+    assert.deepEqual(consumePending(actions, channel.parse(actions, tokens.approve, `${channel.actorId}-intruder`)), { ok: false, reason: "wrong_actor" });
+    assert.equal(consumePending(actions, channel.parse(actions, tokens.approve))?.ok, true, "failed attacks must not consume the legitimate action");
   });
 
   test(`${channel.name} rejects expired actions`, () => {
@@ -270,7 +278,7 @@ for (const channel of CHANNELS) {
     const actions = codec(clock);
     const tokens = channel.render(actions, clock);
     clock.now += 60_001;
-    assert.equal(channel.parse(actions, tokens.approve), undefined);
+    assert.deepEqual(consumePending(actions, channel.parse(actions, tokens.approve)), { ok: false, reason: "expired" });
   });
 }
 

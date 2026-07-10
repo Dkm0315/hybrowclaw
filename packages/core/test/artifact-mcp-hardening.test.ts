@@ -10,6 +10,7 @@ import {
   large_report_contract,
   persistArtifact,
   readArtifactManifest,
+  updateArtifactDelivery,
   xlsx_workbook,
 } from "../src/artifacts.js";
 import {
@@ -100,6 +101,14 @@ test("artifact workspaces isolate tenants and runs under concurrent identical fi
   assert.equal(declaredThroughPackTool.artifactId, "artifact-a3");
   assert.equal(declaredThroughPackTool.manifestPath, tenantRunA.manifestPath);
   assert.match(declaredThroughPackTool.sourcePrompt, /^sha256:/);
+  const delivered = await updateArtifactDelivery(tenantRunA, "artifact-a1", {
+    state: "uploaded",
+    channel: "gchat",
+    target: "spaces/A",
+    providerMessageId: "message-a1",
+  });
+  assert.equal(delivered.delivery.state, "uploaded");
+  assert.equal(delivered.delivery.providerMessageId, "message-a1");
 
   const [manifestA, manifestRunB, manifestTenantB] = await Promise.all([
     readArtifactManifest(tenantRunA),
@@ -107,6 +116,7 @@ test("artifact workspaces isolate tenants and runs under concurrent identical fi
     readArtifactManifest(otherTenant),
   ]);
   assert.deepEqual(manifestA.artifacts.map((item) => item.artifactId).sort(), ["artifact-a1", "artifact-a2", "artifact-a3"]);
+  assert.equal(manifestA.artifacts.find((item) => item.artifactId === "artifact-a1")?.delivery.state, "uploaded");
   assert.deepEqual(manifestRunB.artifacts.map((item) => item.artifactId), ["artifact-a1"]);
   assert.deepEqual(manifestTenantB.artifacts.map((item) => item.artifactId), ["artifact-a1"]);
   assert.notEqual(tenantRunA.workspaceDir, tenantRunB.workspaceDir);

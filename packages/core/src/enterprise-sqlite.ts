@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
@@ -10,15 +10,19 @@ import {
   type EnterpriseActionReceipt,
   type EnterpriseBudgetStore,
   type EnterpriseCounterConsumeInput,
+  type EnterpriseCounterBatchResult,
   type EnterpriseCounterReadInput,
   type EnterpriseCounterResult,
   type EnterpriseIdempotencyClaim,
   type EnterpriseIdempotencyClaimInput,
   type EnterpriseIdempotencyCompleteInput,
   type EnterpriseIdempotencyRecord,
+  type EnterpriseIdempotencyReleaseInput,
+  type EnterpriseIdempotencyRenewInput,
   type EnterpriseIdempotencyStore,
   type EnterpriseRateLimitStore,
   type EnterpriseReceiptMetadataValue,
+  type EnterpriseReceiptQuery,
   type EnterpriseReceiptStore,
   type EnterpriseSubject,
 } from "./enterprise-governance.js";
@@ -52,6 +56,12 @@ type CounterKind = "rate_limit" | "budget";
 const USAGE_OUTCOMES = new Set<EnterpriseUsageOutcome>(["success", "error", "blocked", "cancelled"]);
 const CACHE_STATUSES = new Set<EnterpriseCacheStatus>(["hit", "miss", "bypass"]);
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
+
+class AtomicCounterBatchRejected extends Error {
+  constructor(readonly results: readonly EnterpriseCounterResult[]) {
+    super("Atomic counter batch rejected.");
+  }
+}
 
 /**
  * Durable local enterprise control-plane storage.
@@ -108,6 +118,7 @@ export class EnterpriseSqliteStore implements
         namespace TEXT NOT NULL,
         idempotency_key TEXT NOT NULL,
         fingerprint TEXT NOT NULL,
+        claim_token TEXT NOT NULL,
         state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
         claimed_at_ms REAL NOT NULL,
         expires_at_ms REAL NOT NULL,
@@ -126,6 +137,15 @@ export class EnterpriseSqliteStore implements
       ) STRICT;
       CREATE INDEX IF NOT EXISTS idx_enterprise_receipts_time
         ON enterprise_receipts(occurred_at, receipt_id);
+
+      CREATE TABLE IF NOT EXISTS enterprise_receipt_subjects (
+        receipt_id TEXT NOT NULL REFERENCES enterprise_receipts(receipt_id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        PRIMARY KEY (receipt_id, kind, subject_id)
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS idx_enterprise_receipt_subject_scope
+        ON enterprise_receipt_subjects(kind, subject_id, receipt_id);
 
       CREATE TABLE IF NOT EXISTS enterprise_usage (
         event_id TEXT PRIMARY KEY,
@@ -155,10 +175,52 @@ export class EnterpriseSqliteStore implements
       CREATE INDEX IF NOT EXISTS idx_enterprise_usage_subject_scope
         ON enterprise_usage_subjects(kind, subject_id, event_id);
     `);
+    const idempotencyColumns = this.#db.prepare("PRAGMA table_info(enterprise_idempotency)").all() as Array<{ name?: unknown }>;
+    if (!idempotencyColumns.some((column) => String(column.name) === "claim_token")) {
+      this.#db.exec("ALTER TABLE enterprise_idempotency ADD COLUMN claim_token TEXT NOT NULL DEFAULT '';");
+    }
+    const unindexedReceipts = this.#db.prepare(`
+      SELECT r.receipt_id, r.integrity_hash, r.receipt_json FROM enterprise_receipts r
+      WHERE NOT EXISTS (SELECT 1 FROM enterprise_receipt_subjects s WHERE s.receipt_id = r.receipt_id)
+    `).all() as Record<string, unknown>[];
+    if (unindexedReceipts.length) {
+      this.#transaction(() => {
+        const insert = this.#db.prepare("INSERT OR IGNORE INTO enterprise_receipt_subjects (receipt_id, kind, subject_id) VALUES (?, ?, ?)");
+        for (const row of unindexedReceipts) {
+          const receipt = receiptFromRow(row);
+          for (const subject of normalizeEnterpriseSubjects([...receipt.actor, ...receipt.target])) {
+            insert.run(receipt.receiptId, subject.kind, subject.id);
+          }
+        }
+      });
+    }
   }
 
   async consumeRateLimit(input: EnterpriseCounterConsumeInput): Promise<EnterpriseCounterResult> {
     return this.#consumeCounter("rate_limit", input);
+  }
+
+  async consumeRateLimitsAtomically(inputs: readonly EnterpriseCounterConsumeInput[]): Promise<EnterpriseCounterBatchResult> {
+    if (!inputs.length) return Object.freeze({ accepted: true, results: Object.freeze([]) });
+    inputs.forEach(validateCounterInput);
+    this.#ensureOpen();
+    try {
+      const results = this.#transaction(() => {
+        const decisions: EnterpriseCounterResult[] = [];
+        for (const input of inputs) {
+          const decision = this.#consumeCounterInTransaction("rate_limit", input);
+          decisions.push(decision);
+          if (!decision.accepted) throw new AtomicCounterBatchRejected(decisions);
+        }
+        return decisions;
+      });
+      return Object.freeze({ accepted: true, results: Object.freeze(results) });
+    } catch (error) {
+      if (error instanceof AtomicCounterBatchRejected) {
+        return Object.freeze({ accepted: false, results: Object.freeze(error.results) });
+      }
+      throw error;
+    }
   }
 
   async readRateLimit(input: EnterpriseCounterReadInput): Promise<number> {
@@ -179,7 +241,7 @@ export class EnterpriseSqliteStore implements
     return this.#transaction(() => {
       this.#db.prepare("DELETE FROM enterprise_idempotency WHERE expires_at_ms <= ?").run(input.nowMs);
       const existing = this.#db.prepare(`
-        SELECT namespace, idempotency_key, fingerprint, state, claimed_at_ms, expires_at_ms, result_ref
+        SELECT namespace, idempotency_key, fingerprint, claim_token, state, claimed_at_ms, expires_at_ms, result_ref
         FROM enterprise_idempotency WHERE namespace = ? AND idempotency_key = ?
       `).get(input.namespace, input.key) as Record<string, unknown> | undefined;
       if (existing) {
@@ -191,30 +253,66 @@ export class EnterpriseSqliteStore implements
       }
 
       const expiresAtMs = input.nowMs + input.ttlMs;
+      const claimToken = randomUUID();
       assertDateTimestamp(expiresAtMs, "Idempotency expiry");
       this.#db.prepare(`
         INSERT INTO enterprise_idempotency
-          (namespace, idempotency_key, fingerprint, state, claimed_at_ms, expires_at_ms, result_ref)
-        VALUES (?, ?, ?, 'pending', ?, ?, NULL)
-      `).run(input.namespace, input.key, input.fingerprint, input.nowMs, expiresAtMs);
+          (namespace, idempotency_key, fingerprint, claim_token, state, claimed_at_ms, expires_at_ms, result_ref)
+        VALUES (?, ?, ?, ?, 'pending', ?, ?, NULL)
+      `).run(input.namespace, input.key, input.fingerprint, claimToken, input.nowMs, expiresAtMs);
       return deepFreeze({
         status: "claimed",
-        record: idempotencyRecordFromValues(input.namespace, input.key, input.fingerprint, "pending", input.nowMs, expiresAtMs),
+        record: idempotencyRecordFromValues(input.namespace, input.key, input.fingerprint, claimToken, "pending", input.nowMs, expiresAtMs),
       });
     });
   }
 
+  async renewIdempotency(input: EnterpriseIdempotencyRenewInput): Promise<EnterpriseIdempotencyRecord> {
+    validateIdempotencyOwnership(input, "renewal");
+    if (!Number.isFinite(input.ttlMs) || input.ttlMs <= 0) throw new Error("Idempotency renewal ttlMs must be positive.");
+    this.#ensureOpen();
+    const outcome = this.#transaction((): { record?: EnterpriseIdempotencyRecord; error?: string } => {
+      const row = this.#db.prepare(`
+        SELECT namespace, idempotency_key, fingerprint, claim_token, state, claimed_at_ms, expires_at_ms, result_ref
+        FROM enterprise_idempotency WHERE namespace = ? AND idempotency_key = ?
+      `).get(input.namespace, input.key) as Record<string, unknown> | undefined;
+      if (!row || Number(row.expires_at_ms) <= input.nowMs || String(row.state) !== "pending") {
+        if (row && Number(row.expires_at_ms) <= input.nowMs) {
+          this.#db.prepare("DELETE FROM enterprise_idempotency WHERE namespace = ? AND idempotency_key = ? AND expires_at_ms <= ?")
+            .run(input.namespace, input.key, input.nowMs);
+        }
+        return { error: "Idempotency claim is missing, expired, or already completed." };
+      }
+      const ownershipError = idempotencyOwnershipError(row, input);
+      if (ownershipError) return { error: ownershipError };
+      const expiresAtMs = Math.max(Number(row.expires_at_ms), input.nowMs + input.ttlMs);
+      const updated = this.#db.prepare(`
+        UPDATE enterprise_idempotency SET expires_at_ms = ?
+        WHERE namespace = ? AND idempotency_key = ? AND fingerprint = ? AND claim_token = ? AND state = 'pending'
+      `).run(expiresAtMs, input.namespace, input.key, input.fingerprint, input.claimToken) as { changes?: number | bigint };
+      if (Number(updated.changes ?? 0) !== 1) return { error: "Idempotency claim generation conflict." };
+      return {
+        record: idempotencyRecordFromValues(
+          String(row.namespace), String(row.idempotency_key), String(row.fingerprint), String(row.claim_token),
+          "pending", Number(row.claimed_at_ms), expiresAtMs,
+        ),
+      };
+    });
+    if (outcome.error) throw new Error(outcome.error);
+    return outcome.record as EnterpriseIdempotencyRecord;
+  }
+
   async completeIdempotency(input: EnterpriseIdempotencyCompleteInput): Promise<EnterpriseIdempotencyRecord> {
-    validateNonEmpty(input.namespace, "Idempotency namespace");
-    validateNonEmpty(input.key, "Idempotency key");
-    validateNonEmpty(input.fingerprint, "Idempotency fingerprint");
+    validateIdempotencyOwnership(input, "completion");
     validateNonEmpty(input.resultRef, "Idempotency resultRef");
-    assertDateTimestamp(input.nowMs, "Idempotency completion time");
+    if (input.ttlMs !== undefined && (!Number.isFinite(input.ttlMs) || input.ttlMs <= 0)) {
+      throw new Error("Idempotency completion ttlMs must be positive.");
+    }
     this.#ensureOpen();
 
     const outcome = this.#transaction((): { record?: EnterpriseIdempotencyRecord; error?: string } => {
       const row = this.#db.prepare(`
-        SELECT namespace, idempotency_key, fingerprint, state, claimed_at_ms, expires_at_ms, result_ref
+        SELECT namespace, idempotency_key, fingerprint, claim_token, state, claimed_at_ms, expires_at_ms, result_ref
         FROM enterprise_idempotency WHERE namespace = ? AND idempotency_key = ?
       `).get(input.namespace, input.key) as Record<string, unknown> | undefined;
       if (!row) return { error: "Idempotency claim is missing or expired." };
@@ -223,24 +321,29 @@ export class EnterpriseSqliteStore implements
           .run(input.namespace, input.key);
         return { error: "Idempotency claim is missing or expired." };
       }
-      if (String(row.fingerprint) !== input.fingerprint) return { error: "Idempotency fingerprint conflict." };
+      const ownershipError = idempotencyOwnershipError(row, input);
+      if (ownershipError) return { error: ownershipError };
       if (String(row.state) === "completed" && String(row.result_ref) !== input.resultRef) {
         return { error: "Idempotency claim was already completed with another result." };
       }
-      if (String(row.state) !== "completed") {
+      const expiresAtMs = input.ttlMs === undefined
+        ? Number(row.expires_at_ms)
+        : Math.max(Number(row.expires_at_ms), input.nowMs + input.ttlMs);
+      if (String(row.state) !== "completed" || expiresAtMs !== Number(row.expires_at_ms)) {
         this.#db.prepare(`
-          UPDATE enterprise_idempotency SET state = 'completed', result_ref = ?
-          WHERE namespace = ? AND idempotency_key = ? AND fingerprint = ?
-        `).run(input.resultRef, input.namespace, input.key, input.fingerprint);
+          UPDATE enterprise_idempotency SET state = 'completed', result_ref = ?, expires_at_ms = ?
+          WHERE namespace = ? AND idempotency_key = ? AND fingerprint = ? AND claim_token = ?
+        `).run(input.resultRef, expiresAtMs, input.namespace, input.key, input.fingerprint, input.claimToken);
       }
       return {
         record: idempotencyRecordFromValues(
           String(row.namespace),
           String(row.idempotency_key),
           String(row.fingerprint),
+          String(row.claim_token),
           "completed",
           Number(row.claimed_at_ms),
-          Number(row.expires_at_ms),
+          expiresAtMs,
           input.resultRef,
         ),
       };
@@ -249,13 +352,26 @@ export class EnterpriseSqliteStore implements
     return outcome.record as EnterpriseIdempotencyRecord;
   }
 
+  async releaseIdempotency(input: EnterpriseIdempotencyReleaseInput): Promise<boolean> {
+    validateIdempotencyOwnership(input, "release");
+    this.#ensureOpen();
+    return this.#transaction(() => {
+      const result = this.#db.prepare(`
+        DELETE FROM enterprise_idempotency
+        WHERE namespace = ? AND idempotency_key = ? AND fingerprint = ? AND claim_token = ?
+          AND state = 'pending' AND expires_at_ms > ?
+      `).run(input.namespace, input.key, input.fingerprint, input.claimToken, input.nowMs) as { changes?: number | bigint };
+      return Number(result.changes ?? 0) === 1;
+    });
+  }
+
   async readIdempotency(namespace: string, key: string, nowMs: number): Promise<EnterpriseIdempotencyRecord | undefined> {
     validateNonEmpty(namespace, "Idempotency namespace");
     validateNonEmpty(key, "Idempotency key");
     assertDateTimestamp(nowMs, "Idempotency read time");
     this.#ensureOpen();
     const row = this.#db.prepare(`
-      SELECT namespace, idempotency_key, fingerprint, state, claimed_at_ms, expires_at_ms, result_ref
+      SELECT namespace, idempotency_key, fingerprint, claim_token, state, claimed_at_ms, expires_at_ms, result_ref
       FROM enterprise_idempotency WHERE namespace = ? AND idempotency_key = ?
     `).get(namespace, key) as Record<string, unknown> | undefined;
     if (!row) return undefined;
@@ -283,12 +399,16 @@ export class EnterpriseSqliteStore implements
         if (String(existing.integrity_hash) !== canonical.integrityHash) {
           throw new Error(`Receipt ${canonical.receiptId} already exists with different content.`);
         }
-        return;
+      } else {
+        this.#db.prepare(`
+          INSERT INTO enterprise_receipts (receipt_id, occurred_at, integrity_hash, receipt_json)
+          VALUES (?, ?, ?, ?)
+        `).run(canonical.receiptId, canonical.occurredAt, canonical.integrityHash, JSON.stringify(canonical));
       }
-      this.#db.prepare(`
-        INSERT INTO enterprise_receipts (receipt_id, occurred_at, integrity_hash, receipt_json)
-        VALUES (?, ?, ?, ?)
-      `).run(canonical.receiptId, canonical.occurredAt, canonical.integrityHash, JSON.stringify(canonical));
+      const insertSubject = this.#db.prepare("INSERT OR IGNORE INTO enterprise_receipt_subjects (receipt_id, kind, subject_id) VALUES (?, ?, ?)");
+      for (const subject of normalizeEnterpriseSubjects([...canonical.actor, ...canonical.target])) {
+        insertSubject.run(canonical.receiptId, subject.kind, subject.id);
+      }
     });
   }
 
@@ -301,12 +421,45 @@ export class EnterpriseSqliteStore implements
     return row ? receiptFromRow(row) : undefined;
   }
 
-  async listReceipts(): Promise<readonly EnterpriseActionReceipt[]> {
+  async listReceipts(query: EnterpriseReceiptQuery = {}): Promise<readonly EnterpriseActionReceipt[]> {
+    const validated = validateReceiptQuery(query);
     this.#ensureOpen();
-    const rows = this.#db.prepare(`
-      SELECT receipt_id, integrity_hash, receipt_json FROM enterprise_receipts ORDER BY sequence ASC
-    `).all() as Record<string, unknown>[];
-    return Object.freeze(rows.map(receiptFromRow));
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+    if (validated.from) { conditions.push("r.occurred_at >= ?"); params.push(validated.from); }
+    if (validated.to) { conditions.push("r.occurred_at < ?"); params.push(validated.to); }
+    for (const subject of validated.subjects) {
+      conditions.push(`EXISTS (
+        SELECT 1 FROM enterprise_receipt_subjects scoped
+        WHERE scoped.receipt_id = r.receipt_id AND scoped.kind = ? AND scoped.subject_id = ?
+      )`);
+      params.push(subject.kind, subject.id);
+    }
+    if (validated.subjectAny.length) {
+      conditions.push(`EXISTS (
+        SELECT 1 FROM enterprise_receipt_subjects any_scope
+        WHERE any_scope.receipt_id = r.receipt_id
+          AND (any_scope.kind || ':' || any_scope.subject_id) IN (SELECT value FROM json_each(?))
+      )`);
+      params.push(JSON.stringify(validated.subjectAny.map(enterpriseSubjectKey)));
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const sql = query.limit === undefined
+      ? `SELECT r.receipt_id, r.integrity_hash, r.receipt_json FROM enterprise_receipts r ${where} ORDER BY r.sequence ASC`
+      : `SELECT * FROM (
+          SELECT r.sequence, r.receipt_id, r.integrity_hash, r.receipt_json FROM enterprise_receipts r ${where}
+          ORDER BY r.sequence DESC LIMIT ?
+        ) ORDER BY sequence ASC`;
+    if (query.limit !== undefined) params.push(query.limit);
+    const receipts = (this.#db.prepare(sql).all(...params) as Record<string, unknown>[]).map(receiptFromRow);
+    for (const receipt of receipts) {
+      const subjects = [...receipt.actor, ...receipt.target];
+      if (validated.subjects.length && !enterpriseScopeMatches(subjects, validated.subjects)) throw new Error(`Receipt ${receipt.receiptId} failed its persisted scope index check.`);
+      if (validated.subjectAny.length && !validated.subjectAny.some((subject) => subjects.some((candidate) => candidate.kind === subject.kind && candidate.id === subject.id))) {
+        throw new Error(`Receipt ${receipt.receiptId} failed its persisted any-scope index check.`);
+      }
+    }
+    return Object.freeze(receipts);
   }
 
   async appendUsage(event: EnterpriseUsageEvent): Promise<void> {
@@ -373,6 +526,14 @@ export class EnterpriseSqliteStore implements
       )`);
       params.push(subject.kind, subject.id);
     }
+    if (validated.subjectAny.length) {
+      conditions.push(`EXISTS (
+        SELECT 1 FROM enterprise_usage_subjects any_scope
+        WHERE any_scope.event_id = e.event_id
+          AND (any_scope.kind || ':' || any_scope.subject_id) IN (SELECT value FROM json_each(?))
+      )`);
+      params.push(JSON.stringify(validated.subjectAny.map(enterpriseSubjectKey)));
+    }
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     const columns = `
       e.event_id, e.occurred_at, e.subjects_json, e.outcome, e.latency_ms,
@@ -398,6 +559,10 @@ export class EnterpriseSqliteStore implements
       if (validated.subjects.length && !enterpriseScopeMatches(event.subjects, validated.subjects)) {
         throw new Error(`Usage event ${event.eventId} failed its persisted scope-index integrity check.`);
       }
+      if (validated.subjectAny.length && !validated.subjectAny.some((subject) =>
+        event.subjects.some((candidate) => candidate.kind === subject.kind && candidate.id === subject.id))) {
+        throw new Error(`Usage event ${event.eventId} failed its persisted any-scope index integrity check.`);
+      }
     }
     return Object.freeze(events);
   }
@@ -411,39 +576,41 @@ export class EnterpriseSqliteStore implements
   #consumeCounter(kind: CounterKind, input: EnterpriseCounterConsumeInput): EnterpriseCounterResult {
     validateCounterInput(input);
     this.#ensureOpen();
-    return this.#transaction(() => {
-      this.#db.prepare("DELETE FROM enterprise_counters WHERE kind = ? AND window_end_ms <= ?")
-        .run(kind, input.windowStartMs);
-      const row = this.#db.prepare(`
-        SELECT window_end_ms, value FROM enterprise_counters
-        WHERE kind = ? AND counter_key = ? AND window_start_ms = ?
-      `).get(kind, input.key, input.windowStartMs) as Record<string, unknown> | undefined;
-      const usedBefore = row && Number(row.window_end_ms) === input.windowEndMs ? Number(row.value) : 0;
-      const projected = usedBefore + input.amount;
-      if (!Number.isFinite(projected) || projected < 0) throw new Error("Counter value exceeds the supported numeric range.");
-      const accepted = projected <= input.limit;
-      const usedAfter = accepted || input.commitOnExceed ? projected : usedBefore;
-      if (usedAfter > 0) {
-        this.#db.prepare(`
-          INSERT INTO enterprise_counters (kind, counter_key, window_start_ms, window_end_ms, value)
-          VALUES (?, ?, ?, ?, ?)
-          ON CONFLICT(kind, counter_key, window_start_ms) DO UPDATE SET
-            window_end_ms = excluded.window_end_ms,
-            value = excluded.value
-        `).run(kind, input.key, input.windowStartMs, input.windowEndMs, usedAfter);
-      } else if (row) {
-        this.#db.prepare(`
-          DELETE FROM enterprise_counters WHERE kind = ? AND counter_key = ? AND window_start_ms = ?
-        `).run(kind, input.key, input.windowStartMs);
-      }
-      return deepFreeze({
-        accepted,
-        usedBefore,
-        usedAfter,
-        remaining: Math.max(0, input.limit - usedAfter),
-        limit: input.limit,
-        resetAt: new Date(input.windowEndMs).toISOString(),
-      });
+    return this.#transaction(() => this.#consumeCounterInTransaction(kind, input));
+  }
+
+  #consumeCounterInTransaction(kind: CounterKind, input: EnterpriseCounterConsumeInput): EnterpriseCounterResult {
+    this.#db.prepare("DELETE FROM enterprise_counters WHERE kind = ? AND window_end_ms <= ?")
+      .run(kind, input.windowStartMs);
+    const row = this.#db.prepare(`
+      SELECT window_end_ms, value FROM enterprise_counters
+      WHERE kind = ? AND counter_key = ? AND window_start_ms = ?
+    `).get(kind, input.key, input.windowStartMs) as Record<string, unknown> | undefined;
+    const usedBefore = row && Number(row.window_end_ms) === input.windowEndMs ? Number(row.value) : 0;
+    const projected = usedBefore + input.amount;
+    if (!Number.isFinite(projected) || projected < 0) throw new Error("Counter value exceeds the supported numeric range.");
+    const accepted = projected <= input.limit;
+    const usedAfter = accepted || input.commitOnExceed ? projected : usedBefore;
+    if (usedAfter > 0) {
+      this.#db.prepare(`
+        INSERT INTO enterprise_counters (kind, counter_key, window_start_ms, window_end_ms, value)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(kind, counter_key, window_start_ms) DO UPDATE SET
+          window_end_ms = excluded.window_end_ms,
+          value = excluded.value
+      `).run(kind, input.key, input.windowStartMs, input.windowEndMs, usedAfter);
+    } else if (row) {
+      this.#db.prepare(`
+        DELETE FROM enterprise_counters WHERE kind = ? AND counter_key = ? AND window_start_ms = ?
+      `).run(kind, input.key, input.windowStartMs);
+    }
+    return deepFreeze({
+      accepted,
+      usedBefore,
+      usedAfter,
+      remaining: Math.max(0, input.limit - usedAfter),
+      limit: input.limit,
+      resetAt: new Date(input.windowEndMs).toISOString(),
     });
   }
 
@@ -510,11 +677,32 @@ function validateIdempotencyClaim(input: EnterpriseIdempotencyClaimInput): void 
   if (!Number.isFinite(input.ttlMs) || input.ttlMs <= 0) throw new Error("Idempotency ttlMs must be positive.");
 }
 
+function validateIdempotencyOwnership(
+  input: EnterpriseIdempotencyCompleteInput | EnterpriseIdempotencyReleaseInput | EnterpriseIdempotencyRenewInput,
+  operation: string,
+): void {
+  validateNonEmpty(input.namespace, "Idempotency namespace");
+  validateNonEmpty(input.key, "Idempotency key");
+  validateNonEmpty(input.fingerprint, "Idempotency fingerprint");
+  validateNonEmpty(input.claimToken, "Idempotency claimToken");
+  assertDateTimestamp(input.nowMs, `Idempotency ${operation} time`);
+}
+
+function idempotencyOwnershipError(
+  row: Record<string, unknown>,
+  input: EnterpriseIdempotencyCompleteInput | EnterpriseIdempotencyReleaseInput | EnterpriseIdempotencyRenewInput,
+): string | undefined {
+  if (String(row.fingerprint) !== input.fingerprint) return "Idempotency fingerprint conflict.";
+  if (String(row.claim_token) !== input.claimToken) return "Idempotency claim generation conflict.";
+  return undefined;
+}
+
 function idempotencyRecordFromRow(row: Record<string, unknown>): EnterpriseIdempotencyRecord {
   return idempotencyRecordFromValues(
     String(row.namespace),
     String(row.idempotency_key),
     String(row.fingerprint),
+    String(row.claim_token),
     String(row.state) as EnterpriseIdempotencyRecord["state"],
     Number(row.claimed_at_ms),
     Number(row.expires_at_ms),
@@ -526,6 +714,7 @@ function idempotencyRecordFromValues(
   namespace: string,
   key: string,
   fingerprint: string,
+  claimToken: string,
   state: EnterpriseIdempotencyRecord["state"],
   claimedAtMs: number,
   expiresAtMs: number,
@@ -535,6 +724,7 @@ function idempotencyRecordFromValues(
     namespace,
     key,
     fingerprint,
+    claimToken,
     state,
     claimedAt: new Date(claimedAtMs).toISOString(),
     expiresAt: new Date(expiresAtMs).toISOString(),
@@ -658,6 +848,7 @@ function validateUsageQuery(query: EnterpriseUsageQuery): {
   readonly fromMs?: number;
   readonly toMs?: number;
   readonly subjects: readonly EnterpriseSubject[];
+  readonly subjectAny: readonly EnterpriseSubject[];
 } {
   const fromMs = parseOptionalTimestamp(query.from, "Usage query from");
   const toMs = parseOptionalTimestamp(query.to, "Usage query to");
@@ -671,6 +862,25 @@ function validateUsageQuery(query: EnterpriseUsageQuery): {
     ...(fromMs === undefined ? {} : { fromMs }),
     ...(toMs === undefined ? {} : { toMs }),
     subjects: query.subjects ? normalizeEnterpriseSubjects(query.subjects) : Object.freeze([]),
+    subjectAny: query.subjectAny ? normalizeEnterpriseSubjects(query.subjectAny) : Object.freeze([]),
+  };
+}
+
+function validateReceiptQuery(query: EnterpriseReceiptQuery): {
+  readonly from?: string;
+  readonly to?: string;
+  readonly subjects: readonly EnterpriseSubject[];
+  readonly subjectAny: readonly EnterpriseSubject[];
+} {
+  const fromMs = parseOptionalTimestamp(query.from, "Receipt query from");
+  const toMs = parseOptionalTimestamp(query.to, "Receipt query to");
+  if (fromMs !== undefined && toMs !== undefined && fromMs >= toMs) throw new Error("Receipt query to must be after from.");
+  if (query.limit !== undefined && (!Number.isSafeInteger(query.limit) || query.limit <= 0)) throw new Error("Receipt query limit must be positive.");
+  return {
+    ...(query.from === undefined ? {} : { from: new Date(fromMs as number).toISOString() }),
+    ...(query.to === undefined ? {} : { to: new Date(toMs as number).toISOString() }),
+    subjects: query.subjects ? normalizeEnterpriseSubjects(query.subjects) : Object.freeze([]),
+    subjectAny: query.subjectAny ? normalizeEnterpriseSubjects(query.subjectAny) : Object.freeze([]),
   };
 }
 

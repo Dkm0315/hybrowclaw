@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export const ENTERPRISE_SUBJECT_PRECEDENCE = [
   "tenant",
@@ -78,8 +78,17 @@ export interface EnterpriseCounterResult {
   readonly resetAt: string;
 }
 
+export interface EnterpriseCounterBatchResult {
+  /** True only when every counter was admitted and committed. */
+  readonly accepted: boolean;
+  /** Decisions in the same order as the requested counters. */
+  readonly results: readonly EnterpriseCounterResult[];
+}
+
 export interface EnterpriseRateLimitStore {
   consumeRateLimit(input: EnterpriseCounterConsumeInput): Promise<EnterpriseCounterResult>;
+  /** All counters commit together or none do. Required for multi-dimensional limits. */
+  consumeRateLimitsAtomically(inputs: readonly EnterpriseCounterConsumeInput[]): Promise<EnterpriseCounterBatchResult>;
   readRateLimit(input: EnterpriseCounterReadInput): Promise<number>;
 }
 
@@ -100,7 +109,30 @@ export interface EnterpriseIdempotencyCompleteInput {
   readonly namespace: string;
   readonly key: string;
   readonly fingerprint: string;
+  /** Unique generation token returned by the successful claim. */
+  readonly claimToken: string;
   readonly resultRef: string;
+  readonly nowMs: number;
+  /** Optional retention window applied after successful completion. */
+  readonly ttlMs?: number;
+}
+
+export interface EnterpriseIdempotencyReleaseInput {
+  readonly namespace: string;
+  readonly key: string;
+  readonly fingerprint: string;
+  /** Unique generation token returned by the successful claim. */
+  readonly claimToken: string;
+  readonly nowMs: number;
+}
+
+export interface EnterpriseIdempotencyRenewInput {
+  readonly namespace: string;
+  readonly key: string;
+  readonly fingerprint: string;
+  /** Unique generation token returned by the successful claim. */
+  readonly claimToken: string;
+  readonly ttlMs: number;
   readonly nowMs: number;
 }
 
@@ -108,6 +140,7 @@ export interface EnterpriseIdempotencyRecord {
   readonly namespace: string;
   readonly key: string;
   readonly fingerprint: string;
+  readonly claimToken: string;
   readonly state: "pending" | "completed";
   readonly claimedAt: string;
   readonly expiresAt: string;
@@ -121,7 +154,11 @@ export interface EnterpriseIdempotencyClaim {
 
 export interface EnterpriseIdempotencyStore {
   claimIdempotency(input: EnterpriseIdempotencyClaimInput): Promise<EnterpriseIdempotencyClaim>;
+  /** Extend only the exact pending claim generation held by the caller. */
+  renewIdempotency(input: EnterpriseIdempotencyRenewInput): Promise<EnterpriseIdempotencyRecord>;
   completeIdempotency(input: EnterpriseIdempotencyCompleteInput): Promise<EnterpriseIdempotencyRecord>;
+  /** Release only a matching pending claim; completed claims are immutable. */
+  releaseIdempotency(input: EnterpriseIdempotencyReleaseInput): Promise<boolean>;
   readIdempotency(namespace: string, key: string, nowMs: number): Promise<EnterpriseIdempotencyRecord | undefined>;
 }
 
@@ -159,7 +196,15 @@ export interface EnterpriseActionReceipt {
 export interface EnterpriseReceiptStore {
   appendReceipt(receipt: EnterpriseActionReceipt): Promise<void>;
   readReceipt(receiptId: string): Promise<EnterpriseActionReceipt | undefined>;
-  listReceipts(): Promise<readonly EnterpriseActionReceipt[]>;
+  listReceipts(query?: EnterpriseReceiptQuery): Promise<readonly EnterpriseActionReceipt[]>;
+}
+
+export interface EnterpriseReceiptQuery {
+  readonly from?: string;
+  readonly to?: string;
+  readonly subjects?: readonly EnterpriseSubject[];
+  readonly subjectAny?: readonly EnterpriseSubject[];
+  readonly limit?: number;
 }
 
 export interface EnterprisePolicyDecision {
@@ -218,6 +263,7 @@ interface StoredIdempotency {
   namespace: string;
   key: string;
   fingerprint: string;
+  claimToken: string;
   state: "pending" | "completed";
   claimedAtMs: number;
   expiresAtMs: number;
@@ -241,6 +287,22 @@ export class InMemoryEnterpriseGovernanceStore implements
     this.#rateLimitOperations += 1;
     if (this.#rateLimitOperations % SWEEP_INTERVAL === 0) sweepExpiredCounters(this.#rateLimits, input.windowStartMs);
     return consumeCounter(this.#rateLimits, input);
+  }
+
+  async consumeRateLimitsAtomically(inputs: readonly EnterpriseCounterConsumeInput[]): Promise<EnterpriseCounterBatchResult> {
+    if (!inputs.length) return deepFreeze({ accepted: true, results: [] });
+    this.#rateLimitOperations += inputs.length;
+    if (this.#rateLimitOperations % SWEEP_INTERVAL < inputs.length) {
+      sweepExpiredCounters(this.#rateLimits, Math.min(...inputs.map((input) => input.windowStartMs)));
+    }
+    const staged = new Map(this.#rateLimits);
+    const results = inputs.map((input) => consumeCounter(staged, input));
+    const accepted = results.every((result) => result.accepted);
+    if (accepted) {
+      this.#rateLimits.clear();
+      for (const [key, value] of staged) this.#rateLimits.set(key, value);
+    }
+    return deepFreeze({ accepted, results });
   }
 
   async readRateLimit(input: EnterpriseCounterReadInput): Promise<number> {
@@ -273,6 +335,7 @@ export class InMemoryEnterpriseGovernanceStore implements
       namespace: input.namespace,
       key: input.key,
       fingerprint: input.fingerprint,
+      claimToken: randomUUID(),
       state: "pending",
       claimedAtMs: input.nowMs,
       expiresAtMs: input.nowMs + input.ttlMs,
@@ -281,25 +344,51 @@ export class InMemoryEnterpriseGovernanceStore implements
     return { status: "claimed", record: freezeIdempotencyRecord(record) };
   }
 
+  async renewIdempotency(input: EnterpriseIdempotencyRenewInput): Promise<EnterpriseIdempotencyRecord> {
+    validateIdempotencyOwnership(input, "renewal");
+    validateOptionalTtl(input.ttlMs, "Idempotency renewal ttlMs");
+    const storageKey = idempotencyStorageKey(input.namespace, input.key);
+    const existing = this.#idempotency.get(storageKey);
+    if (!existing || existing.expiresAtMs <= input.nowMs || existing.state !== "pending") {
+      if (existing && existing.expiresAtMs <= input.nowMs) this.#idempotency.delete(storageKey);
+      throw new Error("Idempotency claim is missing, expired, or already completed.");
+    }
+    assertIdempotencyOwnership(existing, input);
+    existing.expiresAtMs = Math.max(existing.expiresAtMs, input.nowMs + input.ttlMs);
+    return freezeIdempotencyRecord(existing);
+  }
+
   async completeIdempotency(input: EnterpriseIdempotencyCompleteInput): Promise<EnterpriseIdempotencyRecord> {
-    validateNonEmpty(input.namespace, "Idempotency namespace");
-    validateNonEmpty(input.key, "Idempotency key");
-    validateNonEmpty(input.fingerprint, "Idempotency fingerprint");
+    validateIdempotencyOwnership(input, "completion");
     validateNonEmpty(input.resultRef, "Idempotency resultRef");
-    validateTimestamp(input.nowMs, "Idempotency completion time");
+    validateOptionalTtl(input.ttlMs, "Idempotency completion ttlMs");
     const storageKey = idempotencyStorageKey(input.namespace, input.key);
     const existing = this.#idempotency.get(storageKey);
     if (!existing || existing.expiresAtMs <= input.nowMs) {
       if (existing) this.#idempotency.delete(storageKey);
       throw new Error("Idempotency claim is missing or expired.");
     }
-    if (existing.fingerprint !== input.fingerprint) throw new Error("Idempotency fingerprint conflict.");
+    assertIdempotencyOwnership(existing, input);
     if (existing.state === "completed" && existing.resultRef !== input.resultRef) {
       throw new Error("Idempotency claim was already completed with another result.");
     }
     existing.state = "completed";
     existing.resultRef = input.resultRef;
+    if (input.ttlMs !== undefined) existing.expiresAtMs = Math.max(existing.expiresAtMs, input.nowMs + input.ttlMs);
     return freezeIdempotencyRecord(existing);
+  }
+
+  async releaseIdempotency(input: EnterpriseIdempotencyReleaseInput): Promise<boolean> {
+    validateIdempotencyOwnership(input, "release");
+    const storageKey = idempotencyStorageKey(input.namespace, input.key);
+    const existing = this.#idempotency.get(storageKey);
+    if (!existing) return false;
+    if (existing.expiresAtMs <= input.nowMs) {
+      this.#idempotency.delete(storageKey);
+      return false;
+    }
+    if (existing.fingerprint !== input.fingerprint || existing.claimToken !== input.claimToken || existing.state !== "pending") return false;
+    return this.#idempotency.delete(storageKey);
   }
 
   async readIdempotency(namespace: string, key: string, nowMs: number): Promise<EnterpriseIdempotencyRecord | undefined> {
@@ -328,8 +417,11 @@ export class InMemoryEnterpriseGovernanceStore implements
     return this.#receipts.get(receiptId);
   }
 
-  async listReceipts(): Promise<readonly EnterpriseActionReceipt[]> {
-    return Object.freeze([...this.#receipts.values()]);
+  async listReceipts(query: EnterpriseReceiptQuery = {}): Promise<readonly EnterpriseActionReceipt[]> {
+    validateReceiptQuery(query);
+    let receipts = [...this.#receipts.values()].filter((receipt) => receiptMatchesQuery(receipt, query));
+    if (query.limit !== undefined) receipts = receipts.slice(-query.limit);
+    return Object.freeze(receipts);
   }
 }
 
@@ -565,7 +657,52 @@ function validateIdempotencyClaim(input: EnterpriseIdempotencyClaimInput): void 
   validateNonEmpty(input.key, "Idempotency key");
   validateNonEmpty(input.fingerprint, "Idempotency fingerprint");
   validateTimestamp(input.nowMs, "Idempotency claim time");
-  if (!Number.isFinite(input.ttlMs) || input.ttlMs <= 0) throw new Error("Idempotency ttlMs must be positive.");
+  if (input.ttlMs === undefined) throw new Error("Idempotency ttlMs must be positive.");
+  validateOptionalTtl(input.ttlMs, "Idempotency ttlMs");
+}
+
+function validateIdempotencyOwnership(
+  input: EnterpriseIdempotencyCompleteInput | EnterpriseIdempotencyReleaseInput | EnterpriseIdempotencyRenewInput,
+  operation: string,
+): void {
+  validateNonEmpty(input.namespace, "Idempotency namespace");
+  validateNonEmpty(input.key, "Idempotency key");
+  validateNonEmpty(input.fingerprint, "Idempotency fingerprint");
+  validateNonEmpty(input.claimToken, "Idempotency claimToken");
+  validateTimestamp(input.nowMs, `Idempotency ${operation} time`);
+}
+
+function assertIdempotencyOwnership(
+  existing: StoredIdempotency,
+  input: EnterpriseIdempotencyCompleteInput | EnterpriseIdempotencyReleaseInput | EnterpriseIdempotencyRenewInput,
+): void {
+  if (existing.fingerprint !== input.fingerprint) throw new Error("Idempotency fingerprint conflict.");
+  if (existing.claimToken !== input.claimToken) throw new Error("Idempotency claim generation conflict.");
+}
+
+function validateOptionalTtl(ttlMs: number | undefined, label: string): void {
+  if (ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs <= 0)) throw new Error(`${label} must be positive.`);
+}
+
+function validateReceiptQuery(query: EnterpriseReceiptQuery): void {
+  const fromMs = query.from === undefined ? undefined : Date.parse(query.from);
+  const toMs = query.to === undefined ? undefined : Date.parse(query.to);
+  if (fromMs !== undefined && !Number.isFinite(fromMs)) throw new Error("Receipt query from must be an ISO timestamp.");
+  if (toMs !== undefined && !Number.isFinite(toMs)) throw new Error("Receipt query to must be an ISO timestamp.");
+  if (fromMs !== undefined && toMs !== undefined && fromMs >= toMs) throw new Error("Receipt query to must be after from.");
+  if (query.subjects) normalizeEnterpriseSubjects(query.subjects);
+  if (query.subjectAny) normalizeEnterpriseSubjects(query.subjectAny);
+  if (query.limit !== undefined && (!Number.isSafeInteger(query.limit) || query.limit <= 0)) throw new Error("Receipt query limit must be positive.");
+}
+
+function receiptMatchesQuery(receipt: EnterpriseActionReceipt, query: EnterpriseReceiptQuery): boolean {
+  const occurredAt = Date.parse(receipt.occurredAt);
+  if (query.from && occurredAt < Date.parse(query.from)) return false;
+  if (query.to && occurredAt >= Date.parse(query.to)) return false;
+  const subjects = [...receipt.actor, ...receipt.target];
+  if (query.subjects?.length && !enterpriseScopeMatches(subjects, query.subjects)) return false;
+  return !query.subjectAny?.length || query.subjectAny.some((subject) =>
+    subjects.some((candidate) => candidate.kind === subject.kind && candidate.id === subject.id));
 }
 
 function freezeIdempotencyRecord(record: StoredIdempotency): EnterpriseIdempotencyRecord {
@@ -573,6 +710,7 @@ function freezeIdempotencyRecord(record: StoredIdempotency): EnterpriseIdempoten
     namespace: record.namespace,
     key: record.key,
     fingerprint: record.fingerprint,
+    claimToken: record.claimToken,
     state: record.state,
     claimedAt: new Date(record.claimedAtMs).toISOString(),
     expiresAt: new Date(record.expiresAtMs).toISOString(),

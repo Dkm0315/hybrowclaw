@@ -44,11 +44,17 @@ interface CachedSession {
   readonly threadId: string;
   readonly cwd: string;
   readonly model?: string;
+  readonly scopeKey: string;
   readonly createdAt: number;
+  lastUsedAt: number;
+  pendingRuns: number;
   queue: Promise<void>;
 }
 
 const SESSION_CACHE = new Map<string, CachedSession>();
+let sessionCacheTail = Promise.resolve();
+const DEFAULT_SESSION_CACHE_SIZE = 8;
+const DEFAULT_SESSION_IDLE_MS = 30 * 60_000;
 
 export function clearCodexAppServerSessions(): void {
   for (const session of SESSION_CACHE.values()) session.client.close();
@@ -60,35 +66,51 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
   const started = Date.now();
   const keepAlive = input.keepAlive ?? true;
   const instructionsHash = await hashInstructionsFile(input.instructionsFile);
-  const key = input.cacheKey
-    ? `${input.cacheKey}\0instructions:${instructionsHash}`
-    : `${input.cwd}\0${input.model ?? ""}\0instructions:${instructionsHash}`;
-  let cached = keepAlive ? SESSION_CACHE.get(key) : undefined;
-  if (!cached || !cached.client.isAlive()) {
-    cached?.client.close();
-    SESSION_CACHE.delete(key);
-    const client = new CodexAppServerClient({
-      command: resolveCodexCommand(input.command),
-      cwd: input.cwd,
-      model: input.model,
-      instructionsFile: input.instructionsFile,
-      networkAccess: input.networkAccess,
-      env: input.env,
-    });
-    try {
+  const command = resolveCodexCommand(input.command);
+  const scopeKey = appServerScopeKey(input, command);
+  const key = `${scopeKey}\0instructions:${instructionsHash}`;
+  let cached: CachedSession;
+  try {
+    cached = await withSessionCacheLock(async () => {
+      pruneSessionCache(Date.now(), key);
+      let session = keepAlive ? SESSION_CACHE.get(key) : undefined;
+      if (session?.client.isAlive()) {
+        session.lastUsedAt = Date.now();
+        SESSION_CACHE.delete(key);
+        SESSION_CACHE.set(key, session);
+        return session;
+      }
+      session?.client.close();
+      SESSION_CACHE.delete(key);
+      closeSupersededSessions(scopeKey);
+      const cacheable = keepAlive && makeSessionCacheRoom(key);
+      const client = new CodexAppServerClient({
+        command,
+        cwd: input.cwd,
+        model: input.model,
+        instructionsFile: input.instructionsFile,
+        networkAccess: input.networkAccess,
+        env: input.env,
+      });
+      try {
       await client.initialize();
       const threadId = await client.startThread(input.cwd);
-      cached = { client, threadId, cwd: input.cwd, model: input.model, createdAt: Date.now(), queue: Promise.resolve() };
-      if (keepAlive) SESSION_CACHE.set(key, cached);
-    } catch (error) {
-      client.close();
-      return {
-        status: "failed",
-        finalMessage: "",
-        durationMs: Date.now() - started,
-        errorMessage: error instanceof Error ? error.message : String(error),
-      };
-    }
+      const now = Date.now();
+        session = { client, threadId, cwd: input.cwd, model: input.model, scopeKey, createdAt: now, lastUsedAt: now, pendingRuns: 0, queue: Promise.resolve() };
+        if (cacheable) SESSION_CACHE.set(key, session);
+        return session;
+      } catch (error) {
+        client.close();
+        throw error;
+      }
+    });
+  } catch (error) {
+    return {
+      status: "failed",
+      finalMessage: "",
+      durationMs: Date.now() - started,
+      errorMessage: error instanceof Error ? error.message : String(error),
+    };
   }
 
   return await runExclusive(cached, async () => {
@@ -107,11 +129,12 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
       errorMessage: turn.errorMessage,
       tokenUsage: turn.tokenUsage,
     } as const;
-    if (!keepAlive) cached.client.close();
+    if (!keepAlive || SESSION_CACHE.get(key) !== cached) cached.client.close();
+    else pruneSessionCache(Date.now(), key);
     return result;
   }).catch((error: unknown) => {
       cached.client.close();
-      SESSION_CACHE.delete(key);
+      if (SESSION_CACHE.get(key) === cached) SESSION_CACHE.delete(key);
       return {
         status: "failed",
         finalMessage: "",
@@ -123,6 +146,7 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
 }
 
 async function runExclusive<T>(session: CachedSession, task: () => Promise<T>): Promise<T> {
+  session.pendingRuns += 1;
   const previous = session.queue.catch(() => {});
   let release!: () => void;
   session.queue = new Promise<void>((resolve) => {
@@ -131,6 +155,67 @@ async function runExclusive<T>(session: CachedSession, task: () => Promise<T>): 
   await previous;
   try {
     return await task();
+  } finally {
+    session.pendingRuns -= 1;
+    session.lastUsedAt = Date.now();
+    release();
+  }
+}
+
+function positiveIntegerEnv(name: string, fallback: number, minimum: number, maximum: number): number {
+  const parsed = Number(process.env[name]);
+  return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+}
+
+function appServerScopeKey(input: CodexAppServerRunInput, command: string): string {
+  const env = [...Object.entries(input.env ?? {})].sort(([left], [right]) => left.localeCompare(right));
+  return createHash("sha256").update(JSON.stringify({
+    conversation: input.cacheKey ?? "",
+    cwd: input.cwd,
+    model: input.model ?? "",
+    command,
+    networkAccess: input.networkAccess === true,
+    env,
+  })).digest("hex");
+}
+
+function closeCachedSession(key: string, session: CachedSession): void {
+  if (session.pendingRuns > 0) return;
+  session.client.close();
+  SESSION_CACHE.delete(key);
+}
+
+function closeSupersededSessions(scopeKey: string): void {
+  for (const [key, session] of SESSION_CACHE) {
+    if (session.scopeKey === scopeKey) closeCachedSession(key, session);
+  }
+}
+
+function makeSessionCacheRoom(protectedKey: string): boolean {
+  const maxSize = positiveIntegerEnv("MUSTER_NATIVE_SESSION_CACHE_SIZE", DEFAULT_SESSION_CACHE_SIZE, 1, 64);
+  for (const [key, session] of [...SESSION_CACHE.entries()].sort((left, right) => left[1].lastUsedAt - right[1].lastUsedAt)) {
+    if (SESSION_CACHE.size < maxSize) break;
+    if (key === protectedKey) continue;
+    closeCachedSession(key, session);
+  }
+  return SESSION_CACHE.size < maxSize;
+}
+
+function pruneSessionCache(now: number, protectedKey: string): void {
+  const idleMs = positiveIntegerEnv("MUSTER_NATIVE_SESSION_IDLE_MS", DEFAULT_SESSION_IDLE_MS, 1_000, 24 * 60 * 60_000);
+  for (const [key, session] of SESSION_CACHE) {
+    if (key !== protectedKey && (!session.client.isAlive() || now - session.lastUsedAt >= idleMs)) closeCachedSession(key, session);
+  }
+  makeSessionCacheRoom(protectedKey);
+}
+
+async function withSessionCacheLock<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = sessionCacheTail.catch(() => undefined);
+  let release!: () => void;
+  sessionCacheTail = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try {
+    return await operation();
   } finally {
     release();
   }

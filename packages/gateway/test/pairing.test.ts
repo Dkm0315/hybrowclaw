@@ -25,6 +25,16 @@ test("unpaired sender gets a stable pairing code until approved", async () => {
   assert.equal(await resolvePairing("telegram:bot", "12345", cwd), undefined);
 });
 
+test("concurrent pairing requests are serialized without lost senders or duplicate codes", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-pairing-concurrent-"));
+  const sameSender = await Promise.all(Array.from({ length: 16 }, () => requestPairing("telegram:bot", "same", cwd)));
+  assert.equal(new Set(sameSender.map((entry) => entry.code)).size, 1);
+  await Promise.all(Array.from({ length: 16 }, (_, index) => requestPairing("telegram:bot", `sender-${index}`, cwd)));
+  const store = await loadPairings(cwd);
+  assert.equal(store.pending.length, 17);
+  assert.equal(new Set(store.pending.map((entry) => entry.code)).size, 17);
+});
+
 test("approvePairing mints a pairingId and the sender resolves afterwards", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-pairing-approve-"));
   const pending = await requestPairing("slack:T024", "U1", cwd);

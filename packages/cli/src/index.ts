@@ -197,10 +197,12 @@ import {
   DEFAULT_GATEWAY_PORT,
   discordInteractionToInbound,
   gchatEventToSurfaceMessage,
+  googleChatAudienceIsValid,
   gatewayConfigPath,
   initGatewayConfig,
   loadGatewayConfig,
   loadPairings,
+  openSqliteGatewayEnterpriseRuntime,
   pollSlackSocket,
   pollTelegram,
   saveGatewayConfig,
@@ -9009,24 +9011,40 @@ async function gatewayCommand(commandArgs: string[]): Promise<void> {
     const gateway = await loadGatewayConfig();
     const config = await loadConfig();
     const port = readNumberFlag(commandArgs, "--port") ?? gateway.port ?? DEFAULT_GATEWAY_PORT;
+    const enterprise = openSqliteGatewayEnterpriseRuntime(process.cwd());
     const controller = new AbortController();
-    process.on("SIGINT", () => controller.abort());
-    process.on("SIGTERM", () => controller.abort());
-    await startGatewayServer({ config, gateway, cwd: process.cwd(), log: (line) => console.log(line) }, port);
-    console.log("routes: GET /v1/health | POST /v1/messages | POST /v1/flows/<run>/approve|reject | POST /v1/adapters/telegram|slack|discord|whatsapp|gchat|teams");
-    if (commandArgs.includes("--with-telegram-poll")) {
-      void pollTelegram({ config, gateway, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) }).catch((error) => {
-        console.error(`telegram poll failed: ${error instanceof Error ? error.message : String(error)}`);
-      });
-      console.log("telegram_poll=background_in_process");
+    const stop = () => controller.abort();
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+    let running: Awaited<ReturnType<typeof startGatewayServer>> | undefined;
+    const workers: Promise<void>[] = [];
+    try {
+      running = await startGatewayServer({ config, gateway, enterprise, cwd: process.cwd(), log: (line) => console.log(line) }, port);
+      console.log("routes: GET /v1/health | POST /v1/messages | POST /v1/flows/<run>/approve|reject | POST /v1/adapters/telegram|slack|discord|whatsapp|gchat|teams");
+      if (commandArgs.includes("--with-telegram-poll")) {
+        workers.push(pollTelegram({ config, gateway, enterprise, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) }).catch((error) => {
+          console.error(`telegram poll failed: ${error instanceof Error ? error.message : String(error)}`);
+        }));
+        console.log("telegram_poll=background_in_process");
+      }
+      if (commandArgs.includes("--with-slack-socket")) {
+        workers.push(pollSlackSocket({ config, gateway, enterprise, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) }).catch((error) => {
+          console.error(`slack socket failed: ${error instanceof Error ? error.message : String(error)}`);
+        }));
+        console.log("slack_socket=background_in_process");
+      }
+      console.log("stop with Ctrl-C");
+      if (!controller.signal.aborted) {
+        await new Promise<void>((resolvePromise) => controller.signal.addEventListener("abort", () => resolvePromise(), { once: true }));
+      }
+    } finally {
+      controller.abort();
+      await Promise.allSettled(workers);
+      await running?.close();
+      await enterprise.close?.();
+      process.off("SIGINT", stop);
+      process.off("SIGTERM", stop);
     }
-    if (commandArgs.includes("--with-slack-socket")) {
-      void pollSlackSocket({ config, gateway, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) }).catch((error) => {
-        console.error(`slack socket failed: ${error instanceof Error ? error.message : String(error)}`);
-      });
-      console.log("slack_socket=background_in_process");
-    }
-    console.log("stop with Ctrl-C");
     return;
   }
   if (action === "daemon") {
@@ -9042,10 +9060,15 @@ async function gatewayCommand(commandArgs: string[]): Promise<void> {
     // needed. Uses the active profile's config + .muster/gateway.json telegram.botToken.
     const gateway = await loadGatewayConfig();
     const config = await loadConfig();
+    const enterprise = openSqliteGatewayEnterpriseRuntime(process.cwd());
     const controller = new AbortController();
     process.on("SIGINT", () => controller.abort());
     console.log("telegram long-poll (no webhook). Message the bot; stop with Ctrl-C.");
-    await pollTelegram({ config, gateway, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) });
+    try {
+      await pollTelegram({ config, gateway, enterprise, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) });
+    } finally {
+      await enterprise.close?.();
+    }
     return;
   }
   throw new Error("Usage: muster gateway <init|status|start [--port 7460] [--with-telegram-poll] [--with-slack-socket]|daemon start|stop|status|restart [--with-telegram-poll] [--with-slack-socket]|webhook telegram --public-url URL|poll>");
@@ -9212,10 +9235,10 @@ const CHANNEL_SETUP_SPECS: readonly ChannelSetupSpec[] = [
     id: "gchat",
     label: "Google Chat App",
     route: "/v1/adapters/gchat",
-    setupUrls: ["https://console.cloud.google.com/apis/library/chat.googleapis.com", "https://developers.google.com/workspace/chat/quickstart/webhooks"],
-    requiredEnvFlags: ["--verification-token-env"],
-    optionalEnvFlags: ["--verification-token"],
-    notes: ["Configure the Chat API app URL to the webhook below. The verification token is required because Google Chat cannot send Muster's gateway bearer token."],
+    setupUrls: ["https://console.cloud.google.com/apis/library/chat.googleapis.com", "https://developers.google.com/workspace/chat/verify-requests-from-chat"],
+    requiredEnvFlags: ["--audience"],
+    optionalEnvFlags: ["--verification-token-env", "--verification-token"],
+    notes: ["Set the Chat API Authentication Audience to the exact HTTPS endpoint URL and pass that URL as --audience. Muster verifies Google-signed OIDC/JWT bearer tokens and the chat@system.gserviceaccount.com identity.", "The legacy verification token remains available only for existing Chat apps."],
   },
   {
     id: "discord",
@@ -9370,7 +9393,7 @@ function printChannelStatus(spec: ChannelSetupSpec, config: GatewayConfig): void
   console.log(`channel=${spec.id} ready=${ready} webhook=${spec.route ?? "-"} setup="muster channels ready ${spec.id}"`);
   if (spec.id === "telegram") console.log(`  name=${config.telegram?.name ?? "-"} bot_token=${configured(Boolean(config.telegram?.botToken))} secret_token=${configured(Boolean(config.telegram?.secretToken))} stream=${config.telegram?.stream ?? "off"} status=${config.telegram?.status ?? "typing"} thinking=${config.telegram?.thinking ?? "off"} busy=${config.telegram?.busy ?? "queue"}`);
   if (spec.id === "slack") console.log(`  mode=${slackMode(config)} bot_token=${configured(Boolean(config.slack?.botToken))} app_token=${configured(Boolean(config.slack?.appToken))} signing_secret=${configured(Boolean(config.slack?.signingSecret))} stream=${config.slack?.stream ?? "off"} status=${config.slack?.status ?? "message"} thinking=${config.slack?.thinking ?? "off"} busy=${config.slack?.busy ?? "queue"}`);
-  if (spec.id === "gchat") console.log(`  verification_token=${configured(Boolean(config.gchat?.verificationToken))}`);
+  if (spec.id === "gchat") console.log(`  auth=${config.gchat?.verification?.mode ?? (config.gchat?.verificationToken ? "legacy_token" : "missing")} audience=${config.gchat?.verification?.audience ?? "-"} verification_token=${configured(Boolean(config.gchat?.verificationToken))}`);
   if (spec.id === "discord") console.log(`  bot_token=${configured(Boolean(config.discord?.botToken))} public_key=${configured(Boolean(config.discord?.publicKey))}`);
   if (spec.id === "whatsapp") console.log(`  access_token=${configured(Boolean(config.whatsapp?.accessToken))} verify_token=${configured(Boolean(config.whatsapp?.verifyToken))} phone_number_id=${configured(Boolean(config.whatsapp?.phoneNumberId))} app_secret=${configured(Boolean(config.whatsapp?.appSecret))}`);
   if (spec.id === "teams") console.log(`  hmac_secret=${configured(Boolean(config.teams?.hmacSecret))}`);
@@ -9509,7 +9532,7 @@ function channelMissingSetup(channel: ChannelId, config: GatewayConfig, override
       mode === "http" && !config.slack?.signingSecret ? "slack.signingSecret" : "",
     ].filter(Boolean);
   }
-  if (channel === "gchat") return [config.gchat?.verificationToken ? "" : "gchat.verificationToken"].filter(Boolean);
+  if (channel === "gchat") return [googleChatAudienceIsValid(config.gchat?.verification?.audience) || config.gchat?.verificationToken ? "" : "gchat.verification.audience"].filter(Boolean);
   if (channel === "discord") return [config.discord?.botToken ? "" : "discord.botToken", config.discord?.publicKey ? "" : "discord.publicKey"].filter(Boolean);
   if (channel === "whatsapp") return [config.whatsapp?.accessToken ? "" : "whatsapp.accessToken", config.whatsapp?.verifyToken ? "" : "whatsapp.verifyToken", config.whatsapp?.phoneNumberId ? "" : "whatsapp.phoneNumberId", config.whatsapp?.appSecret ? "" : "whatsapp.appSecret"].filter(Boolean);
   if (channel === "teams") return [config.teams?.hmacSecret ? "" : "teams.hmacSecret"].filter(Boolean);
@@ -9521,7 +9544,7 @@ function channelAuthMode(channel: ChannelId): string {
   if (channel === "slack") return "slack-socket-app-token";
   if (channel === "discord") return "ed25519-public-key-recommended";
   if (channel === "whatsapp") return "verify-token-and-graph-token";
-  if (channel === "gchat") return "verification-token-required";
+  if (channel === "gchat") return "google-signed-oidc-or-jwt";
   if (channel === "teams") return "hmac-secret-required";
   return "bearer-token";
 }
@@ -9845,8 +9868,19 @@ function applyChannelSetup(channel: ChannelId, config: GatewayConfig, args: read
   }
   if (channel === "gchat") {
     const verificationToken = readSecretFlag(args, "--verification-token", "--verification-token-env");
-    if (!verificationToken) return config;
-    return { ...config, gchat: { verificationToken } };
+    const audience = readFlag([...args], "--audience");
+    if (audience && !googleChatAudienceIsValid(audience)) {
+      throw new Error("--audience must be a Google Cloud project number or the exact HTTPS URL ending /v1/adapters/gchat, without credentials, query, or fragment.");
+    }
+    if (!verificationToken && !audience) return config;
+    return {
+      ...config,
+      gchat: {
+        ...config.gchat,
+        ...(verificationToken ? { verificationToken } : {}),
+        ...(audience ? { verification: { mode: "bearer" as const, audience } } : {}),
+      },
+    };
   }
   if (channel === "discord") {
     const botToken = readSecretFlag(args, "--bot-token", "--bot-token-env");
@@ -9893,7 +9927,7 @@ function findChannelSpec(channel: string): ChannelSetupSpec | undefined {
 function channelReady(channel: ChannelId, config: GatewayConfig): boolean {
   if (channel === "telegram") return Boolean(config.telegram?.botToken);
   if (channel === "slack") return Boolean(config.slack?.botToken && (slackMode(config) === "socket" ? config.slack.appToken : config.slack.signingSecret));
-  if (channel === "gchat") return Boolean(config.gchat?.verificationToken);
+  if (channel === "gchat") return Boolean(googleChatAudienceIsValid(config.gchat?.verification?.audience) || config.gchat?.verificationToken);
   if (channel === "discord") return Boolean(config.discord?.botToken && config.discord.publicKey);
   if (channel === "whatsapp") return Boolean(config.whatsapp?.accessToken && config.whatsapp.verifyToken && config.whatsapp.phoneNumberId && config.whatsapp.appSecret);
   if (channel === "teams") return Boolean(config.teams?.hmacSecret);
