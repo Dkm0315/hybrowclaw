@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "id": "oss-manager-native-qa",
+  "name": "OSS Manager Native Multi-Agent QA",
+  "version": "0.1.0",
+  "kind": "workflow",
+  "entrypoint": "src/index.ts",
+  "permissions": [],
+  "sandbox": "read_only",
+  "evals": [
+    "evals/negative-control.json",
+    "evals/killed-run-recovery.json",
+    "evals/missing-evidence.json",
+    "evals/wrong-sha.json",
+    "evals/data-mismatch.json",
+    "evals/restoration-failure.json"
+  ],
+  "implementedTools": [
+    "oss_qa_source_lock",
+    "oss_qa_diff_classify",
+    "oss_qa_scenario_compile",
+    "oss_qa_run_create",
+    "oss_qa_executor_next",
+    "oss_qa_compensation_register",
+    "oss_qa_mutation_record",
+    "oss_qa_state_record",
+    "oss_qa_run_recover",
+    "oss_qa_progress_render",
+    "oss_qa_report_build",
+    "oss_qa_operation_validate",
+    "oss_qa_catalog",
+    "oss_qa_profile_describe",
+    "oss_qa_evidence_digest"
+  ],
+  "digest": "sha256:3a7bbb32aa553f4fae7b1e2770ff72b980dd6b9c15443300b650f6013d401733",
+  "description": "Native, customer-isolated app/engine QA framework with source locks, deterministic scenario compilation, policy roles, typed execution, semantic evidence, independent probes, compensation-before-mutation, killed-run recovery, and restore-finally verdicts. Includes a sanitized hybrowlabs/OSS-Manager profile and no OpenClaw bridge.",
+  "readiness": {
+    "level": "executable",
+    "status": "beta",
+    "actionability": "end_to_end_workflow",
+    "owner": "muster-core",
+    "surfaces": ["cli", "tui", "gateway", "channel", "frappe"],
+    "setup": {
+      "urls": ["https://github.com/hybrowlabs/OSS-Manager"],
+      "requiredEnv": [],
+      "requiredAnyEnv": [],
+      "credentialStorage": "none"
+    },
+    "diagnostics": {
+      "doctorCommand": "muster capability inspect capability-packs/oss-manager",
+      "smokeCommand": "pnpm exec tsx --test capability-packs/oss-manager/test/*.test.ts",
+      "latencyBudgetMs": 250,
+      "requiresLiveCredentials": false
+    },
+    "safety": {
+      "risk": "high",
+      "permissionMode": "deny_by_default",
+      "mutationApproval": "required",
+      "resultCapBytes": 65536,
+      "secretRedaction": true
+    },
+    "evidence": {
+      "unitTests": ["capability-packs/oss-manager/test/oss-manager.test.ts"],
+      "qaSuites": ["negative-control", "killed-run-recovery", "missing-evidence", "wrong-sha", "data-mismatch", "restoration-failure"],
+      "liveArtifacts": [],
+      "docs": ["capability-packs/oss-manager/README.md"]
+    }
+  }
+}

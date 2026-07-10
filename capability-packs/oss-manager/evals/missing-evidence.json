@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "oss-manager-missing-evidence",
+  "createdAt": "2026-07-10T00:00:00.000Z",
+  "sourceEpisodeId": "oss-manager-native-qa-pack",
+  "prompt": "One command in a compiled command matrix has no evidence receipt. Determine the verdict.",
+  "taskKind": "workflow",
+  "recordedResponseText": "INCONCLUSIVE. Every compiled operation requires a source-locked receipt, semantic assertion, and independent probe where the state contract requires one.",
+  "expectedContains": ["INCONCLUSIVE", "Every compiled operation", "source-locked receipt"],
+  "forbiddenContains": ["PASS", "optional failure"],
+  "evidenceLabels": ["operation-coverage", "missing-evidence"]
+}

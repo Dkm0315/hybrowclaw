@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "hybrowlabs-oss-manager",
+  "name": "Hybrowlabs OSS Manager (sanitized)",
+  "customerIsolation": "separate-profile",
+  "execution": "native-muster",
+  "legacyBridge": false,
+  "source": {
+    "repository": "https://github.com/hybrowlabs/OSS-Manager",
+    "branch": "dev",
+    "schedule": "0 23 * * *",
+    "timezone": "Asia/Kolkata"
+  },
+  "engines": [
+    "sentinel",
+    "redis",
+    "valkey",
+    "postgres",
+    "mongo",
+    "kafka",
+    "qdrant",
+    "observability"
+  ],
+  "safety": {
+    "typedOperationsOnly": true,
+    "modelGeneratedShell": false,
+    "compensationBeforeMutation": true,
+    "restoreFinally": true,
+    "rawTargetInventoryIncluded": false,
+    "credentialsIncluded": false
+  },
+  "notes": [
+    "This profile is intentionally free of hosts, users, credentials, customer tickets, and infrastructure identifiers.",
+    "Deployment adapters provide target inventory and secrets at runtime; they are not part of the capability pack."
+  ]
+}

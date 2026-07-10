@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "oss-manager-killed-run-recovery",
+  "createdAt": "2026-07-10T00:00:00.000Z",
+  "sourceEpisodeId": "oss-manager-native-qa-pack",
+  "prompt": "The worker dies after seed and fault mutations. Determine the next state and recovery order.",
+  "taskKind": "workflow",
+  "recordedResponseText": "RESTORE. The independent recovery controller executes the fault compensation first and seed cleanup second, in reverse registration order.",
+  "expectedContains": ["RESTORE", "independent recovery controller", "reverse registration order"],
+  "forbiddenContains": ["continue testing", "PASS", "ignore cleanup"],
+  "evidenceLabels": ["compensation-ledger", "finally-path"]
+}
