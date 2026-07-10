@@ -1,0 +1,59 @@
+{
+  "$schema": "./customer-profile.schema.json",
+  "schemaVersion": 1,
+  "id": "oxygenhr-sanitized-example",
+  "displayName": "OxygenHR (sanitized deployment example)",
+  "site": {
+    "urlFromEnv": "FRAPPE_SITE_URL",
+    "auth": "oauth2"
+  },
+  "hierarchy": {
+    "sourceDoctype": "Employee",
+    "recordIdField": "name",
+    "principalField": "user_id",
+    "managerRecordField": "reports_to",
+    "activeField": "status",
+    "activeValues": ["Active"],
+    "maxDepth": 32
+  },
+  "indexing": {
+    "coreKinds": [
+      "app",
+      "module",
+      "doctype",
+      "field",
+      "custom_field",
+      "property_setter",
+      "workflow",
+      "report",
+      "print_format",
+      "client_script",
+      "server_script",
+      "funnel",
+      "flow_config",
+      "dynamic_assignment"
+    ],
+    "additionalDoctypes": [
+      "Funnel",
+      "Funnel Task",
+      "Flow Config",
+      "Dynamic User Assignment"
+    ],
+    "pollIntervalSeconds": 60,
+    "eventIngest": true
+  },
+  "cache": {
+    "metadataTtlSeconds": 300,
+    "operationalTtlSeconds": 30
+  },
+  "aliases": [
+    { "phrase": "time off", "doctype": "Leave Application", "source": "profile_data" },
+    { "phrase": "regularise attendance", "doctype": "Attendance Request", "source": "profile_data" },
+    { "phrase": "my tasks", "doctype": "Funnel Task", "source": "profile_data" }
+  ],
+  "writePolicy": {
+    "requirePermissionPreflight": true,
+    "requireBoundApproval": true,
+    "approvalTtlSeconds": 300
+  }
+}

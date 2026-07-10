@@ -6,7 +6,7 @@
   "kind": "tool",
   "slot": "artifacts",
   "entrypoint": "src/index.ts",
-  "description": "Pure artifact helpers for turning structured inputs into markdown, CSV, dashboard manifests, DOCX, XLSX, PPTX, and simple PDF artifacts with app-server handoff planning, Office tool integration maps, and gated multi-step artifact workflows.",
+  "description": "Provider-led DOCX, XLSX, PPTX, PDF, dashboard, CSV, and report contracts with deterministic fallbacks, tenant/run-scoped manifests, structural/render receipts, token-ledger provenance, bounded exports, and truthful channel delivery.",
   "permissions": [],
   "sandbox": "none",
   "evals": [
@@ -30,7 +30,7 @@
     "office_artifact_workflow",
     "artifact_goal_passes"
   ],
-  "status": "v0: deterministic artifact builders return structured Markdown, OOXML, or PDF payloads for the caller to save; structural verification gates inline payloads before publish/share; validation and declaration helpers register local/hosted files with provenance, token-ledger linkage, provider run ids, and channel delivery status; document_generation_workflow gives providers and users a direct invocation contract; higher-fidelity Codex/Claude app-server handoffs are only advertised when the host exposes those skills.",
+  "status": "Beta: provider-led generation contracts keep substantive work with the selected provider and record deterministic fallback reasons. Core helpers persist artifacts by tenant/run/artifact id, atomically append manifests, hash prompt/file provenance, link token-ledger receipts, record structural plus explicit render status, and report uploaded/url/local-only/failed delivery without recent-file inference. Polished provider-hosted skills and MCPs are available only through explicit discovery.",
   "readiness": {
     "level": "executable",
     "status": "beta",
@@ -60,6 +60,8 @@
     },
     "evidence": {
       "unitTests": [
+        "packages/core/test/artifact-mcp-hardening.test.ts",
+        "packages/core/test/artifacts.test.ts",
         "packages/core/test/capability-load.test.ts",
         "packages/core/test/capability.test.ts",
         "packages/core/test/integration-packs.test.ts"

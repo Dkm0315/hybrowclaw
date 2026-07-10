@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -14,7 +14,17 @@ import {
   frappe_user_identity_resolve,
   frappe_records_create,
   frappe_semantic_data_resolve_lite,
+  computeFrappePermissionEpoch,
+  deriveFrappeHierarchyScope,
+  FRAPPE_INDEX_KINDS,
+  pollFrappeEnterpriseSnapshot,
+  resolveFrappeRead,
+  signFrappeApproval,
+  SqliteFrappeReadModel,
+  validateFrappeCustomerProfile,
   tools as frappeTools,
+  type FrappeCacheIdentity,
+  type FrappeEnterpriseSnapshot,
   type FrappeToolContext,
 } from "../../../capability-packs/frappe/src/index.js";
 
@@ -209,10 +219,44 @@ function salarySlipDoctype(): Record<string, unknown> {
   };
 }
 
-function contextFor(siteUrl: string, token = "api-key:api-secret"): FrappeToolContext {
+function enterpriseSnapshot(
+  site = "https://erp.example.test",
+  overrides: Partial<FrappeEnterpriseSnapshot> = {},
+): FrappeEnterpriseSnapshot {
+  return {
+    site,
+    observedAt: "2026-07-10T08:00:00.000Z",
+    validUntil: "2026-07-10T08:05:00.000Z",
+    dataRevision: "data-1",
+    apps: [{ name: "frappe", version: "15" }, { name: "customer_ops", version: "1" }],
+    modules: [{ name: "Operations" }],
+    doctypes: [{
+      name: "Service Request",
+      module: "Operations",
+      modified: "2026-07-10T07:59:00.000Z",
+      fields: [
+        { fieldname: "subject", label: "Subject", fieldtype: "Data", reqd: 1, idx: 1 },
+        { fieldname: "priority", label: "Priority", fieldtype: "Select", options: "Low\nHigh", idx: 2 },
+      ],
+    }],
+    customFields: [{ name: "Service Request-custom_region", dt: "Service Request", fieldname: "custom_region", label: "Region", fieldtype: "Link", options: "Region" }],
+    propertySetters: [{ name: "Service Request-subject-reqd", doc_type: "Service Request", field_name: "subject", property: "reqd", value: "1" }],
+    workflows: [{ name: "Service Request Approval", document_type: "Service Request", is_active: 1 }],
+    reports: [{ name: "Service Request Ageing", ref_doctype: "Service Request", report_type: "Query Report" }],
+    printFormats: [{ name: "Service Request Summary", doc_type: "Service Request" }],
+    clientScripts: [{ name: "Service Request Client", dt: "Service Request", enabled: 1 }],
+    serverScripts: [{ name: "Service Request Validation", reference_doctype: "Service Request", disabled: 0, api_secret: "must-not-persist", script: "token='must-not-persist-either'\nfrappe.msgprint('validated')" }],
+    funnels: [{ name: "Request Fulfilment", document_type: "Service Request" }],
+    flowConfigs: [{ name: "Request Flow", document_type: "Service Request" }],
+    dynamicAssignments: [{ name: "Request Rotation", document_type: "Service Request", assignment_basis: "Round Robin" }],
+    ...overrides,
+  };
+}
+
+function contextFor(siteUrl: string, token = "api-key:api-secret", extra: Record<string, string | undefined> = {}): FrappeToolContext {
   return Object.freeze({
     fetch: globalThis.fetch.bind(globalThis),
-    config: Object.freeze({ FRAPPE_SITE_URL: siteUrl, FRAPPE_API_TOKEN: token }),
+    config: Object.freeze({ FRAPPE_SITE_URL: siteUrl, FRAPPE_API_TOKEN: token, ...extra }),
   });
 }
 
@@ -380,7 +424,7 @@ test("frappe_records_create refuses ungated writes outside an explicit trusted f
       { doctype: "ToDo", doc: { description: "Follow up on T-1" } },
       contextFor(site.url),
     );
-    assert.match((result as { error: string }).error, /requires approval/);
+    assert.match((result as { error: string }).error, /Direct Frappe create is disabled/);
     assert.ok(!site.requests.some((request) => request.method === "POST" && request.url.startsWith("/api/resource/ToDo")));
   } finally {
     site.close();
@@ -545,32 +589,64 @@ test("frappe_safe_write gates creates with permission preflight, dry-run proposa
   const site = await startFrappeStub();
   try {
     const safeWrite = frappeTool("frappe_safe_write");
+    const cwd = await mkdtemp(join(tmpdir(), "muster-frappe-approval-"));
+    const signingKey = "test-only-frappe-approval-key";
+    const context = contextFor(site.url, "api-key:api-secret", {
+      FRAPPE_APPROVAL_SIGNING_KEY: signingKey,
+      FRAPPE_READ_MODEL_PATH: join(cwd, "frappe-read-model.db"),
+    });
+    const mutation = { operation: "create", doctype: "Leave Application", doc: { employee: "EMP-0001", leave_type: "Annual Leave" } };
+
+    const missingDynamicField = await safeWrite({
+      ...mutation,
+      fields: [{ fieldname: "backup_person", label: "Backup person", reqd: 1 }],
+    }, context) as Record<string, unknown>;
+    assert.match(String(missingDynamicField.error), /provide.*Backup person/i);
 
     const proposal = await safeWrite(
-      { operation: "create", doctype: "Leave Application", doc: { employee: "EMP-0001", leave_type: "Annual Leave" } },
-      contextFor(site.url),
+      mutation,
+      context,
     ) as Record<string, unknown>;
     assert.equal(proposal.status, "approval_required");
     assert.equal((proposal.preflight as Record<string, unknown>).allowed, true);
     assert.deepEqual((proposal.proposedMutation as Record<string, unknown>).fields, ["employee", "leave_type"]);
     assert.ok(!site.requests.some((request) => request.method === "POST" && request.url.startsWith("/api/resource/Leave%20Application")), "dry-run must not create a record");
 
+    const bareBoolean = await safeWrite({ ...mutation, approved: true }, context) as Record<string, unknown>;
+    assert.equal(bareBoolean.status, "approval_required", "approved=true is not proof of a human approval");
+
     const denied = await safeWrite(
       { operation: "create", doctype: "Salary Slip", doc: { employee: "EMP-0001" }, approved: true },
-      contextFor(site.url),
+      context,
     ) as Record<string, unknown>;
     assert.equal(denied.status, "denied");
     assert.match(String((denied.preflight as Record<string, unknown>).reason), /Frappe denied create/);
 
+    const approval = signFrappeApproval(
+      proposal.approvalProposal as Parameters<typeof signFrappeApproval>[0],
+      "approver@example.test",
+      signingKey,
+      String((proposal.approvalProposal as Record<string, unknown>).issuedAt),
+    );
+    const tampered = await safeWrite({
+      ...mutation,
+      doc: { employee: "EMP-0001", leave_type: "Sick Leave" },
+      approvalReceipt: approval,
+    }, context) as Record<string, unknown>;
+    assert.equal(tampered.status, "approval_required", "an approval for one mutation must not authorize changed fields");
     const approved = await safeWrite(
-      { operation: "create", doctype: "Leave Application", doc: { employee: "EMP-0001", leave_type: "Annual Leave" }, approved: true, approvalNote: "Approved by fixture test" },
-      contextFor(site.url),
+      { ...mutation, approvalReceipt: approval, approvalNote: "Approved by fixture test" },
+      context,
     ) as Record<string, unknown>;
     assert.equal(approved.status, "executed");
     assert.deepEqual((approved.result as Record<string, unknown>).created, { name: "HR-LAP-0001", doctype: "Leave Application", employee: "EMP-0001", leave_type: "Annual Leave" });
     assert.equal((approved.verification as Record<string, unknown>).verified, true);
     assert.ok((approved.evidenceLog as string[]).includes("permission_preflight:allowed"));
+    assert.ok((approved.evidenceLog as string[]).includes("approval_receipt:consumed"));
     assert.ok((approved.evidenceLog as string[]).includes("verify_result:ok"));
+
+    const replay = await safeWrite({ ...mutation, approvalReceipt: approval }, context) as Record<string, unknown>;
+    assert.match(String(replay.error), /already consumed/);
   } finally {
     site.close();
   }
@@ -609,9 +685,15 @@ test("frappe_artifact_brief emits fixture/live metadata linking site, user, DocT
 test("frappe_chat_interaction_plan asks humane missing-field questions for leave CRUD", async () => {
   const plan = await frappe_chat_interaction_plan({
     prompt: "I want to apply leave for 9th",
+    doctype: "Leave Application",
     siteUrl: "https://erp.example.test",
     values: { from_date: "2026-07-09", to_date: "2026-07-09" },
-    leaveTypes: ["Casual Leave", "Sick Leave"],
+    fields: [
+      { fieldname: "leave_type", label: "Leave type", fieldtype: "Select", options: "Casual Leave\nSick Leave", reqd: 1 },
+      { fieldname: "from_date", label: "From date", fieldtype: "Date", reqd: 1 },
+      { fieldname: "to_date", label: "To date", fieldtype: "Date", reqd: 1 },
+      { fieldname: "description", label: "Reason", fieldtype: "Small Text", reqd: 1 },
+    ],
   }, { config: {} });
 
   assert.equal(plan.kind, "guided_crud");
@@ -653,6 +735,302 @@ test("frappe_chat_interaction_plan attaches Frappe document links and report nex
   assert.deepEqual(plan.table?.rows, [["Amit Sharma", "Pending"]]);
 });
 
+test("SQLite enterprise read model persists every required Frappe metadata surface", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-frappe-read-model-"));
+  const path = join(cwd, "frappe.db");
+  const first = new SqliteFrappeReadModel(path);
+  const revision = first.replaceSnapshot(enterpriseSnapshot());
+  assert.match(revision.schemaRevision, /^[0-9a-f]{64}$/);
+  assert.equal(first.searchIndex("https://erp.example.test", "https://erp.example.test").length, 0, "site identifiers are scope, not indexed answer text");
+  first.close();
+
+  const reopened = new SqliteFrappeReadModel(path);
+  try {
+    const records = reopened.searchIndex("https://erp.example.test", "", FRAPPE_INDEX_KINDS, 100);
+    const kinds = new Set(records.map((record) => record.kind));
+    for (const kind of FRAPPE_INDEX_KINDS) assert.equal(kinds.has(kind), true, `${kind} should survive a database reopen`);
+    const fields = reopened.searchIndex("https://erp.example.test", "priority", ["field"]);
+    assert.equal(fields[0]?.doctype, "Service Request");
+    assert.equal(fields[0]?.payload.fieldname, "priority");
+    assert.doesNotMatch(JSON.stringify(records), /must-not-persist/);
+    assert.match(JSON.stringify(records), /\[REDACTED\]/);
+    assert.deepEqual(reopened.getRevision("https://erp.example.test"), revision);
+  } finally {
+    reopened.close();
+  }
+});
+
+test("permission epochs invalidate cache for roles, User Permissions, shares, permlevels, workflow, and hierarchy changes", async () => {
+  const store = new SqliteFrappeReadModel(":memory:");
+  try {
+    const baseInput = {
+      site: "https://erp.example.test",
+      principal: "worker@example.test",
+      roles: ["Desk User", "Employee"],
+      userPermissions: [{ allow: "Company", for_value: "Example Co" }],
+      shares: [{ doctype: "Service Request", name: "REQ-1", read: 1 }],
+      permlevels: [{ doctype: "Service Request", permlevel: 0, read: 1 }],
+      workflowInputs: [{ doctype: "Service Request", state: "Open", action: "Submit" }],
+      hierarchyInputs: [{ record: "EMP-2", reports_to: "EMP-1" }],
+    };
+    const epoch = computeFrappePermissionEpoch(baseInput);
+    const reordered = computeFrappePermissionEpoch({ ...baseInput, roles: ["Employee", "Desk User"] });
+    assert.equal(epoch.epoch, reordered.epoch, "equivalent permission sets should not churn the epoch");
+    store.putPermissionEpoch(epoch, "2026-07-10T08:00:00.000Z");
+    const identity: FrappeCacheIdentity = {
+      site: epoch.site,
+      principal: epoch.principal,
+      permissionEpoch: epoch.epoch,
+      schemaRevision: "schema-1",
+      dataRevision: "data-1",
+    };
+    await resolveFrappeRead({
+      store,
+      identity,
+      querySignature: "my open requests",
+      ttlMs: 30_000,
+      now: "2026-07-10T08:00:00.000Z",
+      live: async () => ({ value: [{ name: "REQ-1" }] }),
+    });
+    const variants = [
+      { ...baseInput, roles: [...baseInput.roles, "Request Approver"] },
+      { ...baseInput, userPermissions: [{ allow: "Company", for_value: "Other Co" }] },
+      { ...baseInput, shares: [{ doctype: "Service Request", name: "REQ-2", read: 1 }] },
+      { ...baseInput, permlevels: [{ doctype: "Service Request", permlevel: 1, read: 1 }] },
+      { ...baseInput, workflowInputs: [{ doctype: "Service Request", state: "Approved", action: "Close" }] },
+      { ...baseInput, hierarchyInputs: [{ record: "EMP-2", reports_to: "EMP-9" }] },
+    ];
+    for (const changed of variants) {
+      const changedEpoch = computeFrappePermissionEpoch(changed);
+      assert.notEqual(changedEpoch.epoch, epoch.epoch);
+      assert.equal(store.getCache({ ...identity, permissionEpoch: changedEpoch.epoch }, "my open requests"), undefined);
+    }
+  } finally {
+    store.close();
+  }
+});
+
+test("read-model cache never crosses Frappe principals", async () => {
+  const store = new SqliteFrappeReadModel(":memory:");
+  try {
+    const alice: FrappeCacheIdentity = {
+      site: "https://erp.example.test",
+      principal: "alice@example.test",
+      permissionEpoch: "epoch-alice",
+      schemaRevision: "schema-1",
+      dataRevision: "data-1",
+    };
+    await resolveFrappeRead({
+      store,
+      identity: alice,
+      querySignature: "private dashboard",
+      ttlMs: 30_000,
+      now: "2026-07-10T08:00:00.000Z",
+      live: async () => ({ value: { confidentialCount: 7 }, objectRefs: ["Service Request:REQ-7"] }),
+    });
+    const bob = { ...alice, principal: "bob@example.test", permissionEpoch: "epoch-bob" };
+    assert.equal(store.getCache(bob, "private dashboard"), undefined);
+    let liveCalls = 0;
+    const result = await resolveFrappeRead({
+      store,
+      identity: bob,
+      querySignature: "private dashboard",
+      ttlMs: 30_000,
+      now: "2026-07-10T08:00:01.000Z",
+      live: async () => { liveCalls += 1; return { value: { confidentialCount: 0 } }; },
+    });
+    assert.equal(liveCalls, 1);
+    assert.deepEqual(result.value, { confidentialCount: 0 });
+    assert.doesNotMatch(JSON.stringify(result.presentation), /epoch-|cacheKey|Service Request:REQ-7/);
+  } finally {
+    store.close();
+  }
+});
+
+test("customization drift changes schema revision and removes stale cached answers", async () => {
+  const store = new SqliteFrappeReadModel(":memory:");
+  try {
+    const first = store.replaceSnapshot(enterpriseSnapshot());
+    const permission = computeFrappePermissionEpoch({ site: first.site, principal: "user@example.test", roles: ["Employee"] });
+    const identity: FrappeCacheIdentity = {
+      site: first.site,
+      principal: permission.principal,
+      permissionEpoch: permission.epoch,
+      schemaRevision: first.schemaRevision,
+      dataRevision: first.dataRevision,
+    };
+    await resolveFrappeRead({
+      store,
+      identity,
+      querySignature: "required fields",
+      ttlMs: 60_000,
+      now: "2026-07-10T08:00:00.000Z",
+      live: async () => ({ value: ["subject"] }),
+    });
+    const second = store.replaceSnapshot(enterpriseSnapshot("https://erp.example.test", {
+      observedAt: "2026-07-10T08:01:00.000Z",
+      propertySetters: [{ name: "Service Request-custom_region-reqd", doc_type: "Service Request", field_name: "custom_region", property: "reqd", value: "1" }],
+    }));
+    assert.notEqual(second.schemaRevision, first.schemaRevision);
+    assert.equal(store.getCache(identity, "required fields"), undefined);
+    assert.equal(store.searchIndex(second.site, "custom_region", ["property_setter"])[0]?.payload.value, "1");
+  } finally {
+    store.close();
+  }
+});
+
+test("manager hierarchy scope comes only from configured live Frappe fields", () => {
+  const rows = [
+    { name: "EMP-1", user_id: "manager@example.test", reports_to: "", status: "Active" },
+    { name: "EMP-2", user_id: "direct@example.test", reports_to: "EMP-1", status: "Active" },
+    { name: "EMP-3", user_id: "indirect@example.test", reports_to: "EMP-2", status: "Active" },
+    { name: "EMP-4", user_id: "inactive@example.test", reports_to: "EMP-1", status: "Left" },
+    { name: "EMP-5", user_id: "cycle@example.test", reports_to: "EMP-5", status: "Active" },
+  ];
+  const config = {
+    sourceDoctype: "Employee",
+    recordIdField: "name",
+    principalField: "user_id",
+    managerRecordField: "reports_to",
+    activeField: "status",
+    activeValues: ["Active"],
+  };
+  const scope = deriveFrappeHierarchyScope("manager@example.test", config, rows);
+  assert.deepEqual(scope.directReportPrincipals, ["direct@example.test"]);
+  assert.deepEqual(scope.descendantPrincipals, ["direct@example.test", "indirect@example.test"]);
+  assert.equal(scope.depthByRecordId["EMP-3"], 2);
+  assert.equal(scope.descendantPrincipals.includes("inactive@example.test"), false);
+
+  const titleOnly = deriveFrappeHierarchyScope("fake-manager@example.test", config, [
+    ...rows,
+    { name: "EMP-6", user_id: "fake-manager@example.test", reports_to: "", status: "Active", roles: ["Senior Manager", "HR Manager"] },
+  ]);
+  assert.deepEqual(titleOnly.descendantPrincipals, [], "role or title strings must never manufacture hierarchy scope");
+});
+
+test("cache hit and stale fallback preserve data order while keeping internal provenance separate", async () => {
+  const store = new SqliteFrappeReadModel(":memory:");
+  try {
+    const identity: FrappeCacheIdentity = {
+      site: "https://erp.example.test",
+      principal: "worker@example.test",
+      permissionEpoch: "permission-1",
+      schemaRevision: "schema-1",
+      dataRevision: "data-1",
+    };
+    let calls = 0;
+    const live = async () => ({ value: [{ rank: 2 }, { rank: 1 }], objectRefs: ["Service Request:REQ-2", "Service Request:REQ-1"] });
+    const first = await resolveFrappeRead({ store, identity, querySignature: "ranked queue", ttlMs: 1_000, now: "2026-07-10T08:00:00.000Z", live: async () => { calls += 1; return live(); } });
+    const hit = await resolveFrappeRead({ store, identity, querySignature: "ranked queue", ttlMs: 1_000, now: "2026-07-10T08:00:00.500Z", live: async () => { calls += 1; return live(); } });
+    const stale = await resolveFrappeRead({ store, identity, querySignature: "ranked queue", ttlMs: 1_000, now: "2026-07-10T08:00:02.000Z", live: async () => { calls += 1; return { value: [{ rank: 3 }, { rank: 2 }] }; } });
+    assert.equal(calls, 2);
+    assert.deepEqual(first.value, [{ rank: 2 }, { rank: 1 }]);
+    assert.deepEqual(hit.value, [{ rank: 2 }, { rank: 1 }]);
+    assert.equal(hit.receipt.cacheState, "hit");
+    assert.equal(stale.receipt.cacheState, "stale");
+    assert.equal(stale.presentation.status, "refreshed");
+  } finally {
+    store.close();
+  }
+});
+
+test("optional Frappe events are idempotent and invalidate cached data revisions", async () => {
+  const store = new SqliteFrappeReadModel(":memory:");
+  try {
+    const revision = store.replaceSnapshot(enterpriseSnapshot());
+    const identity: FrappeCacheIdentity = {
+      site: revision.site,
+      principal: "worker@example.test",
+      permissionEpoch: "permission-1",
+      schemaRevision: revision.schemaRevision,
+      dataRevision: revision.dataRevision,
+    };
+    await resolveFrappeRead({
+      store,
+      identity,
+      querySignature: "live count",
+      ttlMs: 60_000,
+      now: "2026-07-10T08:00:00.000Z",
+      live: async () => ({ value: { count: 1 } }),
+    });
+    const event = {
+      eventId: "event-1",
+      site: revision.site,
+      operation: "data_changed" as const,
+      revision: "data-2",
+      observedAt: "2026-07-10T08:01:00.000Z",
+    };
+    const first = store.applyEvent(event);
+    const duplicate = store.applyEvent(event);
+    assert.equal(first.applied, true);
+    assert.equal(first.invalidatedCacheEntries, 1);
+    assert.equal(duplicate.duplicate, true);
+    assert.equal(store.getCache(identity, "live count"), undefined);
+    assert.equal(store.getRevision(revision.site)?.dataRevision, "data-2");
+  } finally {
+    store.close();
+  }
+});
+
+test("enterprise indexing derives answers from arbitrary customer metadata without customer-name branches", () => {
+  const store = new SqliteFrappeReadModel(":memory:");
+  try {
+    store.replaceSnapshot(enterpriseSnapshot("https://tenant-a.example.test", {
+      doctypes: [{ name: "Incident Dispatch Grid", module: "Field Operations", fields: [{ fieldname: "dispatch_window", label: "Dispatch Window", fieldtype: "Duration" }] }],
+    }));
+    assert.deepEqual(store.searchIndex("https://tenant-a.example.test", "dispatch window").map((record) => record.objectId), ["Incident Dispatch Grid", "Incident Dispatch Grid:dispatch_window"]);
+    assert.equal(store.searchIndex("https://tenant-a.example.test", "OxygenHR").length, 0);
+    store.replaceSnapshot(enterpriseSnapshot("https://tenant-a.example.test", {
+      observedAt: "2026-07-10T08:10:00.000Z",
+      doctypes: [{ name: "Roster Divergence", module: "Field Operations", fields: [{ fieldname: "variance", label: "Variance", fieldtype: "Float" }] }],
+    }));
+    assert.equal(store.searchIndex("https://tenant-a.example.test", "dispatch window").length, 0);
+    assert.equal(store.searchIndex("https://tenant-a.example.test", "roster variance")[0]?.doctype, "Roster Divergence");
+  } finally {
+    store.close();
+  }
+});
+
+test("zero-app OAuth polling builds a field-hydrated snapshot from standard Frappe REST endpoints", async () => {
+  const requests: string[] = [];
+  const fetchStub: typeof globalThis.fetch = async (url, init) => {
+    const value = String(url);
+    requests.push(value);
+    assert.equal(new Headers(init?.headers).get("authorization"), "Bearer oauth-test-token");
+    if (value.includes("frappe.utils.change_log.get_versions")) return new Response(JSON.stringify({ message: { frappe: { version: "15.1.0" } } }), { status: 200 });
+    if (value.includes("/api/resource/Module%20Def")) return new Response(JSON.stringify({ data: [{ name: "Operations" }] }), { status: 200 });
+    if (value.includes("/api/resource/DocType/Service%20Request")) return new Response(JSON.stringify({ data: { name: "Service Request", module: "Operations", fields: [{ fieldname: "subject", label: "Subject" }] } }), { status: 200 });
+    if (value.includes("/api/resource/DocType")) return new Response(JSON.stringify({ data: [{ name: "Service Request", module: "Operations" }] }), { status: 200 });
+    return new Response(JSON.stringify({ exception: "not found" }), { status: 404 });
+  };
+  const result = await pollFrappeEnterpriseSnapshot({
+    site: "https://erp.example.test/",
+    fetch: fetchStub,
+    oauth: { getAccessToken: async () => ({ accessToken: "oauth-test-token" }) },
+    pageSize: 10,
+    observedAt: "2026-07-10T08:00:00.000Z",
+    resources: [
+      { snapshotKey: "modules", kind: "module", doctype: "Module Def", optional: false },
+      { snapshotKey: "doctypes", kind: "doctype", doctype: "DocType", optional: false },
+    ],
+  });
+  assert.equal(result.warnings.length, 0);
+  assert.equal(result.snapshot.apps?.[0] && (result.snapshot.apps[0] as Record<string, unknown>).name, "frappe");
+  assert.equal((result.snapshot.doctypes?.[0] as Record<string, unknown>).fields instanceof Array, true);
+  assert.match(result.snapshot.schemaRevision ?? "", /^[0-9a-f]{64}$/);
+  assert.equal(requests.some((url) => url.includes("/api/resource/DocType/Service%20Request")), true);
+});
+
+test("sanitized OxygenHR profile is valid data and contains no deployment secrets", async () => {
+  const path = resolve(packDir, "profiles", "oxygenhr.sanitized.json");
+  const raw = await readFile(path, "utf8");
+  const profile = JSON.parse(raw) as unknown;
+  const result = validateFrappeCustomerProfile(profile);
+  assert.equal(result.valid, true);
+  assert.doesNotMatch(raw, /api[_-]?secret|client[_-]?secret|password|pwhr\.in|ragnardataops/i);
+  assert.match(raw, /"sourceDoctype": "Employee"/);
+});
+
 test("the frappe pack loads through loadCapabilityPack and runs inside a flow", async () => {
   const site = await startFrappeStub();
   try {
@@ -670,8 +1048,11 @@ test("the frappe pack loads through loadCapabilityPack and runs inside a flow", 
         "frappe-federated-bridge__frappe_chat_interaction_plan",
         "frappe-federated-bridge__frappe_context_build",
         "frappe-federated-bridge__frappe_context_setup_plan",
+        "frappe-federated-bridge__frappe_customer_profile_validate",
         "frappe-federated-bridge__frappe_docs_context",
+        "frappe-federated-bridge__frappe_enterprise_contract",
         "frappe-federated-bridge__frappe_fast_route",
+        "frappe-federated-bridge__frappe_hierarchy_scope",
         "frappe-federated-bridge__frappe_hybrid_retrieve",
         "frappe-federated-bridge__frappe_identity_resolve",
         "frappe-federated-bridge__frappe_installed_context",

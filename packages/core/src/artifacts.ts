@@ -1,4 +1,6 @@
-import { readFile, stat } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { basename, join, relative, resolve, sep } from "node:path";
 
 type Row = Record<string, unknown>;
 
@@ -17,6 +19,86 @@ export type ChannelDeliveryStatus =
   | "failed";
 
 export type ArtifactValidationStatus = "valid" | "invalid";
+
+export type ArtifactDeliveryState = "uploaded" | "url" | "local-only" | "failed";
+
+export type ArtifactDeliveryReceipt = {
+  state: ArtifactDeliveryState;
+  channel: string;
+  target?: string;
+  url?: string;
+  providerMessageId?: string;
+  reason?: string;
+  attemptedAt: string;
+};
+
+export type ArtifactGenerationProvenance = {
+  mode: "provider" | "deterministic_fallback";
+  providerId?: string;
+  model?: string;
+  providerRunId?: string;
+  fallbackReason?: string;
+  promptSha256: string;
+};
+
+export type ArtifactRenderVerification = {
+  status: "passed" | "failed" | "not_run";
+  engine?: string;
+  checkedAt: string;
+  issues: string[];
+  facts: Record<string, number | string | boolean>;
+};
+
+export type ArtifactVerificationReceipt = {
+  status: "passed" | "failed";
+  checkedAt: string;
+  sha256: string;
+  structural: {
+    status: "passed" | "failed";
+    checks: VerificationCheck[];
+  };
+  render: ArtifactRenderVerification;
+};
+
+export type ArtifactWorkspace = {
+  schemaVersion: 1;
+  rootDir: string;
+  workspaceDir: string;
+  filesDir: string;
+  manifestPath: string;
+  tenantId: string;
+  runId: string;
+  workspaceId: string;
+};
+
+export type ArtifactManifestEntry = {
+  artifactId: string;
+  title: string;
+  type: ArtifactType;
+  format: ArtifactResult["format"];
+  filename: string;
+  relativePath: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256: string;
+  createdAt: string;
+  sourceChannel: string;
+  provenance: ArtifactGenerationProvenance;
+  tokenLedgerId?: string;
+  verification: ArtifactVerificationReceipt;
+  delivery: ArtifactDeliveryReceipt;
+};
+
+export type ArtifactManifest = {
+  schemaVersion: 1;
+  kind: "muster-artifact-manifest";
+  workspaceId: string;
+  tenantId: string;
+  runId: string;
+  createdAt: string;
+  updatedAt: string;
+  artifacts: ArtifactManifestEntry[];
+};
 
 export type ArtifactValidationResult = {
   status: ArtifactValidationStatus;
@@ -41,9 +123,15 @@ export type ArtifactDeclaration = {
   failureReason: string | undefined;
   validationStatus: ArtifactValidationStatus;
   validationIssues: string[];
+  artifactId?: string;
+  manifestPath?: string;
+  sha256?: string;
+  verification?: ArtifactVerificationReceipt;
+  delivery?: ArtifactDeliveryReceipt;
+  provenance?: ArtifactGenerationProvenance;
 };
 
-type ArtifactResult = {
+export type ArtifactResult = {
   filename: string;
   mimeType: string;
   format: "docx" | "xlsx" | "pptx" | "pdf";
@@ -308,6 +396,331 @@ function verifyArtifactBytes(format: ArtifactResult["format"], bytes: Uint8Array
 
 function verificationStatus(checks: readonly VerificationCheck[]): "passed" | "failed" {
   return checks.every((check) => check.status === "passed") ? "passed" : "failed";
+}
+
+function sha256(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function receiptIdentifier(value: string | undefined, fallback?: string): string | undefined {
+  const normalized = value?.trim();
+  if (!normalized) return fallback;
+  return /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,159}$/.test(normalized) ? normalized : fallback;
+}
+
+function boundedReceiptText(value: string | undefined, fallback?: string): string | undefined {
+  const normalized = value?.trim();
+  if (!normalized) return fallback;
+  return normalized
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
+    .replace(/\b(?:sk|ghp|github_pat|xox[baprs])-[-A-Za-z0-9_]{8,}\b/gi, "[REDACTED]")
+    .replace(/\b((?:api[_-]?key|token|password|secret))\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]")
+    .slice(0, 500);
+}
+
+function scopePathSegment(value: string, label: string): string {
+  const normalized = value.trim();
+  if (!normalized) throw new Error(`${label} is required.`);
+  const slug = normalized.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || label;
+  return `${slug}-${sha256(normalized).slice(0, 12)}`;
+}
+
+function artifactIdArg(value?: string): string {
+  const id = value?.trim() || randomUUID();
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(id)) {
+    throw new Error("artifactId must contain only letters, numbers, dot, underscore, or dash.");
+  }
+  return id;
+}
+
+function safeArtifactFilename(value: string): string {
+  const name = basename(value).replace(/[^a-zA-Z0-9._ -]+/g, "-").replace(/\s+/g, " ").trim();
+  if (!name || name === "." || name === "..") throw new Error("Artifact filename is invalid.");
+  return name.slice(0, 180);
+}
+
+function assertContained(base: string, target: string): void {
+  const path = relative(resolve(base), resolve(target));
+  if (path === ".." || path.startsWith(`..${sep}`)) {
+    throw new Error(`Artifact path escapes scoped workspace: ${target}`);
+  }
+}
+
+function initialArtifactManifest(workspace: ArtifactWorkspace, now: string): ArtifactManifest {
+  return {
+    schemaVersion: 1,
+    kind: "muster-artifact-manifest",
+    workspaceId: workspace.workspaceId,
+    tenantId: workspace.tenantId,
+    runId: workspace.runId,
+    createdAt: now,
+    updatedAt: now,
+    artifacts: [],
+  };
+}
+
+function parseArtifactManifest(raw: string, workspace: ArtifactWorkspace): ArtifactManifest {
+  const parsed = JSON.parse(raw) as Partial<ArtifactManifest>;
+  if (
+    parsed.schemaVersion !== 1
+    || parsed.kind !== "muster-artifact-manifest"
+    || parsed.workspaceId !== workspace.workspaceId
+    || parsed.tenantId !== workspace.tenantId
+    || parsed.runId !== workspace.runId
+    || !Array.isArray(parsed.artifacts)
+  ) {
+    throw new Error(`Artifact manifest scope mismatch or corrupt manifest: ${workspace.manifestPath}`);
+  }
+  return parsed as ArtifactManifest;
+}
+
+export async function createArtifactWorkspace(args: {
+  rootDir: string;
+  tenantId: string;
+  runId: string;
+}): Promise<ArtifactWorkspace> {
+  const rootDir = resolve(args.rootDir);
+  const tenantSegment = scopePathSegment(args.tenantId, "tenant");
+  const runSegment = scopePathSegment(args.runId, "run");
+  const workspaceDir = join(rootDir, `tenant-${tenantSegment}`, `run-${runSegment}`);
+  const filesDir = join(workspaceDir, "files");
+  const manifestPath = join(workspaceDir, "manifest.json");
+  assertContained(rootDir, workspaceDir);
+  await mkdir(filesDir, { recursive: true, mode: 0o700 });
+  const workspace: ArtifactWorkspace = {
+    schemaVersion: 1,
+    rootDir,
+    workspaceDir,
+    filesDir,
+    manifestPath,
+    tenantId: args.tenantId,
+    runId: args.runId,
+    workspaceId: sha256(`${args.tenantId}\0${args.runId}`).slice(0, 24),
+  };
+  try {
+    const now = new Date().toISOString();
+    await writeFile(manifestPath, `${JSON.stringify(initialArtifactManifest(workspace, now), null, 2)}\n`, { flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    parseArtifactManifest(await readFile(manifestPath, "utf8"), workspace);
+  }
+  return workspace;
+}
+
+export async function readArtifactManifest(workspace: ArtifactWorkspace): Promise<ArtifactManifest> {
+  assertContained(workspace.rootDir, workspace.manifestPath);
+  return parseArtifactManifest(await readFile(workspace.manifestPath, "utf8"), workspace);
+}
+
+async function acquireManifestLock(manifestPath: string): Promise<() => Promise<void>> {
+  const lockPath = `${manifestPath}.lock`;
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    try {
+      const handle = await open(lockPath, "wx", 0o600);
+      return async () => {
+        await handle.close();
+        await unlink(lockPath).catch(() => undefined);
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (Date.now() >= deadline) throw new Error(`Timed out waiting for artifact manifest lock: ${manifestPath}`);
+      try {
+        const lockStat = await stat(lockPath);
+        if (Date.now() - lockStat.mtimeMs > 30_000) await unlink(lockPath);
+      } catch (lockError) {
+        if ((lockError as NodeJS.ErrnoException).code !== "ENOENT") throw lockError;
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 15));
+    }
+  }
+}
+
+async function appendArtifactManifestEntry(workspace: ArtifactWorkspace, entry: ArtifactManifestEntry): Promise<void> {
+  const release = await acquireManifestLock(workspace.manifestPath);
+  try {
+    const manifest = await readArtifactManifest(workspace);
+    if (manifest.artifacts.some((artifact) => artifact.artifactId === entry.artifactId)) {
+      throw new Error(`Artifact id already exists in this run: ${entry.artifactId}`);
+    }
+    const updated: ArtifactManifest = {
+      ...manifest,
+      updatedAt: new Date().toISOString(),
+      artifacts: [...manifest.artifacts, entry],
+    };
+    const temporary = `${workspace.manifestPath}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(updated, null, 2)}\n`, { mode: 0o600 });
+    await rename(temporary, workspace.manifestPath);
+  } finally {
+    await release();
+  }
+}
+
+function normalizeDeliveryReceipt(
+  value: Partial<ArtifactDeliveryReceipt> | undefined,
+  sourceChannel: string,
+  verificationPassed: boolean,
+): ArtifactDeliveryReceipt {
+  const attemptedAt = value?.attemptedAt ?? new Date().toISOString();
+  const channel = receiptIdentifier(value?.channel, receiptIdentifier(sourceChannel, "unknown")) ?? "unknown";
+  const target = receiptIdentifier(value?.target);
+  const providerMessageId = receiptIdentifier(value?.providerMessageId);
+  if (!verificationPassed) {
+    return {
+      state: "failed",
+      channel,
+      reason: "Artifact verification failed; delivery was blocked.",
+      attemptedAt,
+    };
+  }
+  const state = value?.state ?? "local-only";
+  if (state === "url") {
+    if (!value?.url) throw new Error("URL delivery requires url.");
+    const parsed = new URL(value.url);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("Artifact delivery URL must use HTTP or HTTPS.");
+    if (parsed.username || parsed.password || [...parsed.searchParams.keys()].some((key) => /token|secret|key|signature|credential/i.test(key))) {
+      throw new Error("Artifact delivery URL must not embed credentials or signed secret query parameters.");
+    }
+  }
+  if (state === "uploaded" && !providerMessageId && !target) {
+    throw new Error("Uploaded artifact delivery requires providerMessageId or target evidence.");
+  }
+  if (state === "failed" && !value?.reason) throw new Error("Failed artifact delivery requires a truthful reason.");
+  return {
+    state,
+    channel,
+    target,
+    url: value?.url,
+    providerMessageId,
+    reason: boundedReceiptText(value?.reason, state === "local-only" ? "No authenticated uploader or artifact host was used." : undefined),
+    attemptedAt,
+  };
+}
+
+function channelStatusForDelivery(delivery: ArtifactDeliveryReceipt): ChannelDeliveryStatus {
+  if (delivery.state === "uploaded") return "artifact_uploaded";
+  if (delivery.state === "url") return "artifact_hosted";
+  if (delivery.state === "local-only") return "artifact_local_only";
+  return "failed";
+}
+
+export async function persistArtifact(args: {
+  workspace: ArtifactWorkspace;
+  artifact: ArtifactResult;
+  title: string;
+  sourceChannel: string;
+  sourcePrompt: string;
+  artifactId?: string;
+  providerId?: string;
+  model?: string;
+  providerRunId?: string;
+  tokenLedgerId?: string;
+  generationMode: "provider" | "deterministic_fallback";
+  fallbackReason?: string;
+  requiredText?: readonly string[];
+  renderVerification?: Partial<ArtifactRenderVerification>;
+  delivery?: Partial<ArtifactDeliveryReceipt>;
+}): Promise<{
+  declaration: ArtifactDeclaration;
+  manifestPath: string;
+  entry: ArtifactManifestEntry;
+}> {
+  const artifactId = artifactIdArg(args.artifactId);
+  const filename = safeArtifactFilename(args.artifact.filename);
+  const localPath = join(args.workspace.filesDir, `${artifactId}-${filename}`);
+  assertContained(args.workspace.workspaceDir, localPath);
+  const bytes = Buffer.from(args.artifact.base64, "base64");
+  await writeFile(localPath, bytes, { flag: "wx", mode: 0o600 });
+  try {
+    const checkedAt = new Date().toISOString();
+    const checks = verifyArtifactBytes(args.artifact.format, bytes, { requiredText: args.requiredText });
+    const structuralStatus = verificationStatus(checks);
+    const renderStatus = args.renderVerification?.status ?? "not_run";
+    if (renderStatus !== "not_run" && !args.renderVerification?.engine?.trim()) {
+      throw new Error("Render verification pass/fail requires the renderer engine identity.");
+    }
+    if (renderStatus === "failed" && !(args.renderVerification?.issues?.length)) {
+      throw new Error("Failed render verification requires at least one issue.");
+    }
+    const render: ArtifactRenderVerification = {
+      status: renderStatus,
+      engine: args.renderVerification?.engine,
+      checkedAt: args.renderVerification?.checkedAt ?? checkedAt,
+      issues: args.renderVerification?.issues ?? (renderStatus === "not_run" ? ["No renderer receipt was supplied; only structural verification is proven."] : []),
+      facts: args.renderVerification?.facts ?? {},
+    };
+    const digest = sha256(bytes);
+    const verification: ArtifactVerificationReceipt = {
+      status: structuralStatus === "passed" && render.status !== "failed" ? "passed" : "failed",
+      checkedAt,
+      sha256: digest,
+      structural: { status: structuralStatus, checks },
+      render,
+    };
+    const delivery = normalizeDeliveryReceipt(args.delivery, args.sourceChannel, verification.status === "passed");
+    const sourceChannel = receiptIdentifier(args.sourceChannel, "unknown") ?? "unknown";
+    const providerId = receiptIdentifier(args.providerId);
+    const providerRunId = receiptIdentifier(args.providerRunId);
+    const tokenLedgerId = receiptIdentifier(args.tokenLedgerId);
+    const provenance: ArtifactGenerationProvenance = {
+      mode: args.generationMode,
+      providerId,
+      model: boundedReceiptText(args.model),
+      providerRunId,
+      fallbackReason: args.generationMode === "deterministic_fallback"
+        ? boundedReceiptText(args.fallbackReason, "Provider generation was unavailable or failed its content contract.")
+        : undefined,
+      promptSha256: sha256(args.sourcePrompt),
+    };
+    const createdAt = new Date().toISOString();
+    const entry: ArtifactManifestEntry = {
+      artifactId,
+      title: args.title.trim() || "Artifact",
+      type: args.artifact.format,
+      format: args.artifact.format,
+      filename,
+      relativePath: relative(args.workspace.workspaceDir, localPath),
+      mimeType: args.artifact.mimeType,
+      sizeBytes: bytes.length,
+      sha256: digest,
+      createdAt,
+      sourceChannel,
+      provenance,
+      tokenLedgerId,
+      verification,
+      delivery,
+    };
+    await appendArtifactManifestEntry(args.workspace, entry);
+    const declaration: ArtifactDeclaration = {
+      type: args.artifact.format,
+      title: entry.title,
+      mimeType: entry.mimeType,
+      localPath,
+      hostedUrl: delivery.state === "url" ? delivery.url : undefined,
+      sizeBytes: bytes.length,
+      sourceChannel,
+      sourcePrompt: `sha256:${provenance.promptSha256}`,
+      providerRunId,
+      tokenLedgerId,
+      deliveryStatus: channelStatusForDelivery(delivery),
+      failureReason: delivery.state === "failed" ? delivery.reason : undefined,
+      validationStatus: verification.status === "passed" ? "valid" : "invalid",
+      validationIssues: [
+        ...checks.filter((check) => check.status === "failed").map((check) => check.summary),
+        ...(render.status === "failed" ? render.issues : []),
+      ],
+      artifactId,
+      manifestPath: args.workspace.manifestPath,
+      sha256: digest,
+      verification,
+      delivery,
+      provenance,
+    };
+    return { declaration, manifestPath: args.workspace.manifestPath, entry };
+  } catch (error) {
+    await unlink(localPath).catch(() => undefined);
+    throw error;
+  }
 }
 
 function packageCoreProperties(title: string, subject: string): string {
@@ -732,7 +1145,44 @@ export async function declare_artifact(args: {
   tokenLedgerId?: string;
   deliveryStatus?: ChannelDeliveryStatus;
   failureReason?: string;
+  artifact?: ArtifactResult;
+  workspace?: { rootDir: string; tenantId: string; runId: string };
+  artifactId?: string;
+  providerId?: string;
+  model?: string;
+  generationMode?: "provider" | "deterministic_fallback";
+  fallbackReason?: string;
+  requiredText?: readonly string[];
+  renderVerification?: Partial<ArtifactRenderVerification>;
+  delivery?: Partial<ArtifactDeliveryReceipt>;
 }): Promise<ArtifactDeclaration> {
+  if (args.artifact || args.workspace) {
+    if (!args.artifact || !args.workspace) {
+      throw new Error("Scoped artifact declaration requires both artifact payload and workspace { rootDir, tenantId, runId }.");
+    }
+    if (args.type !== args.artifact.format) {
+      throw new Error(`Artifact declaration type ${args.type} does not match payload format ${args.artifact.format}.`);
+    }
+    const workspace = await createArtifactWorkspace(args.workspace);
+    const persisted = await persistArtifact({
+      workspace,
+      artifact: args.artifact,
+      title: args.title,
+      sourceChannel: args.sourceChannel,
+      sourcePrompt: args.sourcePrompt,
+      artifactId: args.artifactId,
+      providerId: args.providerId,
+      model: args.model,
+      providerRunId: args.providerRunId,
+      tokenLedgerId: args.tokenLedgerId,
+      generationMode: args.generationMode ?? "provider",
+      fallbackReason: args.fallbackReason,
+      requiredText: args.requiredText,
+      renderVerification: args.renderVerification,
+      delivery: args.delivery,
+    });
+    return persisted.declaration;
+  }
   const validation = args.localPath
     ? await validate_artifact_file({ type: args.type, localPath: args.localPath })
     : validationResult(args.type, 0, args.hostedUrl ? [] : ["Artifact declaration requires a local path or hosted URL."]);
@@ -780,36 +1230,132 @@ export async function artifact_structural_verify(args: Record<string, unknown>):
   };
 }
 
+function boundedInteger(value: unknown, fallback: number, minimum: number, maximum: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(maximum, Math.max(minimum, Math.floor(parsed)));
+}
+
+function artifactCustomerPackDependencies(): Record<string, unknown> {
+  return {
+    required: [
+      { id: "provider-runtime", contract: "run structured provider work and return provider/run identity" },
+      { id: "artifact-store", contract: "supply tenantId, runId, and a private workspace root" },
+      { id: "token-ledger", contract: "supply a ledger receipt id for generation and delivery cost attribution" },
+      { id: "delivery-adapter", contract: "return uploaded, url, local-only, or failed with a truthful reason" },
+    ],
+    optional: [
+      { id: "artifact-renderer", contract: "return render engine, visual facts, and pass/fail issues" },
+      { id: "mcp-runtime", contract: "expose explicitly discovered and approved Office/storage capabilities" },
+      { id: "approval-policy", contract: "gate upload, share, overwrite, and send operations" },
+    ],
+    rule: "Customer packs declare interfaces and scopes; they do not hardcode a customer, provider, channel, or credential.",
+  };
+}
+
+function explicitProviderCapabilities(host: Record<string, unknown>): Record<string, unknown> {
+  const safeCapabilityIds = (value: unknown): string[] => Array.isArray(value)
+    ? value.map(String).map((item) => item.trim()).filter((item) => /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/.test(item))
+    : [];
+  const skills = safeCapabilityIds(host.skills);
+  const mcpServers = safeCapabilityIds(host.mcpServers);
+  const discoveryId = typeof host.discoveryId === "string" && host.discoveryId.trim() ? host.discoveryId.trim() : undefined;
+  return {
+    providerId: typeof host.providerId === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/.test(host.providerId.trim()) ? host.providerId.trim() : undefined,
+    discovery: skills.length || mcpServers.length ? "explicit" : "none",
+    discoveryId: discoveryId && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(discoveryId) ? discoveryId : undefined,
+    skills,
+    mcpServers,
+    reusePolicy: [
+      "Use only capabilities named in this explicit discovery payload.",
+      "Never infer a provider from a model name or filesystem cache.",
+      "Never copy opaque provider credentials into Muster; route through the approved host handle or configure Muster explicitly.",
+    ],
+  };
+}
+
+export async function large_report_contract(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const totalRows = boundedInteger(args.totalRows, 0, 0, Number.MAX_SAFE_INTEGER);
+  const requestedPageSize = boundedInteger(args.pageSize, 100, 20, 1_000);
+  const previewRows = boundedInteger(args.previewRows, 50, 1, 200);
+  const sheetRowCap = boundedInteger(args.sheetRowCap, 100_000, 1_000, 1_000_000);
+  const snapshotId = stringArg(args, "snapshotId") || undefined;
+  return {
+    totalRows,
+    pagination: {
+      kind: "cursor",
+      pageSize: requestedPageSize,
+      previewRows: Math.min(previewRows, requestedPageSize),
+      stableSnapshotRequired: true,
+      snapshotId,
+      cursorContents: "opaque snapshot id + sort key + last row identity; never raw query text or credentials",
+    },
+    export: {
+      mode: totalRows > previewRows ? "asynchronous" : "inline_or_asynchronous",
+      formats: ["csv", "xlsx", "pdf", "docx"],
+      xlsxSheetRowCap: sheetRowCap,
+      chunks: totalRows > 0 ? Math.max(1, Math.ceil(totalRows / sheetRowCap)) : 1,
+      delivery: "persist the full export in the scoped artifact workspace and return its artifact id; never put the full payload in model context",
+    },
+    integrity: [
+      "bind every page and export to one source snapshot and permission decision",
+      "record query hash, row count, filters, ordering, and source watermark in the receipt",
+      "fail closed if permission scope or source watermark changes during export",
+    ],
+  };
+}
+
 export async function office_artifact_contract(args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const requested = Array.isArray(args.formats) ? args.formats.map((item) => String(item).toLowerCase()) : ["docx", "xlsx", "pptx", "pdf"];
   const formats = ["docx", "xlsx", "pptx", "pdf"].filter((format) => requested.includes(format));
   return {
     pillar: "office_artifacts",
-    promise: "Create editable Office/PDF drafts locally, verify package structure, then route to app-server skills or authenticated suites only when available.",
+    promise: "Ask the selected provider to create substantive content, persist it in a run-scoped workspace, verify it, and use deterministic local builders only as an explicit fallback.",
     formats: formats.map((format) => ({
       format,
       localBuilder: { docx: "docx_document", xlsx: "xlsx_workbook", pptx: "pptx_presentation", pdf: "pdf_document" }[format],
       verifier: "artifact_structural_verify",
       appServerSkill: { docx: "documents", xlsx: "spreadsheets", pptx: "presentations", pdf: "pdf" }[format],
       qualityGate: format === "xlsx"
-        ? "formula/range/content checks locally; app-server spreadsheet skill for charts, recalculation, and render QA"
+        ? "formula/range/content checks locally; provider-hosted spreadsheet skill for charts, recalculation, and render QA"
         : format === "pptx"
-          ? "slide/package/content checks locally; app-server presentation skill for layout previews and overlap QA"
+          ? "slide/package/content checks locally; provider-hosted presentation skill for layout previews and overlap QA"
           : format === "docx"
-            ? "document package/content checks locally; app-server document skill for render QA, comments, redlines, and Google Docs import"
-            : "PDF header/trailer/content checks locally; app-server PDF skill for rendering, extraction, and visual QA",
+            ? "document package/content checks locally; provider-hosted document skill for render QA, comments, redlines, and native document import"
+            : "PDF header/trailer/content checks locally; provider-hosted PDF skill for rendering, extraction, and visual QA",
     })),
-    workflow: ["intake", "capabilities", "draft", "verify", "polish_or_setup_blocker", "approval_gated_publish", "receipt_and_eval"],
+    generation: {
+      primary: "provider-led structured content using the active provider runtime",
+      fallback: "deterministic local builder only after provider unavailability, timeout, or invalid structured output is recorded",
+      providerNeutral: true,
+    },
+    workspace: {
+      scope: ["tenantId", "runId", "artifactId"],
+      manifest: "one append-only manifest per tenant/run workspace; every file is resolved by artifactId, never by most-recent-file scans",
+    },
+    verification: {
+      structural: "required before delivery",
+      render: "required for visual-quality claims; not_run is recorded when no renderer is available",
+      provenance: ["provider/run identity or fallback reason", "prompt hash", "artifact sha256", "token ledger id"],
+    },
+    delivery: {
+      states: ["uploaded", "url", "local-only", "failed"],
+      rule: "local-only and failed always include a reason; verification failure blocks upload/share",
+    },
+    largeReports: await large_report_contract(args),
+    customerPackDependencies: artifactCustomerPackDependencies(),
+    workflow: ["intake", "explicit_capability_discovery", "provider_generate", "deterministic_fallback_if_recorded", "persist", "structural_verify", "render_verify_or_not_run", "approval_gated_publish", "receipt_and_ledger"],
     userControls: [
-      "choose local draft or polished app-server handoff",
-      "choose destination: local, Google Drive, Microsoft 365, or channel attachment",
+      "choose provider-led output or an explicit deterministic fallback",
+      "choose destination: local, an authenticated document suite, or channel attachment",
       "verify before publish",
       "store artifact receipt in memory, not raw file body by default",
     ],
     noFalseClaims: [
       "local builders are deterministic but intentionally basic",
       "visual QA requires a renderer or host artifact skill",
-      "Google/Microsoft uploads require authenticated connectors and explicit approval",
+      "remote uploads require an authenticated connector and explicit approval",
+      "provider-hosted skills and MCPs are reusable only after explicit discovery; Muster never silently copies provider credentials",
     ],
   };
 }
@@ -828,7 +1374,7 @@ export async function artifact_capability_plan(args: Record<string, unknown>): P
   ].map((skill) => ({
     ...skill,
     available: hostSkills.includes(skill.id),
-    setup: hostSkills.includes(skill.id) ? "route through the active app-server session" : "enable the corresponding Codex/Claude app-server plugin or skill before handoff",
+    setup: hostSkills.includes(skill.id) ? "route through the explicitly discovered provider host" : "explicitly discover or enable the corresponding provider-hosted plugin or skill before handoff",
   }));
   return {
     intent: stringArg(args, "intent", "artifact_generation"),
@@ -843,10 +1389,13 @@ export async function artifact_capability_plan(args: Record<string, unknown>): P
       pdf: "pdf_document",
     },
     appServerHandoffs: appServerSkills,
+    providerHost: explicitProviderCapabilities(host),
+    customerPackDependencies: artifactCustomerPackDependencies(),
     policy: [
-      "Use local builders for deterministic, dependency-light artifacts and tests.",
-      "Use app-server document/spreadsheet/presentation/PDF skills for polished files that need render/visual QA.",
-      "Never claim app-server generation is available unless the host explicitly reports that skill or plugin.",
+      "Use the selected provider for substantive content when the provider runtime is ready.",
+      "Use local builders only for an explicit deterministic fallback, dependency-light artifacts, and tests.",
+      "Use explicitly discovered provider-hosted document/spreadsheet/presentation/PDF skills for polished files that need render/visual QA.",
+      "Never claim provider-hosted generation is available unless the active host explicitly reports that skill or MCP.",
     ],
   };
 }
@@ -859,18 +1408,20 @@ export async function office_tool_integrations(args: Record<string, unknown>): P
     purpose: "office_artifact_generation",
     local: [
       { id: "docx_document", formats: ["docx"], depth: "verified-editable-draft", available: true, verifier: "artifact_structural_verify", notes: "Dependency-light OOXML document package for deterministic CI and lightweight deliverables." },
-      { id: "xlsx_workbook", formats: ["xlsx"], depth: "verified-editable-draft", available: true, verifier: "artifact_structural_verify", notes: "Inline-string workbook for tabular outputs; formula/chart authoring should use an app-server spreadsheet skill." },
+      { id: "xlsx_workbook", formats: ["xlsx"], depth: "verified-editable-draft", available: true, verifier: "artifact_structural_verify", notes: "Inline-string workbook for tabular outputs; formula/chart authoring should use an explicitly discovered provider-hosted spreadsheet skill." },
       { id: "pptx_presentation", formats: ["pptx"], depth: "verified-editable-draft", available: true, verifier: "artifact_structural_verify", notes: "Simple editable deck package; polished layouts should route to a presentation skill." },
-      { id: "pdf_document", formats: ["pdf"], depth: "verified-static-draft", available: true, verifier: "artifact_structural_verify", notes: "Simple one-page PDF payload; visual QA and complex layout should route to a PDF/document skill." },
+      { id: "pdf_document", formats: ["pdf"], depth: "verified-static-draft", available: true, verifier: "artifact_structural_verify", notes: "Paginated deterministic PDF fallback; visual QA and complex layout should route to a discovered PDF/document skill." },
     ],
     appServerSkills: [
-      { id: "documents", formats: ["docx", "google-docs"], available: hostSkills.includes("documents"), setup: "Enable the document plugin/skill in the active Codex or Claude app-server session." },
+      { id: "documents", formats: ["docx", "google-docs"], available: hostSkills.includes("documents"), setup: "Explicitly discover or enable the document skill in the active provider host." },
       { id: "spreadsheets", formats: ["xlsx", "csv", "google-sheets"], available: hostSkills.includes("spreadsheets"), setup: "Enable the spreadsheet plugin/skill for formulas, charts, recalculation, and render QA." },
       { id: "presentations", formats: ["pptx", "google-slides"], available: hostSkills.includes("presentations"), setup: "Enable the presentation plugin/skill for layout libraries, slide previews, and overlap checks." },
       { id: "pdf", formats: ["pdf"], available: hostSkills.includes("pdf"), setup: "Enable the PDF plugin/skill for extraction, rendering, and visual verification." },
     ],
+    providerHost: explicitProviderCapabilities(host),
+    customerPackDependencies: artifactCustomerPackDependencies(),
     officeSuites: [
-      { id: "google-drive", available: mcpServers.includes("google-drive"), useFor: "Import DOCX/PPTX/XLSX into native Google Docs, Slides, or Sheets after local/app-server creation." },
+      { id: "google-drive", available: mcpServers.includes("google-drive"), useFor: "Import DOCX/PPTX/XLSX into native documents after provider or deterministic fallback creation." },
       { id: "microsoft-365", available: mcpServers.includes("microsoft-365") || mcpServers.includes("onedrive") || mcpServers.includes("sharepoint"), useFor: "Future OneDrive/SharePoint/Office Graph import and sharing workflows." },
       { id: "libreoffice", available: false, useFor: "Optional local render/convert gate when installed; do not assume it exists in the core binary." },
       { id: "pandoc", available: false, useFor: "Optional Markdown/document conversion path when installed; keep it as an explicit external dependency." },
@@ -910,7 +1461,7 @@ export async function office_artifact_workflow(args: Record<string, unknown>): P
     },
     {
       id: "capabilities",
-      action: "Inspect local builders, app-server skills, MCP servers, and optional Office import routes.",
+      action: "Inspect local builders plus explicitly discovered provider-hosted skills, MCP servers, and optional Office import routes.",
       tool: "office_tool_integrations",
       risk: "safe",
       inputFrom: "artifact_spec",
@@ -921,7 +1472,7 @@ export async function office_artifact_workflow(args: Record<string, unknown>): P
       action: providerLed
         ? "Send the user's rich content request to the selected provider, then let the harness write and validate the returned artifact content."
         : polished
-          ? "Create a deterministic draft locally, then prepare a handoff spec for the app-server artifact skill."
+          ? "Create a deterministic fallback locally, then prepare a handoff spec for the discovered provider-hosted artifact skill."
           : "Create the artifact with the local deterministic builder.",
       tool: builder,
       risk: "safe",
@@ -937,10 +1488,10 @@ export async function office_artifact_workflow(args: Record<string, unknown>): P
     },
     {
       id: "polish",
-      action: polished ? "Route to app-server document/spreadsheet/presentation/PDF skill for visual QA, formulas, charts, slide layout, or conversion." : "Skip app-server polish unless the user asks for layout-grade output.",
+      action: polished ? "Route to the discovered provider-hosted document/spreadsheet/presentation/PDF skill for visual QA, formulas, charts, slide layout, or conversion." : "Skip provider-hosted polish unless the user asks for layout-grade output.",
       risk: polished ? "review" : "safe",
       inputFrom: "verification_report",
-      gate: polished ? "Host must expose the matching app-server skill; otherwise return setup guidance, not a fake artifact." : undefined,
+      gate: polished ? "The active provider host must explicitly expose the matching skill; otherwise return setup guidance, not a fake artifact." : undefined,
       output: polished ? "polished_artifact_or_setup_blocker" : "verified_artifact",
     },
     {
@@ -965,6 +1516,7 @@ export async function office_artifact_workflow(args: Record<string, unknown>): P
   ];
   const sourcePrompt = stringArg(args, "prompt", "");
   const sourceChannel = stringArg(args, "sourceChannel", destination || "local");
+  const host = typeof args.hostCapabilities === "object" && args.hostCapabilities !== null ? args.hostCapabilities as Record<string, unknown> : {};
   const registryDeclaration: ArtifactDeclaration = {
     type: (["markdown", "docx", "xlsx", "pptx", "pdf"].includes(format) ? format : "docx") as ArtifactType,
     title: stringArg(args, "title", "Artifact"),
@@ -996,10 +1548,23 @@ export async function office_artifact_workflow(args: Record<string, unknown>): P
       : undefined,
     deliveryStatuses,
     registryDeclaration,
-    sourceEvidence: [
-      "OpenClaw Lobster uses one deterministic workflow call, explicit approvals, resumable envelopes, output caps, and sandbox-aware execution.",
-      "Muster flow/goal loops add durable run records, replay/diff, token ledger attribution, and eval-gated learning around the workflow.",
-    ],
+    generationPolicy: {
+      primary: "provider",
+      deterministicFallbackWhen: ["provider_unavailable", "provider_timeout", "invalid_structured_content"],
+      fallbackMustRecordReason: true,
+      providerHost: explicitProviderCapabilities(host),
+    },
+    workspaceContract: {
+      scope: ["tenantId", "runId", "artifactId"],
+      manifest: "append-only per run",
+      resolution: "artifactId only; recent-file lookup is forbidden",
+    },
+    deliveryContract: {
+      states: ["uploaded", "url", "local-only", "failed"],
+      truthfulReasons: true,
+    },
+    largeReport: await large_report_contract(args),
+    customerPackDependencies: artifactCustomerPackDependencies(),
     steps,
     envelope: {
       statuses: ["ok", "needs_approval", "blocked", "failed"],
@@ -1018,7 +1583,7 @@ export async function office_artifact_workflow(args: Record<string, unknown>): P
 export async function document_generation_workflow(args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const requestedFormat = stringArg(args, "format", "markdown").toLowerCase();
   const format = (["markdown", "docx", "xlsx", "pptx", "pdf"].includes(requestedFormat) ? requestedFormat : "markdown") as ArtifactType;
-  const originMode = stringArg(args, "originMode", "harness-created").toLowerCase() === "provider-generated"
+  const originMode = stringArg(args, "originMode", "provider-generated").toLowerCase() === "provider-generated"
     ? "provider-generated"
     : "harness-created";
   const providerLed = originMode === "provider-generated";
@@ -1040,14 +1605,22 @@ export async function document_generation_workflow(args: Record<string, unknown>
   const sourcePrompt = stringArg(args, "prompt", "");
   const sourceChannel = stringArg(args, "sourceChannel", "local");
   const builder = builderByFormat[format];
+  const host = typeof args.hostCapabilities === "object" && args.hostCapabilities !== null ? args.hostCapabilities as Record<string, unknown> : {};
   return {
     format,
     mode: originMode,
     invokeSequence: providerLed
-      ? ["provider_run", builder, "validate_artifact_file", "declare_artifact"]
-      : [builder, "validate_artifact_file", "declare_artifact"],
+      ? ["provider_run", builder, "declare_artifact"]
+      : [builder, "declare_artifact"],
     requiredInputs: requiredInputsByFormat[format],
     localBuilderRole: providerLed ? "write_provider_content_only" : "create_from_structured_inputs",
+    generationPolicy: {
+      primary: "provider",
+      requestedMode: originMode,
+      deterministicFallbackWhen: ["provider_unavailable", "provider_timeout", "invalid_structured_content"],
+      fallbackMustRecordReason: true,
+      providerHost: explicitProviderCapabilities(host),
+    },
     providerInstructions: providerLed
       ? [
           sourcePrompt || `Generate substantive ${format.toUpperCase()} content for ${title}.`,
@@ -1059,8 +1632,22 @@ export async function document_generation_workflow(args: Record<string, unknown>
     validation: {
       tool: "validate_artifact_file",
       required: ["exists", "non_empty", "format_header_or_ooxml_package", "content_structure"],
+      renderReceipt: "passed, failed, or not_run with reason",
     },
+    workspace: {
+      required: ["tenantId", "runId"],
+      artifactIdentity: "artifactId",
+      manifestResolution: "never scan for the latest file",
+    },
+    delivery: {
+      states: ["uploaded", "url", "local-only", "failed"],
+      failedAndLocalOnlyRequireReason: true,
+    },
+    largeReport: await large_report_contract(args),
+    customerPackDependencies: artifactCustomerPackDependencies(),
     registry: {
+      mode: "scoped_workspace",
+      required: ["artifact", "workspace.rootDir", "workspace.tenantId", "workspace.runId", "generationMode"],
       type: format,
       title,
       sourceChannel,
@@ -1080,10 +1667,10 @@ export async function artifact_goal_passes(args: Record<string, unknown>): Promi
     strictness,
     passes: [
       { id: "design", owner: "artifact-architect", checks: ["format fit", "audience", "privacy", "source availability", "success rubric"] },
-      { id: "build", owner: "artifact-builder", checks: ["local deterministic artifact", "bounded payload", "no secrets in output", "editable container when applicable"] },
-      { id: "verify", owner: "qa-reviewer", checks: ["structural package validation", "content inclusion", "format recognition", "size cap", "visual QA when renderer exists"] },
-      { id: "polish", owner: "app-server-specialist", checks: ["use document/spreadsheet/presentation/PDF skill when host exposes it", "do not fake missing plugins", "capture setup blocker"] },
-      { id: "deliver", owner: "release-captain", checks: ["approval for uploads/sends", "token ledger entry", "artifact receipt", "changelog/release note if product surface changed"] },
+      { id: "build", owner: "artifact-builder", checks: ["provider-led content", "recorded deterministic fallback only", "tenant/run workspace", "bounded payload", "no secrets in receipts", "editable container when applicable"] },
+      { id: "verify", owner: "qa-reviewer", checks: ["structural package validation", "content inclusion", "format recognition", "size cap", "render pass/fail/not_run receipt"] },
+      { id: "polish", owner: "provider-host-specialist", checks: ["use explicitly discovered document/spreadsheet/presentation/PDF skill", "do not fake missing plugins", "capture setup blocker"] },
+      { id: "deliver", owner: "release-captain", checks: ["approval for uploads/sends", "token ledger entry", "scoped manifest receipt", "truthful delivery state", "changelog/release note if product surface changed"] },
       { id: "learn", owner: "evaluator", checks: ["record user feedback", "promote only with eval evidence", "keep raw file content out of broad memory by default"] },
     ],
     breakTests: [
@@ -1092,6 +1679,9 @@ export async function artifact_goal_passes(args: Record<string, unknown>): Promi
       "destination upload without credentials should require setup",
       "mutating publish/share should pause for approval",
       "failed verification should not write memory as success",
+      "same filename in concurrent tenant/run workspaces must never cross-resolve",
+      "uploaded delivery without provider message or target evidence must fail",
+      "artifact lookup by most-recent-file must not exist",
     ],
   };
 }

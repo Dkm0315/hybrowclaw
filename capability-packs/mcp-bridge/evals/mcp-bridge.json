@@ -5,12 +5,17 @@
   "sourceEpisodeId": "capability-pack-mcp-bridge",
   "prompt": "Verify the Muster MCP Bridge capability pack baseline contract.",
   "taskKind": "architecture",
-  "recordedResponseText": "mcp-bridge capability pack baseline.\nImplemented tools: mcp_bridge_setup_plan, mcp_bridge_config_lint, mcp_bridge_install_workflow, mcp_bridge_tool_policy.\nStatus: v0: setup, lint, and workflow planning only; actual install/test/OAuth runs through Muster's native mcp commands..\nSafety: secret redaction is required and no raw credentials should be printed.",
+  "recordedResponseText": "mcp-bridge capability pack baseline.\nImplemented tools: mcp_bridge_setup_plan, mcp_bridge_config_lint, mcp_bridge_install_workflow, mcp_bridge_tool_policy.\nStatus: native MCP commands own install, OAuth, connection, and execution. The bridge requires explicit auth and readiness, tool allowlists, bounded redacted results, timeout and call limits, per-server failure isolation, and receipts linked to tenant, run, token ledger, and artifacts. Provider-hosted MCPs or skills are reusable only after explicit discovery and approval; credentials are never copied. Customer packs depend on generic identity, policy, secret-store, audit-ledger, provider-host, and artifact-store contracts.\nSafety: secret redaction is required and no raw credentials should be printed.",
   "expectedContains": [
     "mcp-bridge",
     "mcp_bridge_setup_plan",
     "mcp_bridge_config_lint",
     "mcp_bridge_install_workflow",
+    "explicit auth and readiness",
+    "tool allowlists",
+    "bounded redacted results",
+    "per-server failure isolation",
+    "explicit discovery and approval",
     "secret redaction"
   ],
   "forbiddenContains": [

@@ -332,7 +332,7 @@ test("document_generation_workflow exposes a direct invocation contract for prov
     sourceChannel: "cli",
   });
   assert.equal(local.mode, "harness-created");
-  assert.deepEqual(local.invokeSequence, ["docx_document", "validate_artifact_file", "declare_artifact"]);
+  assert.deepEqual(local.invokeSequence, ["docx_document", "declare_artifact"]);
   assert.deepEqual(local.requiredInputs, ["title", "summary", "sections"]);
   assert.equal(local.registry.type, "docx");
   assert.equal(local.registry.sourceChannel, "cli");
@@ -345,7 +345,7 @@ test("document_generation_workflow exposes a direct invocation contract for prov
     prompt: "Generate a 12-page CTO evidence PDF with implementation detail and proof.",
   });
   assert.equal(provider.mode, "provider-generated");
-  assert.deepEqual(provider.invokeSequence, ["provider_run", "pdf_document", "validate_artifact_file", "declare_artifact"]);
+  assert.deepEqual(provider.invokeSequence, ["provider_run", "pdf_document", "declare_artifact"]);
   assert.match(String(provider.providerInstructions), /Generate a 12-page CTO evidence PDF/);
   assert.match(String(provider.providerInstructions), /Return structured sections/);
   assert.equal(provider.localBuilderRole, "write_provider_content_only");

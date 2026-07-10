@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://themuster.dev/schemas/frappe-customer-profile-v1.json",
+  "title": "Muster Frappe customer profile",
+  "description": "Data-only deployment policy for a Frappe site. It selects indexed surfaces and live hierarchy fields without adding customer-specific code or answers.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "displayName", "site", "hierarchy", "indexing", "cache", "writePolicy"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}$" },
+    "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "site": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["urlFromEnv", "auth"],
+      "properties": {
+        "urlFromEnv": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+        "auth": { "enum": ["oauth2", "api_token"] }
+      }
+    },
+    "hierarchy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceDoctype", "recordIdField", "principalField", "managerRecordField"],
+      "properties": {
+        "sourceDoctype": { "type": "string", "minLength": 1 },
+        "recordIdField": { "type": "string", "minLength": 1 },
+        "principalField": { "type": "string", "minLength": 1 },
+        "managerRecordField": { "type": "string", "minLength": 1 },
+        "activeField": { "type": "string", "minLength": 1 },
+        "activeValues": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "maxDepth": { "type": "integer", "minimum": 1, "maximum": 128 }
+      }
+    },
+    "indexing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["coreKinds", "pollIntervalSeconds"],
+      "properties": {
+        "coreKinds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": ["app", "module", "doctype", "field", "custom_field", "property_setter", "workflow", "report", "print_format", "client_script", "server_script", "funnel", "flow_config", "dynamic_assignment"]
+          }
+        },
+        "additionalDoctypes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "pollIntervalSeconds": { "type": "integer", "minimum": 15 },
+        "eventIngest": { "type": "boolean" }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metadataTtlSeconds", "operationalTtlSeconds"],
+      "properties": {
+        "metadataTtlSeconds": { "type": "integer", "minimum": 1 },
+        "operationalTtlSeconds": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "aliases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["phrase", "doctype", "source"],
+        "properties": {
+          "phrase": { "type": "string", "minLength": 1 },
+          "doctype": { "type": "string", "minLength": 1 },
+          "source": { "const": "profile_data" }
+        }
+      }
+    },
+    "writePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requirePermissionPreflight", "requireBoundApproval", "approvalTtlSeconds"],
+      "properties": {
+        "requirePermissionPreflight": { "const": true },
+        "requireBoundApproval": { "const": true },
+        "approvalTtlSeconds": { "type": "integer", "minimum": 30, "maximum": 1800 }
+      }
+    }
+  }
+}

@@ -12,14 +12,16 @@
   "sandbox": "network_limited",
   "secrets": [
     "FRAPPE_SITE_URL",
-    "FRAPPE_API_TOKEN"
+    "FRAPPE_API_TOKEN",
+    "FRAPPE_APPROVAL_SIGNING_KEY",
+    "FRAPPE_READ_MODEL_PATH"
   ],
   "evals": [
     "evals/identity-resolution.json",
     "evals/permission-scoping.json"
   ],
-  "digest": "sha256:4c5f0eb8d4db0d9a89a2661796bcb05363a69fd2b1dec702c9f98268f6480b72",
-  "description": "Permission-scoped Frappe/ERPNext tools with federated OAuth identity. Every read and write executes as the paired Frappe user; Frappe remains the only authorization authority. The pack owns Frappe context induction so the main Muster binary stays light: site URL plus API token, or one-time admin login credentials, can discover installed apps/modules and combine live metadata with Frappe, ERPNext, and Frappe Suite docs.",
+  "digest": "sha256:42111428ce10d0816ba547d633e8bed53b7d420fdb5d0447bdb957ad22cac250",
+  "description": "Permission-scoped Frappe/ERPNext tools with federated OAuth identity and an executable enterprise read model. Frappe remains the authorization authority. SQLite provides local/test persistence while the Postgres deployment contract preserves the same site, principal, permission-epoch, and revision boundaries. Customer deployments are data-only profiles; no customer-specific answers live in the pack code.",
   "implementedTools": [
     "frappe_identity_resolve",
     "frappe_user_identity_resolve",
@@ -38,7 +40,10 @@
     "frappe_chat_interaction_plan",
     "frappe_permission_check",
     "frappe_safe_write",
-    "frappe_artifact_brief"
+    "frappe_artifact_brief",
+    "frappe_enterprise_contract",
+    "frappe_customer_profile_validate",
+    "frappe_hierarchy_scope"
   ],
   "plannedTools": [
     "frappe_customization_context",
@@ -46,7 +51,7 @@
     "frappe_records_update",
     "frappe_dataset_fetch_for_artifact"
   ],
-  "status": "v0.5: loads through the capability-pack loader (HC-012). The pack now includes OAuth/API-token Frappe user identity plus Employee/role resolution, site induction, query classification, hybrid graph/docs retrieval, a sub-3s Frappe read-model plan, fast-route intent decisions, humane chat interaction plans for guided CRUD/report UX, permission checks, gated safe writes, and Frappe artifact briefs as pure {fetch, config}-context tools with exact Frappe error passthrough. Frappe remains the authorization authority; mutation execution requires explicit approval through frappe_safe_write.",
+  "status": "v0.6 beta: executable SQLite read-model storage, Postgres deployment contract, zero-app REST/OAuth polling, optional idempotent event ingestion, full metadata/customization indexing, revision-scoped caches, complete permission epochs, live-field hierarchy scope, signed one-use write approvals, and data-only customer profiles. Frappe remains the authorization authority; cached answers are keyed by site, principal, permission epoch, schema revision, and data revision.",
   "readiness": {
     "level": "verified",
     "status": "beta",
@@ -67,7 +72,12 @@
         "FRAPPE_API_TOKEN"
       ],
       "requiredAnyEnv": [],
-      "credentialStorage": "env"
+      "credentialStorage": "env",
+      "notes": [
+        "FRAPPE_APPROVAL_SIGNING_KEY and FRAPPE_READ_MODEL_PATH are required only when executing bound write approvals.",
+        "OAuth token providers can supply user access tokens to the zero-app poller without persisting tokens in the read model.",
+        "profiles/oxygenhr.sanitized.json is example deployment data, not customer-specific code."
+      ]
     },
     "diagnostics": {
       "doctorCommand": "muster plugins check frappe-federated-bridge",
@@ -93,8 +103,9 @@
       ],
       "liveArtifacts": [],
       "docs": [
-        "README.md",
-        "docs/RELEASE_TRAIN.md"
+        "FRAPPE_SURFACE_SPEC.md",
+        "profiles/customer-profile.schema.json",
+        "profiles/oxygenhr.sanitized.json"
       ]
     }
   }

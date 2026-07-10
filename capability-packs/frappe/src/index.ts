@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 /**
  * Frappe/ERPNext capability pack v0 — three real tools ported from the
@@ -23,6 +23,20 @@ import { createHash } from "node:crypto";
  */
 
 import { frappeFastRoute, frappeReadModelPlan } from "./read-model.js";
+import {
+  createFrappeApprovalProposal,
+  deriveFrappeHierarchyScope,
+  FRAPPE_POSTGRES_DEPLOYMENT_CONTRACT,
+  FRAPPE_ZERO_APP_RESOURCE_SPECS,
+  SqliteFrappeReadModel,
+  validateFrappeCustomerProfile,
+  verifyFrappeApproval,
+  type FrappeApprovalProposal,
+  type FrappeApprovalReceipt,
+  type FrappeHierarchyConfig,
+} from "./enterprise.js";
+
+export * from "./enterprise.js";
 
 export interface FrappeToolContext {
   readonly fetch?: typeof globalThis.fetch;
@@ -394,7 +408,7 @@ async function resolveRuntimeAuth(args: Record<string, unknown>, context: Frappe
     return { error: "Frappe context build needs FRAPPE_API_TOKEN, or runtime args siteUrl + adminUser + adminPassword. Password args are used only for this call and are never returned." };
   }
   const login = await frappeLogin(context.fetch, siteUrl, user, password);
-  if (!login.ok) return login;
+  if ("error" in login) return login;
   return { siteUrl, auth: { kind: "cookie", value: login.cookie }, mode: "admin_login" };
 }
 
@@ -451,7 +465,7 @@ export async function frappe_user_identity_resolve(
   if (!user) return { error: `Frappe get_logged_user returned no user: ${JSON.stringify(userResult.data).slice(0, 200)}` };
 
   const employee = await resolveEmployeeForUser(auth, context, user);
-  if ("error" in employee) return employee;
+  if (employee && "error" in employee) return employee;
   const roles = await resolveRolesForUser(auth, context, user);
   if ("error" in roles) return roles;
   const employeeId = employee?.name;
@@ -522,15 +536,7 @@ export async function frappe_records_create(
     return { error: 'frappe_records_create requires a "doc" object with the document fields.' };
   }
   if (!booleanArg(args.trustedFixture)) {
-    if (!booleanArg(args.approved)) {
-      return { error: "frappe_records_create requires approval for writes. Use frappe_safe_write to get a permission preflight, dry-run proposal, approval gate, execution, verification, and evidence log; trusted fixtures must pass trustedFixture=true explicitly." };
-    }
-    const safe = await frappe_safe_write({ ...args, operation: "create", approved: true }, context);
-    if ("error" in safe) return safe;
-    if (safe.status !== "executed" || !safe.result?.created) {
-      return { error: `frappe_records_create approved path did not create a document: ${safe.status}` };
-    }
-    return { created: safe.result.created };
+    return { error: "Direct Frappe create is disabled for runtime requests. Use frappe_safe_write so Frappe permission, current mandatory fields, a mutation-bound human approval, atomic replay protection, execution, and verification remain one guarded path." };
   }
   const result = await frappeRequest(context, "POST", `/api/resource/${encodeURIComponent(doctype)}`, doc as Record<string, unknown>);
   if (!result.ok) return result;
@@ -978,6 +984,7 @@ export async function frappe_safe_write(
   preflight: { readonly allowed: boolean; readonly reason: string; readonly source: "frappe_api" };
   proposedMutation: { readonly operation: "create" | "update"; readonly doctype: string; readonly docname?: string; readonly fields: string[]; readonly dryRun: boolean };
   approvalGate: { readonly required: boolean; readonly approved: boolean; readonly approvalNote?: string; readonly instruction: string };
+  approvalProposal?: FrappeApprovalProposal;
   result?: { readonly created?: Record<string, unknown>; readonly updated?: Record<string, unknown> };
   verification?: { readonly verified: boolean; readonly fetched?: Record<string, unknown>; readonly reason?: string };
   evidenceLog: string[];
@@ -990,29 +997,71 @@ export async function frappe_safe_write(
     return { error: 'frappe_safe_write requires a "doc" object with proposed fields.' };
   }
   const docRecord = doc as Record<string, unknown>;
+  const docname = argString(args, "docname");
+  if (operation === "update" && !docname) {
+    return { error: 'frappe_safe_write update requires a "docname" argument.' };
+  }
+  if (Array.isArray(args.fields) || Array.isArray(args.metaFields) || Array.isArray(args.propertySetters)) {
+    const missing = [...metadataRequiredFields(args), ...propertySetterRequiredFields(args)]
+      .filter((field) => !hasMeaningfulValue(docRecord[field.fieldname]));
+    if (missing.length) {
+      return {
+        error: `To move forward with this request, provide the fields Frappe currently marks as mandatory: ${missing.map((field) => field.label).join(", ")}.`,
+      };
+    }
+  }
   const auth = await resolveRuntimeAuth(args, context);
   if ("error" in auth) return auth;
   const permission = operation === "create" ? "create" : "write";
   const evidenceLog = ["resolve_identity:ok"];
-  const preflightResult = await livePermissionPreflight(context, auth.siteUrl, auth.auth, doctype, permission, argString(args, "docname"));
+  const preflightResult = await livePermissionPreflight(context, auth.siteUrl, auth.auth, doctype, permission, docname);
   const preflight = {
     allowed: preflightResult.allowed,
     reason: preflightResult.reason,
     source: "frappe_api" as const,
   };
   evidenceLog.push(preflight.allowed ? "permission_preflight:allowed" : "permission_preflight:denied");
-  const proposedMutation = {
+  const proposedMutation: {
+    operation: "create" | "update";
+    doctype: string;
+    docname?: string;
+    fields: string[];
+    dryRun: boolean;
+  } = {
     operation,
     doctype,
-    docname: argString(args, "docname"),
+    ...(docname ? { docname } : {}),
     fields: Object.keys(docRecord).sort(),
-    dryRun: !booleanArg(args.approved),
+    dryRun: true,
   };
+  const userResult = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", "/api/method/frappe.auth.get_logged_user");
+  if (!userResult.ok) return userResult;
+  const principal = typeof userResult.data.message === "string" ? userResult.data.message : "";
+  if (!principal) return { error: "Frappe write approval could not resolve the authenticated principal." };
+  const suppliedReceipt = normalizeApprovalReceipt(args.approvalReceipt);
+  const approvalProposal = createFrappeApprovalProposal({
+    site: auth.siteUrl,
+    principal,
+    operation,
+    doctype,
+    ...(proposedMutation.docname ? { docname: proposedMutation.docname } : {}),
+    doc: docRecord,
+    permissionEpoch: argString(args, "permissionEpoch") ?? `live-preflight:${stableHash([auth.siteUrl, principal, doctype, permission].join("|"))}`,
+    schemaRevision: argString(args, "schemaRevision") ?? "live",
+    dataRevision: argString(args, "dataRevision") ?? "live",
+    issuedAt: suppliedReceipt?.proposal.issuedAt ?? new Date().toISOString(),
+    ttlMs: Math.max(30_000, Math.min(positiveInteger(args.approvalTtlMs, 300_000), 600_000)),
+    nonce: suppliedReceipt?.proposal.nonce ?? randomUUID(),
+  });
+  const signingKey = context.config.FRAPPE_APPROVAL_SIGNING_KEY ?? "";
+  const approvalDecision = suppliedReceipt
+    ? verifyFrappeApproval({ receipt: suppliedReceipt, expected: approvalProposal, signingKey })
+    : { valid: false, reason: "A human-approved, mutation-bound receipt is required." };
   const approvalGate = {
     required: true,
-    approved: booleanArg(args.approved),
+    approved: approvalDecision.valid,
     approvalNote: argString(args, "approvalNote"),
-    instruction: "Re-run with approved=true only after the human user approves this exact mutation.",
+    instruction: "Approve this exact proposal through the host UI, then pass its signed receipt. A bare approved=true flag is not accepted.",
   };
 
   if (!preflight.allowed) {
@@ -1023,6 +1072,7 @@ export async function frappe_safe_write(
       preflight,
       proposedMutation,
       approvalGate,
+      approvalProposal,
       evidenceLog,
     };
   }
@@ -1035,16 +1085,27 @@ export async function frappe_safe_write(
       preflight,
       proposedMutation,
       approvalGate,
+      approvalProposal,
       evidenceLog,
     };
   }
 
+  if (!suppliedReceipt) return { error: "Frappe write approval receipt is missing." };
+  const readModelPath = context.config.FRAPPE_READ_MODEL_PATH;
+  if (!readModelPath) return { error: "Frappe write execution requires FRAPPE_READ_MODEL_PATH so approval consumption is atomic and replay-safe." };
+  const approvalStore = new SqliteFrappeReadModel(readModelPath);
+  try {
+    if (!approvalStore.consumeApproval(suppliedReceipt.proposal.proposalId, suppliedReceipt.signature)) {
+      return { error: "Frappe approval receipt was already consumed; request a fresh approval." };
+    }
+  } finally {
+    approvalStore.close();
+  }
+  evidenceLog.push("approval_binding:verified", "approval_receipt:consumed");
+
   const mutationPath = operation === "create"
     ? `/api/resource/${encodeURIComponent(doctype)}`
     : `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(proposedMutation.docname ?? "")}`;
-  if (operation === "update" && !proposedMutation.docname) {
-    return { error: 'frappe_safe_write update requires a "docname" argument.' };
-  }
   const mutation = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, operation === "create" ? "POST" : "PUT", mutationPath, docRecord);
   if (!mutation.ok) return mutation;
   evidenceLog.push("execute_mutation:ok");
@@ -1072,6 +1133,7 @@ export async function frappe_safe_write(
     preflight,
     proposedMutation: { ...proposedMutation, dryRun: false },
     approvalGate,
+    approvalProposal,
     result: operation === "create" ? { created: returnedDoc } : { updated: returnedDoc },
     verification,
     evidenceLog,
@@ -1099,7 +1161,7 @@ export async function frappe_artifact_brief(
   content: string;
   evidence: string[];
 }> {
-  const mode = argString(args, "mode") === "live" ? "live" : "fixture";
+  const mode: "fixture" | "live" = argString(args, "mode") === "live" ? "live" : "fixture";
   const artifactType = argString(args, "artifactType") ?? "implementation_brief";
   const format = argString(args, "format") ?? "markdown";
   const site = argString(args, "site") ?? context.config.FRAPPE_SITE_URL ?? "fixture-site";
@@ -1191,7 +1253,7 @@ export async function frappe_chat_interaction_plan(
       kind: "blocked",
       title: `Cannot ${operationLabel(operation)} ${doctype}`,
       message: "I cannot move forward with this request yet.",
-      reason: argString(args.reason) ?? "The current Frappe permission, workflow, or validation state does not allow this action.",
+      reason: argString(args, "reason") ?? "The current Frappe permission, workflow, or validation state does not allow this action.",
       doctype,
       operation,
       requiredFields: [],
@@ -1269,6 +1331,49 @@ export async function frappe_chat_interaction_plan(
   };
 }
 
+export async function frappe_enterprise_contract(
+  _args: Record<string, unknown>,
+  _context: FrappeToolContext,
+): Promise<{
+  postgres: typeof FRAPPE_POSTGRES_DEPLOYMENT_CONTRACT;
+  zeroAppResources: typeof FRAPPE_ZERO_APP_RESOURCE_SPECS;
+  profileSchemaVersion: 1;
+}> {
+  return {
+    postgres: FRAPPE_POSTGRES_DEPLOYMENT_CONTRACT,
+    zeroAppResources: FRAPPE_ZERO_APP_RESOURCE_SPECS,
+    profileSchemaVersion: 1,
+  };
+}
+
+export async function frappe_customer_profile_validate(
+  args: Record<string, unknown>,
+  _context: FrappeToolContext,
+): Promise<ReturnType<typeof validateFrappeCustomerProfile>> {
+  return validateFrappeCustomerProfile(args.profile ?? args);
+}
+
+export async function frappe_hierarchy_scope(
+  args: Record<string, unknown>,
+  _context: FrappeToolContext,
+): Promise<ReturnType<typeof deriveFrappeHierarchyScope> | FrappeError> {
+  const principal = argString(args, "principal") ?? argString(args, "user");
+  if (!principal) return { error: 'frappe_hierarchy_scope requires a "principal" argument.' };
+  const config = recordObject(args.config);
+  if (!config) return { error: 'frappe_hierarchy_scope requires a data-driven "config" object.' };
+  const rows: Array<Record<string, unknown>> = Array.isArray(args.rows)
+    ? args.rows.flatMap((row): Array<Record<string, unknown>> => {
+      const record = recordObject(row);
+      return record ? [record] : [];
+    })
+    : [];
+  try {
+    return deriveFrappeHierarchyScope(principal, config as unknown as FrappeHierarchyConfig, rows);
+  } catch (error) {
+    return { error: `Frappe hierarchy scope could not be derived: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
 /** Loader entrypoint contract: tools record, registered as frappe-federated-bridge__<name>. */
 export const tools = {
   frappe_identity_resolve,
@@ -1289,18 +1394,22 @@ export const tools = {
   frappe_permission_check,
   frappe_safe_write,
   frappe_artifact_brief,
+  frappe_enterprise_contract,
+  frappe_customer_profile_validate,
+  frappe_hierarchy_scope,
 };
 
 function inferDoctype(prompt: string, args: Record<string, unknown>): string {
-  const explicit = argString(args, "doctype");
+  const explicit = argString(args, "doctype") ?? argString(args, "resolvedDoctype");
   if (explicit) return explicit;
   const lower = prompt.toLowerCase();
-  if (lower.includes("leave")) return "Leave Application";
-  if (lower.includes("attendance") || lower.includes("regularization") || lower.includes("regularisation")) return "Attendance Request";
-  if (lower.includes("expense")) return "Expense Claim";
-  if (lower.includes("ticket") || lower.includes("helpdesk")) return "HD Ticket";
-  if (lower.includes("task")) return "Task";
-  if (lower.includes("employee")) return "Employee";
+  const aliases = Array.isArray(args.aliases) ? args.aliases : [];
+  for (const alias of aliases) {
+    const row = recordObject(alias);
+    const phrase = row ? recordString(row, "phrase") : undefined;
+    const doctype = row ? recordString(row, "doctype") : undefined;
+    if (phrase && doctype && lower.includes(phrase.toLowerCase())) return doctype;
+  }
   return "Frappe Document";
 }
 
@@ -1321,15 +1430,7 @@ function requiredFieldsForInteraction(
   if (operation === "read") return [];
   const fromMeta = metadataRequiredFields(args);
   const fromPropertySetters = propertySetterRequiredFields(args);
-  const fields = [...fromMeta, ...fromPropertySetters];
-  if (!fields.length && doctype === "Leave Application") {
-    fields.push(
-      { fieldname: "leave_type", label: "Leave type", reason: "Frappe needs the leave type to check balance and policy.", options: stringList(args.leaveTypes).length ? stringList(args.leaveTypes) : ["Casual Leave", "Sick Leave", "Earned Leave", "Leave Without Pay"] },
-      { fieldname: "from_date", label: "From date", reason: "Frappe needs the start date to calculate the leave duration." },
-      { fieldname: "to_date", label: "To date", reason: "Frappe needs the end date to calculate the leave duration." },
-      { fieldname: "description", label: "Reason", reason: "Your setup requires a reason before submission." },
-    );
-  }
+  const fields: Array<{ fieldname: string; label: string; reason: string; options?: readonly string[] }> = [...fromMeta, ...fromPropertySetters];
   if (!fields.length) {
     fields.push({ fieldname: "name_or_subject", label: "Document details", reason: "Frappe needs the required fields for this DocType before it can save the document." });
   }
@@ -1400,6 +1501,7 @@ function operationLabel(operation: FrappeInteractionPlan["operation"]): string {
     case "approve": return "approve";
     case "reject": return "reject";
     case "read": return "read";
+    default: return "process";
   }
 }
 
@@ -2071,6 +2173,35 @@ function stableArtifactId(site: string, user: string, prompt: string, generatedA
 
 function recordObject(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function normalizeApprovalReceipt(value: unknown): FrappeApprovalReceipt | undefined {
+  const receipt = recordObject(value);
+  const proposal = recordObject(receipt?.proposal);
+  if (!receipt || !proposal) return undefined;
+  const signature = recordString(receipt, "signature");
+  const approvedBy = recordString(receipt, "approvedBy");
+  const approvedAt = recordString(receipt, "approvedAt");
+  if (!signature || !approvedBy || !approvedAt) return undefined;
+  const requiredProposalFields = [
+    "proposalId",
+    "mutationHash",
+    "site",
+    "principal",
+    "operation",
+    "doctype",
+    "permissionEpoch",
+    "schemaRevision",
+    "dataRevision",
+    "issuedAt",
+    "expiresAt",
+    "nonce",
+    "humanSummary",
+  ];
+  if (!requiredProposalFields.every((key) => recordString(proposal, key))) return undefined;
+  if (!Array.isArray(proposal.fields) || !proposal.fields.every((field) => typeof field === "string")) return undefined;
+  if (!Array.isArray(proposal.bindingRequirements) || !proposal.bindingRequirements.every((item) => typeof item === "string")) return undefined;
+  return value as FrappeApprovalReceipt;
 }
 
 function recordString(value: unknown, key: string): string | undefined {
