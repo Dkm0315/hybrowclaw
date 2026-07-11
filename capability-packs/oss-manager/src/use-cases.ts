@@ -3,6 +3,7 @@ import type {
   DeploymentProfile,
   DiffClassification,
   EngineId,
+  JsonValue,
   QaSuiteContract,
   QaSuiteEngineId,
   QaUseCaseFamily,
@@ -13,7 +14,7 @@ import type {
 import { HYBROWLABS_SUITE_MANIFEST_V2 } from "./suite-catalog.generated.js";
 import { asRecord, requiredString, sha256, uniqueSorted } from "./utils.js";
 
-export const OSS_MANAGER_SUITE_CATALOG_VERSION = "oss-manager-qa-suites-v2";
+export const OSS_MANAGER_SUITE_CATALOG_VERSION = "oss-manager-qa-suites-v3";
 
 const READ_ONLY_EVIDENCE = ["suite_receipt", "semantic_assertion", "independent_probe", "source_sha"] as const;
 const MUTATION_EVIDENCE = [...READ_ONLY_EVIDENCE, "registered_compensation", "post_restore_proof"] as const;
@@ -25,17 +26,39 @@ function suite(
   risk: QaUseCaseRisk = "read_only",
   commandIds: readonly string[] = [],
 ): QaSuiteContract {
+  const id = `${engine}:${name}:${scopes.join(",")}`;
+  const family = familyForSuite(name);
+  const evidenceRequired = risk === "mutation_gated" ? MUTATION_EVIDENCE : READ_ONLY_EVIDENCE;
+  const expected: JsonValue = commandIds.length
+    ? { commandExitCodes: Object.fromEntries(uniqueSorted(commandIds).map((commandId) => [commandId, 0])) }
+    : { contractSatisfied: true };
   return {
-    id: `${engine}:${name}:${scopes.join(",")}`,
+    id,
     engine,
     suite: name,
     scopes,
-    family: familyForSuite(name),
+    family,
     risk,
     approvalRequired: risk !== "read_only",
     compensationRequired: risk === "mutation_gated",
     commandIds,
-    evidenceRequired: risk === "mutation_gated" ? MUTATION_EVIDENCE : READ_ONLY_EVIDENCE,
+    evidenceRequired,
+    validator: {
+      id: `validator:${id}`,
+      owner: {
+        kind: "feature_suite",
+        feature: family,
+        suiteContractId: id,
+      },
+      operator: "deep_equal",
+      expected,
+      evidenceRequired,
+      terminal: true,
+      deployment: {
+        required: risk === "mutation_gated",
+        postDeploymentFamilies: risk === "mutation_gated" ? ["health_status"] : [],
+      },
+    },
   };
 }
 
@@ -98,7 +121,7 @@ export function selectUseCases(
   sourceSha: string,
 ): QaUseCasePlan {
   const catalog = profile.id === "hybrowlabs-oss-manager" ? HYBROWLABS_SUITE_CATALOG : genericCatalog(profile.enabledEngines);
-  const catalogVersion = profile.id === "hybrowlabs-oss-manager" ? OSS_MANAGER_SUITE_CATALOG_VERSION : "generic-typed-suites-v1";
+  const catalogVersion = profile.id === "hybrowlabs-oss-manager" ? OSS_MANAGER_SUITE_CATALOG_VERSION : "generic-typed-suites-v2";
   const selected: QaUseCaseSelection[] = [];
   const baseline = catalog.find((item) => item.engine === "all" && item.suite === "baseline");
   if (baseline) selected.push(selectionFor(baseline, undefined, "contract", "Locked source baseline is required for every plan."));
@@ -131,6 +154,7 @@ export function selectUseCases(
 
   const deduped = [...new Map(selected.map((item) => [item.selectionId, item])).values()]
     .sort((left, right) => left.selectionId.localeCompare(right.selectionId));
+  assertDeploymentValidationCoverage(deduped);
   return {
     catalogVersion,
     catalogDigest: sha256(catalog),
@@ -142,6 +166,19 @@ export function selectUseCases(
   };
 }
 
+function assertDeploymentValidationCoverage(selected: readonly QaUseCaseSelection[]): void {
+  for (const deployment of selected.filter((item) => item.validator.deployment.required)) {
+    for (const family of deployment.validator.deployment.postDeploymentFamilies) {
+      const covered = selected.some((candidate) => candidate.selectionId !== deployment.selectionId
+        && candidate.targetEngine === deployment.targetEngine
+        && candidate.family === family);
+      if (!covered) {
+        throw new Error(`Mutation-gated suite ${deployment.selectionId} lacks required post-deployment ${family} validation coverage.`);
+      }
+    }
+  }
+}
+
 export function suiteCatalogReport(profileId = "hybrowlabs-oss-manager") {
   if (profileId !== "hybrowlabs-oss-manager") throw new Error(`No source-manifest reference catalog is bundled for profile ${profileId}.`);
   return {
@@ -150,6 +187,7 @@ export function suiteCatalogReport(profileId = "hybrowlabs-oss-manager") {
     digest: sha256(HYBROWLABS_SUITE_CATALOG),
     count: HYBROWLABS_SUITE_CATALOG.length,
     commandIdCount: HYBROWLABS_SUITE_CATALOG.reduce((total, item) => total + item.commandIds.length, 0),
+    validatorCount: HYBROWLABS_SUITE_CATALOG.filter((item) => item.validator.owner.suiteContractId === item.id).length,
     contracts: HYBROWLABS_SUITE_CATALOG,
     containsCommands: false,
   };
@@ -258,6 +296,9 @@ function selectionFor(
       : contract.risk === "destructive_plan"
         ? "approval_adapter_required" as const
         : "typed_adapter_required" as const,
+    blockedReason: contract.risk === "mutation_gated"
+      ? "Reviewed deployment adapter and exact compensation binding are not bundled in this pack."
+      : undefined,
     reason,
   };
 }

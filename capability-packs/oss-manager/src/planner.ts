@@ -13,7 +13,10 @@ import type {
   ClassifiedFile,
   DeploymentProfile,
   DiffClassification,
+  DocumentationImpactGate,
+  DocumentationWaiver,
   EngineId,
+  OwnedDocumentation,
   ProfilePathRule,
   QaPlan,
   QaScenario,
@@ -70,12 +73,17 @@ export function compilePlanFromArgs(args: Record<string, unknown>): QaPlan {
   const lock = normalizeLock(args.lock);
   const classification = normalizeClassification(args.classification, lock);
   const profile = resolveProfile(args.profile, optionalString(args.profileId));
+  const documentationImpact = evaluateDocumentationImpact(
+    classification,
+    lock,
+    args.documentationImpact ?? args.documentation,
+  );
   const useCases = selectUseCases(profile, classification, lock.headSha);
   const scenarios = compileScenarios(profile, classification, lock, useCases);
   const scenarioMutationIds = scenarios.flatMap((scenario) => scenario.operations)
     .filter((operation) => operation.mutating)
     .map((operation) => operation.id);
-  const commonOperations = compileCommonOperations(lock, classification, useCases, scenarioMutationIds);
+  const commonOperations = compileCommonOperations(lock, classification, documentationImpact, useCases, scenarioMutationIds);
   const operations = dedupeOperations([...commonOperations, ...scenarios.flatMap((scenario) => scenario.operations)]);
   operations.forEach(validateTypedOperation);
   const tokenPolicy = {
@@ -86,6 +94,7 @@ export function compilePlanFromArgs(args: Record<string, unknown>): QaPlan {
       baseSha: lock.baseSha,
       headSha: lock.headSha,
       profileId: profile.id,
+      documentationImpact,
       suiteCatalogDigest: useCases.catalogDigest,
       useCaseIds: useCases.selected.map((item) => item.selectionId),
       scenarios: scenarios.map((item) => item.id),
@@ -95,6 +104,7 @@ export function compilePlanFromArgs(args: Record<string, unknown>): QaPlan {
     profileId: profile.id,
     lockDigest: lock.lockDigest,
     sourceSha: lock.headSha,
+    documentationImpact,
     useCases,
     scenarios,
     operations,
@@ -108,6 +118,12 @@ export function compilePlanFromArgs(args: Record<string, unknown>): QaPlan {
     planDigest,
     ...planBody,
   };
+}
+
+export function documentationImpactFromArgs(args: Record<string, unknown>): DocumentationImpactGate {
+  const lock = normalizeLock(args.lock);
+  const classification = normalizeClassification(args.classification, lock);
+  return evaluateDocumentationImpact(classification, lock, args.documentationImpact ?? args.documentation);
 }
 
 export function resolveProfile(value: unknown, profileId?: string): DeploymentProfile {
@@ -312,6 +328,7 @@ function engineScenario(
           scopes: item.scopes,
           selection: item.selection,
           approvalRequired: item.approvalRequired,
+          validatorId: item.validator.id,
           sourceSha: lock.headSha,
         },
       )),
@@ -348,6 +365,7 @@ function contractScenario(id: string, title: string, reason: string, lock: Sourc
 function compileCommonOperations(
   lock: SourceLock,
   classification: DiffClassification,
+  documentationImpact: DocumentationImpactGate,
   useCases: QaUseCasePlan,
   mutationOperationIds: readonly string[],
 ): TypedOperation[] {
@@ -361,10 +379,164 @@ function compileCommonOperations(
       suiteCatalogDigest: useCases.catalogDigest,
       gatedUseCaseIds: useCases.selected.filter((item) => item.approvalRequired).map((item) => item.selectionId),
       mutationOperationIds,
+      documentationImpactStatus: documentationImpact.status,
+      documentationAffectedPaths: documentationImpact.affectedPaths,
+      documentationWaiverId: documentationImpact.waiver?.id ?? null,
     }),
+    ...useCases.selected
+      .filter((item) => item.selection === "contract")
+      .map((item) => operation(
+        `${seed}-${item.id}`,
+        "COMMAND_MATRIX",
+        "matrix.suite_contract",
+        `profile://qa/suite/${item.suite}`,
+        undefined,
+        false,
+        {
+          suiteContractId: item.id,
+          selectionId: item.selectionId,
+          family: item.family,
+          scopes: item.scopes,
+          selection: item.selection,
+          approvalRequired: item.approvalRequired,
+          validatorId: item.validator.id,
+          sourceSha: lock.headSha,
+        },
+      )),
     operation(seed, "POST_PROOF", "proof.snapshot_compare", "profile://qa/post-proof", undefined, false, { comparison: "before_vs_after_allowed_state" }),
     operation(seed, "REPORT", "report.render_receipts", "profile://qa/report", undefined, false, { format: "human_summary_plus_raw_receipt_index" }),
   ];
+}
+
+function evaluateDocumentationImpact(
+  classification: DiffClassification,
+  lock: SourceLock,
+  value: unknown,
+): DocumentationImpactGate {
+  const required = classification.impact === "RUNTIME" || classification.impact === "HIGH_RISK";
+  const affectedPaths = uniqueSorted(classification.files
+    .filter((file) => !file.categories.every((category) => category === "docs" || category === "tests"))
+    .map((file) => file.path));
+  if (!required) {
+    return {
+      required: false,
+      status: "NOT_REQUIRED",
+      affectedPaths: [],
+      ownedDocumentation: [],
+      reason: `${classification.impact} changes do not require the runtime documentation-impact gate.`,
+    };
+  }
+
+  const declaration = value === undefined ? {} : asRecord(value, "documentationImpact");
+  const rawOwned = declaration.ownedDocumentation ?? declaration.ownedDocs ?? [];
+  if (!Array.isArray(rawOwned)) throw new Error("documentationImpact.ownedDocumentation must be an array.");
+  const ownedDocumentation = rawOwned.map((item, index) => normalizeOwnedDocumentation(item, index, classification, affectedPaths));
+  const covered = new Set(ownedDocumentation.flatMap((item) => item.covers));
+  const uncovered = affectedPaths.filter((path) => !covered.has(path));
+  if (!uncovered.length && ownedDocumentation.length) {
+    return {
+      required: true,
+      status: "SATISFIED",
+      affectedPaths,
+      ownedDocumentation,
+      reason: "Owned documentation explicitly covers every runtime or high-risk changed path.",
+    };
+  }
+
+  const rawWaiver = declaration.waiver ?? declaration.approval;
+  const waiver = rawWaiver === undefined ? undefined : normalizeDocumentationWaiver(rawWaiver);
+  if (waiver) {
+    const pathsMatch = sameStrings(waiver.paths, affectedPaths);
+    const sourceMatches = waiver.sourceSha === lock.headSha;
+    const impactMatches = waiver.impact === classification.impact;
+    if (pathsMatch && sourceMatches && impactMatches) {
+      return {
+        required: true,
+        status: "WAIVED",
+        affectedPaths,
+        ownedDocumentation,
+        waiver,
+        reason: `Documentation impact was explicitly approved for the locked source and ${affectedPaths.length} exact changed path(s).`,
+      };
+    }
+    const mismatches = [
+      !sourceMatches ? "source SHA" : undefined,
+      !impactMatches ? "impact" : undefined,
+      !pathsMatch ? "path scope" : undefined,
+    ].filter(Boolean).join(", ");
+    return {
+      required: true,
+      status: "BLOCKED",
+      affectedPaths,
+      ownedDocumentation,
+      waiver,
+      reason: `Documentation waiver is not bounded to the locked ${mismatches}.`,
+    };
+  }
+
+  return {
+    required: true,
+    status: "BLOCKED",
+    affectedPaths,
+    ownedDocumentation,
+    reason: uncovered.length
+      ? `Documentation impact is missing owned coverage for ${uncovered.join(", ")}.`
+      : "Documentation impact requires owned documentation or an explicit bounded approval.",
+  };
+}
+
+function normalizeOwnedDocumentation(
+  value: unknown,
+  index: number,
+  classification: DiffClassification,
+  affectedPaths: readonly string[],
+): OwnedDocumentation {
+  const item = asRecord(value, `documentationImpact.ownedDocumentation[${index}]`);
+  const path = normalizeRepoPath(requiredString(item.path, `documentationImpact.ownedDocumentation[${index}].path`));
+  if (!categoriesFor(path).includes("docs")) throw new Error(`Owned documentation path ${path} is not a documentation path.`);
+  const covers = stringArray(item.covers, `documentationImpact.ownedDocumentation[${index}].covers`).map(normalizeRepoPath);
+  const outsideScope = covers.find((coveredPath) => !affectedPaths.includes(coveredPath));
+  if (outsideScope) throw new Error(`Owned documentation coverage ${outsideScope} is outside the locked change scope.`);
+  const owner = requiredString(item.owner, `documentationImpact.ownedDocumentation[${index}].owner`);
+  for (const coveredPath of covers) {
+    const file = classification.files.find((candidate) => candidate.path === coveredPath);
+    const allowedOwners = file ? uniqueSorted([
+      ...file.apps.map((app) => `app:${app}`),
+      ...file.modules.map((module) => `module:${module}`),
+      ...file.engines.map((engine) => `engine:${engine}`),
+    ]) : [];
+    if (!allowedOwners.includes(owner)) {
+      throw new Error(`Owned documentation owner ${owner} does not own ${coveredPath}; expected one of ${allowedOwners.join(", ")}.`);
+    }
+  }
+  return {
+    path,
+    owner,
+    covers,
+  };
+}
+
+function normalizeDocumentationWaiver(value: unknown): DocumentationWaiver {
+  const waiver = asRecord(value, "documentationImpact.waiver");
+  const impact = requiredString(waiver.impact, "documentationImpact.waiver.impact");
+  if (impact !== "RUNTIME" && impact !== "HIGH_RISK") {
+    throw new Error("documentationImpact.waiver.impact must be RUNTIME or HIGH_RISK.");
+  }
+  return {
+    id: requiredString(waiver.id ?? waiver.approvalId, "documentationImpact.waiver.id"),
+    approvedBy: requiredString(waiver.approvedBy ?? waiver.approver, "documentationImpact.waiver.approvedBy"),
+    reason: requiredString(waiver.reason, "documentationImpact.waiver.reason"),
+    sourceSha: gitSha(waiver.sourceSha, "documentationImpact.waiver.sourceSha"),
+    impact,
+    paths: stringArray(waiver.paths, "documentationImpact.waiver.paths").map(normalizeRepoPath),
+  };
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  const normalizedLeft = uniqueSorted(left);
+  const normalizedRight = uniqueSorted(right);
+  return normalizedLeft.length === normalizedRight.length
+    && normalizedLeft.every((value, index) => value === normalizedRight[index]);
 }
 
 function operation(

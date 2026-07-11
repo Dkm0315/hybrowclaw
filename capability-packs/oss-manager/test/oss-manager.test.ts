@@ -4,6 +4,7 @@ import {
   HYBROWLABS_SUITE_CATALOG,
   oss_qa_compensation_register,
   oss_qa_diff_classify,
+  oss_qa_documentation_impact,
   oss_qa_executor_next,
   oss_qa_mutation_record,
   oss_qa_operation_validate,
@@ -15,7 +16,10 @@ import {
   oss_qa_state_record,
   oss_qa_suite_catalog,
   oss_qa_suite_manifest_validate,
+  oss_qa_suite_validation_record,
   oss_qa_use_case_select,
+  oss_qa_validation_coverage,
+  oss_qa_validator_evaluate,
   type EvidenceReceipt,
   type QaAssertion,
   type QaPlan,
@@ -64,7 +68,21 @@ async function fixture(path = "sentinel/failover.ts", profileId = "generic-oss-q
     profileId,
     changes: [{ path, status: "modified", additions: 12, deletions: 3 }],
   });
-  const plan = await oss_qa_scenario_compile({ lock, classification, profileId });
+  const documentationImpact = ["RUNTIME", "HIGH_RISK"].includes(classification.impact)
+    ? {
+      waiver: {
+        id: "test-doc-impact-approval",
+        approvedBy: "test-release-owner",
+        reason: "Test fixture exercises runtime behavior without changing product documentation.",
+        sourceSha: lock.headSha,
+        impact: classification.impact,
+        paths: classification.files
+          .filter((file) => !file.categories.every((category) => category === "docs" || category === "tests"))
+          .map((file) => file.path),
+      },
+    }
+    : undefined;
+  const plan = await oss_qa_scenario_compile({ lock, classification, profileId, documentationImpact });
   const run = await oss_qa_run_create({ lock, plan, startedAt: NOW });
   return { lock, classification, plan, run };
 }
@@ -73,7 +91,7 @@ function receipt(
   run: QaRun,
   state: QaState,
   kind: EvidenceReceipt["kind"],
-  options: { operationId?: string; sourceSha?: string; producerRole?: EvidenceReceipt["producerRole"]; exitCode?: number; suffix?: string } = {},
+  options: { operationId?: string; selectionId?: string; sourceSha?: string; producerRole?: EvidenceReceipt["producerRole"]; observedAt?: string; exitCode?: number; suffix?: string } = {},
 ): EvidenceReceipt {
   const suffix = options.suffix ?? String(++sequence);
   return {
@@ -81,9 +99,10 @@ function receipt(
     state,
     kind,
     operationId: options.operationId,
+    selectionId: options.selectionId,
     producerRole: options.producerRole ?? producerFor(state),
     subject: options.operationId ?? state.toLowerCase(),
-    observedAt: NOW,
+    observedAt: options.observedAt ?? NOW,
     sourceSha: options.sourceSha ?? run.lock.headSha,
     payloadDigest: DIGEST,
     evidenceRef: `artifact://qa/${run.runId}/${state.toLowerCase()}/${suffix}`,
@@ -104,7 +123,11 @@ function assertion(id: string, evidenceId: string, passed = true, subject = "sem
   };
 }
 
-async function passState(run: QaRun): Promise<QaRun> {
+function validatorEvidence(requirements: readonly string[], prefix: string) {
+  return Object.fromEntries(requirements.map((requirement) => [requirement, [`${prefix}-${requirement}`]]));
+}
+
+async function passState(run: QaRun, recordValidations = true): Promise<QaRun> {
   const state = run.currentState;
   const operations = run.plan.operations.filter((operation) => operation.state === state);
   const newReceipts: EvidenceReceipt[] = [];
@@ -140,7 +163,33 @@ async function passState(run: QaRun): Promise<QaRun> {
       probes.push(assertion(`probe-${state}-${subject.operationId ?? "state"}`, probeReceipt.id, true, "independent probe"));
     }
   }
-  return oss_qa_state_record({ run, receipts: newReceipts, assertions, probes, completedAt: NOW });
+  let recorded = await oss_qa_state_record({ run, receipts: newReceipts, assertions, probes, completedAt: NOW });
+  if (state === "COMMAND_MATRIX" && recordValidations) {
+    for (const selection of recorded.plan.useCases.selected) {
+      if (recorded.validationResults.some((result) => result.selectionId === selection.selectionId)) continue;
+      const operation = recorded.plan.operations.find((item) => item.state === "COMMAND_MATRIX" && item.params.selectionId === selection.selectionId);
+      if (!operation) continue;
+      const suiteReceipt = recorded.evidence.find((item) => item.operationId === operation.id && item.kind === "command");
+      const probeReceipt = recorded.evidence.find((item) => item.operationId === operation.id && item.kind === "probe");
+      assert.ok(suiteReceipt);
+      assert.ok(probeReceipt);
+      const evidence = Object.fromEntries(selection.validator.evidenceRequired.map((requirement) => [
+        requirement,
+        [requirement === "independent_probe" ? probeReceipt.id : suiteReceipt.id],
+      ]));
+      recorded = await oss_qa_suite_validation_record({
+        run: recorded,
+        validation: {
+          selectionId: selection.selectionId,
+          validatorId: selection.validator.id,
+          observed: selection.validator.expected,
+          evidence,
+          observedAt: NOW,
+        },
+      });
+    }
+  }
+  return recorded;
 }
 
 async function markNotApplicable(run: QaRun, reason = "No operation is selected for this locked change."): Promise<QaRun> {
@@ -202,11 +251,21 @@ test("sanitized OSS Manager suite catalog covers all 138 source contracts withou
   assert.equal(report.count, 138);
   assert.equal(report.count, HYBROWLABS_SUITE_CATALOG.length);
   assert.equal(report.commandIdCount, 234);
+  assert.equal(report.validatorCount, 138);
   assert.equal(report.containsCommands, false);
   assert.equal(new Set(HYBROWLABS_SUITE_CATALOG.map((item) => item.id)).size, 138);
+  assert.equal(new Set(HYBROWLABS_SUITE_CATALOG.map((item) => item.validator.id)).size, 138);
+  assert.equal(HYBROWLABS_SUITE_CATALOG.every((item) => item.validator.owner.kind === "feature_suite"
+    && item.validator.owner.feature === item.family
+    && item.validator.owner.suiteContractId === item.id
+    && item.validator.deployment.required === (item.risk === "mutation_gated")
+    && item.validator.terminal), true);
   assert.equal(HYBROWLABS_SUITE_CATALOG.some((item) => item.engine === "postgres" && item.suite === "active_active_validate"), true);
   assert.equal(HYBROWLABS_SUITE_CATALOG.some((item) => item.engine === "postgres" && item.suite === "migration_validate"), true);
   assert.equal(JSON.stringify(HYBROWLABS_SUITE_CATALOG).includes('"command"'), false);
+
+  const generic = await fixture();
+  assert.equal(generic.plan.useCases.selected.every((item) => item.validator.owner.suiteContractId === item.id), true);
 });
 
 test("source manifest metadata must match the reviewed suite catalog and rejects raw commands", async () => {
@@ -249,6 +308,161 @@ test("source manifest metadata must match the reviewed suite catalog and rejects
       suites: [{ engine: "redis", suite: "status", configScope: "all", safe: true, commands: ["./ossmgr status"] }],
     },
   }), /forbidden raw execution field commands/);
+});
+
+test("validator verdicts are evaluator-owned and forged pass fields are rejected", async () => {
+  const contract = HYBROWLABS_SUITE_CATALOG.find((item) => item.engine === "qdrant" && item.suite === "health" && item.scopes.includes("standalone"));
+  assert.ok(contract);
+  const observation = {
+    selectionId: `qdrant:${contract.id}`,
+    validatorId: contract.validator.id,
+    observed: { commandExitCodes: {} },
+    evidence: validatorEvidence(contract.validator.evidenceRequired, "health"),
+    observedAt: NOW,
+  };
+  await assert.rejects(
+    oss_qa_validator_evaluate({ contract, observation: { ...observation, passed: true } }),
+    /passed is evaluator-owned/,
+  );
+  const result = await oss_qa_validator_evaluate({ contract, observation });
+  assert.equal(result.verdict, "FAIL");
+  assert.deepEqual(result.expected, contract.validator.expected);
+  assert.deepEqual(result.observed, observation.observed);
+  assert.match(result.reason, /feature-owned expected value/);
+  const selection = {
+    ...contract,
+    selectionId: observation.selectionId,
+    targetEngine: "qdrant" as const,
+    selection: "direct" as const,
+    dispatch: "typed_adapter_required" as const,
+    reason: "forged coverage regression",
+  };
+  const coverage = await oss_qa_validation_coverage({
+    selected: [selection],
+    results: [{ ...result, verdict: "PASS" }],
+  });
+  assert.equal(coverage.passable, false);
+  assert.deepEqual(coverage.invalidSelectionIds, [selection.selectionId]);
+});
+
+test("mutation-gated validators require deploy-then-validate ordering and complete coverage", async () => {
+  const deployContract = HYBROWLABS_SUITE_CATALOG.find((item) => item.engine === "qdrant" && item.suite === "apply" && item.scopes.includes("standalone"));
+  const healthContract = HYBROWLABS_SUITE_CATALOG.find((item) => item.engine === "qdrant" && item.suite === "health" && item.scopes.includes("standalone"));
+  assert.ok(deployContract);
+  assert.ok(healthContract);
+  const deploy = {
+    ...deployContract,
+    selectionId: `qdrant:${deployContract.id}`,
+    targetEngine: "qdrant" as const,
+    selection: "direct" as const,
+    dispatch: "approval_compensation_adapter_required" as const,
+    reason: "deployment contract regression",
+  };
+  const health = {
+    ...healthContract,
+    selectionId: `qdrant:${healthContract.id}`,
+    targetEngine: "qdrant" as const,
+    selection: "adjacent" as const,
+    dispatch: "typed_adapter_required" as const,
+    reason: "post-deployment health regression",
+  };
+  const deploymentObservedAt = "2026-07-10T12:01:00.000Z";
+  const deployResult = await oss_qa_validator_evaluate({
+    contract: deploy,
+    observation: {
+      selectionId: deploy.selectionId,
+      validatorId: deploy.validator.id,
+      observed: deploy.validator.expected,
+      evidence: validatorEvidence(deploy.validator.evidenceRequired, "deploy"),
+      deployment: { evidenceId: "deploy-suite_receipt", observedAt: deploymentObservedAt },
+      observedAt: "2026-07-10T12:02:00.000Z",
+    },
+  });
+  assert.equal(deployResult.verdict, "PASS");
+  const outOfOrderDeployResult = await oss_qa_validator_evaluate({
+    contract: deploy,
+    observation: {
+      selectionId: deploy.selectionId,
+      validatorId: deploy.validator.id,
+      observed: deploy.validator.expected,
+      evidence: validatorEvidence(deploy.validator.evidenceRequired, "deploy-out-of-order"),
+      deployment: { evidenceId: "deploy-out-of-order-suite_receipt", observedAt: deploymentObservedAt },
+      observedAt: "2026-07-10T12:00:00.000Z",
+    },
+  });
+  assert.equal(outOfOrderDeployResult.verdict, "INCONCLUSIVE");
+  assert.match(outOfOrderDeployResult.reason, /after deployment evidence/);
+
+  const earlyHealth = await oss_qa_validator_evaluate({
+    contract: health,
+    observation: {
+      selectionId: health.selectionId,
+      validatorId: health.validator.id,
+      observed: health.validator.expected,
+      evidence: validatorEvidence(health.validator.evidenceRequired, "health-early"),
+      observedAt: "2026-07-10T12:00:00.000Z",
+    },
+  });
+  const earlyCoverage = await oss_qa_validation_coverage({ selected: [deploy, health], results: [deployResult, earlyHealth] });
+  assert.equal(earlyCoverage.complete, true);
+  assert.equal(earlyCoverage.passable, false);
+  assert.equal(earlyCoverage.deploymentOrderFailures.length, 1);
+
+  const lateHealth = await oss_qa_validator_evaluate({
+    contract: health,
+    observation: {
+      selectionId: health.selectionId,
+      validatorId: health.validator.id,
+      observed: health.validator.expected,
+      evidence: validatorEvidence(health.validator.evidenceRequired, "health-late"),
+      observedAt: "2026-07-10T12:03:00.000Z",
+    },
+  });
+  const orderedCoverage = await oss_qa_validation_coverage({ selected: [deploy, health], results: [deployResult, lateHealth] });
+  assert.equal(orderedCoverage.passable, true);
+  const selectionBlockedCoverage = await oss_qa_validation_coverage({
+    selected: [{ ...deploy, blockedReason: "Reviewed adapter binding is unavailable." }, health],
+    results: [deployResult, lateHealth],
+  });
+  assert.equal(selectionBlockedCoverage.passable, false);
+  assert.deepEqual(selectionBlockedCoverage.blockedSelectionIds, [deploy.selectionId]);
+
+  const blockedDeploy = await oss_qa_validator_evaluate({
+    contract: deploy,
+    observation: {
+      selectionId: deploy.selectionId,
+      validatorId: deploy.validator.id,
+      observed: deploy.validator.expected,
+      evidence: validatorEvidence(deploy.validator.evidenceRequired, "deploy-blocked"),
+      deployment: { evidenceId: "deploy-blocked-suite_receipt", observedAt: deploymentObservedAt },
+      observedAt: "2026-07-10T12:02:00.000Z",
+      blockedReason: "Reviewed deployment adapter and exact compensation are not bound.",
+    },
+  });
+  const blockedCoverage = await oss_qa_validation_coverage({ selected: [deploy, health], results: [blockedDeploy, lateHealth] });
+  assert.equal(blockedDeploy.verdict, "BLOCKED");
+  assert.equal(blockedCoverage.passable, false);
+  assert.deepEqual(blockedCoverage.blockedSelectionIds, [deploy.selectionId]);
+});
+
+test("a plan-blocked mutation suite persists BLOCKED even when observed equals expected", async () => {
+  const { run } = await fixture("redis-script/engines/qdrant/apply.py", "hybrowlabs-oss-manager");
+  const selection = run.plan.useCases.selected.find((item) => item.targetEngine === "qdrant" && item.suite === "apply");
+  assert.ok(selection);
+  assert.match(selection.blockedReason ?? "", /not bundled/);
+  const recorded = await oss_qa_suite_validation_record({
+    run,
+    validation: {
+      selectionId: selection.selectionId,
+      validatorId: selection.validator.id,
+      observed: selection.validator.expected,
+      evidence: {},
+      observedAt: NOW,
+    },
+  });
+  const result = recorded.validationResults.find((item) => item.selectionId === selection.selectionId);
+  assert.equal(result?.verdict, "BLOCKED");
+  assert.equal((await oss_qa_report_build({ run: recorded })).verdict, "INCONCLUSIVE");
 });
 
 test("real OSS Manager feature paths select deep direct and adjacent use cases", async () => {
@@ -298,6 +512,12 @@ test("real OSS Manager feature paths select deep direct and adjacent use cases",
   assert.equal(has("valkey", "backup"), true);
   assert.equal(has("observability", "dashboard"), true);
   assert.equal(useCases.selected.filter((item) => item.risk === "mutation_gated").every((item) => item.dispatch === "approval_compensation_adapter_required"), true);
+  assert.equal(useCases.selected.filter((item) => item.risk === "mutation_gated").every((item) => item.blockedReason?.includes("not bundled")), true);
+  assert.equal(useCases.selected.filter((item) => item.risk === "mutation_gated").every((deployment) => useCases.selected.some((validator) => (
+    validator.selectionId !== deployment.selectionId
+      && validator.targetEngine === deployment.targetEngine
+      && validator.family === "health_status"
+  ))), true);
 
   const plan = await oss_qa_scenario_compile({ lock, classification, profileId: "hybrowlabs-oss-manager" });
   assert.equal(plan.scenarios.length <= classification.engines.length * 2, true);
@@ -331,6 +551,70 @@ test("docs-only and test-only changes never select infrastructure mutations", as
     assert.equal(plan.useCases.gatedCount, 0);
     assert.equal(plan.useCases.selected.every((item) => item.selection === "contract"), true);
   }
+});
+
+test("runtime documentation impact requires owned coverage or an exact bounded approval", async () => {
+  const changedPath = "redis/runtime/status.ts";
+  const lock = await oss_qa_source_lock({
+    repository: "https://example.test/customer/app",
+    branch: "dev",
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    lockedAt: NOW,
+  });
+  const classification = await oss_qa_diff_classify({
+    lock,
+    changes: [{ path: changedPath, status: "modified", additions: 8, deletions: 2 }],
+  });
+  const blocked = await oss_qa_documentation_impact({ lock, classification });
+  assert.equal(blocked.status, "BLOCKED");
+  assert.deepEqual(blocked.affectedPaths, [changedPath]);
+
+  const ownedDeclaration = {
+    ownedDocumentation: [{
+      path: "docs/redis/runtime-status.md",
+      owner: "module:redis",
+      covers: [changedPath],
+    }],
+  };
+  const owned = await oss_qa_documentation_impact({ lock, classification, documentationImpact: ownedDeclaration });
+  assert.equal(owned.status, "SATISFIED");
+  await assert.rejects(oss_qa_documentation_impact({
+    lock,
+    classification,
+    documentationImpact: {
+      ownedDocumentation: [{ ...ownedDeclaration.ownedDocumentation[0], owner: "unrelated-team" }],
+    },
+  }), /does not own/);
+
+  const waiver = {
+    id: "doc-impact-approval-42",
+    approvedBy: "release-owner",
+    reason: "The user-facing runtime contract is unchanged for this locked patch.",
+    sourceSha: HEAD_SHA,
+    impact: classification.impact,
+    paths: [changedPath],
+  };
+  const waived = await oss_qa_documentation_impact({ lock, classification, documentationImpact: { waiver } });
+  assert.equal(waived.status, "WAIVED");
+  const unbounded = await oss_qa_documentation_impact({
+    lock,
+    classification,
+    documentationImpact: { waiver: { ...waiver, sourceSha: WRONG_SHA } },
+  });
+  assert.equal(unbounded.status, "BLOCKED");
+  assert.match(unbounded.reason, /source SHA/);
+
+  const blockedPlan = await oss_qa_scenario_compile({ lock, classification });
+  let run = await oss_qa_run_create({ lock, plan: blockedPlan, startedAt: NOW });
+  run = await passState(run); // source
+  run = await passState(run); // diff
+  run = await passState(run); // topology
+  run = await passState(run); // before snapshot
+  run = await passState(run); // docs gate
+  assert.equal(run.stateResults.at(-1)?.verdict, "INCONCLUSIVE");
+  assert.equal(run.currentState, "REPORT");
+  assert.match(run.stateResults.at(-1)?.reason ?? "", /Documentation impact/);
 });
 
 test("unknown custom app changes never inherit an arbitrary engine fault scenario", async () => {
@@ -405,6 +689,22 @@ test("exit code zero without semantic evidence is INCONCLUSIVE, never PASS", asy
   assert.match(result.stateResults[0].reason, /Exit status and receipts alone/);
 });
 
+test("legacy assertion passed=true cannot override mismatched observed state", async () => {
+  const { run } = await fixture();
+  const operation = run.plan.operations.find((item) => item.state === "SOURCE_LOCK");
+  assert.ok(operation);
+  const sourceReceipt = receipt(run, "SOURCE_LOCK", "source", { operationId: operation.id });
+  const forged = {
+    ...assertion("forged-source-lock", sourceReceipt.id),
+    passed: true,
+    expected: "locked source digest",
+    actual: "different source digest",
+  };
+  const result = await oss_qa_state_record({ run, receipts: [sourceReceipt], assertions: [forged], completedAt: NOW });
+  assert.equal(result.stateResults[0].verdict, "FAIL");
+  assert.match(result.stateResults[0].reason, /different source digest/);
+});
+
 test("negative control failure is surfaced even when the command exits zero", async () => {
   const { run } = await fixture();
   const operation = run.plan.operations.find((item) => item.state === "SOURCE_LOCK");
@@ -465,7 +765,7 @@ test("data mismatch is FAIL with raw digest evidence", async () => {
   run = await markNotApplicable(run); // seed
   run = await markNotApplicable(run); // fault
   run = await markNotApplicable(run); // observe
-  run = await markNotApplicable(run); // matrix
+  run = await passState(run); // baseline suite matrix
   assert.equal(run.currentState, "DATA_VERIFY");
   const digest = receipt(run, "DATA_VERIFY", "data_digest", { suffix: "mismatch" });
   const probeReceipt = receipt(run, "DATA_VERIFY", "probe", { producerRole: "invariant-auditor", suffix: "mismatch-probe" });
@@ -612,6 +912,39 @@ test("successful mutation run verifies every operation and every compensation be
   assert.equal(run.mutationLedger.every((entry) => entry.status === "RESTORED"), true);
 });
 
+test("a selected suite without a terminal validation result cannot produce PASS", async () => {
+  const lock = await oss_qa_source_lock({
+    repository: "https://example.test/customer/app",
+    branch: "dev",
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    lockedAt: NOW,
+  });
+  const classification = await oss_qa_diff_classify({ lock, changes: [] });
+  const plan = await oss_qa_scenario_compile({ lock, classification });
+  let run = await oss_qa_run_create({ lock, plan, startedAt: NOW });
+  run = await passState(run); // source
+  run = await passState(run); // diff
+  run = await markNotApplicable(run); // topology
+  run = await markNotApplicable(run); // before
+  run = await passState(run); // gate
+  run = await markNotApplicable(run); // seed
+  run = await markNotApplicable(run); // fault
+  run = await markNotApplicable(run); // observe
+  run = await passState(run, false); // matrix without selected-suite validation
+  run = await markNotApplicable(run); // data
+  run = await markNotApplicable(run, "No mutations were applied."); // restore
+  run = await passState(run); // post-proof
+  run = await passState(run); // report
+  assert.equal(run.status, "INCONCLUSIVE");
+  const report = await oss_qa_report_build({ run });
+  const validations = report.validations as { missingSelectionIds: string[]; complete: boolean; passable: boolean };
+  assert.equal(report.verdict, "INCONCLUSIVE");
+  assert.equal(validations.complete, false);
+  assert.equal(validations.passable, false);
+  assert.deepEqual(validations.missingSelectionIds, plan.useCases.selected.map((item) => item.selectionId));
+});
+
 test("no-change contract completes PASS with explicit NOT_APPLICABLE states", async () => {
   const lock = await oss_qa_source_lock({
     repository: "https://example.test/customer/app",
@@ -631,11 +964,30 @@ test("no-change contract completes PASS with explicit NOT_APPLICABLE states", as
   run = await markNotApplicable(run); // seed
   run = await markNotApplicable(run); // fault
   run = await markNotApplicable(run); // observe
-  run = await markNotApplicable(run); // command matrix
+  run = await passState(run); // baseline suite matrix
   run = await markNotApplicable(run); // data
   run = await markNotApplicable(run, "No mutations were applied."); // restore
   run = await passState(run); // post-proof common operation
   run = await passState(run); // report
   assert.equal(run.status, "PASS");
   assert.equal(run.stateResults.some((result) => result.verdict === "NOT_APPLICABLE"), true);
+  const report = await oss_qa_report_build({ run });
+  const validations = report.validations as {
+    complete: boolean;
+    passable: boolean;
+    results: Array<{ expected: unknown; observed: unknown; reason: string; evidence: Record<string, string[]> }>;
+  };
+  assert.equal(validations.complete, true);
+  assert.equal(validations.passable, true);
+  assert.equal(validations.results.length, 1);
+  assert.deepEqual(validations.results[0].expected, validations.results[0].observed);
+  assert.match(validations.results[0].reason, /feature-owned expected value/);
+  assert.equal(Object.keys(validations.results[0].evidence).length > 0, true);
+  const forgedRun = {
+    ...run,
+    validationResults: run.validationResults.map((result, index) => index === 0
+      ? { ...result, observed: { contractSatisfied: false }, verdict: "PASS" as const }
+      : result),
+  };
+  await assert.rejects(oss_qa_report_build({ run: forgedRun }), /does not match deterministic evaluator output/);
 });

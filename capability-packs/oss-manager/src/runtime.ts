@@ -7,12 +7,15 @@ import type {
   QaPlan,
   QaRun,
   QaState,
+  QaUseCaseSelection,
+  QaValidationResult,
   QaVerdict,
   StateResult,
   TypedOperation,
 } from "./types.js";
 import { normalizeLock, validateTypedOperation } from "./planner.js";
-import { asRecord, isoTimestamp, optionalString, redactExcerpt, requiredString, sha256, shortDigest, uniqueSorted } from "./utils.js";
+import { evaluateValidationCoverage, evaluateValidator, normalizeValidationObservation } from "./validation.js";
+import { asRecord, isoTimestamp, optionalString, redactExcerpt, requiredString, sha256, shortDigest, stableStringify, uniqueSorted } from "./utils.js";
 
 const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/i;
 const PROBE_REQUIRED = new Set<QaState>(["TOPOLOGY", "BEFORE_SNAPSHOT", "SEED", "FAULT", "OBSERVE", "COMMAND_MATRIX", "DATA_VERIFY", "RESTORE", "POST_PROOF"]);
@@ -66,10 +69,33 @@ export function createRunFromArgs(args: Record<string, unknown>): QaRun {
     startedAt,
     stateResults: [],
     evidence: [],
+    validationResults: [],
     mutationLedger: [],
     failureOrigins: [],
     recovery: { requested: false, pendingOperationIds: [] },
   };
+}
+
+export function recordSuiteValidationFromArgs(args: Record<string, unknown>): QaRun {
+  const run = normalizeRun(args.run);
+  assertRunning(run);
+  const raw = args.validations ?? (args.validation === undefined ? undefined : [args.validation]);
+  if (!Array.isArray(raw) || !raw.length) throw new Error("validation or validations must contain at least one observation.");
+  const validationResults = [...run.validationResults];
+  for (const value of raw) {
+    const observation = normalizeValidationObservation(value);
+    const selection = run.plan.useCases.selected.find((item) => item.selectionId === observation.selectionId);
+    if (!selection) throw new Error(`Validation selection ${observation.selectionId} is not in locked plan ${run.plan.planId}.`);
+    if (validationResults.some((result) => result.selectionId === selection.selectionId)) {
+      throw new Error(`Validation selection ${selection.selectionId} already has an immutable terminal result.`);
+    }
+    const result = evaluateValidator(selection.validator, selection.blockedReason
+      ? { ...observation, blockedReason: selection.blockedReason }
+      : observation);
+    validateValidationEvidence(run, selection, result);
+    validationResults.push(result);
+  }
+  return { ...run, validationResults };
 }
 
 export function registerCompensationFromArgs(args: Record<string, unknown>): QaRun {
@@ -185,7 +211,7 @@ export function recordStateFromArgs(args: Record<string, unknown>): QaRun {
       stateResults,
       failureOrigins,
       evidence,
-      status: finalVerdict(stateResults, run.mutationLedger),
+      status: finalVerdict(stateResults, run.mutationLedger, run.plan, run.validationResults),
       finishedAt: completedAt,
       recovery: { ...run.recovery, pendingOperationIds: pendingRestores(run.mutationLedger).map((entry) => entry.operationId) },
     };
@@ -249,7 +275,7 @@ export function nextDispatchFromArgs(args: Record<string, unknown>): Record<stri
   }
   const operations = run.plan.operations.filter((operation) => operation.state === run.currentState);
   const dispatchable: TypedOperation[] = [];
-  const blocked: Array<{ operationId?: string; useCaseId?: string; reason: string }> = [];
+  const blocked: Array<{ operationId?: string; useCaseId?: string; validatorId?: string; reason: string }> = [];
   for (const operation of operations) {
     if (!operation.mutating) {
       dispatchable.push(operation);
@@ -265,7 +291,8 @@ export function nextDispatchFromArgs(args: Record<string, unknown>): Record<stri
     for (const useCase of run.plan.useCases.selected.filter((item) => item.risk === "mutation_gated")) {
       blocked.push({
         useCaseId: useCase.selectionId,
-        reason: "bind_reviewed_typed_adapter_and_exact_compensation_before_dispatch",
+        validatorId: useCase.validator.id,
+        reason: useCase.blockedReason ?? "bind_reviewed_typed_adapter_and_exact_compensation_before_dispatch",
       });
     }
   }
@@ -280,7 +307,8 @@ export function nextDispatchFromArgs(args: Record<string, unknown>): Record<stri
 
 export function buildReportFromArgs(args: Record<string, unknown>): Record<string, unknown> {
   const run = normalizeRun(args.run);
-  const verdict = run.status === "RUNNING" ? finalVerdict(run.stateResults, run.mutationLedger) : run.status;
+  const coverage = evaluateValidationCoverage(run.plan.useCases.selected, run.validationResults);
+  const verdict = finalVerdict(run.stateResults, run.mutationLedger, run.plan, run.validationResults);
   const stateCounts = Object.fromEntries(
     (["PASS", "FAIL", "INCONCLUSIVE", "NOT_APPLICABLE", "RESTORE_FAILED"] as const).map((status) => [status, run.stateResults.filter((result) => result.verdict === status).length]),
   );
@@ -292,6 +320,7 @@ export function buildReportFromArgs(args: Record<string, unknown>): Record<strin
     verdict,
     summary: summaryFor(verdict, run, pending.length),
     stateCounts,
+    documentationImpact: run.plan.documentationImpact,
     useCases: {
       catalogVersion: run.plan.useCases.catalogVersion,
       catalogDigest: run.plan.useCases.catalogDigest,
@@ -307,7 +336,13 @@ export function buildReportFromArgs(args: Record<string, unknown>): Record<strin
         selection: item.selection,
         risk: item.risk,
         dispatch: item.dispatch,
+        validatorId: item.validator.id,
+        blockedReason: item.blockedReason,
       })),
+    },
+    validations: {
+      ...coverage,
+      results: run.validationResults,
     },
     scenarios: run.plan.scenarios.map((scenario) => ({
       id: scenario.id,
@@ -323,11 +358,20 @@ export function buildReportFromArgs(args: Record<string, unknown>): Record<strin
       pending: pending.map((entry) => entry.operationId),
     },
     failures: run.failureOrigins,
+    validationFailures: run.validationResults
+      .filter((result) => result.verdict !== "PASS")
+      .map((result) => ({
+        selectionId: result.selectionId,
+        validatorId: result.validatorId,
+        verdict: result.verdict,
+        reason: result.reason,
+      })),
     evidence: run.evidence.map((receipt) => ({
       id: receipt.id,
       state: receipt.state,
       kind: receipt.kind,
       operationId: receipt.operationId,
+      selectionId: receipt.selectionId,
       subject: receipt.subject,
       payloadDigest: receipt.payloadDigest,
       evidenceRef: receipt.evidenceRef,
@@ -342,9 +386,18 @@ export function normalizeRun(value: unknown): QaRun {
   if (run.schemaVersion !== 1) throw new Error("run.schemaVersion must be 1.");
   if (!QA_STATES.includes(run.currentState)) throw new Error("run.currentState is invalid.");
   if (!Array.isArray(run.stateResults) || !Array.isArray(run.evidence) || !Array.isArray(run.mutationLedger)) throw new Error("run is missing state, evidence, or mutation ledgers.");
+  const rawValidationResults = (run as QaRun & { validationResults?: unknown }).validationResults ?? [];
+  if (!Array.isArray(rawValidationResults)) throw new Error("run.validationResults must be an array.");
   const lock = normalizeLock(run.lock);
   const plan = normalizePlan(run.plan, lock.lockDigest, lock.headSha);
-  return { ...run, lock, plan };
+  const normalized: QaRun = { ...run, lock, plan, validationResults: [] };
+  const validationResults = rawValidationResults.map((result) => normalizePersistedValidation(normalized, result));
+  const complete = { ...normalized, validationResults };
+  if (complete.status !== "RUNNING") {
+    const expectedStatus = finalVerdict(complete.stateResults, complete.mutationLedger, complete.plan, complete.validationResults);
+    if (complete.status !== expectedStatus) throw new Error(`Run status ${complete.status} does not match deterministic verdict ${expectedStatus}.`);
+  }
+  return complete;
 }
 
 function evaluateState(
@@ -377,6 +430,9 @@ function evaluateState(
   if (missingOperationId) return inconclusiveFor(state, `Operation ${missingOperationId} has no evidence receipt.`);
   const unappliedMutation = plannedOperations.find((operation) => operation.mutating && run.mutationLedger.find((entry) => entry.operationId === operation.id)?.status !== "APPLIED");
   if (unappliedMutation) return inconclusiveFor(state, `Mutation ${unappliedMutation.id} is not APPLIED through the compensation ledger.`);
+  if (state === "GATE" && run.plan.documentationImpact.status === "BLOCKED") {
+    return inconclusiveFor(state, run.plan.documentationImpact.reason);
+  }
   if (!assertions.length) return inconclusiveFor(state, "Exit status and receipts alone cannot pass; a semantic assertion is required.");
   const receiptIds = new Set(receipts.map((receipt) => receipt.id));
   const missingAssertionEvidence = [...assertions, ...probes].find((assertion) => !assertion.evidenceIds.length || assertion.evidenceIds.some((id) => !receiptIds.has(id)));
@@ -430,11 +486,20 @@ function inconclusiveFor(state: QaState, reason: string): { verdict: QaVerdict; 
   return { verdict: state === "RESTORE" ? "RESTORE_FAILED" : "INCONCLUSIVE", reason };
 }
 
-function finalVerdict(results: readonly StateResult[], ledger: readonly MutationLedgerEntry[]): QaVerdict {
+function finalVerdict(
+  results: readonly StateResult[],
+  ledger: readonly MutationLedgerEntry[],
+  plan: QaPlan,
+  validationResults: readonly QaValidationResult[],
+): QaVerdict {
   if (ledger.some((entry) => entry.status === "RESTORE_FAILED") || results.some((result) => result.verdict === "RESTORE_FAILED")) return "RESTORE_FAILED";
   if (pendingRestores(ledger).length) return "RESTORE_FAILED";
-  if (results.some((result) => result.verdict === "FAIL")) return "FAIL";
+  if (results.some((result) => result.verdict === "FAIL") || validationResults.some((result) => result.verdict === "FAIL")) return "FAIL";
+  if (plan.documentationImpact.status === "BLOCKED") return "INCONCLUSIVE";
+  const coverage = evaluateValidationCoverage(plan.useCases.selected, validationResults);
+  if (!coverage.passable) return "INCONCLUSIVE";
   if (results.some((result) => result.verdict === "INCONCLUSIVE")) return "INCONCLUSIVE";
+  if (!results.some((result) => result.state === "REPORT")) return "INCONCLUSIVE";
   if (results.length && results.every((result) => result.verdict === "NOT_APPLICABLE")) return "NOT_APPLICABLE";
   return "PASS";
 }
@@ -449,10 +514,17 @@ function normalizePlan(value: unknown, lockDigest: string, sourceSha: string): Q
   if (!Array.isArray(plan.operations) || !Array.isArray(plan.scenarios) || !plan.useCases || !Array.isArray(plan.useCases.selected)) {
     throw new Error("Plan is missing operations, scenarios, or use-case contracts.");
   }
+  if (!plan.documentationImpact
+    || !["NOT_REQUIRED", "SATISFIED", "WAIVED", "BLOCKED"].includes(plan.documentationImpact.status)
+    || !Array.isArray(plan.documentationImpact.affectedPaths)
+    || !Array.isArray(plan.documentationImpact.ownedDocumentation)) {
+    throw new Error("Plan is missing a deterministic documentation-impact decision.");
+  }
   const expectedDigest = sha256({
     profileId: plan.profileId,
     lockDigest: plan.lockDigest,
     sourceSha: plan.sourceSha,
+    documentationImpact: plan.documentationImpact,
     useCases: plan.useCases,
     scenarios: plan.scenarios,
     operations: plan.operations,
@@ -463,6 +535,7 @@ function normalizePlan(value: unknown, lockDigest: string, sourceSha: string): Q
     profileId: plan.profileId,
     lockDigest: plan.lockDigest,
     sourceSha: plan.sourceSha,
+    documentationImpact: plan.documentationImpact,
     useCases: plan.useCases,
     scenarios: plan.scenarios,
     operations: plan.operations,
@@ -499,6 +572,7 @@ function normalizeReceipt(value: unknown, state: QaState): EvidenceReceipt {
     state,
     kind,
     operationId: optionalString(receipt.operationId),
+    selectionId: optionalString(receipt.selectionId),
     producerRole,
     subject: requiredString(receipt.subject, "receipt.subject"),
     observedAt: isoTimestamp(receipt.observedAt, "receipt.observedAt"),
@@ -510,25 +584,116 @@ function normalizeReceipt(value: unknown, state: QaState): EvidenceReceipt {
   };
 }
 
-function normalizeAssertions(value: unknown, label: string): QaAssertion[] {
+function normalizeAssertions(value: unknown, label: string): Array<QaAssertion & { readonly passed: boolean }> {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw new Error(`${label} must be an array.`);
   return value.map((item, index) => {
     const assertion = asRecord(item, `${label}[${index}]`);
-    if (typeof assertion.passed !== "boolean") throw new Error(`${label}[${index}].passed must be boolean.`);
+    if (assertion.passed !== undefined && typeof assertion.passed !== "boolean") throw new Error(`${label}[${index}].passed must be boolean when supplied.`);
     if (!Array.isArray(assertion.evidenceIds) || !assertion.evidenceIds.every((id) => typeof id === "string" && id.trim())) {
       throw new Error(`${label}[${index}].evidenceIds must contain receipt IDs.`);
     }
+    const expected = requiredString(assertion.expected, `${label}[${index}].expected`);
+    const actual = requiredString(assertion.actual, `${label}[${index}].actual`);
     return {
       id: requiredString(assertion.id, `${label}[${index}].id`),
       subject: requiredString(assertion.subject, `${label}[${index}].subject`),
-      passed: assertion.passed,
+      passed: stableStringify(actual) === stableStringify(expected),
       evidenceIds: uniqueSorted(assertion.evidenceIds as string[]),
-      expected: requiredString(assertion.expected, `${label}[${index}].expected`),
-      actual: requiredString(assertion.actual, `${label}[${index}].actual`),
+      expected,
+      actual,
       producerRole: normalizeRole(assertion.producerRole, `${label}[${index}].producerRole`),
     };
   });
+}
+
+function normalizePersistedValidation(run: QaRun, value: unknown): QaValidationResult {
+  const persisted = asRecord(value, "run.validationResults[]");
+  const selectionId = requiredString(persisted.selectionId, "run.validationResults[].selectionId");
+  const selection = run.plan.useCases.selected.find((item) => item.selectionId === selectionId);
+  if (!selection) throw new Error(`Persisted validation selection ${selectionId} is not in locked plan ${run.plan.planId}.`);
+  const deploymentEvidenceId = optionalString(persisted.deploymentEvidenceId);
+  const deploymentObservedAt = optionalString(persisted.deploymentObservedAt);
+  if (Boolean(deploymentEvidenceId) !== Boolean(deploymentObservedAt)) {
+    throw new Error(`Persisted validation ${selectionId} has incomplete deployment evidence metadata.`);
+  }
+  const observation = {
+    selectionId,
+    validatorId: requiredString(persisted.validatorId, "run.validationResults[].validatorId"),
+    observed: persisted.observed,
+    evidence: persisted.evidence,
+    observedAt: persisted.observedAt,
+    blockedReason: persisted.verdict === "BLOCKED"
+      ? requiredString(persisted.reason, "run.validationResults[].reason")
+      : undefined,
+    deployment: deploymentEvidenceId && deploymentObservedAt
+      ? { evidenceId: deploymentEvidenceId, observedAt: deploymentObservedAt }
+      : undefined,
+  };
+  const evaluated = evaluateValidator(selection.validator, observation);
+  if (selection.blockedReason && evaluated.verdict !== "BLOCKED") {
+    throw new Error(`Persisted validation ${selectionId} cannot pass a blocked suite selection.`);
+  }
+  validateValidationEvidence(run, selection, evaluated);
+  if (stableStringify(persisted) !== stableStringify(evaluated)) {
+    throw new Error(`Persisted validation ${selectionId} does not match deterministic evaluator output.`);
+  }
+  return evaluated;
+}
+
+function validateValidationEvidence(
+  run: QaRun,
+  selection: QaUseCaseSelection,
+  result: QaValidationResult,
+): void {
+  const receipts = new Map(run.evidence.map((receipt) => [receipt.id, receipt]));
+  for (const evidenceId of result.evidenceIds) {
+    const receipt = receipts.get(evidenceId);
+    if (!receipt) throw new Error(`Validation ${selection.selectionId} references unknown evidence ${evidenceId}.`);
+    if (receipt.sourceSha !== run.lock.headSha) throw new Error(`Validation evidence ${evidenceId} does not use locked SHA ${run.lock.headSha}.`);
+    if (Date.parse(receipt.observedAt) > Date.parse(result.observedAt)) {
+      throw new Error(`Validation ${selection.selectionId} predates evidence ${evidenceId}.`);
+    }
+  }
+
+  const requiredReceipt = (requirement: string, predicate: (receipt: EvidenceReceipt) => boolean, label: string): void => {
+    const ids = result.evidence[requirement] ?? [];
+    if (ids.length && !ids.some((id) => {
+      const receipt = receipts.get(id);
+      return receipt ? predicate(receipt) : false;
+    })) throw new Error(`Validation ${selection.selectionId} ${requirement} must reference ${label}.`);
+  };
+  requiredReceipt("suite_receipt", (receipt) => receipt.kind === "command" && receiptMatchesSelection(run, receipt, selection), "a command receipt bound to the selected suite");
+  requiredReceipt("independent_probe", (receipt) => receipt.kind === "probe"
+    && ["invariant-auditor", "recovery-controller"].includes(receipt.producerRole)
+    && receiptMatchesSelection(run, receipt, selection), "an independent probe receipt bound to the selected suite");
+  requiredReceipt("post_restore_proof", (receipt) => receipt.kind === "proof", "a post-restore proof receipt");
+  requiredReceipt("registered_compensation", (receipt) => receipt.kind === "gate" && receiptMatchesSelection(run, receipt, selection), "a suite-bound compensation gate receipt");
+
+  if (result.deploymentEvidenceId) {
+    const deploymentReceipt = receipts.get(result.deploymentEvidenceId);
+    if (!deploymentReceipt) throw new Error(`Deployment evidence ${result.deploymentEvidenceId} is not in run evidence.`);
+    if (deploymentReceipt.kind !== "command" || !receiptMatchesSelection(run, deploymentReceipt, selection)) {
+      throw new Error(`Deployment evidence ${result.deploymentEvidenceId} is not bound to ${selection.selectionId}.`);
+    }
+    if (deploymentReceipt.observedAt !== result.deploymentObservedAt) {
+      throw new Error(`Deployment timestamp for ${selection.selectionId} does not match its evidence receipt.`);
+    }
+    if (!(result.evidence.suite_receipt ?? []).includes(deploymentReceipt.id)) {
+      throw new Error(`Deployment evidence ${deploymentReceipt.id} must also be declared as suite_receipt evidence.`);
+    }
+  }
+}
+
+function receiptMatchesSelection(run: QaRun, receipt: EvidenceReceipt, selection: QaUseCaseSelection): boolean {
+  const operation = receipt.operationId
+    ? run.plan.operations.find((candidate) => candidate.id === receipt.operationId)
+    : undefined;
+  const operationSelectionId = typeof operation?.params.selectionId === "string"
+    ? operation.params.selectionId
+    : undefined;
+  if (receipt.selectionId && operationSelectionId && receipt.selectionId !== operationSelectionId) return false;
+  return (receipt.selectionId ?? operationSelectionId) === selection.selectionId;
 }
 
 function normalizeRole(value: unknown, label: string): PolicyRoleId {
@@ -558,8 +723,16 @@ function assertUniqueEvidence(existing: readonly EvidenceReceipt[], incoming: re
 function summaryFor(verdict: QaVerdict, run: QaRun, pending: number): string {
   if (verdict === "PASS") return `${run.plan.scenarios.length} scenario(s) passed with semantic evidence and verified restoration.`;
   if (verdict === "RESTORE_FAILED") return `Recovery is not complete; ${pending} mutation(s) still require operator attention.`;
-  if (verdict === "FAIL") return `${run.failureOrigins.length} verified failure(s) were found; see raw evidence receipts.`;
-  if (verdict === "INCONCLUSIVE") return "The run did not collect enough independent evidence to certify a result.";
+  if (verdict === "FAIL") {
+    const validationFailures = run.validationResults.filter((result) => result.verdict === "FAIL").length;
+    return `${run.failureOrigins.length + validationFailures} verified failure(s) were found; see structured validation results and raw evidence receipts.`;
+  }
+  if (verdict === "INCONCLUSIVE") {
+    const coverage = evaluateValidationCoverage(run.plan.useCases.selected, run.validationResults);
+    return coverage.missingSelectionIds.length
+      ? `${coverage.missingSelectionIds.length} selected suite(s) lack a terminal validation result.`
+      : "The run did not collect enough independent evidence to certify a result.";
+  }
   return "No selected scenario applied to this locked change.";
 }
 

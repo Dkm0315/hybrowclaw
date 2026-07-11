@@ -51,6 +51,8 @@ export type QaUseCaseFamily =
   | "destructive_dry_run";
 export type QaUseCaseRisk = "read_only" | "mutation_gated" | "destructive_plan";
 export type QaUseCaseDispatch = "typed_adapter_required" | "approval_adapter_required" | "approval_compensation_adapter_required";
+export type QaValidationVerdict = "PASS" | "FAIL" | "INCONCLUSIVE" | "BLOCKED";
+export type DocumentationImpactStatus = "NOT_REQUIRED" | "SATISFIED" | "WAIVED" | "BLOCKED";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
@@ -146,6 +148,25 @@ export interface TypedOperation {
   readonly evidenceRequired: readonly string[];
 }
 
+export interface QaValidatorOwner {
+  readonly kind: "feature_suite";
+  readonly feature: QaUseCaseFamily;
+  readonly suiteContractId: string;
+}
+
+export interface QaSuiteValidator {
+  readonly id: string;
+  readonly owner: QaValidatorOwner;
+  readonly operator: "deep_equal";
+  readonly expected: JsonValue;
+  readonly evidenceRequired: readonly string[];
+  readonly terminal: true;
+  readonly deployment: {
+    readonly required: boolean;
+    readonly postDeploymentFamilies: readonly QaUseCaseFamily[];
+  };
+}
+
 export interface QaSuiteContract {
   readonly id: string;
   readonly engine: QaSuiteEngineId;
@@ -157,6 +178,7 @@ export interface QaSuiteContract {
   readonly compensationRequired: boolean;
   readonly commandIds: readonly string[];
   readonly evidenceRequired: readonly string[];
+  readonly validator: QaSuiteValidator;
 }
 
 export interface QaUseCaseSelection extends QaSuiteContract {
@@ -164,6 +186,7 @@ export interface QaUseCaseSelection extends QaSuiteContract {
   readonly targetEngine?: EngineId;
   readonly selection: "direct" | "adjacent" | "contract";
   readonly dispatch: QaUseCaseDispatch;
+  readonly blockedReason?: string;
   readonly reason: string;
 }
 
@@ -175,6 +198,30 @@ export interface QaUseCasePlan {
   readonly selected: readonly QaUseCaseSelection[];
   readonly readOnlyCount: number;
   readonly gatedCount: number;
+}
+
+export interface OwnedDocumentation {
+  readonly path: string;
+  readonly owner: string;
+  readonly covers: readonly string[];
+}
+
+export interface DocumentationWaiver {
+  readonly id: string;
+  readonly approvedBy: string;
+  readonly reason: string;
+  readonly sourceSha: string;
+  readonly impact: Extract<ChangeImpact, "RUNTIME" | "HIGH_RISK">;
+  readonly paths: readonly string[];
+}
+
+export interface DocumentationImpactGate {
+  readonly required: boolean;
+  readonly status: DocumentationImpactStatus;
+  readonly affectedPaths: readonly string[];
+  readonly ownedDocumentation: readonly OwnedDocumentation[];
+  readonly waiver?: DocumentationWaiver;
+  readonly reason: string;
 }
 
 export interface QaScenario {
@@ -196,6 +243,7 @@ export interface QaPlan {
   readonly profileId: string;
   readonly lockDigest: string;
   readonly sourceSha: string;
+  readonly documentationImpact: DocumentationImpactGate;
   readonly useCases: QaUseCasePlan;
   readonly scenarios: readonly QaScenario[];
   readonly operations: readonly TypedOperation[];
@@ -213,6 +261,7 @@ export interface EvidenceReceipt {
   readonly state: QaState;
   readonly kind: "source" | "diff" | "topology" | "snapshot" | "gate" | "command" | "probe" | "data_digest" | "restore" | "proof" | "report" | "negative_control";
   readonly operationId?: string;
+  readonly selectionId?: string;
   readonly producerRole: PolicyRoleId;
   readonly subject: string;
   readonly observedAt: string;
@@ -226,11 +275,62 @@ export interface EvidenceReceipt {
 export interface QaAssertion {
   readonly id: string;
   readonly subject: string;
-  readonly passed: boolean;
+  /** @deprecated Evaluators derive the verdict from expected and actual. */
+  readonly passed?: boolean;
   readonly evidenceIds: readonly string[];
   readonly expected: string;
   readonly actual: string;
   readonly producerRole: PolicyRoleId;
+}
+
+export interface QaValidationEvidence {
+  readonly [requirement: string]: readonly string[];
+}
+
+export interface QaValidationObservation {
+  readonly selectionId: string;
+  readonly validatorId: string;
+  readonly observed: JsonValue;
+  readonly evidence: QaValidationEvidence;
+  readonly observedAt: string;
+  readonly blockedReason?: string;
+  readonly deployment?: {
+    readonly evidenceId: string;
+    readonly observedAt: string;
+  };
+}
+
+export interface QaValidationResult {
+  readonly id: string;
+  readonly selectionId: string;
+  readonly validatorId: string;
+  readonly owner: QaValidatorOwner;
+  readonly verdict: QaValidationVerdict;
+  readonly terminal: true;
+  readonly expected: JsonValue;
+  readonly observed: JsonValue;
+  readonly reason: string;
+  readonly evidence: QaValidationEvidence;
+  readonly evidenceIds: readonly string[];
+  readonly observedAt: string;
+  readonly deploymentEvidenceId?: string;
+  readonly deploymentObservedAt?: string;
+}
+
+export interface QaValidationCoverage {
+  readonly expectedCount: number;
+  readonly terminalCount: number;
+  readonly passedCount: number;
+  readonly complete: boolean;
+  readonly passable: boolean;
+  readonly missingSelectionIds: readonly string[];
+  readonly failedSelectionIds: readonly string[];
+  readonly inconclusiveSelectionIds: readonly string[];
+  readonly blockedSelectionIds: readonly string[];
+  readonly duplicateSelectionIds: readonly string[];
+  readonly invalidSelectionIds: readonly string[];
+  readonly unexpectedSelectionIds: readonly string[];
+  readonly deploymentOrderFailures: readonly string[];
 }
 
 export interface StateResult {
@@ -267,6 +367,7 @@ export interface QaRun {
   readonly finishedAt?: string;
   readonly stateResults: readonly StateResult[];
   readonly evidence: readonly EvidenceReceipt[];
+  readonly validationResults: readonly QaValidationResult[];
   readonly mutationLedger: readonly MutationLedgerEntry[];
   readonly failureOrigins: readonly { readonly state: QaState; readonly verdict: QaVerdict; readonly reason: string }[];
   readonly recovery: {

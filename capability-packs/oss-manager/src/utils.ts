@@ -45,6 +45,11 @@ export function jsonRecord(value: unknown, label: string): Readonly<Record<strin
   return sortValue(record) as Readonly<Record<string, JsonValue>>;
 }
 
+export function jsonValue(value: unknown, label: string): JsonValue {
+  assertJsonValue(value, label);
+  return sortValue(value) as JsonValue;
+}
+
 export function redactExcerpt(value: unknown): string | undefined {
   const raw = optionalString(value);
   if (!raw) return undefined;
