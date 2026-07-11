@@ -32,7 +32,22 @@ export function sessionHandlesPath(cwd = process.cwd()): string {
 
 type Store = Record<string, SessionHandleRecord>;
 const recordKey = (backendId: string, conversationKey: string): string => `${backendId}:${conversationKey}`;
-const KNOWN_BACKENDS = ["codex", "claude"] as const;
+const STORE_TAILS = new Map<string, Promise<void>>();
+
+async function withStoreLock<T>(cwd: string, operation: () => Promise<T>): Promise<T> {
+  const path = sessionHandlesPath(cwd);
+  const previous = STORE_TAILS.get(path)?.catch(() => undefined) ?? Promise.resolve();
+  let release!: () => void;
+  const tail = new Promise<void>((resolve) => { release = resolve; });
+  STORE_TAILS.set(path, tail);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (STORE_TAILS.get(path) === tail) STORE_TAILS.delete(path);
+  }
+}
 
 async function load(cwd: string): Promise<Store> {
   try {
@@ -54,39 +69,45 @@ async function persist(store: Store, cwd: string): Promise<void> {
 }
 
 export async function loadSessionHandle(conversationKey: string, backendId: string, cwd = process.cwd()): Promise<SessionHandleRecord | undefined> {
-  return (await load(cwd))[recordKey(backendId, conversationKey)];
+  return withStoreLock(cwd, async () => (await load(cwd))[recordKey(backendId, conversationKey)]);
 }
 
 export async function saveSessionHandle(record: SessionHandleRecord, cwd = process.cwd()): Promise<void> {
-  const store = await load(cwd);
-  store[recordKey(record.backendId, record.conversationKey)] = record;
-  await persist(store, cwd);
+  await withStoreLock(cwd, async () => {
+    const store = await load(cwd);
+    store[recordKey(record.backendId, record.conversationKey)] = record;
+    await persist(store, cwd);
+  });
 }
 
 export async function clearSessionHandle(conversationKey: string, backendId: string, cwd = process.cwd()): Promise<void> {
-  const store = await load(cwd);
-  const key = recordKey(backendId, conversationKey);
-  if (!(key in store)) return;
-  delete store[key];
-  await persist(store, cwd);
+  await withStoreLock(cwd, async () => {
+    const store = await load(cwd);
+    const key = recordKey(backendId, conversationKey);
+    if (!(key in store)) return;
+    delete store[key];
+    await persist(store, cwd);
+  });
 }
 
 export async function clearConversationSessionHandles(
   conversationKey: string,
   cwd = process.cwd(),
-  backendIds: readonly string[] = KNOWN_BACKENDS,
+  backendIds?: readonly string[],
 ): Promise<number> {
-  const store = await load(cwd);
-  let removed = 0;
-  for (const backendId of backendIds) {
-    const key = recordKey(backendId, conversationKey);
-    if (key in store) {
-      delete store[key];
-      removed += 1;
+  return withStoreLock(cwd, async () => {
+    const store = await load(cwd);
+    const allowedBackends = backendIds ? new Set(backendIds) : undefined;
+    let removed = 0;
+    for (const [key, record] of Object.entries(store)) {
+      if (record.conversationKey === conversationKey && (!allowedBackends || allowedBackends.has(record.backendId))) {
+        delete store[key];
+        removed += 1;
+      }
     }
-  }
-  if (removed > 0) await persist(store, cwd);
-  return removed;
+    if (removed > 0) await persist(store, cwd);
+    return removed;
+  });
 }
 
 /**

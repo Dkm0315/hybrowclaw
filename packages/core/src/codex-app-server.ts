@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
@@ -14,9 +14,25 @@ export interface CodexAppServerRunInput {
   readonly env?: Record<string, string>;
   readonly timeoutMs?: number;
   readonly command?: string;
+  /** Persisted Codex thread to re-open when no warm process is cached. */
+  readonly threadId?: string;
+  /** Stable conversation identity. Omit it to disable cross-call process reuse. */
   readonly cacheKey?: string;
+  /** Long-lived host that owns the warm process (gateway, RPC server, or TUI). */
+  readonly transportOwner?: string;
   readonly keepAlive?: boolean;
   readonly onDelta?: (text: string) => void;
+}
+
+export type CodexAppServerCacheState = "hit" | "miss" | "shared-miss" | "disabled";
+
+export interface CodexAppServerTimings {
+  readonly startupMs: number;
+  readonly queueMs: number;
+  readonly threadOpenMs: number;
+  readonly requestToFirstDeltaMs?: number;
+  readonly cacheState: CodexAppServerCacheState;
+  readonly threadOpenState: "cached" | "started" | "resumed";
 }
 
 export interface CodexAppServerRunResult {
@@ -25,6 +41,7 @@ export interface CodexAppServerRunResult {
   readonly threadId?: string;
   readonly durationMs: number;
   readonly firstDeltaMs?: number;
+  readonly timings?: CodexAppServerTimings;
   readonly errorMessage?: string;
   readonly tokenUsage?: {
     readonly inputTokens?: number;
@@ -43,6 +60,9 @@ interface PendingRequest {
 interface CachedSession {
   readonly client: CodexAppServerClient;
   readonly threadId: string;
+  readonly cacheKey: string;
+  readonly conversationKey?: string;
+  readonly transportOwner?: string;
   readonly cwd: string;
   readonly model?: string;
   readonly scopeKey: string;
@@ -52,60 +72,79 @@ interface CachedSession {
   queue: Promise<void>;
 }
 
+interface CreatedSession {
+  readonly session: CachedSession;
+  readonly startupMs: number;
+  readonly threadOpenMs: number;
+  readonly threadOpenState: "started" | "resumed";
+}
+
+interface SessionLease extends CreatedSession {
+  readonly cacheState: CodexAppServerCacheState;
+}
+
+interface SessionCreation {
+  readonly conversationKey?: string;
+  readonly transportOwner?: string;
+  readonly requestedThreadId?: string;
+  waiters: number;
+  client?: CodexAppServerClient;
+  promise: Promise<CreatedSession>;
+}
+
+interface ClientMetadata {
+  readonly conversationKey?: string;
+  readonly transportOwner?: string;
+  session?: CachedSession;
+}
+
 const SESSION_CACHE = new Map<string, CachedSession>();
-let sessionCacheTail = Promise.resolve();
+const SESSION_CREATIONS = new Map<string, SessionCreation>();
+const ACTIVE_CLIENTS = new Map<CodexAppServerClient, ClientMetadata>();
 const DEFAULT_SESSION_CACHE_SIZE = 8;
 const DEFAULT_SESSION_IDLE_MS = 30 * 60_000;
 
-export function clearCodexAppServerSessions(): void {
-  for (const session of SESSION_CACHE.values()) session.client.close();
-  SESSION_CACHE.clear();
+export function clearCodexAppServerSessions(transportOwner?: string): void {
+  for (const [key, session] of SESSION_CACHE) {
+    if (transportOwner === undefined || session.transportOwner === transportOwner) SESSION_CACHE.delete(key);
+  }
+  for (const [key, creation] of SESSION_CREATIONS) {
+    if (transportOwner === undefined || creation.transportOwner === transportOwner) SESSION_CREATIONS.delete(key);
+  }
+  for (const [client, metadata] of ACTIVE_CLIENTS) {
+    if (transportOwner === undefined || metadata.transportOwner === transportOwner) client.close();
+  }
+}
+
+/** Drop only one conversation's warm process; other chats keep their cache state. */
+export function clearCodexAppServerConversation(conversationKey: string, transportOwner?: string): void {
+  for (const [key, session] of SESSION_CACHE) {
+    if (session.conversationKey !== conversationKey || (transportOwner !== undefined && session.transportOwner !== transportOwner)) continue;
+    SESSION_CACHE.delete(key);
+  }
+  for (const [key, creation] of SESSION_CREATIONS) {
+    if (creation.conversationKey !== conversationKey || (transportOwner !== undefined && creation.transportOwner !== transportOwner)) continue;
+    SESSION_CREATIONS.delete(key);
+    creation.client?.close();
+  }
+  for (const [client, metadata] of ACTIVE_CLIENTS) {
+    if (metadata.conversationKey !== conversationKey || (transportOwner !== undefined && metadata.transportOwner !== transportOwner)) continue;
+    if (!metadata.session || metadata.session.pendingRuns === 0) client.close();
+  }
 }
 
 export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<CodexAppServerRunResult> {
   if (!input.prompt.trim()) throw new Error("Codex prompt is required.");
   const started = Date.now();
-  const keepAlive = input.keepAlive ?? true;
+  const keepAlive = (input.keepAlive ?? true) && input.cacheKey !== undefined;
   const instructionsHash = await hashInstructionsFile(input.instructionsFile);
   const command = resolveCodexCommand(input.command);
-  const scopeKey = appServerScopeKey(input, command);
+  const conversationIdentity = input.cacheKey ?? `anonymous:${randomUUID()}`;
+  const scopeKey = appServerScopeKey(input, command, conversationIdentity);
   const key = `${scopeKey}\0instructions:${instructionsHash}`;
-  let cached: CachedSession;
+  let lease: SessionLease;
   try {
-    cached = await withSessionCacheLock(async () => {
-      pruneSessionCache(Date.now(), key);
-      let session = keepAlive ? SESSION_CACHE.get(key) : undefined;
-      if (session?.client.isAlive()) {
-        session.lastUsedAt = Date.now();
-        SESSION_CACHE.delete(key);
-        SESSION_CACHE.set(key, session);
-        return session;
-      }
-      session?.client.close();
-      SESSION_CACHE.delete(key);
-      closeSupersededSessions(scopeKey);
-      const cacheable = keepAlive && makeSessionCacheRoom(key);
-      const client = new CodexAppServerClient({
-        command,
-        cwd: input.cwd,
-        model: input.model,
-        reasoning: input.reasoning,
-        instructionsFile: input.instructionsFile,
-        networkAccess: input.networkAccess,
-        env: input.env,
-      });
-      try {
-      await client.initialize();
-      const threadId = await client.startThread(input.cwd);
-      const now = Date.now();
-        session = { client, threadId, cwd: input.cwd, model: input.model, scopeKey, createdAt: now, lastUsedAt: now, pendingRuns: 0, queue: Promise.resolve() };
-        if (cacheable) SESSION_CACHE.set(key, session);
-        return session;
-      } catch (error) {
-        client.close();
-        throw error;
-      }
-    });
+    lease = await acquireSession({ input, command, key, scopeKey, keepAlive });
   } catch (error) {
     return {
       status: "failed",
@@ -115,40 +154,160 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
     };
   }
 
-  return await runExclusive(cached, async () => {
-    const turn = await cached.client.runTurn({
-      threadId: cached.threadId,
+  let queueMs = 0;
+  return await runExclusive(lease.session, async (measuredQueueMs) => {
+    queueMs = measuredQueueMs;
+    let firstDeltaAt: number | undefined;
+    const turn = await lease.session.client.runTurn({
+      threadId: lease.session.threadId,
       prompt: input.prompt,
       timeoutMs: input.timeoutMs ?? 180_000,
-      onDelta: input.onDelta,
+      onDelta: (text) => {
+        firstDeltaAt ??= Date.now();
+        input.onDelta?.(text);
+      },
     });
+    const requestToFirstDeltaMs = firstDeltaAt === undefined ? undefined : firstDeltaAt - started;
     const result = {
       status: turn.errorMessage ? "failed" : "completed",
       finalMessage: turn.finalMessage,
-      threadId: cached.threadId,
+      threadId: lease.session.threadId,
       durationMs: Date.now() - started,
       firstDeltaMs: turn.firstDeltaMs,
+      timings: appServerTimings(lease, queueMs, requestToFirstDeltaMs),
       errorMessage: turn.errorMessage,
       tokenUsage: turn.tokenUsage,
     } as const;
-    if (!keepAlive || SESSION_CACHE.get(key) !== cached) cached.client.close();
-    else pruneSessionCache(Date.now(), key);
+    if (SESSION_CACHE.get(key) === lease.session) pruneSessionCache(Date.now(), key);
     return result;
   }).catch((error: unknown) => {
-      cached.client.close();
-      if (SESSION_CACHE.get(key) === cached) SESSION_CACHE.delete(key);
+      lease.session.client.close();
+      if (SESSION_CACHE.get(key) === lease.session) SESSION_CACHE.delete(key);
       return {
         status: "failed",
         finalMessage: "",
-        threadId: cached.threadId,
+        threadId: lease.session.threadId,
         durationMs: Date.now() - started,
+        timings: appServerTimings(lease, queueMs),
         errorMessage: error instanceof Error ? error.message : String(error),
       };
     });
 }
 
-async function runExclusive<T>(session: CachedSession, task: () => Promise<T>): Promise<T> {
-  session.pendingRuns += 1;
+function appServerTimings(lease: SessionLease, queueMs: number, requestToFirstDeltaMs?: number): CodexAppServerTimings {
+  return {
+    startupMs: lease.startupMs,
+    queueMs,
+    threadOpenMs: lease.threadOpenMs,
+    requestToFirstDeltaMs,
+    cacheState: lease.cacheState,
+    threadOpenState: lease.cacheState === "hit" ? "cached" : lease.threadOpenState,
+  };
+}
+
+async function acquireSession(input: {
+  readonly input: CodexAppServerRunInput;
+  readonly command: string;
+  readonly key: string;
+  readonly scopeKey: string;
+  readonly keepAlive: boolean;
+}): Promise<SessionLease> {
+  const { key, scopeKey, keepAlive } = input;
+  pruneSessionCache(Date.now(), key);
+  const cached = keepAlive ? SESSION_CACHE.get(key) : undefined;
+  if (cached?.client.isAlive() && (!input.input.threadId || cached.threadId === input.input.threadId)) {
+    cached.pendingRuns += 1;
+    cached.lastUsedAt = Date.now();
+    SESSION_CACHE.delete(key);
+    SESSION_CACHE.set(key, cached);
+    return { session: cached, startupMs: 0, threadOpenMs: 0, threadOpenState: "started", cacheState: "hit" };
+  }
+  if (cached) invalidateCachedSession(key, cached);
+  if (keepAlive) closeSupersededSessions(scopeKey, key);
+
+  const existing = keepAlive ? SESSION_CREATIONS.get(key) : undefined;
+  if (existing) {
+    if (existing.requestedThreadId !== input.input.threadId) {
+      await existing.promise.catch(() => undefined);
+      return acquireSession(input);
+    }
+    existing.waiters += 1;
+    const created = await existing.promise;
+    return { ...created, cacheState: "shared-miss" };
+  }
+
+  const creation = {
+    conversationKey: input.input.cacheKey,
+    transportOwner: input.input.transportOwner,
+    requestedThreadId: input.input.threadId,
+    waiters: 1,
+  } as SessionCreation;
+  creation.promise = createSession(input, creation).finally(() => {
+    if (SESSION_CREATIONS.get(key) === creation) SESSION_CREATIONS.delete(key);
+  });
+  if (keepAlive) SESSION_CREATIONS.set(key, creation);
+  const created = await creation.promise;
+  return { ...created, cacheState: keepAlive ? "miss" : "disabled" };
+}
+
+async function createSession(
+  input: {
+    readonly input: CodexAppServerRunInput;
+    readonly command: string;
+    readonly key: string;
+    readonly scopeKey: string;
+    readonly keepAlive: boolean;
+  },
+  creation: SessionCreation,
+): Promise<CreatedSession> {
+  const startupStartedAt = Date.now();
+  const client = new CodexAppServerClient({
+    command: input.command,
+    cwd: input.input.cwd,
+    model: input.input.model,
+    reasoning: input.input.reasoning,
+    instructionsFile: input.input.instructionsFile,
+    networkAccess: input.input.networkAccess,
+    env: input.input.env,
+    onClose: () => ACTIVE_CLIENTS.delete(client),
+  });
+  creation.client = client;
+  const metadata: ClientMetadata = { conversationKey: input.input.cacheKey, transportOwner: input.input.transportOwner };
+  ACTIVE_CLIENTS.set(client, metadata);
+  try {
+    await client.initialize();
+    const startupMs = Date.now() - startupStartedAt;
+    const threadOpenStartedAt = Date.now();
+    const threadId = input.input.threadId
+      ? await client.resumeThread(input.input.threadId, input.input.cwd)
+      : await client.startThread(input.input.cwd);
+    const threadOpenMs = Date.now() - threadOpenStartedAt;
+    const now = Date.now();
+    const session: CachedSession = {
+      client,
+      threadId,
+      cacheKey: input.key,
+      conversationKey: input.input.cacheKey,
+      transportOwner: input.input.transportOwner,
+      cwd: input.input.cwd,
+      model: input.input.model,
+      scopeKey: input.scopeKey,
+      createdAt: now,
+      lastUsedAt: now,
+      pendingRuns: creation.waiters,
+      queue: Promise.resolve(),
+    };
+    metadata.session = session;
+    if (input.keepAlive && makeSessionCacheRoom(input.key)) SESSION_CACHE.set(input.key, session);
+    return { session, startupMs, threadOpenMs, threadOpenState: input.input.threadId ? "resumed" : "started" };
+  } catch (error) {
+    client.close();
+    throw error;
+  }
+}
+
+async function runExclusive<T>(session: CachedSession, task: (queueMs: number) => Promise<T>): Promise<T> {
+  const queuedAt = Date.now();
   const previous = session.queue.catch(() => {});
   let release!: () => void;
   session.queue = new Promise<void>((resolve) => {
@@ -156,11 +315,12 @@ async function runExclusive<T>(session: CachedSession, task: () => Promise<T>): 
   });
   await previous;
   try {
-    return await task();
+    return await task(Date.now() - queuedAt);
   } finally {
     session.pendingRuns -= 1;
     session.lastUsedAt = Date.now();
     release();
+    if (session.pendingRuns === 0 && SESSION_CACHE.get(session.cacheKey) !== session) session.client.close();
   }
 }
 
@@ -169,10 +329,11 @@ function positiveIntegerEnv(name: string, fallback: number, minimum: number, max
   return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
 }
 
-function appServerScopeKey(input: CodexAppServerRunInput, command: string): string {
+function appServerScopeKey(input: CodexAppServerRunInput, command: string, conversationIdentity: string): string {
   const env = [...Object.entries(input.env ?? {})].sort(([left], [right]) => left.localeCompare(right));
   return createHash("sha256").update(JSON.stringify({
-    conversation: input.cacheKey ?? "",
+    conversation: conversationIdentity,
+    transportOwner: input.transportOwner ?? "",
     cwd: input.cwd,
     model: input.model ?? "",
     reasoning: input.reasoning ?? "",
@@ -184,13 +345,18 @@ function appServerScopeKey(input: CodexAppServerRunInput, command: string): stri
 
 function closeCachedSession(key: string, session: CachedSession): void {
   if (session.pendingRuns > 0) return;
-  session.client.close();
   SESSION_CACHE.delete(key);
+  session.client.close();
 }
 
-function closeSupersededSessions(scopeKey: string): void {
+function invalidateCachedSession(key: string, session: CachedSession): void {
+  SESSION_CACHE.delete(key);
+  if (session.pendingRuns === 0) session.client.close();
+}
+
+function closeSupersededSessions(scopeKey: string, protectedKey: string): void {
   for (const [key, session] of SESSION_CACHE) {
-    if (session.scopeKey === scopeKey) closeCachedSession(key, session);
+    if (key !== protectedKey && session.scopeKey === scopeKey) invalidateCachedSession(key, session);
   }
 }
 
@@ -207,21 +373,11 @@ function makeSessionCacheRoom(protectedKey: string): boolean {
 function pruneSessionCache(now: number, protectedKey: string): void {
   const idleMs = positiveIntegerEnv("MUSTER_NATIVE_SESSION_IDLE_MS", DEFAULT_SESSION_IDLE_MS, 1_000, 24 * 60 * 60_000);
   for (const [key, session] of SESSION_CACHE) {
-    if (key !== protectedKey && (!session.client.isAlive() || now - session.lastUsedAt >= idleMs)) closeCachedSession(key, session);
+    if (key === protectedKey) continue;
+    if (!session.client.isAlive()) invalidateCachedSession(key, session);
+    else if (now - session.lastUsedAt >= idleMs) closeCachedSession(key, session);
   }
   makeSessionCacheRoom(protectedKey);
-}
-
-async function withSessionCacheLock<T>(operation: () => Promise<T>): Promise<T> {
-  const previous = sessionCacheTail.catch(() => undefined);
-  let release!: () => void;
-  sessionCacheTail = new Promise<void>((resolve) => { release = resolve; });
-  await previous;
-  try {
-    return await operation();
-  } finally {
-    release();
-  }
 }
 
 async function hashInstructionsFile(path: string | undefined): Promise<string> {
@@ -232,6 +388,7 @@ async function hashInstructionsFile(path: string | undefined): Promise<string> {
 
 class CodexAppServerClient {
   private readonly child: ChildProcessWithoutNullStreams;
+  private readonly onClose?: () => void;
   private nextId = 1;
   private stdoutBuffer = "";
   private readonly pending = new Map<number, PendingRequest>();
@@ -248,7 +405,9 @@ class CodexAppServerClient {
     readonly instructionsFile?: string;
     readonly networkAccess?: boolean;
     readonly env?: Record<string, string>;
+    readonly onClose?: () => void;
   }) {
+    this.onClose = input.onClose;
     const args = ["app-server", "--stdio"];
     if (input.model) args.push("-c", `model=${JSON.stringify(input.model)}`);
     if (input.reasoning) args.push("-c", `model_reasoning_effort=${JSON.stringify(input.reasoning === "none" ? "low" : input.reasoning)}`);
@@ -261,14 +420,11 @@ class CodexAppServerClient {
     });
     this.child.stdout.on("data", (chunk: Buffer) => this.readStdout(chunk.toString("utf8")));
     this.child.stderr.on("data", (chunk: Buffer) => this.readStderr(chunk.toString("utf8")));
+    this.child.on("error", (error) => {
+      this.finishClose(new Error(this.formatError(`codex app-server failed to start: ${error.message}`)));
+    });
     this.child.on("exit", () => {
-      this.closed = true;
-      const error = new Error(this.formatError("codex app-server exited"));
-      for (const pending of this.pending.values()) {
-        clearTimeout(pending.timer);
-        pending.reject(error);
-      }
-      this.pending.clear();
+      this.finishClose(new Error(this.formatError("codex app-server exited")));
     });
   }
 
@@ -278,17 +434,15 @@ class CodexAppServerClient {
 
   close(): void {
     if (this.closed) return;
-    this.closed = true;
-    for (const pending of this.pending.values()) clearTimeout(pending.timer);
-    this.pending.clear();
-    this.child.stdin.destroy();
+    this.finishClose(new Error(this.formatError("codex app-server closed")));
     this.child.kill();
+    this.child.stdin.destroy();
   }
 
   async initialize(): Promise<void> {
     await this.request("initialize", {
       clientInfo: { name: "muster", title: "Muster", version: "0.1" },
-      capabilities: {},
+      capabilities: { experimentalApi: true },
     }, 10_000);
     this.notify("initialized");
   }
@@ -299,6 +453,15 @@ class CodexAppServerClient {
     const threadId = stringValue(thread.id) ?? stringValue(thread.sessionId) ?? stringValue(result.sessionId) ?? stringValue(result.threadId);
     if (!threadId) throw new Error("codex app-server thread/start returned no thread id");
     return threadId;
+  }
+
+  async resumeThread(threadId: string, cwd: string): Promise<string> {
+    const result = await this.request("thread/resume", { threadId, cwd, excludeTurns: true }, 30_000);
+    const thread = asRecord(result.thread);
+    const resumedId = stringValue(thread.id) ?? stringValue(thread.sessionId) ?? stringValue(result.sessionId) ?? stringValue(result.threadId);
+    if (!resumedId) throw new Error("codex app-server thread/resume returned no thread id");
+    if (resumedId !== threadId) throw new Error(`codex app-server resumed unexpected thread ${resumedId}; expected ${threadId}`);
+    return resumedId;
   }
 
   async runTurn(input: {
@@ -323,6 +486,7 @@ class CodexAppServerClient {
     let tokenUsage: CodexAppServerRunResult["tokenUsage"] | undefined;
 
     while (Date.now() - started < input.timeoutMs) {
+      if (!this.isAlive()) throw new Error(this.formatError("codex app-server exited during turn"));
       const message = await this.takeNotification(250);
       if (!message) continue;
       const method = stringValue(message.method) ?? "";
@@ -452,6 +616,17 @@ class CodexAppServerClient {
   private formatError(message: string): string {
     const tail = this.stderrLines.slice(-12).join("\n");
     return tail ? `${message}\ncodex stderr:\n${tail}` : message;
+  }
+
+  private finishClose(error: Error): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
+    this.onClose?.();
   }
 }
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, writeFile, appendFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, writeFile, appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { test } from "node:test";
@@ -363,6 +363,69 @@ rl.on("line", (line) => {
     else process.env.MUSTER_CODEX_COMMAND = previousCommand;
     if (previousTransport === undefined) delete process.env.MUSTER_CODEX_TRANSPORT;
     else process.env.MUSTER_CODEX_TRANSPORT = previousTransport;
+  }
+});
+
+test("executeRun re-opens the persisted Codex thread after warm cache eviction", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-run-codex-resume-"));
+  const fake = join(cwd, "codex-fake.mjs");
+  const resumeLog = join(cwd, "resume.log");
+  await writeFile(fake, `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+let threadId = "thread-persisted";
+function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ id: msg.id, result: { userAgent: "fake" } });
+  else if (msg.method === "thread/start") send({ id: msg.id, result: { thread: { id: threadId } } });
+  else if (msg.method === "thread/resume") {
+    appendFileSync(${JSON.stringify(resumeLog)}, JSON.stringify(msg.params) + "\\n");
+    threadId = msg.params.threadId;
+    send({ id: msg.id, result: { thread: { id: threadId } } });
+  } else if (msg.method === "turn/start") {
+    send({ id: msg.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
+    send({ method: "item/agentMessage/delta", params: { threadId, turnId: "turn-1", itemId: "m", delta: threadId } });
+    send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m", text: threadId }, threadId, turnId: "turn-1" } });
+    send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  const previousCommand = process.env.MUSTER_CODEX_COMMAND;
+  process.env.MUSTER_CODEX_COMMAND = fake;
+  try {
+    const base = {
+      cwd,
+      workspaceDir: cwd,
+      runtime: "codex" as const,
+      conversationKey: "gateway:resume-test",
+      nativeSession: true,
+      nativeTransport: "warm" as const,
+      skipRecall: true,
+      skipSkillSelection: true,
+      skipAgentRules: true,
+      skipMemoryWrite: true,
+    };
+    const first = await executeRun(defaultConfig(), { ...base, prompt: "one" });
+    clearCodexAppServerSessions();
+    const second = await executeRun(defaultConfig(), { ...base, prompt: "two" });
+
+    assert.equal(first.episode.responseText, "thread-persisted");
+    assert.equal(second.episode.responseText, "thread-persisted");
+    assert.equal(second.timings?.providerTransport, "warm");
+    assert.equal(second.timings?.providerCacheState, "miss");
+    assert.equal(second.timings?.providerThreadOpenState, "resumed");
+    assert.equal(typeof second.timings?.providerRequestToFirstDeltaMs, "number");
+    const resume = JSON.parse((await readFile(resumeLog, "utf8")).trim()) as Record<string, unknown>;
+    assert.equal(resume.threadId, "thread-persisted");
+    assert.equal(resume.cwd, cwd);
+    assert.equal(resume.excludeTurns, true);
+  } finally {
+    clearCodexAppServerSessions();
+    if (previousCommand === undefined) delete process.env.MUSTER_CODEX_COMMAND;
+    else process.env.MUSTER_CODEX_COMMAND = previousCommand;
   }
 });
 

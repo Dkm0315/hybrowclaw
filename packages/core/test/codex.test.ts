@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { buildCodexArgs, parseCodexEvents, runCodex } from "../src/codex.js";
-import { clearCodexAppServerSessions, runCodexAppServer } from "../src/codex-app-server.js";
+import { clearCodexAppServerConversation, clearCodexAppServerSessions, runCodexAppServer } from "../src/codex-app-server.js";
 
 test("buildCodexArgs: fresh turn runs codex exec at full native power", () => {
   const args = buildCodexArgs({
@@ -107,7 +107,7 @@ rl.on("line", (line) => {
   const msg = JSON.parse(line);
   if (msg.method === "initialize") send({ id: msg.id, result: { userAgent: "fake" } });
   else if (msg.method === "initialized") {}
-  else if (msg.method === "thread/start") send({ id: msg.id, result: { thread: { id: threadId } } });
+  else if (msg.method === "thread/start") setTimeout(() => send({ id: msg.id, result: { thread: { id: threadId } } }), 40);
   else if (msg.method === "turn/start") {
     turn += 1;
     send({ id: msg.id, result: { turn: { id: "turn-" + turn, status: "inProgress" } } });
@@ -131,6 +131,17 @@ rl.on("line", (line) => {
     assert.equal(typeof second.firstDeltaMs, "number");
     assert.deepEqual(deltas, ["ok1", "ok2"]);
     assert.equal(second.tokenUsage?.cachedInputTokens, 10);
+    assert.equal(first.timings?.cacheState, "miss");
+    assert.equal(first.timings?.threadOpenState, "started");
+    assert.equal(typeof first.timings?.startupMs, "number");
+    assert.equal(typeof first.timings?.threadOpenMs, "number");
+    assert.equal(typeof first.timings?.requestToFirstDeltaMs, "number");
+    assert.ok((first.timings?.requestToFirstDeltaMs ?? 0) >= 35, "cold request-to-first-delta includes thread startup");
+    assert.equal(second.timings?.cacheState, "hit");
+    assert.equal(second.timings?.threadOpenState, "cached");
+    assert.equal(second.timings?.startupMs, 0);
+    assert.equal(second.timings?.threadOpenMs, 0);
+    assert.ok((second.timings?.requestToFirstDeltaMs ?? Infinity) < (first.timings?.requestToFirstDeltaMs ?? 0), "warm hit excludes cold startup from request latency");
   } finally {
     clearCodexAppServerSessions();
     await rm(dir, { recursive: true, force: true });
@@ -177,8 +188,138 @@ rl.on("line", async (line) => {
 
     assert.equal(one.finalMessage, "ok:one");
     assert.equal(two.finalMessage, "ok:two");
+    assert.ok(Math.max(one.timings?.queueMs ?? 0, two.timings?.queueMs ?? 0) >= 40, "one concurrent turn reports its warm-session queue delay");
     const events = (await readFile(log, "utf8")).trim().split("\n");
     assert.deepEqual(events, ["start:warm", "done:warm", "start:one", "done:one", "start:two", "done:two"]);
+  } finally {
+    clearCodexAppServerSessions();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runCodexAppServer: resumes a persisted thread after the warm process is gone", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "muster-codex-app-server-resume-"));
+  const fake = join(dir, "codex-fake.mjs");
+  const resumeLog = join(dir, "resume.json");
+  await writeFile(fake, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+let threadId = "thread-" + process.pid;
+function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ id: msg.id, result: { userAgent: "fake" } });
+  else if (msg.method === "thread/start") send({ id: msg.id, result: { thread: { id: threadId } } });
+  else if (msg.method === "thread/resume") {
+    writeFileSync(${JSON.stringify(resumeLog)}, JSON.stringify(msg.params));
+    threadId = msg.params.threadId;
+    send({ id: msg.id, result: { thread: { id: threadId } } });
+  } else if (msg.method === "turn/start") {
+    send({ id: msg.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
+    send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m", text: threadId }, threadId, turnId: "turn-1" } });
+    send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  try {
+    const first = await runCodexAppServer({ prompt: "one", cwd: dir, command: fake, cacheKey: "resume-chat" });
+    clearCodexAppServerSessions();
+    const second = await runCodexAppServer({ prompt: "two", cwd: dir, command: fake, cacheKey: "resume-chat", threadId: first.threadId });
+
+    assert.equal(first.status, "completed");
+    assert.equal(second.status, "completed");
+    assert.equal(second.threadId, first.threadId);
+    assert.equal(second.timings?.threadOpenState, "resumed");
+    assert.deepEqual(JSON.parse(await readFile(resumeLog, "utf8")), {
+      threadId: first.threadId,
+      cwd: dir,
+      excludeTurns: true,
+    });
+  } finally {
+    clearCodexAppServerSessions();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runCodexAppServer: cold starts are single-flight per key and parallel across conversations", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "muster-codex-app-server-flights-"));
+  const fake = join(dir, "codex-fake.mjs");
+  const opensLog = join(dir, "opens.log");
+  await writeFile(fake, `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+const threadId = "thread-" + process.pid;
+let turn = 0;
+function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ id: msg.id, result: { userAgent: "fake" } });
+  else if (msg.method === "thread/start") {
+    appendFileSync(${JSON.stringify(opensLog)}, process.pid + ":" + Date.now() + "\\n");
+    setTimeout(() => send({ id: msg.id, result: { thread: { id: threadId } } }), 900);
+  } else if (msg.method === "turn/start") {
+    turn += 1;
+    const turnId = "turn-" + turn;
+    send({ id: msg.id, result: { turn: { id: turnId, status: "inProgress" } } });
+    send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m-" + turn, text: threadId }, threadId, turnId } });
+    send({ method: "turn/completed", params: { threadId, turn: { id: turnId, status: "completed" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  try {
+    const [a1, a2, b] = await Promise.all([
+      runCodexAppServer({ prompt: "A1", cwd: dir, command: fake, cacheKey: "A" }),
+      runCodexAppServer({ prompt: "A2", cwd: dir, command: fake, cacheKey: "A" }),
+      runCodexAppServer({ prompt: "B", cwd: dir, command: fake, cacheKey: "B" }),
+    ]);
+
+    assert.equal(a1.threadId, a2.threadId, "same-key callers share one cold process");
+    assert.notEqual(a1.threadId, b.threadId, "different conversations stay isolated");
+    assert.deepEqual(new Set([a1.timings?.cacheState, a2.timings?.cacheState]), new Set(["miss", "shared-miss"]));
+    const opens = (await readFile(opensLog, "utf8")).trim().split("\n").map((line) => Number(line.split(":")[1]));
+    assert.equal(opens.length, 2, "one process per cold conversation key");
+    assert.ok(Math.abs(opens[0] - opens[1]) < 700, "different cold keys initialize without a global lock");
+  } finally {
+    clearCodexAppServerSessions();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("clearCodexAppServerConversation invalidates only the targeted warm conversation", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "muster-codex-app-server-invalidate-"));
+  const fake = join(dir, "codex-fake.mjs");
+  await writeFile(fake, `#!/usr/bin/env node
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+const threadId = "thread-" + process.pid;
+function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ id: msg.id, result: { userAgent: "fake" } });
+  else if (msg.method === "thread/start") send({ id: msg.id, result: { thread: { id: threadId } } });
+  else if (msg.method === "turn/start") {
+    send({ id: msg.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
+    send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m", text: threadId }, threadId, turnId: "turn-1" } });
+    send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  try {
+    const firstA = await runCodexAppServer({ prompt: "A1", cwd: dir, command: fake, cacheKey: "A" });
+    const firstB = await runCodexAppServer({ prompt: "B1", cwd: dir, command: fake, cacheKey: "B" });
+    clearCodexAppServerConversation("A");
+    const secondA = await runCodexAppServer({ prompt: "A2", cwd: dir, command: fake, cacheKey: "A" });
+    const secondB = await runCodexAppServer({ prompt: "B2", cwd: dir, command: fake, cacheKey: "B" });
+
+    assert.notEqual(secondA.threadId, firstA.threadId);
+    assert.equal(secondA.timings?.cacheState, "miss");
+    assert.equal(secondB.threadId, firstB.threadId);
+    assert.equal(secondB.timings?.cacheState, "hit");
   } finally {
     clearCodexAppServerSessions();
     await rm(dir, { recursive: true, force: true });

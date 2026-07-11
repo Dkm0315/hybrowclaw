@@ -41,17 +41,32 @@ test("saving the same key overwrites; clear removes only that key", async () => 
   assert.equal((await loadSessionHandle("other", "codex", cwd))?.handle, "keep", "clear is surgical");
 });
 
-test("clearConversationSessionHandles removes all known backend handles for one conversation", async () => {
+test("concurrent session-handle saves preserve every conversation", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-sh-concurrent-"));
+  const records = Array.from({ length: 24 }, (_, index) => rec({
+    conversationKey: `conversation-${index}`,
+    handle: `thread-${index}`,
+  }));
+
+  await Promise.all(records.map((record) => saveSessionHandle(record, cwd)));
+
+  const loaded = await Promise.all(records.map((record) => loadSessionHandle(record.conversationKey, record.backendId, cwd)));
+  assert.deepEqual(loaded.map((record) => record?.handle), records.map((record) => record.handle));
+});
+
+test("clearConversationSessionHandles removes every backend handle for one conversation", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-sh-clear-all-"));
   await saveSessionHandle(rec({ backendId: "codex", handle: "codex-thread" }), cwd);
   await saveSessionHandle(rec({ backendId: "claude", handle: "claude-session" }), cwd);
+  await saveSessionHandle(rec({ backendId: "future-provider", handle: "future-session" }), cwd);
   await saveSessionHandle(rec({ backendId: "codex", conversationKey: "other", handle: "keep" }), cwd);
 
   const removed = await clearConversationSessionHandles("telegram:bot:c1", cwd);
 
-  assert.equal(removed, 2);
+  assert.equal(removed, 3);
   assert.equal(await loadSessionHandle("telegram:bot:c1", "codex", cwd), undefined);
   assert.equal(await loadSessionHandle("telegram:bot:c1", "claude", cwd), undefined);
+  assert.equal(await loadSessionHandle("telegram:bot:c1", "future-provider", cwd), undefined);
   assert.equal((await loadSessionHandle("other", "codex", cwd))?.handle, "keep");
 });
 

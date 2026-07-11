@@ -7,8 +7,8 @@ import { defaultHookBus, type HookBus } from "./hooks.js";
 import { appendGoalLoopTurn, buildGoalLoopTurn, rememberedMemoryWrite, type GoalLoopMemoryWrite } from "./goal-loop.js";
 import { runClaudeCode } from "./claude.js";
 import { runCodex } from "./codex.js";
-import { runCodexAppServer } from "./codex-app-server.js";
-import { canReuseHandle, clearSessionHandle, loadSessionHandle, saveSessionHandle } from "./session-handle.js";
+import { clearCodexAppServerConversation, clearCodexAppServerSessions, runCodexAppServer } from "./codex-app-server.js";
+import { canReuseHandle, clearConversationSessionHandles, clearSessionHandle, loadSessionHandle, saveSessionHandle } from "./session-handle.js";
 import { renderConversation } from "./compactor.js";
 import { messagesToTranscript, openSessionStore } from "./sessions.js";
 
@@ -78,6 +78,8 @@ export interface RunOptions {
   readonly nativeSessionKeepAlive?: boolean;
   /** Native transport preference. "warm" reuses app-server/session transports where supported; "exec" forces one process per turn. */
   readonly nativeTransport?: "auto" | "warm" | "exec";
+  /** Long-lived host that owns warm native transports, for targeted shutdown. */
+  readonly nativeTransportOwner?: string;
   /**
    * Conversation identity (e.g. the surface conversation id). When set, the
    * native provider session for THIS conversation is resumed across turns via
@@ -133,10 +135,27 @@ export interface RunTimingBreakdown {
   readonly firstTokenMs?: number;
   readonly providerTransport?: string;
   readonly providerAttemptCount?: number;
+  readonly providerStartupMs?: number;
+  readonly providerQueueMs?: number;
+  readonly providerThreadOpenMs?: number;
+  readonly providerRequestToFirstDeltaMs?: number;
+  readonly providerCacheState?: string;
+  readonly providerThreadOpenState?: string;
   readonly fallbackMs?: number;
   readonly backendFallbackMs?: number;
   readonly memoryWriteMs?: number;
   readonly persistMs: number;
+}
+
+/** Provider-neutral lifecycle boundary used by long-lived gateway/RPC hosts. */
+export function closeWarmProviderTransports(transportOwner?: string): void {
+  clearCodexAppServerSessions(transportOwner);
+}
+
+/** Clear persisted and in-memory native continuity for one conversation only. */
+export async function invalidateNativeConversation(conversationKey: string, cwd = process.cwd()): Promise<number> {
+  clearCodexAppServerConversation(conversationKey);
+  return clearConversationSessionHandles(conversationKey, cwd);
 }
 
 interface LocalFastAnswer {
@@ -228,6 +247,12 @@ interface AttemptResult {
   readonly sessionId?: string;
   readonly firstTokenMs?: number;
   readonly providerTransport?: string;
+  readonly providerStartupMs?: number;
+  readonly providerQueueMs?: number;
+  readonly providerThreadOpenMs?: number;
+  readonly providerRequestToFirstDeltaMs?: number;
+  readonly providerCacheState?: string;
+  readonly providerThreadOpenState?: string;
   readonly backendFallbackMs?: number;
   readonly tokenUsage?: {
     readonly inputTokens?: number;
@@ -370,10 +395,10 @@ const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
           networkAccess: true,
           env: codexEnv,
           timeoutMs: options.timeoutMs,
+          threadId: reuse ? stored.handle : (options.resume ? options.sessionId : undefined),
           keepAlive: options.nativeSessionKeepAlive ?? true,
-          cacheKey: options.conversationKey
-            ? `${options.conversationKey}\0${workspaceDir}\0${route.model ?? ""}`
-            : undefined,
+          cacheKey: options.conversationKey,
+          transportOwner: options.nativeTransportOwner,
           onDelta: options.onDelta,
         })
       : await runCodex({
@@ -408,6 +433,7 @@ const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
         })
       : codexResult;
     const backendFallbackMs = useAppServer && codexResult.status === "failed" ? Date.now() - backendFallbackStartedAt : 0;
+    const appServerTimings = useAppServer && "timings" in codexResult ? codexResult.timings : undefined;
     // Persist the thread for next turn on success; drop a broken thread on
     // failure so it is never resumed into a dead end.
     if (useNativeSession && options.conversationKey) {
@@ -441,6 +467,12 @@ const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
       providerTransport: useAppServer
         ? (codexResult.status === "failed" ? "warm-fallback-exec" : "warm")
         : "exec",
+      providerStartupMs: appServerTimings?.startupMs,
+      providerQueueMs: appServerTimings?.queueMs,
+      providerThreadOpenMs: appServerTimings?.threadOpenMs,
+      providerRequestToFirstDeltaMs: appServerTimings?.requestToFirstDeltaMs,
+      providerCacheState: appServerTimings?.cacheState,
+      providerThreadOpenState: appServerTimings?.threadOpenState,
       backendFallbackMs,
       tokenUsage: "tokenUsage" in finalCodexResult ? finalCodexResult.tokenUsage : undefined,
     };
@@ -814,7 +846,7 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
     kind: "system_check",
     label: "run_timing",
     status: "observed",
-    detail: `total=${Date.now() - runStartedAt}ms planning=${planningMs}ms recall=${recallMs}ms rules=${agentRulesMs}ms skills=${skillSelectionMs}ms prompt=${promptBuildMs}ms hooks=${hookMs}ms provider=${providerMs}ms first_token_ms=${attempt.firstTokenMs ?? "-"} transport=${attempt.providerTransport ?? "unknown"} fallback=${fallbackMs}ms backend_fallback=${attempt.backendFallbackMs ?? 0}ms attempts=${providerAttemptCount}`,
+    detail: `total=${Date.now() - runStartedAt}ms planning=${planningMs}ms recall=${recallMs}ms rules=${agentRulesMs}ms skills=${skillSelectionMs}ms prompt=${promptBuildMs}ms hooks=${hookMs}ms provider=${providerMs}ms first_token_ms=${attempt.firstTokenMs ?? "-"} transport=${attempt.providerTransport ?? "unknown"} startup=${attempt.providerStartupMs ?? "-"}ms queue=${attempt.providerQueueMs ?? "-"}ms thread_open=${attempt.providerThreadOpenMs ?? "-"}ms request_first_delta=${attempt.providerRequestToFirstDeltaMs ?? "-"}ms cache=${attempt.providerCacheState ?? "-"} thread_state=${attempt.providerThreadOpenState ?? "-"} fallback=${fallbackMs}ms backend_fallback=${attempt.backendFallbackMs ?? 0}ms attempts=${providerAttemptCount}`,
   });
   for (const receipt of recallReceipt.receipts) {
     evidence.push({
@@ -915,6 +947,12 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
     firstTokenMs: attempt.firstTokenMs,
     providerTransport: attempt.providerTransport,
     providerAttemptCount,
+    providerStartupMs: attempt.providerStartupMs,
+    providerQueueMs: attempt.providerQueueMs,
+    providerThreadOpenMs: attempt.providerThreadOpenMs,
+    providerRequestToFirstDeltaMs: attempt.providerRequestToFirstDeltaMs,
+    providerCacheState: attempt.providerCacheState,
+    providerThreadOpenState: attempt.providerThreadOpenState,
     fallbackMs,
     backendFallbackMs: attempt.backendFallbackMs ?? 0,
     memoryWriteMs,

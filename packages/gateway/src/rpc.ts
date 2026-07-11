@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Readable, Writable } from "node:stream";
-import { executeRun, listTokenRecords } from "@musterhq/core";
+import { closeWarmProviderTransports, executeRun, listTokenRecords } from "@musterhq/core";
 import type { MusterConfig } from "@musterhq/core";
 
 /**
@@ -38,12 +38,14 @@ export interface RpcCore {
   subscribe(listener: (event: RpcEvent) => void): () => void;
   mintTicket(): { ticket: string; expiresAt: number };
   consumeTicket(ticket: string): boolean;
+  close(): void;
 }
 
 const TICKET_TTL_MS = 30_000;
 
-export function createRpcCore(options: { config: MusterConfig; cwd?: string }): RpcCore {
+export function createRpcCore(options: { config: MusterConfig; cwd?: string; nativeTransportOwner?: string }): RpcCore {
   const cwd = options.cwd ?? process.cwd();
+  const nativeTransportOwner = options.nativeTransportOwner ?? `rpc:${randomUUID()}`;
   const listeners = new Set<(event: RpcEvent) => void>();
   const tickets = new Map<string, number>();
   const sessions = new Set<string>();
@@ -70,6 +72,10 @@ export function createRpcCore(options: { config: MusterConfig; cwd?: string }): 
       const outcome = await executeRun(options.config, {
         prompt,
         cwd,
+        conversationKey: `rpc:${sessionId}`,
+        nativeTransport: "warm",
+        nativeSessionKeepAlive: true,
+        nativeTransportOwner,
         surfaceId: `rpc:${sessionId}`,
         scopes: [{ kind: "session", id: sessionId }, { kind: "user", id: String(params.userId ?? "rpc-user") }],
       });
@@ -85,7 +91,7 @@ export function createRpcCore(options: { config: MusterConfig; cwd?: string }): 
       if (outcome.episode.outcome?.kind !== "completed") {
         throw new Error(outcome.episode.outcome?.detail ?? "Run failed");
       }
-      return { runId: outcome.plan.runId, text: outcome.episode.responseText };
+      return { runId: outcome.plan.runId, text: outcome.episode.responseText, timings: outcome.timings };
     },
 
     "ledger.recent": async (params) => {
@@ -129,6 +135,12 @@ export function createRpcCore(options: { config: MusterConfig; cwd?: string }): 
       const expiresAt = tickets.get(ticket);
       tickets.delete(ticket); // single-use: gone whether valid or expired
       return expiresAt !== undefined && expiresAt >= Date.now();
+    },
+    close() {
+      closeWarmProviderTransports(nativeTransportOwner);
+      sessions.clear();
+      tickets.clear();
+      listeners.clear();
     },
   };
 }

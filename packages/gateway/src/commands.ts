@@ -1,4 +1,4 @@
-import { clearConversationSessionHandles } from "@musterhq/core";
+import { invalidateNativeConversation } from "@musterhq/core";
 import type { MusterConfig } from "@musterhq/core";
 import type { GatewayConfig, GatewayCustomCommand } from "./gateway-config.js";
 import type { PairedSender } from "./pairing.js";
@@ -234,6 +234,6 @@ export async function dispatchCommand(message: SurfaceMessage, ctx: CommandConte
 async function clearCommandSessionHandles(ctx: CommandContext): Promise<number> {
   const keys = [...new Set([ctx.conversationKey, ctx.legacyConversationKey].filter((key): key is string => Boolean(key)))];
   let removed = 0;
-  for (const key of keys) removed += await clearConversationSessionHandles(key, ctx.cwd);
+  for (const key of keys) removed += await invalidateNativeConversation(key, ctx.cwd);
   return removed;
 }

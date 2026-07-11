@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { mkdtemp, stat } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { defaultConfig, loadSessionHandle, promoteSkill, runFlow, saveSessionHandle, writeCandidateSkill } from "@musterhq/core";
+import { setTimeout as delay } from "node:timers/promises";
+import { clearCodexAppServerSessions, defaultConfig, loadSessionHandle, promoteSkill, runCodexAppServer, runFlow, saveSessionHandle, writeCandidateSkill } from "@musterhq/core";
 import type { EvolveReport, MusterConfig } from "@musterhq/core";
 import { approvePairing, initGatewayConfig, pollTelegram, startGatewayServer } from "../src/index.js";
 import type { GatewayConfig, PairingChallenge, SurfaceReply } from "../src/index.js";
@@ -69,6 +70,57 @@ test("gateway health endpoint answers without auth", async () => {
   } finally {
     await gw.close();
     llm.close();
+  }
+});
+
+test("gateway shutdown closes warm native processes owned by the daemon", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-gw-native-shutdown-"));
+  const fake = join(cwd, "codex-fake.mjs");
+  const closeLog = join(cwd, "closed.log");
+  const owner = "gateway:test-owner";
+  await writeFile(fake, `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+const threadId = "thread-" + process.pid;
+let closeRecorded = false;
+function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+function recordClose() {
+  if (closeRecorded) return;
+  closeRecorded = true;
+  appendFileSync(${JSON.stringify(closeLog)}, "closed\\n");
+}
+process.on("exit", recordClose);
+process.on("SIGTERM", () => process.exit(0));
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ id: msg.id, result: { userAgent: "fake" } });
+  else if (msg.method === "thread/start") send({ id: msg.id, result: { thread: { id: threadId } } });
+  else if (msg.method === "turn/start") {
+    send({ id: msg.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
+    send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m", text: "ok" }, threadId, turnId: "turn-1" } });
+    send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  let running: Awaited<ReturnType<typeof startGatewayServer>> | undefined;
+  try {
+    const warm = await runCodexAppServer({ prompt: "warm", cwd, command: fake, cacheKey: "gateway-chat", transportOwner: owner });
+    assert.equal(warm.status, "completed");
+    const init = await initGatewayConfig(cwd);
+    running = await startGatewayServer({ config: defaultConfig(), gateway: init.config, cwd, nativeTransportOwner: owner }, 0);
+    await running.close();
+    running = undefined;
+
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if ((await readFile(closeLog, "utf8").catch(() => "")).includes("closed")) break;
+      await delay(25);
+    }
+    assert.match(await readFile(closeLog, "utf8"), /closed/);
+  } finally {
+    await running?.close();
+    clearCodexAppServerSessions();
   }
 });
 
@@ -301,8 +353,28 @@ test("a paired sender's /help is answered by the gateway dispatcher, never the m
   }
 });
 
-test("a paired sender's /new clears provider session handles without invoking the model", async () => {
+test("a paired sender's /new and /reset surgically invalidate native continuity without invoking the model", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-gw-new-"));
+  const fake = join(cwd, "codex-fake.mjs");
+  await writeFile(fake, `#!/usr/bin/env node
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+const threadId = "thread-" + process.pid;
+function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ id: msg.id, result: { userAgent: "fake" } });
+  else if (msg.method === "thread/start") send({ id: msg.id, result: { thread: { id: threadId } } });
+  else if (msg.method === "turn/start") {
+    send({ id: msg.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
+    send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m", text: threadId }, threadId, turnId: "turn-1" } });
+    send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  const warmTarget = await runCodexAppServer({ prompt: "target", cwd, command: fake, cacheKey: "web:demo:c1" });
+  const warmOther = await runCodexAppServer({ prompt: "other", cwd, command: fake, cacheKey: "web:demo:c2" });
   await saveSessionHandle({
     conversationKey: "web:demo:c1",
     backendId: "codex",
@@ -338,9 +410,19 @@ test("a paired sender's /new clears provider session handles without invoking th
     assert.match(reply.text, /fresh thread/i);
     assert.equal(await loadSessionHandle("web:demo:c1", "codex", cwd), undefined);
     assert.equal(await loadSessionHandle("web:demo:c1", "claude", cwd), undefined);
+    const freshTarget = await runCodexAppServer({ prompt: "target again", cwd, command: fake, cacheKey: "web:demo:c1" });
+    const stillWarmOther = await runCodexAppServer({ prompt: "other again", cwd, command: fake, cacheKey: "web:demo:c2" });
+    assert.notEqual(freshTarget.threadId, warmTarget.threadId, "/new evicts the targeted warm provider process");
+    assert.equal(stillWarmOther.threadId, warmOther.threadId, "/new leaves unrelated conversations warm");
+    const resetReply = await (await send("/reset")).json() as SurfaceReply;
+    assert.match(resetReply.text, /Reset this chat/i);
+    assert.equal(modelCalls, 0);
+    const resetTarget = await runCodexAppServer({ prompt: "after reset", cwd, command: fake, cacheKey: "web:demo:c1" });
+    assert.notEqual(resetTarget.threadId, freshTarget.threadId, "/reset evicts the targeted warm provider process");
   } finally {
     await gw.close();
     llm.close();
+    clearCodexAppServerSessions();
   }
 });
 

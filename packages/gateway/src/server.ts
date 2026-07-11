@@ -3,7 +3,7 @@ import { access, readFile, mkdir, realpath, stat, writeFile } from "node:fs/prom
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
-import { activeProfile, createArtifactWorkspace, createEnterpriseActionReceipt, createStreamEventChannel, dataDir, estimateTokens, executeRun, extractMediaTags, getFlowRun, persistArtifact, profileWorkspaceDir, resolveAgentSkillAllowlist, resolveSkillCommand, resumeFlow, runDraftLoop, StreamRun, updateArtifactDelivery } from "@musterhq/core";
+import { activeProfile, closeWarmProviderTransports, createArtifactWorkspace, createEnterpriseActionReceipt, createStreamEventChannel, dataDir, estimateTokens, executeRun, extractMediaTags, getFlowRun, persistArtifact, profileWorkspaceDir, resolveAgentSkillAllowlist, resolveSkillCommand, resumeFlow, runDraftLoop, StreamRun, updateArtifactDelivery } from "@musterhq/core";
 import type { ArtifactDeliveryReceipt, ArtifactResult, ArtifactWorkspace } from "@musterhq/core";
 import type { DraftSink, FlowToolRegistry, MusterConfig } from "@musterhq/core";
 import { dispatchCommand, gatewayAgentCatalog, gatewayCommandCatalog, parseCommand, resolveCustomCommand } from "./commands.js";
@@ -68,6 +68,8 @@ export interface GatewayServerOptions {
   readonly ingressSpool?: DurableGatewayIngressSpool;
   readonly approvalActions?: ApprovalActionCodec;
   readonly approvalStore?: SqliteApprovalActionStore;
+  /** Internal owner token for warm native provider processes. */
+  readonly nativeTransportOwner?: string;
 }
 
 export interface RunningGateway {
@@ -518,7 +520,7 @@ async function recoverPendingApprovals(options: GatewayServerOptions, store: Sql
 
 export async function handleSurfaceMessage(
   message: SurfaceMessage,
-  options: Pick<GatewayServerOptions, "config" | "cwd"> & {
+  options: Pick<GatewayServerOptions, "config" | "cwd" | "nativeTransportOwner"> & {
     readonly gateway?: GatewayConfig;
     readonly enterprise?: GatewayEnterpriseRuntime;
     readonly approvalStore?: SqliteApprovalActionStore;
@@ -632,6 +634,9 @@ export async function handleSurfaceMessage(
       workspaceDir,
       skipRecall: !shouldRecallForChannel(message.text),
       conversationKey: sessionKey,
+      nativeTransport: "warm",
+      nativeSessionKeepAlive: true,
+      nativeTransportOwner: options.nativeTransportOwner,
       agentId: profile,
       ...(process.env.MUSTER_CODEX_HOME ? { codexHome: process.env.MUSTER_CODEX_HOME } : {}),
       surfaceId: message.surfaceId,
@@ -2790,7 +2795,8 @@ export function startGatewayServer(options: GatewayServerOptions, port = 0): Pro
     secret: createHash("sha256").update(`muster-approval:${options.gateway.token}`).digest(),
     store: approvalStore,
   });
-  const effectiveOptions: GatewayServerOptions = { ...options, enterprise, gchatVerifier, ingress, ingressSpool, approvalStore, approvalActions };
+  const nativeTransportOwner = options.nativeTransportOwner ?? `gateway:${randomUUID()}`;
+  const effectiveOptions: GatewayServerOptions = { ...options, enterprise, gchatVerifier, ingress, ingressSpool, approvalStore, approvalActions, nativeTransportOwner };
   // One outbound queue per gateway: chat keys share retry_after backoff state.
   const queue = createOutboundQueue();
   const backgroundTasks = new Set<Promise<void>>();
@@ -2812,6 +2818,7 @@ export function startGatewayServer(options: GatewayServerOptions, port = 0): Pro
       if (server.listening) {
         await new Promise<void>((done) => server.close(() => done()));
       }
+      closeWarmProviderTransports(nativeTransportOwner);
       if (ownsApprovalStore) approvalStore.close();
       if (ownsEnterpriseRuntime) await enterprise.close?.();
     };
@@ -2836,8 +2843,8 @@ export function startGatewayServer(options: GatewayServerOptions, port = 0): Pro
         server,
         waitForIdle: () => waitForBackgroundTasks(backgroundTasks),
         close: async () => {
-          await new Promise<void>((done, fail) => server.close((error) => (error ? fail(error) : done())));
           try {
+            await new Promise<void>((done, fail) => server.close((error) => (error ? fail(error) : done())));
             await waitForBackgroundTasks(backgroundTasks, 30_000);
           } finally {
             await cleanupOwnedResources();

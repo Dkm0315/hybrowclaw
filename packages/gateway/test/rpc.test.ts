@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,6 +55,81 @@ test("contract handshake, session lifecycle, prompt round-trip with ledger.tick"
     assert.equal((ledger.result as { records: unknown[] }).records.length, 1);
   } finally {
     llm.close();
+  }
+});
+
+test("RPC uses owned warm transports and isolates native threads by session", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-rpc-native-"));
+  const fake = join(cwd, "codex-fake.mjs");
+  const closeLog = join(cwd, "closed.log");
+  await writeFile(fake, `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+const threadId = "thread-" + process.pid;
+let turn = 0;
+let closeRecorded = false;
+function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+function recordClose() {
+  if (closeRecorded) return;
+  closeRecorded = true;
+  appendFileSync(${JSON.stringify(closeLog)}, process.pid + "\\n");
+}
+process.on("exit", recordClose);
+process.on("SIGTERM", () => process.exit(0));
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ id: msg.id, result: { userAgent: "fake" } });
+  else if (msg.method === "thread/start") send({ id: msg.id, result: { thread: { id: threadId } } });
+  else if (msg.method === "turn/start") {
+    turn += 1;
+    const turnId = "turn-" + turn;
+    send({ id: msg.id, result: { turn: { id: turnId, status: "inProgress" } } });
+    send({ method: "item/agentMessage/delta", params: { threadId, turnId, itemId: "m", delta: threadId } });
+    send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m", text: threadId }, threadId, turnId } });
+    send({ method: "turn/completed", params: { threadId, turn: { id: turnId, status: "completed" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  const previousCommand = process.env.MUSTER_CODEX_COMMAND;
+  process.env.MUSTER_CODEX_COMMAND = fake;
+  const core = createRpcCore({ config: defaultConfig(), cwd, nativeTransportOwner: "rpc:test-owner" });
+  try {
+    const create = async (id: number): Promise<string> => {
+      const response = await core.handle({ jsonrpc: "2.0", id, method: "session.create" });
+      return (response.result as { sessionId: string }).sessionId;
+    };
+    const submit = async (id: number, sessionId: string, prompt: string) => {
+      const response = await core.handle({ jsonrpc: "2.0", id, method: "prompt.submit", params: { sessionId, prompt } });
+      assert.equal(response.error, undefined);
+      return response.result as { text: string; timings?: { providerTransport?: string; providerCacheState?: string } };
+    };
+    const sessionA = await create(1);
+    const sessionB = await create(2);
+    const firstA = await submit(3, sessionA, "alpha request");
+    const secondA = await submit(4, sessionA, "continue alpha");
+    const firstB = await submit(5, sessionB, "beta request");
+
+    assert.equal(firstA.text, secondA.text, "one RPC session keeps its native thread");
+    assert.notEqual(firstA.text, firstB.text, "separate RPC sessions use isolated native threads");
+    assert.equal(firstA.timings?.providerTransport, "warm");
+    assert.equal(firstA.timings?.providerCacheState, "miss");
+    assert.equal(secondA.timings?.providerCacheState, "hit");
+    assert.equal(firstB.timings?.providerCacheState, "miss");
+
+    core.close();
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const closed = await readFile(closeLog, "utf8").catch(() => "");
+      if (closed.trim().split("\n").filter(Boolean).length === 2) break;
+      await delay(25);
+    }
+    const closedPids = (await readFile(closeLog, "utf8")).trim().split("\n");
+    assert.equal(new Set(closedPids).size, 2, "RPC shutdown closes every process owned by that host");
+  } finally {
+    core.close();
+    if (previousCommand === undefined) delete process.env.MUSTER_CODEX_COMMAND;
+    else process.env.MUSTER_CODEX_COMMAND = previousCommand;
   }
 });
 
