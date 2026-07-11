@@ -11,6 +11,7 @@ import { openSessionStore } from "@musterhq/core";
 
 const execFileAsync = promisify(execFile);
 const cliPath = resolve(import.meta.dirname, "..", "src", "index.ts");
+const cliPackageVersion = (JSON.parse(await readFile(resolve(import.meta.dirname, "..", "package.json"), "utf8")) as { version: string }).version;
 
 test("CLI help exposes terminal and pi surfaces", async () => {
   const { stdout } = await runCli(["help"]);
@@ -56,13 +57,13 @@ test("CLI help exposes terminal and pi surfaces", async () => {
 
 test("CLI version and update commands are explicit", async () => {
   const version = await runCli(["--version"]);
-  assert.equal(version.stdout.trim(), "muster 0.1.10");
+  assert.equal(version.stdout.trim(), `muster ${cliPackageVersion}`);
 
   const namedVersion = await runCli(["version"]);
-  assert.equal(namedVersion.stdout.trim(), "muster 0.1.10");
+  assert.equal(namedVersion.stdout.trim(), `muster ${cliPackageVersion}`);
 
   const update = await runCli(["update", "--manager", "npm", "--target", "0.1.10"]);
-  assert.match(update.stdout, /muster_current=0\.1\.10/);
+  assert.match(update.stdout, new RegExp(`muster_current=${cliPackageVersion.replace(/\./g, "\\.")}`));
   assert.match(update.stdout, /package=@musterhq\/cli/);
   assert.match(update.stdout, /target=0\.1\.10/);
   assert.match(update.stdout, /manager=npm/);
@@ -2825,7 +2826,7 @@ test("CLI roster inspect and install verify entries into a lockfile", async () =
 
   const dryRunActivation = await runCli(["roster", "activate", "demo-pack", "--lock", lockPath, "--dry-run"], cwd);
   assert.match(dryRunActivation.stdout, /activation=demo-pack status=ready/);
-  assert.match(dryRunActivation.stdout, /activation_verify=ready muster=0\.1\.10/);
+  assert.match(dryRunActivation.stdout, new RegExp(`activation_verify=ready muster=${cliPackageVersion.replace(/\./g, "\\.")}`));
   assert.match(dryRunActivation.stdout, /allow=demo-pack/);
   assert.match(dryRunActivation.stdout, /config=unchanged dry_run=true/);
   const activationJson = JSON.parse((await runCli(["roster", "activate", "demo-pack", "--lock", lockPath, "--dry-run", "--json"], cwd)).stdout) as {

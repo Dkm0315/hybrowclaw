@@ -212,7 +212,7 @@ import {
   telegramUpdateToSurfaceMessage,
   whatsAppWebhookToSurfaceMessages
 } from "@musterhq/gateway";
-import { existsSync, openSync } from "node:fs";
+import { existsSync, openSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { access, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -239,8 +239,17 @@ process.on("warning", (warning) => {
 });
 
 const [, , command, ...args] = process.argv;
-const CLI_MUSTER_VERSION = "0.1.10";
+const CLI_MUSTER_VERSION = readCliPackageVersion();
 const CLI_PACKAGE_NAME = "@musterhq/cli";
+
+function readCliPackageVersion(): string {
+  const packagePath = fileURLToPath(new URL("../package.json", import.meta.url));
+  const parsed = JSON.parse(readFileSync(packagePath, "utf8")) as { version?: unknown };
+  if (typeof parsed.version !== "string" || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(parsed.version)) {
+    throw new Error(`Invalid CLI package version in ${packagePath}`);
+  }
+  return parsed.version;
+}
 
 async function main(): Promise<void> {
   if (command === "--skip-onboarding" || command === "--no-onboarding") {
