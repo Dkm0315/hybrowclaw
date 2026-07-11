@@ -6,7 +6,7 @@ import { basename, extname, isAbsolute, join, relative, resolve } from "node:pat
 import { activeProfile, createArtifactWorkspace, createEnterpriseActionReceipt, createStreamEventChannel, dataDir, estimateTokens, executeRun, extractMediaTags, getFlowRun, persistArtifact, profileWorkspaceDir, resolveAgentSkillAllowlist, resolveSkillCommand, resumeFlow, runDraftLoop, StreamRun, updateArtifactDelivery } from "@musterhq/core";
 import type { ArtifactDeliveryReceipt, ArtifactResult, ArtifactWorkspace } from "@musterhq/core";
 import type { DraftSink, FlowToolRegistry, MusterConfig } from "@musterhq/core";
-import { dispatchCommand, parseCommand, resolveCustomCommand } from "./commands.js";
+import { dispatchCommand, gatewayAgentCatalog, gatewayCommandCatalog, parseCommand, resolveCustomCommand } from "./commands.js";
 import { conversationSessionId, isPairingChallenge, parseSurfaceMessage } from "./envelope.js";
 import type { PairingChallenge, SurfaceArtifact, SurfaceMessage, SurfaceReply } from "./envelope.js";
 import { pairingScopes, requestPairing, resolvePairing } from "./pairing.js";
@@ -2708,6 +2708,15 @@ async function route(
     }
     const reply = await handleSurfaceMessage(message, { config: options.config, gateway: options.gateway, enterprise: options.enterprise, approvalStore: options.approvalStore, cwd, registry: options.registry });
     sendJson(response, 200, reply);
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/v1/catalog") {
+    sendJson(response, 200, {
+      commands: gatewayCommandCatalog(options.gateway),
+      personas: gatewayAgentCatalog(options.config),
+      source: "muster_native_http",
+    });
     return;
   }
 

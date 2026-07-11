@@ -8,6 +8,7 @@ export interface CodexAppServerRunInput {
   readonly prompt: string;
   readonly cwd: string;
   readonly model?: string;
+  readonly reasoning?: "none" | "low" | "medium" | "high";
   readonly instructionsFile?: string;
   readonly networkAccess?: boolean;
   readonly env?: Record<string, string>;
@@ -88,6 +89,7 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
         command,
         cwd: input.cwd,
         model: input.model,
+        reasoning: input.reasoning,
         instructionsFile: input.instructionsFile,
         networkAccess: input.networkAccess,
         env: input.env,
@@ -173,6 +175,7 @@ function appServerScopeKey(input: CodexAppServerRunInput, command: string): stri
     conversation: input.cacheKey ?? "",
     cwd: input.cwd,
     model: input.model ?? "",
+    reasoning: input.reasoning ?? "",
     command,
     networkAccess: input.networkAccess === true,
     env,
@@ -241,12 +244,14 @@ class CodexAppServerClient {
     readonly command: string;
     readonly cwd: string;
     readonly model?: string;
+    readonly reasoning?: "none" | "low" | "medium" | "high";
     readonly instructionsFile?: string;
     readonly networkAccess?: boolean;
     readonly env?: Record<string, string>;
   }) {
     const args = ["app-server", "--stdio"];
     if (input.model) args.push("-c", `model=${JSON.stringify(input.model)}`);
+    if (input.reasoning) args.push("-c", `model_reasoning_effort=${JSON.stringify(input.reasoning === "none" ? "low" : input.reasoning)}`);
     if (input.networkAccess) args.push("-c", "sandbox_workspace_write.network_access=true");
     if (input.instructionsFile) args.push("-c", `experimental_instructions_file=${JSON.stringify(input.instructionsFile)}`);
     this.child = spawn(input.command, args, {

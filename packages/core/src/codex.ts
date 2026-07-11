@@ -25,6 +25,7 @@ export interface CodexRunInput {
   readonly cwd: string;
   /** User's chosen model, preserved (e.g. gpt-5.5). */
   readonly model?: string;
+  readonly reasoning?: "none" | "low" | "medium" | "high";
   /**
    * muster memory + skill index, injected as a system-level instructions file
    * (-c experimental_instructions_file=). Goes to the system prompt, NOT the
@@ -101,6 +102,7 @@ export function buildCodexArgs(input: CodexRunInput, outputLastMessageFile: stri
   if (!isResume) args.push("-C", input.cwd);
   args.push("--skip-git-repo-check");
   if (input.model) args.push("-m", input.model);
+  if (input.reasoning) args.push("-c", `model_reasoning_effort=${JSON.stringify(input.reasoning === "none" ? "low" : input.reasoning)}`);
   if (!isResume) args.push("-s", input.sandbox ?? "workspace-write");
   if (input.ignoreRules) args.push("--ignore-rules");
   // `codex exec` is non-interactive (no approval prompt possible) and has NO `-a`

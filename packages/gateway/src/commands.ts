@@ -3,7 +3,7 @@ import type { MusterConfig } from "@musterhq/core";
 import type { GatewayConfig, GatewayCustomCommand } from "./gateway-config.js";
 import type { PairedSender } from "./pairing.js";
 import type { SurfaceMessage, SurfaceReply } from "./envelope.js";
-import { isInteractionCommand, renderInteractionCommand } from "./interaction.js";
+import { INTERACTION_COMMANDS, isInteractionCommand, renderInteractionCommand } from "./interaction.js";
 import type { GatewayEnterpriseRuntime } from "./enterprise-runtime.js";
 
 /**
@@ -73,6 +73,80 @@ const BUILTINS = [
   "approvals", "audit", "incidents", "providers", "models", "plugins", "skills", "mcp", "channels", "agents", "artifacts", "sessions", "memory",
 ] as const;
 type BuiltinName = (typeof BUILTINS)[number];
+
+export interface GatewayCommandCatalogEntry {
+  readonly name: string;
+  readonly label: string;
+  readonly description: string;
+  readonly surfaces: readonly string[];
+  readonly requires_write: boolean;
+  readonly source: "muster_builtin" | "muster_custom";
+  readonly capability?: string;
+  readonly minimum_role?: "manager" | "system";
+}
+
+const CONTROL_COMMANDS: Readonly<Record<string, string>> = {
+  pair: "Show the pairing bound to this sender",
+  new: "Start a fresh provider thread without clearing memory",
+  reset: "Reset provider session handles for this conversation",
+  stop: "Stop or inspect the active conversational run",
+};
+
+/** Stable provider-free command catalog shared by every channel and app. */
+export function gatewayCommandCatalog(gateway?: GatewayConfig): readonly GatewayCommandCatalogEntry[] {
+  const commands = new Map<string, GatewayCommandCatalogEntry>();
+  for (const descriptor of INTERACTION_COMMANDS) {
+    commands.set(descriptor.name, {
+      name: descriptor.name,
+      label: commandLabel(descriptor.name),
+      description: descriptor.summary,
+      surfaces: ["*"],
+      requires_write: false,
+      source: "muster_builtin",
+      ...(descriptor.capability ? { capability: descriptor.capability } : {}),
+      ...(descriptor.minimumRole ? { minimum_role: descriptor.minimumRole } : {}),
+    });
+  }
+  for (const [name, description] of Object.entries(CONTROL_COMMANDS)) {
+    commands.set(name, {
+      name,
+      label: commandLabel(name),
+      description,
+      surfaces: ["*"],
+      requires_write: false,
+      source: "muster_builtin",
+    });
+  }
+  for (const [name, entry] of Object.entries(gateway?.commands?.entries ?? {})) {
+    const normalized = name.trim().toLowerCase().replace(/^\//, "").replaceAll("_", "-");
+    if (!normalized || commands.has(normalized)) continue;
+    commands.set(normalized, {
+      name: normalized,
+      label: commandLabel(normalized),
+      description: entry.description?.trim() || "Configured Muster command",
+      surfaces: entry.surfaces?.length ? [...entry.surfaces] : ["*"],
+      requires_write: false,
+      source: "muster_custom",
+    });
+  }
+  return Object.freeze([...commands.values()].sort((left, right) => left.label.localeCompare(right.label)));
+}
+
+export function gatewayAgentCatalog(config: MusterConfig): Readonly<Record<string, { readonly label: string; readonly description: string; readonly source: "muster_runtime" }>> {
+  return Object.freeze(Object.fromEntries(
+    Object.values(config.runtimes ?? {})
+      .filter((runtime) => runtime.enabled)
+      .map((runtime) => [runtime.id, {
+        label: commandLabel(runtime.id),
+        description: `Muster runtime using provider ${runtime.provider}`,
+        source: "muster_runtime" as const,
+      }]),
+  ));
+}
+
+function commandLabel(name: string): string {
+  return name.split(/[-_]/g).filter(Boolean).map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`).join(" ");
+}
 
 export function isBuiltinCommand(name: string): name is BuiltinName {
   return (BUILTINS as readonly string[]).includes(name);

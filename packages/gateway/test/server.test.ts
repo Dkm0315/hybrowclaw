@@ -97,6 +97,40 @@ test("POST /v1/messages requires the gateway bearer token", async () => {
   }
 });
 
+test("GET /v1/catalog exposes universal commands and runtimes without a model call", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-gw-catalog-"));
+  let modelCalls = 0;
+  const llm = await startStubServer(() => {
+    modelCalls += 1;
+    return { status: 200, payload: { choices: [{ message: { content: "MODEL_WAS_CALLED" } }] } };
+  });
+  const gw = await startTestGateway(cwd, llm.url);
+  try {
+    const unauthorized = await fetch(`${gw.url}/v1/catalog`);
+    assert.equal(unauthorized.status, 401);
+
+    const response = await fetch(`${gw.url}/v1/catalog`, {
+      headers: { authorization: `Bearer ${gw.gateway.token}` },
+    });
+    assert.equal(response.status, 200);
+    const payload = await response.json() as {
+      commands: Array<{ name: string; source: string }>;
+      personas: Record<string, unknown>;
+      source: string;
+    };
+    const names = new Set(payload.commands.map((command) => command.name));
+    for (const name of ["tokens", "usage", "limits", "evals", "plugins", "skills", "mcp", "memory"]) {
+      assert.ok(names.has(name), `catalog includes /${name}`);
+    }
+    assert.ok(payload.personas.native);
+    assert.equal(payload.source, "muster_native_http");
+    assert.equal(modelCalls, 0);
+  } finally {
+    await gw.close();
+    llm.close();
+  }
+});
+
 test("invalid envelopes are rejected with 400 and a reason", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-gw-envelope-"));
   const llm = await startStubServer(() => ({ status: 200, payload: { choices: [{ message: { content: "ok" } }] } }));
