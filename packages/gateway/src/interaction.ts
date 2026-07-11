@@ -533,12 +533,12 @@ async function usageCard(ctx: InteractionContext, identity: PairedIdentity | und
         return { label: humanizeValue(surface), value: surface };
       })),
       commandFilter(ctx, "/usage", "outcome", "Outcome", observedValueOptions(scopedEvents.map((event) => event.outcome))),
-      ...(audience === "self" ? [] : [commandFilter(
-        { ...ctx, args: setArgument(ctx.args, "scope", "team") },
+      ...(audience === "self" || requestedScope === "self" ? [] : [commandFilter(
+        ctx,
         "/usage",
         "user",
         "User",
-        authorizedUserOptions(identity, assignment),
+        observedSubjectOptions(scopedEvents, "user", (value) => ({ label: value, value })),
       )]),
     ]),
     drilldowns: [
