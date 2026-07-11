@@ -50,6 +50,7 @@ export interface GatewayUsageRecordInput {
   readonly outputTokens?: number;
   readonly requestCategory?: string;
   readonly action: string;
+  readonly agentId?: string;
   readonly policyIds?: readonly string[];
 }
 
@@ -94,6 +95,7 @@ export function gatewayEnterpriseSubjects(
   paired: PairedSender,
   assignment: GatewayGovernanceAssignment = {},
   tokens?: TokenRecord,
+  agentId?: string,
 ): readonly EnterpriseSubject[] {
   const identity = paired.identity?.provider === "frappe" ? paired.identity : undefined;
   const userId = assignment.userId ?? identity?.user ?? identity?.employee ?? message.senderId;
@@ -106,6 +108,7 @@ export function gatewayEnterpriseSubjects(
     ...(assignment.departmentIds ?? []).map((id) => ({ kind: "department" as const, id })),
     ...roles.map((id) => ({ kind: "role" as const, id })),
     { kind: "user", id: userId },
+    ...(agentId ? [{ kind: "agent" as const, id: agentId }] : []),
     ...(tokens?.provider ? [{ kind: "provider" as const, id: tokens.provider }] : []),
     ...(tokens?.model ? [{ kind: "model" as const, id: tokens.model }] : []),
   ]);
@@ -119,11 +122,12 @@ export async function enforceGatewayRateLimits(input: {
   readonly message: SurfaceMessage;
   readonly paired: PairedSender;
   readonly assignment: GatewayGovernanceAssignment;
+  readonly agentId: string;
   readonly estimatedTokens: number;
   readonly nowMs?: number;
 }): Promise<GatewayGovernancePreflightResult> {
   const limits = (input.gateway.governance?.rateLimits ?? []).filter((limit) =>
-    gatewayLimitMatches(limit, input.message, input.paired, input.assignment));
+    gatewayLimitMatches(limit, input.message, input.paired, input.assignment, input.agentId));
   if (!limits.length) return { policyIds: [] };
 
   let release!: () => void;
@@ -173,7 +177,7 @@ export async function enforceGatewayRateLimits(input: {
 }
 
 export async function recordGatewayUsage(runtime: GatewayEnterpriseRuntime, input: GatewayUsageRecordInput): Promise<void> {
-  const subjects = gatewayEnterpriseSubjects(input.message, input.paired, input.assignment, input.tokens);
+  const subjects = gatewayEnterpriseSubjects(input.message, input.paired, input.assignment, input.tokens, input.agentId);
   const occurredAt = input.tokens?.createdAt ?? new Date().toISOString();
   const requestFingerprint = sha256(input.message.text);
   const eventId = input.tokens?.runId ?? `gateway_${randomUUID()}`;
@@ -233,16 +237,19 @@ function gatewayLimitMatches(
   message: SurfaceMessage,
   paired: PairedSender,
   assignment: GatewayGovernanceAssignment,
+  agentId: string,
 ): boolean {
   const identity = paired.identity?.provider === "frappe" ? paired.identity : undefined;
   if (limit.subject.kind === "user") {
     return [assignment.userId, identity?.user, identity?.employee, message.senderId, paired.pairingId].includes(limit.subject.id);
   }
   if (limit.subject.kind === "role") return [...(assignment.roles ?? []), ...(identity?.roles ?? [])].includes(limit.subject.id);
+  if (limit.subject.kind === "department") return assignment.departmentIds?.includes(limit.subject.id) ?? false;
   if (limit.subject.kind === "channel") return limit.subject.id === `${message.surfaceId}:${message.conversationId}` || limit.subject.id === message.conversationId;
   if (limit.subject.kind === "surface") return limit.subject.id === message.surfaceId;
   if (limit.subject.kind === "tenant") return limit.subject.id === assignment.tenantId || limit.subject.id === identity?.site;
   if (limit.subject.kind === "workspace") return limit.subject.id === assignment.workspaceId;
+  if (limit.subject.kind === "agent") return limit.subject.id === agentId;
   return false;
 }
 

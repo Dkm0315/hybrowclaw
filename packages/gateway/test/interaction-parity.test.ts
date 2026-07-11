@@ -3,7 +3,7 @@ import { mkdir, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { defaultConfig } from "@musterhq/core";
+import { defaultConfig, enterpriseWindowBounds } from "@musterhq/core";
 import {
   INTERACTION_COMMANDS,
   approvePairing,
@@ -193,6 +193,74 @@ test("self and department reports require the caller tenant boundary", async () 
   };
   const denied = await dispatchCommand(message("/usage scope=team"), { ...commandContext(BASE_PAIRED, unboundManager), enterprise });
   assert.equal(denied?.presentation?.kpis?.find((kpi) => kpi.label === "Runs")?.value, "0");
+});
+
+test("report filters are executable and route to real scoped reports", async () => {
+  const gateway: GatewayConfig = {
+    token: "test",
+    governance: {
+      assignments: {
+        default: {
+          tenantId: "tenant-a",
+          roles: ["System Manager"],
+          canViewTenantUsage: true,
+        },
+      },
+    },
+  };
+  const menu = await dispatchCommand(message("/reports"), commandContext(MANAGER_PAIRED, gateway));
+  const area = menu?.presentation?.filters?.find((filter) => filter.id === "area");
+  assert.ok(area?.options?.some((option) => option.value === "personal-usage"));
+  assert.equal(area?.action?.command, "/reports area={value}");
+
+  const selected = await dispatchCommand(message("/reports area=personal-usage period=7d"), commandContext(MANAGER_PAIRED, gateway));
+  assert.equal(selected?.presentation?.title, "Usage");
+  assert.equal(selected?.presentation?.filters?.find((filter) => filter.id === "period")?.selected, "7d");
+});
+
+test("limits show enforced counters, remaining allowance, and reset time", async () => {
+  const enterprise = createInMemoryGatewayEnterpriseRuntime();
+  const nowMs = Date.now();
+  const bounds = enterpriseWindowBounds("day", nowMs);
+  const base = `user:manager@example.test:${bounds.key}`;
+  await enterprise.rateLimitStore.consumeRateLimit({
+    key: `gateway:${base}:runs`,
+    windowStartMs: bounds.startMs,
+    windowEndMs: bounds.endMs,
+    amount: 2,
+    limit: 10,
+  });
+  await enterprise.rateLimitStore.consumeRateLimit({
+    key: `gateway:${base}:tokens`,
+    windowStartMs: bounds.startMs,
+    windowEndMs: bounds.endMs,
+    amount: 2_500,
+    limit: 20_000,
+  });
+  const gateway: GatewayConfig = {
+    token: "test",
+    governance: {
+      enabled: true,
+      assignments: { default: { userId: "manager@example.test", roles: ["System Manager"] } },
+      rateLimits: [{
+        subject: { kind: "user", id: "manager@example.test" },
+        window: "day",
+        maxRuns: 10,
+        maxTokens: 20_000,
+      }],
+    },
+  };
+  const reply = await dispatchCommand(message("/limits"), { ...commandContext(MANAGER_PAIRED, gateway), enterprise });
+  const row = reply?.presentation?.tables?.[0].rows?.[0] ?? [];
+  assert.deepEqual(row.slice(0, 4), [
+    "user:manager@example.test",
+    "day",
+    "2 / 10 (8 left)",
+    "2500 / 20000 (17500 left)",
+  ]);
+  assert.match(row[4] ?? "", /Z$/);
+  assert.equal(reply?.presentation?.kpis?.find((kpi) => kpi.label === "Token balance")?.value, "17500");
+  assert.equal(reply?.presentation?.filters?.find((filter) => filter.id === "subject")?.action?.command, "/limits subject={value}");
 });
 
 test("help pagination actions persist and execute as direct commands", async () => {

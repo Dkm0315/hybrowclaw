@@ -315,6 +315,48 @@ test("telegram webhook shows typing and delivers MEDIA artifacts as documents", 
   }
 });
 
+test("Frappe context words do not turn a normal OSS Manager answer into a failed artifact", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-gw-frappe-artifact-intent-"));
+  const { mkdir } = await import("node:fs/promises");
+  await mkdir(join(cwd, ".muster"), { recursive: true });
+  await writeFile(gatewayConfigPath(cwd), JSON.stringify({
+    token: "test-token",
+    telegram: { botToken: "123:ABC", thinking: "progress" },
+  }));
+  const gateway = await loadGatewayConfig(cwd);
+  await requestPairing(TELEGRAM_SURFACE_ID, "5599220011", cwd).then((pending) => approvePairing(pending.code, cwd));
+  const llm = await startStubLlm("OSS Manager supports architecture, delivery, support, and deterministic validation.");
+  const outbound: Array<{ method: string; body: unknown }> = [];
+  const fetcher = (async (url: string | URL | Request, init?: RequestInit) => {
+    const method = String(url).split("/").pop() ?? "";
+    outbound.push({ method, body: JSON.parse(String(init?.body ?? "{}")) });
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 775 } }), { status: 200 });
+  }) as typeof fetch;
+  const running = await startGatewayServer({ config: stubConfig(llm.url), gateway, cwd, fetcher }, 0);
+  try {
+    const frappeEnvelope = [
+      "Selected Ragnar agent: OSS Manager",
+      "Report in this order: scope, evidence, semantic assertions, and blockers.",
+      "",
+      "User request:",
+      "What can you tell me about OSS Manager?",
+    ].join("\n");
+    const response = await fetch(`http://127.0.0.1:${running.port}/v1/adapters/telegram`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer test-token" },
+      body: JSON.stringify({ ...telegramUpdate, update_id: 837366098, message: { ...telegramUpdate.message, text: frappeEnvelope } }),
+    });
+    assert.equal(response.status, 200);
+    await running.waitForIdle();
+    const serialized = JSON.stringify(outbound);
+    assert.doesNotMatch(serialized, /Artifact delivery failed|Preparing artifact route/);
+    assert.match(serialized, /OSS Manager supports architecture/);
+  } finally {
+    await running.close();
+    llm.close();
+  }
+});
+
 test("telegram artifact delivery rejects absolute paths and workspace symlink escapes", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-gw-telegram-artifact-containment-"));
   const { mkdir, symlink } = await import("node:fs/promises");

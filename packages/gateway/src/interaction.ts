@@ -1,7 +1,14 @@
 import type { GatewayConfig, GatewayGovernanceAssignment, GatewayGovernanceRateLimit } from "./gateway-config.js";
 import type { PairedIdentity, PairedSender } from "./pairing.js";
 import type { SurfaceMessage, SurfaceReply } from "./envelope.js";
-import { aggregateEnterpriseUsage, type EnterpriseActionReceipt, type EnterpriseSubject, type EnterpriseUsageEvent, type MusterConfig } from "@musterhq/core";
+import {
+  aggregateEnterpriseUsage,
+  enterpriseWindowBounds,
+  type EnterpriseActionReceipt,
+  type EnterpriseSubject,
+  type EnterpriseUsageEvent,
+  type MusterConfig,
+} from "@musterhq/core";
 import { commandPage, paginateRows, renderPresentationText } from "./presentation.js";
 import { gatewayEnterpriseSubjects, usageEventsForSubjects, type GatewayEnterpriseRuntime } from "./enterprise-runtime.js";
 import type {
@@ -382,33 +389,56 @@ function toolsCard(ctx: InteractionContext, identity: PairedIdentity | undefined
   };
 }
 
-function reportsCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
+async function reportsCard(ctx: InteractionContext, identity: PairedIdentity | undefined): Promise<InteractionCard> {
   const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
   const role = roleTier(identity, assignment?.roles);
   const audience: PresentationAudience = role.system ? "admin" : role.manager || role.hrbp ? "manager" : "self";
-  const rows: string[][] = [
-    ["1", "Personal usage", "Your requests, artifacts, and token use"],
-    ["2", "My documents", "Records and documents you recently worked on"],
+  const selectedArea = argumentValue(ctx.args, "area");
+  const reportArgs = argumentsWithout(ctx.args, ["area", "page"]);
+  if (selectedArea === "personal-usage") {
+    return usageCard({ ...ctx, args: setArgument(reportArgs, "scope", "self") }, identity);
+  }
+  if (selectedArea === "artifacts") return artifactsCard(ctx);
+  if (selectedArea === "team-usage" && (role.manager || role.hrbp || role.system)) {
+    return usageCard({ ...ctx, args: setArgument(reportArgs, "scope", "team") }, identity);
+  }
+  if (selectedArea === "audit" && (role.manager || role.hrbp || role.system)) {
+    return governanceQueueCard({ ...ctx, args: reportArgs }, "Audit", "Governed actions and outcomes for the authorized scope.", identity, "/audit");
+  }
+  if (selectedArea === "incidents" && (role.manager || role.hrbp || role.system)) {
+    return governanceQueueCard({ ...ctx, args: reportArgs }, "Incidents", "Failures, policy denials, and recovery actions for the authorized scope.", identity, "/incidents");
+  }
+  if (selectedArea === "system-governance" && role.system) {
+    return usageCard({ ...ctx, args: setArgument(reportArgs, "scope", "team") }, identity);
+  }
+
+  const areas = [
+    { label: "Personal usage", value: "personal-usage", detail: "Requests, tokens, latency, and cache" },
+    { label: "Artifacts", value: "artifacts", detail: "Generated files and delivery capability" },
+    ...((role.manager || role.hrbp || role.system) ? [
+      { label: "Team usage", value: "team-usage", detail: "Explicit reporting hierarchy only" },
+      { label: "Audit", value: "audit", detail: "Governed actions and outcomes" },
+      { label: "Incidents", value: "incidents", detail: "Failures, denials, and recovery" },
+    ] : []),
+    ...(role.system ? [{ label: "System governance", value: "system-governance", detail: "Tenant-authorized usage and controls" }] : []),
   ];
-  if (role.manager || role.hrbp || role.system) rows.push(["3", "Team reports", "Team usage, approvals, exceptions, and pending work"]);
-  if (role.hrbp || role.system) rows.push(["4", "HR reports", "Leave, attendance, employee lifecycle, and policy reports"]);
-  if (role.system) rows.push(["5", "System governance", "Token spend, rate limits, denied requests, provider usage"]);
+  const rows = areas.map((area, index) => [String(index + 1), area.label, area.detail]);
   return {
     kind: "report",
     title: "Reports",
-    lead: "Choose the report area. I will ask follow-up questions only when the report needs a date range, department, employee, or export format.",
+    lead: "Choose a report area or open a drill-down. Every option runs against the scope this identity is allowed to see.",
     audience,
     table: { columns: ["No", "Report area", "Includes"], rows },
-    filters: [
-      { id: "period", label: "Period", options: [{ label: "Today", value: "today" }, { label: "7 days", value: "7d" }, { label: "30 days", value: "30d" }] },
-      { id: "department", label: "Department" },
-      { id: "status", label: "Status" },
-      { id: "provider", label: "Provider" },
-    ],
-    drilldowns: [
-      { label: "Usage report", detail: "Open token and latency dimensions", command: "/usage", kind: "drilldown" },
-      { label: "Audit report", detail: "Open governed event dimensions", command: "/audit", kind: "drilldown" },
-    ],
+    filters: compact([
+      commandFilter(ctx, "/reports", "area", "Report area", areas.map(({ label, value }) => ({ label, value }))),
+      commandFilter(ctx, "/reports", "period", "Period", periodOptions()),
+    ]),
+    drilldowns: areas.slice(0, 5).map((area) => ({
+      label: area.label,
+      detail: area.detail,
+      command: `/reports area=${encodeURIComponent(area.value)}`,
+      kind: "drilldown" as const,
+    })),
     next: [
       { label: "Refresh", detail: "Refresh authorized report data", command: "/reports", style: "primary" },
       { label: "/tokens", detail: "View usage and token reports" },
@@ -420,8 +450,8 @@ function reportsCard(ctx: InteractionContext, identity: PairedIdentity | undefin
 
 async function usageCard(ctx: InteractionContext, identity: PairedIdentity | undefined): Promise<InteractionCard> {
   const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
-  const limits = visibleRateLimits(ctx.gateway, assignment, identity);
   const role = roleTier(identity, assignment?.roles);
+  const limitSnapshots = await readRateLimitSnapshots(ctx, assignment, identity, role, "current");
   const audience: PresentationAudience = role.system ? "admin" : role.manager || role.hrbp ? "manager" : "self";
   const requestedScope = argumentValue(ctx.args, "scope") ?? "self";
   const querySubjects = usageQuerySubjects(ctx, assignment, requestedScope);
@@ -433,7 +463,8 @@ async function usageCard(ctx: InteractionContext, identity: PairedIdentity | und
       subjectAny: querySubjectAny,
     })
     : [];
-  const visibleEvents = filterUsageEvents(events, ctx, assignment, requestedScope);
+  const scopedEvents = filterUsageEvents(events, ctx, assignment, requestedScope);
+  const visibleEvents = filterUsageDimensions(scopedEvents, ctx.args);
   const aggregation = aggregateEnterpriseUsage(visibleEvents, ["request_category", "provider", "outcome"]);
   const page = commandPage(ctx.args);
   const rows = aggregation.groups.map((group) => [
@@ -474,8 +505,10 @@ async function usageCard(ctx: InteractionContext, identity: PairedIdentity | und
       {
         id: "usage-limits",
         title: "Configured limits",
-        columns: ["Scope", "Limit"],
-        rows: limits.length ? limits : [["Current sender", "No explicit rate limit configured"]],
+        columns: ["Scope", "Window", "Requests", "Tokens", "Resets"],
+        rows: limitSnapshots.length
+          ? limitSnapshots.map(rateLimitSnapshotRow)
+          : [["Current identity", "—", "No enforced cap", "No enforced cap", "—"]],
       },
     ],
     trends: [{
@@ -488,12 +521,26 @@ async function usageCard(ctx: InteractionContext, identity: PairedIdentity | und
         { label: "p99", value: aggregation.totals.p99LatencyMs },
       ],
     }],
-    filters: [
-      { id: "period", label: "Period", options: [{ label: "Today", value: "today" }, { label: "7 days", value: "7d" }, { label: "30 days", value: "30d" }] },
-      { id: "user", label: audience === "self" ? "Current user" : "User or hierarchy" },
-      { id: "provider", label: "Provider" },
-      { id: "channel", label: "Channel" },
-    ],
+    filters: compact([
+      commandFilter(ctx, "/usage", "period", "Period", periodOptions()),
+      ...(audience === "self" ? [] : [commandFilter(ctx, "/usage", "scope", "Scope", [
+        { label: "My usage", value: "self" },
+        { label: "Authorized team", value: "team" },
+      ])]),
+      commandFilter(ctx, "/usage", "provider", "Provider", configuredProviderOptions(ctx, scopedEvents)),
+      commandFilter(ctx, "/usage", "channel", "Channel", observedSubjectOptions(scopedEvents, "channel", (value) => {
+        const surface = value.split(":", 1)[0];
+        return { label: humanizeValue(surface), value: surface };
+      })),
+      commandFilter(ctx, "/usage", "outcome", "Outcome", observedValueOptions(scopedEvents.map((event) => event.outcome))),
+      ...(audience === "self" ? [] : [commandFilter(
+        { ...ctx, args: setArgument(ctx.args, "scope", "team") },
+        "/usage",
+        "user",
+        "User",
+        authorizedUserOptions(identity, assignment),
+      )]),
+    ]),
     drilldowns: [
       { label: "Limits", command: "/limits", kind: "drilldown" },
       { label: "Security", command: "/security", kind: "drilldown" },
@@ -507,53 +554,73 @@ async function usageCard(ctx: InteractionContext, identity: PairedIdentity | und
   };
 }
 
-function limitsCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
+async function limitsCard(ctx: InteractionContext, identity: PairedIdentity | undefined): Promise<InteractionCard> {
   const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
   const role = roleTier(identity, assignment?.roles);
-  if (!role.manager && !role.hrbp && !role.system) {
-    return {
-      title: "Limits",
-      lead: "You can view your own usage limits from here. Changing limits requires a manager, HRBP, or system role.",
-      next: [
-        { label: "/tokens", detail: "Show your current usage scope" },
-        { label: "/whoami", detail: "Check the role I resolved" },
-      ],
-    };
-  }
+  const visibility = role.manager || role.hrbp || role.system ? "authorized" : "current";
+  const snapshots = await readRateLimitSnapshots(ctx, assignment, identity, role, visibility);
+  const requestRemaining = snapshots
+    .filter((snapshot) => snapshot.maxRuns !== undefined && snapshot.usedRuns !== undefined)
+    .map((snapshot) => Math.max(0, snapshot.maxRuns! - snapshot.usedRuns!));
+  const tokenRemaining = snapshots
+    .filter((snapshot) => snapshot.maxTokens !== undefined && snapshot.usedTokens !== undefined)
+    .map((snapshot) => Math.max(0, snapshot.maxTokens! - snapshot.usedTokens!));
+  const subjectOptions = observedValueOptions(snapshots.map((snapshot) => snapshot.subjectKind));
+  const windowOptions = observedValueOptions(snapshots.map((snapshot) => snapshot.window));
   return {
+    kind: "report",
     title: "Limits",
-    lead: "To change a limit, choose the scope first. I will show the impact before applying anything.",
+    lead: snapshots.length
+      ? "These are the enforced limits visible to this identity, read from the same atomic counters used before provider calls."
+      : "No explicit request or token limit is configured for this identity. Muster is recording usage, but the gateway is not enforcing a cap here.",
+    audience: role.system ? "admin" : role.manager || role.hrbp ? "manager" : "self",
+    kpis: [
+      { label: "Policies", value: String(snapshots.length) },
+      { label: "Request balance", value: requestRemaining.length ? String(Math.min(...requestRemaining)) : "Uncapped", detail: "lowest visible remaining allowance" },
+      { label: "Token balance", value: tokenRemaining.length ? String(Math.min(...tokenRemaining)) : "Uncapped", detail: "lowest visible remaining allowance" },
+      { label: "Counter store", value: ctx.enterprise?.backend ?? "Unavailable", tone: ctx.enterprise ? "positive" : "warning" },
+    ],
     table: {
-      columns: ["No", "Scope", "Examples"],
-      rows: [
-        ["1", "User", "One employee or channel user"],
-        ["2", "Department", "HR, Sales, Operations"],
-        ["3", "Role", "Employee, HRBP, Manager"],
-        ["4", "Channel", "One Slack/GChat/Telegram space"],
-        ["5", "Agent", "Report generator, Frappe operator, office tools"],
-      ],
+      id: "limits",
+      columns: ["Scope", "Window", "Requests", "Tokens", "Resets"],
+      rows: snapshots.length
+        ? snapshots.map(rateLimitSnapshotRow)
+        : [["Current identity", "—", "No enforced cap", "No enforced cap", "—"]],
     },
+    filters: compact([
+      commandFilter(ctx, "/limits", "subject", "Scope type", subjectOptions),
+      commandFilter(ctx, "/limits", "window", "Window", windowOptions),
+    ]),
     next: [
-      { label: "Preview impact", detail: "Show who will be affected before saving" },
-      { label: "Require approval", detail: "Add approval after a token/request threshold" },
+      { label: "Refresh", detail: "Read counters again", command: commandWithArguments("/limits", ctx.args), style: "primary" },
+      { label: "/usage", detail: "Compare allowance with observed token usage" },
       { label: "/security", detail: "Review related safety policy" },
     ],
+    note: "Provider billing credits are separate from gateway token allowances and are shown only when a provider exposes a verifiable billing API.",
   };
 }
 
 function securityCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
   const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
   const role = roleTier(identity, assignment?.roles);
+  const governance = ctx.gateway?.governance;
+  const validation = governance?.requestValidation;
   return {
     title: "Security",
-    lead: "Security controls are based on pairing, channel scope, Frappe permissions, and write approval gates.",
+    lead: governance?.enabled
+      ? "These are the controls currently enforced before a provider call."
+      : "Pairing and Frappe permissions are active, but enterprise gateway governance is not enabled for this deployment.",
     table: {
       columns: ["Control", "State"],
       rows: [
         ["Pairing", "required before agent runs"],
         ["Frappe RBAC", identity ? "enabled for this sender" : "not connected"],
         ["Employee mapping", identity?.employee ? "linked" : "not linked"],
-        ["Write actions", "preview + approval required"],
+        ["Request validation", governance?.enabled ? `enabled · max ${validation?.maxChars ?? 16_000} characters` : "not enabled"],
+        ["Secret detection", governance?.enabled && (validation?.blockSecrets ?? true) ? "blocking enabled" : "not enforced"],
+        ["Rate policies", String(governance?.rateLimits?.length ?? 0)],
+        ["Channel allowlist", assignment?.allowedChannels?.length ? `${assignment.allowedChannels.length} allowed` : "no explicit restriction"],
+        ["Write actions", "preview + approval gate when a mutating workflow declares one"],
         ["Admin controls", role.system ? "available" : "hidden unless role allows"],
       ],
     },
@@ -657,8 +724,9 @@ async function governanceQueueCard(
     })
     : [];
   const visible = filterReceipts(allReceipts, ctx, assignment, role);
-  const matching = visible.filter((receipt) => title === "Audit"
+  const categoryMatches = visible.filter((receipt) => title === "Audit"
     || (title === "Incidents" ? receipt.outcome === "blocked" || receipt.outcome === "failed" : /approval/i.test(receipt.action)));
+  const matching = filterReceiptDimensions(categoryMatches, ctx.args);
   const page = commandPage(ctx.args);
   const rows = matching.slice().reverse().map((receipt) => [
     receipt.occurredAt,
@@ -684,11 +752,17 @@ async function governanceQueueCard(
       rows: paged.rows.length ? paged.rows : [["No matching events", "—", "—", "—"]],
       pagination: paged.pagination,
     },
-    filters: [
-      { id: "period", label: "Period", options: [{ label: "Today", value: "today" }, { label: "7 days", value: "7d" }, { label: "30 days", value: "30d" }] },
-      { id: "status", label: "Status" },
-      ...(audience === "self" ? [] : [{ id: "scope", label: "Department or user" }]),
-    ],
+    filters: compact([
+      commandFilter(ctx, command, "period", "Period", periodOptions()),
+      commandFilter(ctx, command, "status", "Status", observedValueOptions(categoryMatches.map((receipt) => receipt.outcome))),
+      ...(audience === "self" ? [] : [commandFilter(
+        ctx,
+        command,
+        "scope",
+        "Department or user",
+        authorizedReportingScopeOptions(identity, assignment),
+      )]),
+    ]),
     next: [
       { label: "Refresh", detail: "Query the connected ledger", command, style: "primary" },
       { label: "/reports", detail: "Open report workflows" },
@@ -723,6 +797,34 @@ function filterUsageEvents(
     && event.subjects.some((subject) =>
       (subject.kind === "user" && managedUsers.has(subject.id))
         || (subject.kind === "department" && managedDepartments.has(subject.id))));
+}
+
+function filterUsageDimensions(events: readonly EnterpriseUsageEvent[], args: string): readonly EnterpriseUsageEvent[] {
+  const provider = argumentValue(args, "provider");
+  const channel = argumentValue(args, "channel");
+  const outcome = argumentValue(args, "outcome");
+  const user = argumentValue(args, "user");
+  return events.filter((event) => {
+    if (outcome && event.outcome !== outcome) return false;
+    if (provider && !event.subjects.some((subject) => subject.kind === "provider" && subject.id === provider)) return false;
+    if (user && !event.subjects.some((subject) => subject.kind === "user" && subject.id === user)) return false;
+    if (channel && !event.subjects.some((subject) => subject.kind === "channel" && (
+      subject.id === channel || subject.id.startsWith(`${channel}:`)
+    ))) return false;
+    return true;
+  });
+}
+
+function filterReceiptDimensions(receipts: readonly EnterpriseActionReceipt[], args: string): readonly EnterpriseActionReceipt[] {
+  const status = argumentValue(args, "status");
+  const scope = argumentValue(args, "scope");
+  const [scopeKind, ...scopeIdParts] = (scope ?? "").split(":");
+  const scopeId = scopeIdParts.join(":");
+  return receipts.filter((receipt) => {
+    if (status && receipt.outcome !== status) return false;
+    if (scopeId && ![...receipt.actor, ...receipt.target].some((subject) => subject.kind === scopeKind && subject.id === scopeId)) return false;
+    return true;
+  });
 }
 
 function usageQuerySubjects(
@@ -821,10 +923,129 @@ function reportingScopeConfigured(
     || assignment?.managedDepartmentIds?.length));
 }
 
+function periodOptions(): Array<{ label: string; value: string }> {
+  return [
+    { label: "Today", value: "today" },
+    { label: "7 days", value: "7d" },
+    { label: "30 days", value: "30d" },
+  ];
+}
+
+function commandFilter(
+  ctx: InteractionContext,
+  command: string,
+  id: string,
+  label: string,
+  options: readonly { readonly label: string; readonly value: string }[],
+): PresentationFilter | undefined {
+  const unique = new Map<string, string>();
+  for (const option of options) {
+    const value = String(option.value ?? "").trim();
+    if (value && !unique.has(value)) unique.set(value, String(option.label || value));
+  }
+  if (!unique.size) return undefined;
+  const selected = argumentValue(ctx.args, id);
+  return {
+    id,
+    label,
+    ...(selected ? { selected: encodeURIComponent(selected) } : {}),
+    options: [...unique].map(([value, optionLabel]) => ({ label: optionLabel, value: encodeURIComponent(value) })),
+    action: {
+      id: `filter-${command.slice(1)}-${id}`,
+      label: `Apply ${label.toLowerCase()}`,
+      command: commandWithFilter(ctx.args, command, id),
+      kind: "filter",
+    },
+  };
+}
+
+function commandWithFilter(args: string, command: string, key: string): string {
+  const rest = argumentsWithout(args, [key, "page"]);
+  return [command, rest, `${key}={value}`].filter(Boolean).join(" ");
+}
+
+function commandWithArguments(command: string, args: string): string {
+  return [command, args.trim()].filter(Boolean).join(" ");
+}
+
+function argumentsWithout(args: string, keys: readonly string[]): string {
+  const blocked = new Set(keys);
+  return args.split(/\s+/).filter((token) => {
+    const separator = token.indexOf("=");
+    return token && (separator <= 0 || !blocked.has(token.slice(0, separator)));
+  }).join(" ");
+}
+
+function setArgument(args: string, key: string, value: string): string {
+  const rest = argumentsWithout(args, [key]);
+  return [rest, `${key}=${encodeURIComponent(value)}`].filter(Boolean).join(" ");
+}
+
+function observedValueOptions(values: readonly (string | undefined)[]): Array<{ label: string; value: string }> {
+  return [...new Set(values.map((value) => String(value ?? "").trim()).filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right))
+    .map((value) => ({ label: humanizeValue(value), value }));
+}
+
+function observedSubjectOptions(
+  events: readonly EnterpriseUsageEvent[],
+  kind: EnterpriseSubject["kind"],
+  transform: (value: string) => { readonly label: string; readonly value: string },
+): Array<{ label: string; value: string }> {
+  const options = new Map<string, string>();
+  for (const event of events) {
+    for (const subject of event.subjects) {
+      if (subject.kind !== kind) continue;
+      const option = transform(subject.id);
+      if (option.value && !options.has(option.value)) options.set(option.value, option.label);
+    }
+  }
+  return [...options].map(([value, label]) => ({ label, value }));
+}
+
+function configuredProviderOptions(ctx: InteractionContext, events: readonly EnterpriseUsageEvent[]): Array<{ label: string; value: string }> {
+  const values = new Set(Object.keys(ctx.config.providers));
+  for (const event of events) {
+    for (const subject of event.subjects) if (subject.kind === "provider") values.add(subject.id);
+  }
+  return [...values].sort().map((value) => ({ label: value, value }));
+}
+
+function authorizedUserOptions(
+  identity: PairedIdentity | undefined,
+  assignment: GatewayGovernanceAssignment | undefined,
+): Array<{ label: string; value: string }> {
+  const self = assignment?.userId ?? identity?.user ?? identity?.employee;
+  return [
+    ...(self ? [{ label: identity?.employeeName ? `${identity.employeeName} (me)` : `${self} (me)`, value: self }] : []),
+    ...(assignment?.managedUserIds ?? []).filter((value) => value !== self).map((value) => ({ label: value, value })),
+  ];
+}
+
+function authorizedReportingScopeOptions(
+  identity: PairedIdentity | undefined,
+  assignment: GatewayGovernanceAssignment | undefined,
+): Array<{ label: string; value: string }> {
+  return [
+    ...authorizedUserOptions(identity, assignment).map((option) => ({ label: option.label, value: `user:${option.value}` })),
+    ...(assignment?.managedDepartmentIds ?? []).map((value) => ({ label: `Department: ${value}`, value: `department:${value}` })),
+  ];
+}
+
+function humanizeValue(value: string): string {
+  return value.replaceAll("_", " ").replaceAll("-", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
 function argumentValue(args: string, key: string): string | undefined {
   for (const token of args.split(/\s+/)) {
     const separator = token.indexOf("=");
-    if (separator > 0 && token.slice(0, separator) === key) return decodeURIComponent(token.slice(separator + 1));
+    if (separator > 0 && token.slice(0, separator) === key) {
+      try {
+        return decodeURIComponent(token.slice(separator + 1));
+      } catch {
+        return token.slice(separator + 1);
+      }
+    }
   }
   return undefined;
 }
@@ -1058,29 +1279,125 @@ function governanceAssignment(gateway: GatewayConfig | undefined, message: Surfa
   return assignments[`${message.surfaceId}:${message.senderId}`] ?? assignments[message.senderId] ?? assignments[paired.pairingId] ?? assignments.default;
 }
 
-function visibleRateLimits(
-  gateway: GatewayConfig | undefined,
-  assignment: GatewayGovernanceAssignment | undefined,
-  identity: PairedIdentity | undefined,
-): string[][] {
-  const limits = gateway?.governance?.rateLimits ?? [];
-  const rows: string[][] = [];
-  for (const limit of limits) {
-    if (!limitMatches(limit, assignment, identity)) continue;
-    const caps = compact([
-      limit.maxRuns === undefined ? undefined : `${limit.maxRuns} requests/${limit.window}`,
-      limit.maxTokens === undefined ? undefined : `${limit.maxTokens} tokens/${limit.window}`,
-    ]).join(", ");
-    rows.push([`${limit.subject.kind}:${limit.subject.id}`, caps || `configured per ${limit.window}`]);
-  }
-  return rows;
+interface RateLimitSnapshot {
+  readonly subjectKind: GatewayGovernanceRateLimit["subject"]["kind"];
+  readonly subjectId: string;
+  readonly window: GatewayGovernanceRateLimit["window"];
+  readonly maxRuns?: number;
+  readonly usedRuns?: number;
+  readonly maxTokens?: number;
+  readonly usedTokens?: number;
+  readonly resetAt: string;
 }
 
-function limitMatches(limit: GatewayGovernanceRateLimit, assignment: GatewayGovernanceAssignment | undefined, identity: PairedIdentity | undefined): boolean {
-  if (limit.subject.kind === "role") return !!assignment?.roles?.includes(limit.subject.id) || !!identity?.roles.includes(limit.subject.id);
-  if (limit.subject.kind === "tenant") return assignment?.tenantId === limit.subject.id || identity?.site === limit.subject.id;
-  if (limit.subject.kind === "user") return assignment?.userId === limit.subject.id || identity?.user === limit.subject.id || identity?.employee === limit.subject.id;
-  return true;
+async function readRateLimitSnapshots(
+  ctx: InteractionContext,
+  assignment: GatewayGovernanceAssignment | undefined,
+  identity: PairedIdentity | undefined,
+  role: ReturnType<typeof roleTier>,
+  visibility: "current" | "authorized",
+): Promise<RateLimitSnapshot[]> {
+  const subjectFilter = argumentValue(ctx.args, "subject");
+  const windowFilter = argumentValue(ctx.args, "window");
+  const limits = (ctx.gateway?.governance?.rateLimits ?? []).filter((limit) => {
+    if (subjectFilter && limit.subject.kind !== subjectFilter) return false;
+    if (windowFilter && limit.window !== windowFilter) return false;
+    if (limitMatchesCurrentContext(limit, ctx, assignment, identity)) return true;
+    return visibility === "authorized" && limitVisibleToManager(limit, assignment, identity, role);
+  });
+  const nowMs = Date.now();
+  return Promise.all(limits.map(async (limit) => {
+    const bounds = enterpriseWindowBounds(limit.window, nowMs);
+    const base = `${limit.subject.kind}:${limit.subject.id}:${bounds.key}`;
+    const readCounter = async (metric: "runs" | "tokens", configured: number | undefined): Promise<number | undefined> => {
+      if (configured === undefined || !ctx.enterprise) return undefined;
+      try {
+        return await ctx.enterprise.rateLimitStore.readRateLimit({
+          key: `gateway:${base}:${metric}`,
+          windowStartMs: bounds.startMs,
+          nowMs,
+        });
+      } catch {
+        return undefined;
+      }
+    };
+    const [usedRuns, usedTokens] = await Promise.all([
+      readCounter("runs", limit.maxRuns),
+      readCounter("tokens", limit.maxTokens),
+    ]);
+    return {
+      subjectKind: limit.subject.kind,
+      subjectId: limit.subject.id,
+      window: limit.window,
+      ...(limit.maxRuns === undefined ? {} : { maxRuns: limit.maxRuns, usedRuns }),
+      ...(limit.maxTokens === undefined ? {} : { maxTokens: limit.maxTokens, usedTokens }),
+      resetAt: new Date(bounds.endMs).toISOString(),
+    };
+  }));
+}
+
+function limitMatchesCurrentContext(
+  limit: GatewayGovernanceRateLimit,
+  ctx: InteractionContext,
+  assignment: GatewayGovernanceAssignment | undefined,
+  identity: PairedIdentity | undefined,
+): boolean {
+  const subject = limit.subject;
+  if (subject.kind === "role") {
+    const roles = [...(assignment?.roles ?? []), ...(identity?.roles ?? [])].map((value) => value.toLowerCase());
+    return roles.includes(subject.id.toLowerCase());
+  }
+  if (subject.kind === "department") return [...(assignment?.departmentIds ?? []), identity?.department].filter(Boolean).includes(subject.id);
+  if (subject.kind === "tenant") return assignment?.tenantId === subject.id || identity?.site === subject.id;
+  if (subject.kind === "user") {
+    return [assignment?.userId, identity?.user, identity?.employee, ctx.message.senderId, ctx.paired.pairingId].includes(subject.id);
+  }
+  if (subject.kind === "channel") return subject.id === `${ctx.message.surfaceId}:${ctx.message.conversationId}` || subject.id === ctx.message.conversationId;
+  if (subject.kind === "surface") return subject.id === ctx.message.surfaceId;
+  if (subject.kind === "workspace") return assignment?.workspaceId === subject.id;
+  if (subject.kind === "agent") return ctx.profile === subject.id;
+  return false;
+}
+
+function limitVisibleToManager(
+  limit: GatewayGovernanceRateLimit,
+  assignment: GatewayGovernanceAssignment | undefined,
+  identity: PairedIdentity | undefined,
+  role: ReturnType<typeof roleTier>,
+): boolean {
+  if (role.system) return true;
+  if (!role.manager && !role.hrbp) return false;
+  const subject = limit.subject;
+  if (subject.kind === "user") return assignment?.managedUserIds?.includes(subject.id) ?? false;
+  if (subject.kind === "department") return assignment?.managedDepartmentIds?.includes(subject.id) ?? false;
+  if (subject.kind === "role") return [...(assignment?.roles ?? []), ...(identity?.roles ?? [])].includes(subject.id);
+  if (subject.kind === "tenant") return assignment?.tenantId === subject.id || identity?.site === subject.id;
+  if (subject.kind === "workspace") return assignment?.workspaceId === subject.id;
+  if (subject.kind === "channel") return assignment?.allowedChannels?.includes(subject.id) ?? false;
+  if (subject.kind === "surface") return assignment?.allowedSurfaces?.includes(subject.id) ?? false;
+  if (subject.kind === "agent") return assignment?.capabilities?.some((capability) => ["*", "agents", "governance"].includes(capability)) ?? false;
+  return false;
+}
+
+function rateLimitSnapshotRow(snapshot: RateLimitSnapshot): string[] {
+  return [
+    `${snapshot.subjectKind}:${snapshot.subjectId}`,
+    snapshot.window,
+    formatCounterAllowance(snapshot.usedRuns, snapshot.maxRuns),
+    formatCounterAllowance(snapshot.usedTokens, snapshot.maxTokens),
+    formatResetTime(snapshot.resetAt),
+  ];
+}
+
+function formatCounterAllowance(used: number | undefined, limit: number | undefined): string {
+  if (limit === undefined) return "Not limited";
+  if (used === undefined) return `Counter unavailable / ${limit}`;
+  return `${used} / ${limit} (${Math.max(0, limit - used)} left)`;
+}
+
+function formatResetTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toISOString().replace("T", " ").slice(0, 16) + "Z";
 }
 
 function compact<T>(items: readonly (T | undefined | false | null)[]): T[] {

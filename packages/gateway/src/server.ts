@@ -162,12 +162,26 @@ function deliveryStore(key: string | undefined, result: unknown): void {
   deliveryCache.set(key, { at: Date.now(), result });
 }
 
-const ARTIFACT_REQUEST_RE = /\b(artifact|attach|attachment|document|docx|word|pdf|pptx?|presentation|slides?|xlsx?|excel|spreadsheet|workbook|report|brief|deck)\b/i;
+const EXPLICIT_ARTIFACT_RE = /(?:\/(?:pdf|docx?|word|pptx?|slides?|xlsx?|excel)\b|\b(?:docx|pdf|pptx|xlsx)\b|\b(?:word|excel|powerpoint)\s+(?:file|document|workbook|presentation)\b)/i;
+const ARTIFACT_NOUN_RE = /\b(?:artifact|attachment|document|presentation|slides?|spreadsheet|workbook|report|brief|deck)\b/i;
+const ARTIFACT_CREATION_RE = /\b(?:attach|build|convert|create|draft|export|generate|give|make|need|prepare|produce|send|want|write)\b/i;
 const MEMORY_REQUEST_RE = /\b(remember when|recall|look up memory|search memory|from memory|chat history|previous conversation|earlier conversation|last time|we discussed|named chat|previous session|context from before|what did (we|i) (discuss|say|decide)|my preference)\b/i;
 const ARTIFACT_REF_RE = /(?:^|[\s`"'(])((?:\.\/)?artifacts\/[^\s`"')]+?\.(?:pdf|docx|xlsx|pptx|md|txt|csv|json|zip))/gi;
 
+function userRequestText(text: string): string {
+  const marker = "\nUser request:\n";
+  const offset = text.lastIndexOf(marker);
+  return (offset >= 0 ? text.slice(offset + marker.length) : text).trim();
+}
+
+function isArtifactRequest(text: string): boolean {
+  const request = userRequestText(text);
+  return EXPLICIT_ARTIFACT_RE.test(request)
+    || (ARTIFACT_NOUN_RE.test(request) && ARTIFACT_CREATION_RE.test(request));
+}
+
 function maybeAddChannelArtifactInstructions(text: string): string {
-  if (!ARTIFACT_REQUEST_RE.test(text) || /\bMEDIA\s*:/i.test(text)) return text;
+  if (!isArtifactRequest(text) || /\bMEDIA\s*:/i.test(text)) return text;
   return [
     text,
     "",
@@ -188,9 +202,9 @@ function channelProgressText(text: string, surface: "slack" | "telegram", elapse
   const steps = [
     "Checking the request",
     shouldRecallForChannel(text) ? "Looking up scoped memory" : undefined,
-    ARTIFACT_REQUEST_RE.test(text) ? "Preparing artifact route" : undefined,
+    isArtifactRequest(text) ? "Preparing artifact route" : undefined,
     "Running the provider",
-    ARTIFACT_REQUEST_RE.test(text) ? "Will verify and attach generated files" : undefined,
+    isArtifactRequest(text) ? "Will verify and attach generated files" : undefined,
   ].filter(Boolean);
   const chevron = surface === "slack" ? "▾" : "▾";
   const elapsed = elapsedMs > 0 ? ` · ${Math.max(1, Math.round(elapsedMs / 1000))}s` : "";
@@ -353,6 +367,7 @@ async function gatewayGovernancePreflight(
   message: SurfaceMessage,
   paired: PairedSender,
   assignment: GatewayGovernanceAssignment,
+  agentId: string,
   gateway: Pick<GatewayConfig, "governance"> | undefined,
   enterprise: GatewayEnterpriseRuntime | undefined,
 ): Promise<GatewayPreflight> {
@@ -389,6 +404,7 @@ async function gatewayGovernancePreflight(
     message,
     paired,
     assignment,
+    agentId,
     estimatedTokens,
   });
   return { ...(rate.blocked ? { reply: governanceBlock(rate.blocked) } : {}), policyIds: rate.policyIds };
@@ -582,7 +598,7 @@ export async function handleSurfaceMessage(
     legacyConversationKey: `${message.surfaceId}:${message.conversationId}`,
   });
   if (command) return command;
-  const preflight = await gatewayGovernancePreflight(message, paired, assignment, options.gateway, options.enterprise);
+  const preflight = await gatewayGovernancePreflight(message, paired, assignment, profile, options.gateway, options.enterprise);
   if (preflight.reply) {
     if (options.enterprise) {
       await recordGatewayUsage(options.enterprise, {
@@ -593,6 +609,7 @@ export async function handleSurfaceMessage(
         latencyMs: 0,
         inputTokens: estimateTokens(message.text),
         action: "gateway.run",
+        agentId: profile,
         policyIds: preflight.policyIds,
       });
     }
@@ -652,7 +669,7 @@ export async function handleSurfaceMessage(
       throw new Error(outcome.episode.outcome?.detail ?? "Run failed");
     }
     const extracted = extractMediaTags(outcome.episode.responseText);
-    const artifactRequested = ARTIFACT_REQUEST_RE.test(message.text);
+    const artifactRequested = isArtifactRequest(message.text);
     const artifacts = await resolveChannelArtifacts(
       outcome.episode.responseText,
       extracted.media.map((item) => item.ref),
@@ -683,6 +700,7 @@ export async function handleSurfaceMessage(
         tokens: outcome.tokens,
         requestCategory: classifyGatewayRequest(message.text),
         action: "gateway.run",
+        agentId: profile,
         policyIds: preflight.policyIds,
       });
     }
@@ -703,6 +721,7 @@ export async function handleSurfaceMessage(
         inputTokens: estimateTokens(message.text),
         requestCategory: classifyGatewayRequest(message.text),
         action: "gateway.run",
+        agentId: profile,
         policyIds: preflight.policyIds,
       });
     }

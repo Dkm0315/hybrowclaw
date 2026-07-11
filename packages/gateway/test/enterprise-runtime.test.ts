@@ -118,3 +118,32 @@ test("separate gateway runtimes cannot over-admit one shared SQLite rate limit",
     await provider.close();
   }
 });
+
+test("department and agent limits are enforced before provider execution", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-enterprise-department-agent-"));
+  const provider = await providerServer();
+  const gateway: GatewayConfig = {
+    token: "test-token",
+    governance: {
+      enabled: true,
+      assignments: { default: { userId: "employee-alice", departmentIds: ["Professional Services"] } },
+      rateLimits: [
+        { subject: { kind: "department", id: "Professional Services" }, window: "hour", maxRuns: 5 },
+        { subject: { kind: "agent", id: "default" }, window: "hour", maxRuns: 1 },
+      ],
+    },
+  };
+  const pending = await requestPairing("gchat:app", "users/alice", cwd);
+  await approvePairing(pending.code, cwd);
+  const enterprise = openSqliteGatewayEnterpriseRuntime(cwd);
+  try {
+    const first = await handleSurfaceMessage(message("first agent request"), { config: providerConfig(provider.url), gateway, enterprise, cwd });
+    assert.match("text" in first ? first.text : "", /provider-ok/);
+    const second = await handleSurfaceMessage(message("second agent request"), { config: providerConfig(provider.url), gateway, enterprise, cwd });
+    assert.match("text" in second ? second.text : "", /Rate limit exceeded for agent:default/);
+    assert.equal(provider.calls(), 1);
+  } finally {
+    await enterprise.close?.();
+    await provider.close();
+  }
+});

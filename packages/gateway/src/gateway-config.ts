@@ -107,7 +107,15 @@ export interface GatewayDeviceRecord {
   readonly migratedAt?: string;
 }
 
-export type GatewayGovernanceSubjectKind = "user" | "role" | "channel" | "surface" | "tenant" | "workspace";
+export type GatewayGovernanceSubjectKind =
+  | "user"
+  | "role"
+  | "department"
+  | "channel"
+  | "surface"
+  | "tenant"
+  | "workspace"
+  | "agent";
 export type GatewayGovernanceRateWindow = "minute" | "hour" | "day" | "month";
 
 export interface GatewayGovernanceSubject {
