@@ -96,10 +96,24 @@ export function recordMutationFromArgs(args: Record<string, unknown>): QaRun {
   assertRunning(run);
   const operationId = requiredString(args.operationId, "operationId");
   const event = requiredString(args.event, "event");
-  if (!["applied", "restored", "restore_failed"].includes(event)) throw new Error("event must be applied, restored, or restore_failed.");
+  if (!["dispatching", "applied", "restored", "restore_failed"].includes(event)) {
+    throw new Error("event must be dispatching, applied, restored, or restore_failed.");
+  }
   const operation = findOperation(run, operationId);
   const ledger = run.mutationLedger.find((entry) => entry.operationId === operationId);
   if (!ledger) throw new Error(`Mutation ${operationId} cannot run before its compensation is registered.`);
+  if (event === "dispatching") {
+    if (run.currentState !== operation.state) throw new Error(`Mutation ${operationId} cannot dispatch during ${run.currentState}.`);
+    if (ledger.status !== "REGISTERED") throw new Error(`Mutation ${operationId} is ${ledger.status}, not REGISTERED.`);
+    const dispatchingAt = isoTimestamp(args.recordedAt, "recordedAt", new Date().toISOString());
+    if (Date.parse(dispatchingAt) < Date.parse(ledger.registeredAt)) throw new Error(`Mutation ${operationId} dispatch journal predates compensation registration.`);
+    return {
+      ...run,
+      mutationLedger: run.mutationLedger.map((entry) => entry.operationId === operationId
+        ? { ...entry, status: "DISPATCHING", dispatchingAt }
+        : entry),
+    };
+  }
   const expectedState = event === "applied" ? operation.state : "RESTORE";
   if (event === "applied" && run.currentState !== operation.state) throw new Error(`Mutation ${operationId} cannot apply during ${run.currentState}.`);
   if (event !== "applied" && run.currentState !== "RESTORE") throw new Error(`Compensation ${operationId} can execute only during RESTORE.`);
@@ -118,10 +132,12 @@ export function recordMutationFromArgs(args: Record<string, unknown>): QaRun {
   const mutationLedger = run.mutationLedger.map((entry): MutationLedgerEntry => {
     if (entry.operationId !== operationId) return entry;
     if (event === "applied") {
-      if (entry.status !== "REGISTERED") throw new Error(`Mutation ${operationId} is ${entry.status}, not REGISTERED.`);
+      if (entry.status !== "DISPATCHING") throw new Error(`Mutation ${operationId} is ${entry.status}, not DISPATCHING.`);
       return { ...entry, status: "APPLIED", appliedAt: at, receiptIds: [...entry.receiptIds, receipt.id] };
     }
-    if (entry.status !== "APPLIED") throw new Error(`Compensation ${operationId} requires APPLIED state, got ${entry.status}.`);
+    if (entry.status !== "DISPATCHING" && entry.status !== "APPLIED") {
+      throw new Error(`Compensation ${operationId} requires DISPATCHING or APPLIED state, got ${entry.status}.`);
+    }
     if (event === "restored") return { ...entry, status: "RESTORED", restoredAt: at, receiptIds: [...entry.receiptIds, receipt.id] };
     return {
       ...entry,
@@ -233,7 +249,7 @@ export function nextDispatchFromArgs(args: Record<string, unknown>): Record<stri
   }
   const operations = run.plan.operations.filter((operation) => operation.state === run.currentState);
   const dispatchable: TypedOperation[] = [];
-  const blocked: Array<{ operationId: string; reason: string }> = [];
+  const blocked: Array<{ operationId?: string; useCaseId?: string; reason: string }> = [];
   for (const operation of operations) {
     if (!operation.mutating) {
       dispatchable.push(operation);
@@ -241,8 +257,17 @@ export function nextDispatchFromArgs(args: Record<string, unknown>): Record<stri
     }
     const ledger = run.mutationLedger.find((entry) => entry.operationId === operation.id);
     if (!ledger) blocked.push({ operationId: operation.id, reason: "register_compensation_before_dispatch" });
-    else if (ledger.status === "REGISTERED") dispatchable.push(operation);
+    else if (ledger.status === "REGISTERED") blocked.push({ operationId: operation.id, reason: "record_dispatching_before_side_effect" });
+    else if (ledger.status === "DISPATCHING") dispatchable.push(operation);
     else blocked.push({ operationId: operation.id, reason: `mutation_${ledger.status.toLowerCase()}` });
+  }
+  if (run.currentState === "COMMAND_MATRIX") {
+    for (const useCase of run.plan.useCases.selected.filter((item) => item.risk === "mutation_gated")) {
+      blocked.push({
+        useCaseId: useCase.selectionId,
+        reason: "bind_reviewed_typed_adapter_and_exact_compensation_before_dispatch",
+      });
+    }
   }
   return {
     state: run.currentState,
@@ -267,7 +292,30 @@ export function buildReportFromArgs(args: Record<string, unknown>): Record<strin
     verdict,
     summary: summaryFor(verdict, run, pending.length),
     stateCounts,
-    scenarios: run.plan.scenarios.map((scenario) => ({ id: scenario.id, title: scenario.title, selection: scenario.selection, engine: scenario.engine })),
+    useCases: {
+      catalogVersion: run.plan.useCases.catalogVersion,
+      catalogDigest: run.plan.useCases.catalogDigest,
+      selected: run.plan.useCases.selected.length,
+      readOnly: run.plan.useCases.readOnlyCount,
+      gated: run.plan.useCases.gatedCount,
+      families: uniqueSorted(run.plan.useCases.selected.map((item) => item.family)),
+      items: run.plan.useCases.selected.map((item) => ({
+        selectionId: item.selectionId,
+        targetEngine: item.targetEngine,
+        suite: item.suite,
+        family: item.family,
+        selection: item.selection,
+        risk: item.risk,
+        dispatch: item.dispatch,
+      })),
+    },
+    scenarios: run.plan.scenarios.map((scenario) => ({
+      id: scenario.id,
+      title: scenario.title,
+      selection: scenario.selection,
+      engine: scenario.engine,
+      useCaseIds: scenario.useCaseIds,
+    })),
     restoration: {
       registered: run.mutationLedger.length,
       restored: run.mutationLedger.filter((entry) => entry.status === "RESTORED").length,
@@ -392,17 +440,20 @@ function finalVerdict(results: readonly StateResult[], ledger: readonly Mutation
 }
 
 function pendingRestores(ledger: readonly MutationLedgerEntry[]): MutationLedgerEntry[] {
-  return ledger.filter((entry) => entry.status === "APPLIED" || entry.status === "RESTORE_FAILED").slice().reverse();
+  return ledger.filter((entry) => entry.status === "DISPATCHING" || entry.status === "APPLIED" || entry.status === "RESTORE_FAILED").slice().reverse();
 }
 
 function normalizePlan(value: unknown, lockDigest: string, sourceSha: string): QaPlan {
   const plan = asRecord(value, "plan") as unknown as QaPlan;
   if (plan.lockDigest !== lockDigest || plan.sourceSha !== sourceSha) throw new Error("Plan does not match the supplied source lock.");
-  if (!Array.isArray(plan.operations) || !Array.isArray(plan.scenarios)) throw new Error("Plan is missing operations or scenarios.");
+  if (!Array.isArray(plan.operations) || !Array.isArray(plan.scenarios) || !plan.useCases || !Array.isArray(plan.useCases.selected)) {
+    throw new Error("Plan is missing operations, scenarios, or use-case contracts.");
+  }
   const expectedDigest = sha256({
     profileId: plan.profileId,
     lockDigest: plan.lockDigest,
     sourceSha: plan.sourceSha,
+    useCases: plan.useCases,
     scenarios: plan.scenarios,
     operations: plan.operations,
     mutationCount: plan.mutationCount,
@@ -412,6 +463,7 @@ function normalizePlan(value: unknown, lockDigest: string, sourceSha: string): Q
     profileId: plan.profileId,
     lockDigest: plan.lockDigest,
     sourceSha: plan.sourceSha,
+    useCases: plan.useCases,
     scenarios: plan.scenarios,
     operations: plan.operations,
     mutationCount: plan.mutationCount,

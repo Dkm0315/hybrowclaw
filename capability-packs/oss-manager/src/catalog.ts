@@ -79,7 +79,7 @@ export const ENGINE_DESCRIPTORS: Readonly<Record<EngineId, EngineDescriptor>> = 
   sentinel: descriptor({
     id: "sentinel",
     title: "Redis Sentinel high availability",
-    aliases: ["redis-sentinel", "ha", "failover"],
+    aliases: ["redis-sentinel", "sentinel-ha"],
     modules: ["sentinel", "high-availability", "failover"],
     adjacentModules: ["status", "refresh", "rotation", "logs", "backup", "recovery", "migration"],
     topologyOperation: "engine.sentinel.topology",
@@ -180,6 +180,7 @@ export const ALLOWED_OPERATION_TYPES = new Set<string>([
   "restore.service_start",
   "observe.health_recovery",
   "data.full_digest",
+  "matrix.suite_contract",
   "proof.snapshot_compare",
   "report.render_receipts",
   ...Object.values(ENGINE_DESCRIPTORS).flatMap((engine) => [

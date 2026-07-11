@@ -30,8 +30,27 @@ export const POLICY_ROLE_IDS = [
 
 export type PolicyRoleId = (typeof POLICY_ROLE_IDS)[number];
 export type EngineId = "sentinel" | "redis" | "valkey" | "postgres" | "mongo" | "kafka" | "qdrant" | "observability";
+export type QaSuiteEngineId = Exclude<EngineId, "sentinel"> | "all";
 export type ChangeCategory = "docs" | "tests" | "runtime" | "schema" | "config" | "security" | "build" | "unknown";
 export type ChangeImpact = "NO_CHANGE" | "DOCUMENTATION_ONLY" | "TEST_ONLY" | "NON_RUNTIME" | "RUNTIME" | "HIGH_RISK";
+export type QaUseCaseFamily =
+  | "baseline"
+  | "configuration"
+  | "deployment"
+  | "health_status"
+  | "diagnostics"
+  | "backup_restore"
+  | "recovery"
+  | "high_availability"
+  | "disaster_recovery"
+  | "migration"
+  | "security"
+  | "scale_upgrade"
+  | "integrations"
+  | "observability"
+  | "destructive_dry_run";
+export type QaUseCaseRisk = "read_only" | "mutation_gated" | "destructive_plan";
+export type QaUseCaseDispatch = "typed_adapter_required" | "approval_adapter_required" | "approval_compensation_adapter_required";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
@@ -127,6 +146,37 @@ export interface TypedOperation {
   readonly evidenceRequired: readonly string[];
 }
 
+export interface QaSuiteContract {
+  readonly id: string;
+  readonly engine: QaSuiteEngineId;
+  readonly suite: string;
+  readonly scopes: readonly string[];
+  readonly family: QaUseCaseFamily;
+  readonly risk: QaUseCaseRisk;
+  readonly approvalRequired: boolean;
+  readonly compensationRequired: boolean;
+  readonly commandIds: readonly string[];
+  readonly evidenceRequired: readonly string[];
+}
+
+export interface QaUseCaseSelection extends QaSuiteContract {
+  readonly selectionId: string;
+  readonly targetEngine?: EngineId;
+  readonly selection: "direct" | "adjacent" | "contract";
+  readonly dispatch: QaUseCaseDispatch;
+  readonly reason: string;
+}
+
+export interface QaUseCasePlan {
+  readonly catalogVersion: string;
+  readonly catalogDigest: string;
+  readonly sourceSha: string;
+  readonly profileId: string;
+  readonly selected: readonly QaUseCaseSelection[];
+  readonly readOnlyCount: number;
+  readonly gatedCount: number;
+}
+
 export interface QaScenario {
   readonly id: string;
   readonly title: string;
@@ -135,6 +185,7 @@ export interface QaScenario {
   readonly engine?: EngineId;
   readonly selection: "direct" | "adjacent" | "contract";
   readonly reason: string;
+  readonly useCaseIds: readonly string[];
   readonly invariants: readonly string[];
   readonly operations: readonly TypedOperation[];
 }
@@ -145,6 +196,7 @@ export interface QaPlan {
   readonly profileId: string;
   readonly lockDigest: string;
   readonly sourceSha: string;
+  readonly useCases: QaUseCasePlan;
   readonly scenarios: readonly QaScenario[];
   readonly operations: readonly TypedOperation[];
   readonly mutationCount: number;
@@ -195,9 +247,10 @@ export interface MutationLedgerEntry {
   readonly operationId: string;
   readonly compensation: TypedCompensation;
   readonly registeredAt: string;
+  readonly dispatchingAt?: string;
   readonly appliedAt?: string;
   readonly restoredAt?: string;
-  readonly status: "REGISTERED" | "APPLIED" | "RESTORED" | "RESTORE_FAILED";
+  readonly status: "REGISTERED" | "DISPATCHING" | "APPLIED" | "RESTORED" | "RESTORE_FAILED";
   readonly receiptIds: readonly string[];
   readonly failure?: string;
 }

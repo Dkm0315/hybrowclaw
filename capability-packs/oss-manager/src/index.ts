@@ -24,10 +24,17 @@ import {
 } from "./runtime.js";
 import { QA_STATES } from "./types.js";
 import type { TypedOperation } from "./types.js";
+import {
+  HYBROWLABS_SUITE_CATALOG,
+  OSS_MANAGER_SUITE_CATALOG_VERSION,
+  suiteCatalogReport,
+  validateSuiteManifestFromArgs,
+} from "./use-cases.js";
 import { asRecord, optionalString } from "./utils.js";
 
 export * from "./types.js";
 export { ENGINE_DESCRIPTORS, GENERIC_OSS_QA_PROFILE, HYBROWLABS_OSS_MANAGER_PROFILE, POLICY_ROLES } from "./catalog.js";
+export { HYBROWLABS_SUITE_CATALOG, OSS_MANAGER_SUITE_CATALOG_VERSION } from "./use-cases.js";
 
 /** Locks a repository/branch/base/head identity. The digest excludes time and is deterministic. */
 export async function oss_qa_source_lock(args: Record<string, unknown>) {
@@ -42,6 +49,21 @@ export async function oss_qa_diff_classify(args: Record<string, unknown>) {
 /** Compiles direct and adjacent scenarios into allowlisted typed operations. */
 export async function oss_qa_scenario_compile(args: Record<string, unknown>) {
   return compilePlanFromArgs(args);
+}
+
+/** Selects source-locked direct and adjacent suite contracts without provider calls. */
+export async function oss_qa_use_case_select(args: Record<string, unknown>) {
+  return compilePlanFromArgs(args).useCases;
+}
+
+/** Returns the sanitized suite contract catalog. It intentionally contains no shell. */
+export async function oss_qa_suite_catalog(args: Record<string, unknown> = {}) {
+  return suiteCatalogReport(optionalString(args.profileId));
+}
+
+/** Compares source-adapter metadata with the bundled catalog; drift is INCONCLUSIVE. */
+export async function oss_qa_suite_manifest_validate(args: Record<string, unknown>) {
+  return validateSuiteManifestFromArgs(args);
 }
 
 /** Starts the evidence-gated state contract at SOURCE_LOCK. */
@@ -97,6 +119,11 @@ export async function oss_qa_catalog() {
     states: QA_STATES,
     roles: POLICY_ROLES,
     engines: Object.values(ENGINE_DESCRIPTORS),
+    suiteCatalog: {
+      version: OSS_MANAGER_SUITE_CATALOG_VERSION,
+      count: HYBROWLABS_SUITE_CATALOG.length,
+      containsCommands: false,
+    },
     guarantees: [
       "source_sha_locked",
       "typed_operations_only",
@@ -123,6 +150,9 @@ export const tools = {
   oss_qa_source_lock,
   oss_qa_diff_classify,
   oss_qa_scenario_compile,
+  oss_qa_use_case_select,
+  oss_qa_suite_catalog,
+  oss_qa_suite_manifest_validate,
   oss_qa_run_create,
   oss_qa_compensation_register,
   oss_qa_mutation_record,

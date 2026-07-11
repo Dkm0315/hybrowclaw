@@ -6,6 +6,7 @@ import {
   POLICY_ROLES,
   operationRole,
 } from "./catalog.js";
+import { selectUseCases } from "./use-cases.js";
 import type {
   ChangeCategory,
   ChangedFile,
@@ -17,6 +18,8 @@ import type {
   QaPlan,
   QaScenario,
   QaState,
+  QaUseCasePlan,
+  QaUseCaseSelection,
   SourceLock,
   TypedOperation,
 } from "./types.js";
@@ -67,20 +70,32 @@ export function compilePlanFromArgs(args: Record<string, unknown>): QaPlan {
   const lock = normalizeLock(args.lock);
   const classification = normalizeClassification(args.classification, lock);
   const profile = resolveProfile(args.profile, optionalString(args.profileId));
-  const scenarios = compileScenarios(profile, classification, lock);
-  const commonOperations = compileCommonOperations(lock, classification);
+  const useCases = selectUseCases(profile, classification, lock.headSha);
+  const scenarios = compileScenarios(profile, classification, lock, useCases);
+  const scenarioMutationIds = scenarios.flatMap((scenario) => scenario.operations)
+    .filter((operation) => operation.mutating)
+    .map((operation) => operation.id);
+  const commonOperations = compileCommonOperations(lock, classification, useCases, scenarioMutationIds);
   const operations = dedupeOperations([...commonOperations, ...scenarios.flatMap((scenario) => scenario.operations)]);
   operations.forEach(validateTypedOperation);
   const tokenPolicy = {
     deterministicFirst: true as const,
     noModelShell: true as const,
     modelUse: "bounded_diff_summary_only" as const,
-    cacheKey: sha256({ baseSha: lock.baseSha, headSha: lock.headSha, profileId: profile.id, scenarios: scenarios.map((item) => item.id) }),
+    cacheKey: sha256({
+      baseSha: lock.baseSha,
+      headSha: lock.headSha,
+      profileId: profile.id,
+      suiteCatalogDigest: useCases.catalogDigest,
+      useCaseIds: useCases.selected.map((item) => item.selectionId),
+      scenarios: scenarios.map((item) => item.id),
+    }),
   };
   const planBody = {
     profileId: profile.id,
     lockDigest: lock.lockDigest,
     sourceSha: lock.headSha,
+    useCases,
     scenarios,
     operations,
     mutationCount: operations.filter((operation) => operation.mutating).length,
@@ -186,31 +201,53 @@ function impactReasons(impact: DiffClassification["impact"], files: readonly Cla
   return reasons;
 }
 
-function compileScenarios(profile: DeploymentProfile, classification: DiffClassification, lock: SourceLock): QaScenario[] {
-  if (classification.impact === "NO_CHANGE") return [contractScenario("no-change", "No-change certification", "Verify source identity and cached certification state.", lock)];
-  if (classification.impact === "DOCUMENTATION_ONLY") return [contractScenario("docs-contract", "Documentation contract", "Verify examples, command names, and documented surfaces against the locked source.", lock)];
-  if (classification.impact === "TEST_ONLY") return [contractScenario("test-contract", "Test-manifest contract", "Verify changed tests are discoverable and still exercise declared capabilities.", lock)];
+function compileScenarios(
+  profile: DeploymentProfile,
+  classification: DiffClassification,
+  lock: SourceLock,
+  useCases: QaUseCasePlan,
+): QaScenario[] {
+  const contractUseCases = useCases.selected.filter((item) => item.selection === "contract").map((item) => item.selectionId);
+  if (classification.impact === "NO_CHANGE") return [contractScenario("no-change", "No-change certification", "Verify source identity and cached certification state.", lock, contractUseCases)];
+  if (classification.impact === "DOCUMENTATION_ONLY") return [contractScenario("docs-contract", "Documentation contract", "Verify examples, command names, and documented surfaces against the locked source.", lock, contractUseCases)];
+  if (classification.impact === "TEST_ONLY") return [contractScenario("test-contract", "Test-manifest contract", "Verify changed tests are discoverable and still exercise declared capabilities.", lock, contractUseCases)];
 
-  const directEngines = classification.engines.length ? classification.engines : inferEnginesFromModules(classification.modules, profile.enabledEngines);
-  const engines = directEngines;
+  const inferred = classification.engines.length ? classification.engines : inferEnginesFromModules(classification.modules, profile.enabledEngines);
+  const engines = inferred.filter((engine) => profile.enabledEngines.includes(engine));
   const scenarios: QaScenario[] = [];
   for (const engine of engines) {
     const descriptor = ENGINE_DESCRIPTORS[engine];
-    const changedModule = classification.modules.find((module) => descriptor.modules.includes(module) || descriptor.adjacentModules.includes(module)) ?? descriptor.modules[0];
-    scenarios.push(engineScenario(engine, changedModule, "direct", `Changed paths map to ${descriptor.title}.`, lock));
-    const adjacent = uniqueSorted([
-      ...descriptor.adjacentModules,
-      ...(profile.adjacentModules[changedModule] ?? []),
-    ]).slice(0, 5);
-    for (const module of adjacent) {
-      scenarios.push(engineScenario(engine, module, "adjacent", `${module} is adjacent to changed ${changedModule} behavior.`, lock, true));
+    const changedModule = primaryModuleForEngine(classification, engine);
+    const selections = useCases.selected.filter((item) => item.targetEngine === engine);
+    const direct = selections.filter((item) => item.selection === "direct");
+    const adjacent = selections.filter((item) => item.selection === "adjacent");
+    const behavior = engineBehaviorFor(classification, engine);
+    scenarios.push(engineScenario(
+      engine,
+      changedModule,
+      "direct",
+      `Changed paths map to ${descriptor.title}; selected ${direct.length} direct suite contract(s).`,
+      lock,
+      direct,
+      behavior,
+    ));
+    if (adjacent.length) {
+      scenarios.push(engineScenario(
+        engine,
+        "adjacent-regression",
+        "adjacent",
+        `${adjacent.length} bounded suite contract(s) protect behavior adjacent to changed ${changedModule} paths.`,
+        lock,
+        adjacent,
+        { readOnly: true, requiresFixture: false, requiresFault: false },
+      ));
     }
   }
   if (!scenarios.length) {
     const app = classification.apps[0] ?? "runtime-app";
     const module = classification.modules[0] ?? "control-plane";
     scenarios.push({
-      ...contractScenario(`control-plane-${app}-${module}`, "Control-plane regression", "No engine was inferred; verify generic app contracts without infrastructure mutation.", lock),
+      ...contractScenario(`control-plane-${app}-${module}`, "Control-plane regression", "No engine was inferred; verify generic app contracts without infrastructure mutation.", lock, contractUseCases),
       app,
       module,
     });
@@ -218,31 +255,66 @@ function compileScenarios(profile: DeploymentProfile, classification: DiffClassi
   return dedupeScenarios(scenarios);
 }
 
-function engineScenario(engine: EngineId, module: string, selection: "direct" | "adjacent", reason: string, lock: SourceLock, readOnly = false): QaScenario {
+function engineScenario(
+  engine: EngineId,
+  module: string,
+  selection: "direct" | "adjacent",
+  reason: string,
+  lock: SourceLock,
+  useCases: readonly QaUseCaseSelection[],
+  behavior: { readonly readOnly: boolean; readonly requiresFixture: boolean; readonly requiresFault: boolean },
+): QaScenario {
   const descriptor = ENGINE_DESCRIPTORS[engine];
   const seed = `${engine}-${module}-${lock.headSha}`;
   const target = `engine://${engine}/discovered-cluster`;
-  const operations: TypedOperation[] = [
-    operation(seed, "TOPOLOGY", descriptor.topologyOperation, target, engine, false, { scope: "all_nodes" }),
-    operation(seed, "BEFORE_SNAPSHOT", descriptor.snapshotOperation, target, engine, false, { include: ["roles", "health", "data_digest", "service_state"] }),
-  ];
-  if (!readOnly) {
+  const topologyOperation = operation(seed, "TOPOLOGY", descriptor.topologyOperation, target, engine, false, { scope: "all_nodes" });
+  const snapshotOperation = operation(seed, "BEFORE_SNAPSHOT", descriptor.snapshotOperation, target, engine, false, { include: ["roles", "health", "data_digest", "service_state"] });
+  const capturedPrimary = `topology://${engine}/captured-primary/${shortDigest(snapshotOperation.id)}`;
+  const operations: TypedOperation[] = [topologyOperation, snapshotOperation];
+  if (behavior.requiresFixture) {
     operations.push(
       operation(seed, "SEED", descriptor.seedOperation, `fixture://${engine}/${shortDigest(seed)}`, engine, true, { coverage: "all_supported_types", namespace: `qa_${shortDigest(seed)}` }, {
         operationType: descriptor.cleanupOperation,
         target: `fixture://${engine}/${shortDigest(seed)}`,
         params: { scope: "exact_fixture_namespace" },
       }),
-      operation(seed, "FAULT", descriptor.faultOperation, `topology://${engine}/current-primary`, engine, true, { mode: "controlled_single_service_stop" }, {
+    );
+  }
+  if (behavior.requiresFault) {
+    operations.push(
+      operation(seed, "FAULT", descriptor.faultOperation, capturedPrimary, engine, true, {
+        mode: "controlled_single_service_stop",
+        immutableBinding: "before_snapshot_primary",
+        snapshotOperationId: snapshotOperation.id,
+      }, {
         operationType: descriptor.recoverOperation,
-        target: `topology://${engine}/current-primary`,
-        params: { restore: "captured_service_state" },
+        target: capturedPrimary,
+        params: { restore: "captured_service_state", snapshotOperationId: snapshotOperation.id },
       }),
       operation(seed, "OBSERVE", descriptor.observeOperation, target, engine, false, { requireIndependentProbe: true }),
     );
   }
   operations.push(
     ...descriptor.commandMatrix.map((operationType) => operation(seed, "COMMAND_MATRIX", operationType, target, engine, false, { mode: module })),
+    ...useCases
+      .filter((item) => item.risk !== "mutation_gated")
+      .map((item) => operation(
+        `${seed}-${item.id}`,
+        "COMMAND_MATRIX",
+        "matrix.suite_contract",
+        `engine://${engine}/suite/${item.suite}`,
+        engine,
+        false,
+        {
+          suiteContractId: item.id,
+          selectionId: item.selectionId,
+          family: item.family,
+          scopes: item.scopes,
+          selection: item.selection,
+          approvalRequired: item.approvalRequired,
+          sourceSha: lock.headSha,
+        },
+      )),
     operation(seed, "DATA_VERIFY", descriptor.dataDigestOperation, target, engine, false, { coverage: "every_seeded_record_and_field", ttlToleranceMs: 1500 }),
   );
   return {
@@ -253,12 +325,13 @@ function engineScenario(engine: EngineId, module: string, selection: "direct" | 
     engine,
     selection,
     reason,
+    useCaseIds: useCases.map((item) => item.selectionId),
     invariants: descriptor.invariants,
     operations,
   };
 }
 
-function contractScenario(id: string, title: string, reason: string, lock: SourceLock): QaScenario {
+function contractScenario(id: string, title: string, reason: string, lock: SourceLock, useCaseIds: readonly string[] = []): QaScenario {
   return {
     id: `scenario-${id}-${lock.headSha.slice(0, 8)}`,
     title,
@@ -266,17 +339,29 @@ function contractScenario(id: string, title: string, reason: string, lock: Sourc
     module: id,
     selection: "contract",
     reason,
+    useCaseIds,
     invariants: ["The source lock matches every receipt.", "Declared surfaces remain internally consistent."],
     operations: [],
   };
 }
 
-function compileCommonOperations(lock: SourceLock, classification: DiffClassification): TypedOperation[] {
+function compileCommonOperations(
+  lock: SourceLock,
+  classification: DiffClassification,
+  useCases: QaUseCasePlan,
+  mutationOperationIds: readonly string[],
+): TypedOperation[] {
   const seed = `common-${lock.headSha}`;
   return [
     operation(seed, "SOURCE_LOCK", "source.verify_lock", "profile://source/repository", undefined, false, { lockDigest: lock.lockDigest, headSha: lock.headSha }),
     operation(seed, "DIFF", "diff.verify_classification", "profile://source/diff", undefined, false, { impact: classification.impact, fileCount: classification.files.length }),
-    operation(seed, "GATE", "gate.approve_plan", "profile://qa/release-gate", undefined, false, { riskScore: classification.riskScore, sourceSha: lock.headSha }),
+    operation(seed, "GATE", "gate.approve_plan", "profile://qa/release-gate", undefined, false, {
+      riskScore: classification.riskScore,
+      sourceSha: lock.headSha,
+      suiteCatalogDigest: useCases.catalogDigest,
+      gatedUseCaseIds: useCases.selected.filter((item) => item.approvalRequired).map((item) => item.selectionId),
+      mutationOperationIds,
+    }),
     operation(seed, "POST_PROOF", "proof.snapshot_compare", "profile://qa/post-proof", undefined, false, { comparison: "before_vs_after_allowed_state" }),
     operation(seed, "REPORT", "report.render_receipts", "profile://qa/report", undefined, false, { format: "human_summary_plus_raw_receipt_index" }),
   ];
@@ -405,7 +490,8 @@ function inferModules(path: string, engines: readonly EngineId[]): string[] {
 
 function engineMentioned(path: string, engine: EngineId): boolean {
   const descriptor = ENGINE_DESCRIPTORS[engine];
-  const normalized = path.toLowerCase();
+  // OSS Manager's historical redis-script/ package root is not an engine signal.
+  const normalized = path.toLowerCase().replace(/^redis-script\//, "");
   return [engine, ...descriptor.aliases].some((alias) => new RegExp(`(^|[/_.-])${escapeRegExp(alias)}([/_.-]|$)`, "i").test(normalized));
 }
 
@@ -414,6 +500,30 @@ function inferEnginesFromModules(modules: readonly string[], enabled: readonly E
     const descriptor = ENGINE_DESCRIPTORS[engine];
     return modules.some((module) => descriptor.modules.includes(module) || descriptor.aliases.includes(module));
   });
+}
+
+function primaryModuleForEngine(classification: DiffClassification, engine: EngineId): string {
+  const descriptor = ENGINE_DESCRIPTORS[engine];
+  const modules = uniqueSorted(classification.files
+    .filter((file) => file.engines.includes(engine))
+    .flatMap((file) => file.modules));
+  return modules.find((module) => descriptor.modules.includes(module) || descriptor.adjacentModules.includes(module))
+    ?? descriptor.modules[0]
+    ?? engine;
+}
+
+function engineBehaviorFor(
+  classification: DiffClassification,
+  engine: EngineId,
+): { readOnly: false; requiresFixture: boolean; requiresFault: boolean } {
+  const paths = classification.files
+    .filter((file) => !file.engines.length || file.engines.includes(engine))
+    .map((file) => file.path)
+    .join("\n");
+  const requiresFault = /(^|[/_.-])(?:sentinel|failover|patroni|active[_-]?active|pgactive|dr[_-]?lifecycle)([/_.-]|$)/i.test(paths);
+  const requiresFixture = requiresFault
+    || /(^|[/_.-])(?:apply|backup|restore|recovery|migration|migrate|seed|schema)([/_.-]|$)/i.test(paths);
+  return { readOnly: false, requiresFixture, requiresFault };
 }
 
 function riskFor(categories: readonly ChangeCategory[], status: ChangedFile["status"]): number {

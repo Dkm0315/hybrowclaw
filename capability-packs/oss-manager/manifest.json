@@ -19,6 +19,9 @@
     "oss_qa_source_lock",
     "oss_qa_diff_classify",
     "oss_qa_scenario_compile",
+    "oss_qa_use_case_select",
+    "oss_qa_suite_catalog",
+    "oss_qa_suite_manifest_validate",
     "oss_qa_run_create",
     "oss_qa_executor_next",
     "oss_qa_compensation_register",
@@ -32,16 +35,24 @@
     "oss_qa_profile_describe",
     "oss_qa_evidence_digest"
   ],
-  "digest": "sha256:3a7bbb32aa553f4fae7b1e2770ff72b980dd6b9c15443300b650f6013d401733",
+  "digest": "sha256:f897e31f954588baabe2a4e98b1d4283c0ad1aff1106ddbf196be2aefb55cb84",
   "description": "Native, customer-isolated app/engine QA framework with source locks, deterministic scenario compilation, policy roles, typed execution, semantic evidence, independent probes, compensation-before-mutation, killed-run recovery, and restore-finally verdicts. Includes a sanitized hybrowlabs/OSS-Manager profile and no OpenClaw bridge.",
   "readiness": {
     "level": "executable",
     "status": "beta",
     "actionability": "end_to_end_workflow",
     "owner": "muster-core",
-    "surfaces": ["cli", "tui", "gateway", "channel", "frappe"],
+    "surfaces": [
+      "cli",
+      "tui",
+      "gateway",
+      "channel",
+      "frappe"
+    ],
     "setup": {
-      "urls": ["https://github.com/hybrowlabs/OSS-Manager"],
+      "urls": [
+        "https://github.com/hybrowlabs/OSS-Manager"
+      ],
       "requiredEnv": [],
       "requiredAnyEnv": [],
       "credentialStorage": "none"
@@ -60,10 +71,21 @@
       "secretRedaction": true
     },
     "evidence": {
-      "unitTests": ["capability-packs/oss-manager/test/oss-manager.test.ts"],
-      "qaSuites": ["negative-control", "killed-run-recovery", "missing-evidence", "wrong-sha", "data-mismatch", "restoration-failure"],
+      "unitTests": [
+        "capability-packs/oss-manager/test/oss-manager.test.ts"
+      ],
+      "qaSuites": [
+        "negative-control",
+        "killed-run-recovery",
+        "missing-evidence",
+        "wrong-sha",
+        "data-mismatch",
+        "restoration-failure"
+      ],
       "liveArtifacts": [],
-      "docs": ["capability-packs/oss-manager/README.md"]
+      "docs": [
+        "capability-packs/oss-manager/README.md"
+      ]
     }
   }
 }

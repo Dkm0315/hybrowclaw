@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  HYBROWLABS_SUITE_CATALOG,
   oss_qa_compensation_register,
   oss_qa_diff_classify,
   oss_qa_executor_next,
@@ -12,6 +13,9 @@ import {
   oss_qa_scenario_compile,
   oss_qa_source_lock,
   oss_qa_state_record,
+  oss_qa_suite_catalog,
+  oss_qa_suite_manifest_validate,
+  oss_qa_use_case_select,
   type EvidenceReceipt,
   type QaAssertion,
   type QaPlan,
@@ -165,6 +169,10 @@ function mutationReceipt(run: QaRun, operation: TypedOperation, state: "SEED" | 
   return receipt(run, state, "command", { operationId: operation.id, producerRole: "typed-executor" });
 }
 
+async function markDispatching(run: QaRun, operation: TypedOperation): Promise<QaRun> {
+  return oss_qa_mutation_record({ run, operationId: operation.id, event: "dispatching", recordedAt: NOW });
+}
+
 test("source locks and diff classification are deterministic", async () => {
   const first = await fixture("apps/control/security/policy.ts");
   const second = await fixture("apps/control/security/policy.ts");
@@ -183,6 +191,146 @@ test("scenario compiler selects direct engine and bounded adjacent regressions",
   assert.equal(plan.tokenPolicy.modelUse, "bounded_diff_summary_only");
   assert.equal(plan.operations.some((operation) => operation.operationType === "observe.sentinel_failover"), true);
   assert.equal(plan.operations.filter((operation) => operation.mutating).every((operation) => operation.compensation), true);
+  const fault = plan.operations.find((operation) => operation.state === "FAULT");
+  assert.ok(fault?.compensation);
+  assert.equal(fault.target.includes("current-primary"), false);
+  assert.equal(fault.compensation.target, fault.target);
+});
+
+test("sanitized OSS Manager suite catalog covers all 138 source contracts without shell", async () => {
+  const report = await oss_qa_suite_catalog({ profileId: "hybrowlabs-oss-manager" });
+  assert.equal(report.count, 138);
+  assert.equal(report.count, HYBROWLABS_SUITE_CATALOG.length);
+  assert.equal(report.commandIdCount, 234);
+  assert.equal(report.containsCommands, false);
+  assert.equal(new Set(HYBROWLABS_SUITE_CATALOG.map((item) => item.id)).size, 138);
+  assert.equal(HYBROWLABS_SUITE_CATALOG.some((item) => item.engine === "postgres" && item.suite === "active_active_validate"), true);
+  assert.equal(HYBROWLABS_SUITE_CATALOG.some((item) => item.engine === "postgres" && item.suite === "migration_validate"), true);
+  assert.equal(JSON.stringify(HYBROWLABS_SUITE_CATALOG).includes('"command"'), false);
+});
+
+test("source manifest metadata must match the reviewed suite catalog and rejects raw commands", async () => {
+  const manifest = {
+    sourceSha: HEAD_SHA,
+    version: 2,
+    suites: HYBROWLABS_SUITE_CATALOG.map((item) => ({
+      engine: item.engine,
+      suite: item.suite,
+      configScope: item.scopes.join(","),
+      safe: item.risk !== "mutation_gated",
+      requiresAllowApply: item.risk === "mutation_gated",
+      destructive: item.risk === "destructive_plan",
+      commandIds: item.commandIds,
+    })),
+  };
+  const exact = await oss_qa_suite_manifest_validate({ profileId: "hybrowlabs-oss-manager", manifest });
+  assert.equal(exact.verdict, "PASS");
+  assert.equal(exact.suiteCount, 138);
+  assert.deepEqual(exact.drift, { missing: [], extra: [], mismatched: [] });
+
+  const drifted = await oss_qa_suite_manifest_validate({
+    profileId: "hybrowlabs-oss-manager",
+    manifest: { ...manifest, suites: manifest.suites.slice(1) },
+  });
+  assert.equal(drifted.verdict, "INCONCLUSIVE");
+  assert.equal(drifted.drift.missing.length, 1);
+
+  const missingCommand = structuredClone(manifest);
+  missingCommand.suites[0].commandIds = missingCommand.suites[0].commandIds.slice(1);
+  const commandDrift = await oss_qa_suite_manifest_validate({ profileId: "hybrowlabs-oss-manager", manifest: missingCommand });
+  assert.equal(commandDrift.verdict, "INCONCLUSIVE");
+  assert.equal(commandDrift.drift.mismatched.length, 1);
+
+  await assert.rejects(oss_qa_suite_manifest_validate({
+    profileId: "hybrowlabs-oss-manager",
+    manifest: {
+      sourceSha: HEAD_SHA,
+      version: 2,
+      suites: [{ engine: "redis", suite: "status", configScope: "all", safe: true, commands: ["./ossmgr status"] }],
+    },
+  }), /forbidden raw execution field commands/);
+});
+
+test("real OSS Manager feature paths select deep direct and adjacent use cases", async () => {
+  const lock = await oss_qa_source_lock({
+    repository: "https://github.com/hybrowlabs/OSS-Manager",
+    branch: "dev",
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    lockedAt: NOW,
+  });
+  const paths = [
+    "redis-script/cli/commands/apply.py",
+    "redis-script/cli/commands/destroy.py",
+    "redis-script/engines/postgres/pgactive.py",
+    "redis-script/engines/postgres/patroni.py",
+    "redis-script/engines/postgres/migration.py",
+    "redis-script/engines/postgres/backup.py",
+    "redis-script/engines/postgres/status.py",
+    "redis-script/config/postgres-localvm-patroni-ha-security.yml",
+    "redis-script/config/postgres-localvm-standalone-tls.yml",
+    "redis-script/engines/qdrant/backup.py",
+    "redis-script/engines/kafka/status.py",
+    "redis-script/engines/mongo/backup.py",
+    "redis-script/engines/valkey/commands/backup.py",
+    "redis-script/engines/observability/status.py",
+  ];
+  const classification = await oss_qa_diff_classify({
+    lock,
+    profileId: "hybrowlabs-oss-manager",
+    changes: paths.map((path) => ({ path, status: "modified", additions: 20, deletions: 5 })),
+  });
+  const useCases = await oss_qa_use_case_select({ lock, classification, profileId: "hybrowlabs-oss-manager" });
+  const has = (engine: string, suite: string) => useCases.selected.some((item) => item.targetEngine === engine && item.suite === suite);
+  assert.equal(classification.impact, "HIGH_RISK");
+  assert.equal(has("postgres", "active_active_validate"), true);
+  assert.equal(has("postgres", "patroni_ha_validate"), true);
+  assert.equal(has("postgres", "migration_validate"), true);
+  assert.equal(has("postgres", "tls_validate"), true);
+  assert.equal(has("postgres", "backup"), true);
+  assert.equal(has("postgres", "restore_validate"), true);
+  assert.equal(has("postgres", "status_refresh_all"), true);
+  assert.equal(has("postgres", "apply"), true);
+  assert.equal(has("postgres", "destructive_plan"), true);
+  assert.equal(has("qdrant", "backup"), true);
+  assert.equal(has("kafka", "status_refresh_all"), true);
+  assert.equal(has("mongo", "backup"), true);
+  assert.equal(has("valkey", "backup"), true);
+  assert.equal(has("observability", "dashboard"), true);
+  assert.equal(useCases.selected.filter((item) => item.risk === "mutation_gated").every((item) => item.dispatch === "approval_compensation_adapter_required"), true);
+
+  const plan = await oss_qa_scenario_compile({ lock, classification, profileId: "hybrowlabs-oss-manager" });
+  assert.equal(plan.scenarios.length <= classification.engines.length * 2, true);
+  const selectedMutationIds = new Set(useCases.selected.filter((item) => item.risk === "mutation_gated").map((item) => item.id));
+  assert.equal(plan.operations.some((operation) => operation.operationType === "matrix.suite_contract" && selectedMutationIds.has(String(operation.params.suiteContractId))), false);
+});
+
+test("status-only changes stay read-only while Sentinel changes earn controlled failover", async () => {
+  const statusOnly = await fixture("redis-script/engines/postgres/status.py", "hybrowlabs-oss-manager");
+  assert.deepEqual(statusOnly.classification.engines, ["postgres"]);
+  assert.equal(statusOnly.plan.mutationCount, 0);
+  assert.equal(statusOnly.plan.operations.some((operation) => operation.state === "FAULT"), false);
+
+  const sentinel = await fixture("redis-script/config/sentinel-cluster.yml", "hybrowlabs-oss-manager");
+  assert.deepEqual(sentinel.classification.engines, ["sentinel"]);
+  assert.equal(sentinel.plan.operations.some((operation) => operation.operationType === "observe.sentinel_failover"), true);
+  assert.equal(sentinel.plan.operations.filter((operation) => operation.mutating).every((operation) => operation.compensation), true);
+});
+
+test("PostgreSQL failover paths never create Redis or Sentinel false positives", async () => {
+  const postgres = await fixture("redis-script/engines/postgres/failover.py", "hybrowlabs-oss-manager");
+  assert.deepEqual(postgres.classification.engines, ["postgres"]);
+  assert.equal(postgres.plan.scenarios.some((scenario) => scenario.engine === "sentinel" || scenario.engine === "redis"), false);
+});
+
+test("docs-only and test-only changes never select infrastructure mutations", async () => {
+  for (const path of ["docs/runbooks/status.md", "redis-script/tests/test_postgres_engine.py"]) {
+    const { classification, plan } = await fixture(path, "hybrowlabs-oss-manager");
+    assert.equal(["DOCUMENTATION_ONLY", "TEST_ONLY"].includes(classification.impact), true);
+    assert.equal(plan.mutationCount, 0);
+    assert.equal(plan.useCases.gatedCount, 0);
+    assert.equal(plan.useCases.selected.every((item) => item.selection === "contract"), true);
+  }
 });
 
 test("unknown custom app changes never inherit an arbitrary engine fault scenario", async () => {
@@ -222,6 +370,9 @@ test("deterministic dispatcher blocks every mutation until compensation registra
   const blocked = await oss_qa_executor_next({ run });
   assert.equal((blocked.blocked as Array<{ operationId: string }>).some((item) => item.operationId === seedOperation.id), true);
   run = await oss_qa_compensation_register({ run, operationId: seedOperation.id, registeredAt: NOW });
+  const journaled = await oss_qa_executor_next({ run });
+  assert.equal((journaled.blocked as Array<{ operationId: string; reason: string }>).some((item) => item.operationId === seedOperation.id && item.reason === "record_dispatching_before_side_effect"), true);
+  run = await markDispatching(run, seedOperation);
   const ready = await oss_qa_executor_next({ run });
   assert.equal((ready.dispatchable as TypedOperation[]).some((item) => item.id === seedOperation.id), true);
 });
@@ -335,16 +486,43 @@ test("killed run recovery emits compensations in reverse mutation order", async 
   const seed = run.plan.operations.find((operation) => operation.state === "SEED");
   assert.ok(seed);
   run = await oss_qa_compensation_register({ run, operationId: seed.id, registeredAt: NOW });
+  run = await markDispatching(run, seed);
   run = await oss_qa_mutation_record({ run, operationId: seed.id, event: "applied", receipt: mutationReceipt(run, seed, "SEED") });
   run = await passState(run);
   assert.equal(run.currentState, "FAULT");
   const fault = run.plan.operations.find((operation) => operation.state === "FAULT");
   assert.ok(fault);
   run = await oss_qa_compensation_register({ run, operationId: fault.id, registeredAt: NOW });
+  run = await markDispatching(run, fault);
   run = await oss_qa_mutation_record({ run, operationId: fault.id, event: "applied", receipt: mutationReceipt(run, fault, "FAULT") });
   const recovered = await oss_qa_run_recover({ run, recoveredAt: NOW, reason: "worker process killed" });
   assert.equal(recovered.run.currentState, "RESTORE");
   assert.deepEqual(recovered.recoveryOperations.map((item) => item.operationId), [fault.id, seed.id]);
+});
+
+test("dispatch journal closes the crash window before an applied receipt exists", async () => {
+  let { run } = await fixture();
+  run = await advanceToSeed(run);
+  const seed = run.plan.operations.find((operation) => operation.state === "SEED");
+  assert.ok(seed);
+  run = await oss_qa_compensation_register({ run, operationId: seed.id, registeredAt: NOW });
+  run = await markDispatching(run, seed);
+
+  const recovered = await oss_qa_run_recover({ run, recoveredAt: NOW, reason: "worker died after side effect and before receipt" });
+  assert.equal(recovered.run.currentState, "RESTORE");
+  assert.deepEqual(recovered.recoveryOperations.map((item) => item.operationId), [seed.id]);
+  const restoreReceipt = receipt(recovered.run, "RESTORE", "restore", {
+    operationId: seed.id,
+    producerRole: "recovery-controller",
+    suffix: "dispatch-window",
+  });
+  run = await oss_qa_mutation_record({
+    run: recovered.run,
+    operationId: seed.id,
+    event: "restored",
+    receipt: restoreReceipt,
+  });
+  assert.equal(run.mutationLedger[0].status, "RESTORED");
 });
 
 test("restoration failure is terminal RESTORE_FAILED and cannot be reported as PASS", async () => {
@@ -353,6 +531,7 @@ test("restoration failure is terminal RESTORE_FAILED and cannot be reported as P
   const seed = run.plan.operations.find((operation) => operation.state === "SEED");
   assert.ok(seed);
   run = await oss_qa_compensation_register({ run, operationId: seed.id, registeredAt: NOW });
+  run = await markDispatching(run, seed);
   run = await oss_qa_mutation_record({ run, operationId: seed.id, event: "applied", receipt: mutationReceipt(run, seed, "SEED") });
   run = (await oss_qa_run_recover({ run, recoveredAt: NOW })).run;
   const restoreReceipt = receipt(run, "RESTORE", "restore", { operationId: seed.id, producerRole: "recovery-controller", suffix: "restore-failed" });
@@ -385,11 +564,13 @@ test("successful mutation run verifies every operation and every compensation be
 
   for (const operation of run.plan.operations.filter((item) => item.state === "SEED")) {
     run = await oss_qa_compensation_register({ run, operationId: operation.id, registeredAt: NOW });
+    run = await markDispatching(run, operation);
     run = await oss_qa_mutation_record({ run, operationId: operation.id, event: "applied", receipt: mutationReceipt(run, operation, "SEED") });
   }
   run = await passState(run);
   for (const operation of run.plan.operations.filter((item) => item.state === "FAULT")) {
     run = await oss_qa_compensation_register({ run, operationId: operation.id, registeredAt: NOW });
+    run = await markDispatching(run, operation);
     run = await oss_qa_mutation_record({ run, operationId: operation.id, event: "applied", receipt: mutationReceipt(run, operation, "FAULT") });
   }
   run = await passState(run); // fault

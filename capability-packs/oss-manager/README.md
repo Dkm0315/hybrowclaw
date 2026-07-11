@@ -9,12 +9,13 @@ The pack compiles plans and evaluates executor receipts. It does not receive a s
 1. Lock repository, branch, base SHA, and head SHA.
 2. Classify changed files deterministically.
 3. Compile direct scenarios plus bounded adjacent regressions.
-4. Dispatch only catalog operation IDs with JSON parameters and typed target selectors.
-5. Register the exact compensation before every mutation.
-6. Require a semantic assertion and independent probe; exit code alone never passes.
-7. Enter `RESTORE` after a killed run or failed state whenever applied mutations remain.
-8. Run compensations in reverse registration order.
-9. Preserve raw evidence by digest/reference and emit only redacted excerpts in chat progress.
+4. Reconcile the locked source manifest with all 138 reviewed suite contracts and their command IDs.
+5. Dispatch only catalog operation IDs with JSON parameters and typed target selectors.
+6. Register the exact compensation, then durably journal `DISPATCHING`, before every mutation.
+7. Require a semantic assertion and independent probe; exit code alone never passes.
+8. Enter `RESTORE` after a killed run or failed state whenever a mutation may have reached its target.
+9. Run compensations against immutable captured targets in reverse registration order.
+10. Preserve raw evidence by digest/reference and emit only redacted excerpts in chat progress.
 
 The state contract is fixed:
 
@@ -49,6 +50,9 @@ Actual infrastructure adapters map operation IDs such as `fault.service_stop` or
 - `oss_qa_source_lock`
 - `oss_qa_diff_classify`
 - `oss_qa_scenario_compile`
+- `oss_qa_use_case_select`
+- `oss_qa_suite_catalog`
+- `oss_qa_suite_manifest_validate`
 - `oss_qa_run_create`
 - `oss_qa_executor_next`
 - `oss_qa_compensation_register`
@@ -71,3 +75,7 @@ pnpm hc capability inspect capability-packs/oss-manager
 ```
 
 Live infrastructure certification remains deployment-specific. A deployment must supply reviewed operation adapters, target inventory, secret references, authorization policy, durable run storage, and an independent recovery worker.
+
+## Ragnar agent
+
+Ragnar exposes this workflow through the role-scoped `@oss-manager-tester` agent. Selecting the agent isolates its provider history and applies the same source-lock, approval, evidence, and restoration contract. The agent can plan with this pack, but it must report `BLOCKED` or `INCONCLUSIVE` when the deployment has not supplied the required typed adapters or credentials.
