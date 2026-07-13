@@ -1,5 +1,6 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
-import { access, readFile, mkdir, realpath, stat, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { access, readFile, mkdir, open, realpath, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
@@ -46,6 +47,12 @@ import {
   type GatewayIngressSpoolEntry,
   type GatewayPreparedDelivery,
 } from "./ingress-spool.js";
+import {
+  SqliteAsyncMessageRunStore,
+  type AsyncMessageRunStore,
+  type StoredAsyncMessageRun,
+} from "./async-message-store.js";
+import { DurableConversationLease } from "./conversation-lease.js";
 
 /** HTTP gateway plus channel-specific polling/socket workers. */
 
@@ -68,6 +75,8 @@ export interface GatewayServerOptions {
   readonly ingressSpool?: DurableGatewayIngressSpool;
   readonly approvalActions?: ApprovalActionCodec;
   readonly approvalStore?: SqliteApprovalActionStore;
+  /** Injectable shared async-run store. Defaults to durable local SQLite. */
+  readonly messageRunStore?: AsyncMessageRunStore;
   /** Internal owner token for warm native provider processes. */
   readonly nativeTransportOwner?: string;
 }
@@ -125,134 +134,270 @@ const deliveryCache = new Map<string, { at: number; result: unknown }>();
 const activeConversationRuns = new Map<string, Promise<unknown>>();
 const TELEGRAM_POLL_OFFSET_FILE = "telegram-poll-offset.json";
 
-type AsyncMessageRunStatus = "queued" | "running" | "completed" | "failed";
-
 interface AsyncMessageRunSnapshot {
   readonly runId: string;
-  readonly status: AsyncMessageRunStatus;
+  readonly status: StoredAsyncMessageRun["status"];
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly reply?: SurfaceReply | PairingChallenge;
+  /** Cumulative assistant text emitted by the provider before completion. */
+  readonly partialText?: string;
+  /** Cumulative provider-visible reasoning summary; never raw hidden reasoning. */
+  readonly reasoningText?: string;
   readonly error?: string;
 }
 
-interface AsyncMessageRunRecord {
-  runId: string;
-  status: AsyncMessageRunStatus;
-  createdAt: string;
-  updatedAt: string;
-  reply?: SurfaceReply | PairingChallenge;
-  error?: string;
-  readonly fingerprint: string;
-  readonly idempotencyScope?: string;
-  settled: Promise<void>;
+interface AsyncMessageArtifactDownload {
+  readonly name: string;
+  readonly mime: string;
+  readonly bytes: Buffer;
 }
 
-const ASYNC_MESSAGE_RUN_TTL_MS = 60 * 60_000;
-const ASYNC_MESSAGE_RUN_LIMIT = 1_000;
 const ASYNC_MESSAGE_LONG_POLL_MAX_MS = 25_000;
+const ASYNC_MESSAGE_ARTIFACT_MAX_BYTES = 128 * 1024 * 1024;
+const ASYNC_MESSAGE_PREVIEW_MAX_CHARS = 64 * 1024;
+const ASYNC_MESSAGE_LEASE_MS = 120_000;
+const ASYNC_MESSAGE_POLL_INTERVAL_MS = 50;
+const ASYNC_MESSAGE_PREVIEW_FLUSH_MS = 50;
+const NATIVE_SESSION_MAX_TURNS = boundedPositiveInteger(process.env.MUSTER_NATIVE_SESSION_MAX_TURNS, 12, 1, 100);
+const NATIVE_SESSION_MAX_AGE_MS = boundedPositiveInteger(
+  process.env.MUSTER_NATIVE_SESSION_MAX_AGE_MS,
+  2 * 60 * 60_000,
+  60_000,
+  24 * 60 * 60_000,
+);
+
+function boundedPositiveInteger(value: string | undefined, fallback: number, minimum: number, maximum: number): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) return fallback;
+  return parsed;
+}
+
+interface AsyncMessageRunStream {
+  readonly onDelta: (text: string) => void;
+  readonly onReasoningDelta: (text: string) => void;
+}
+
+const CONVERSATION_RUN_QUEUES = new Map<string, Promise<void>>();
+const DURABLE_CONVERSATION_LEASES = new WeakMap<GatewayEnterpriseRuntime, DurableConversationLease>();
+
+async function runConversationExclusive<T>(
+  conversationKey: string,
+  task: () => Promise<T>,
+  enterprise?: GatewayEnterpriseRuntime,
+): Promise<T> {
+  const previous = CONVERSATION_RUN_QUEUES.get(conversationKey)?.catch(() => undefined) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  CONVERSATION_RUN_QUEUES.set(conversationKey, current);
+  await previous;
+  try {
+    if (!enterprise) return await task();
+    let lease = DURABLE_CONVERSATION_LEASES.get(enterprise);
+    if (!lease) {
+      lease = new DurableConversationLease(enterprise.idempotencyStore);
+      DURABLE_CONVERSATION_LEASES.set(enterprise, lease);
+    }
+    return await lease.run(conversationKey, task);
+  } finally {
+    release();
+    if (CONVERSATION_RUN_QUEUES.get(conversationKey) === current) CONVERSATION_RUN_QUEUES.delete(conversationKey);
+  }
+}
 
 class AsyncMessageRunRegistry {
-  readonly #runs = new Map<string, AsyncMessageRunRecord>();
-  readonly #idempotency = new Map<string, string>();
+  readonly #store: AsyncMessageRunStore;
 
-  start(
+  constructor(store: AsyncMessageRunStore) {
+    this.#store = store;
+  }
+
+  async start(
     message: SurfaceMessage,
     idempotencyKey: string | undefined,
-    execute: () => Promise<SurfaceReply | PairingChallenge>,
-  ): { readonly snapshot: AsyncMessageRunSnapshot; readonly replayed: boolean; readonly conflict: boolean; readonly work?: Promise<void> } {
-    this.#prune();
-    const fingerprint = createHash("sha256").update(JSON.stringify(message)).digest("hex");
+    artifactRoots: readonly string[],
+    execute: (stream: AsyncMessageRunStream) => Promise<SurfaceReply | PairingChallenge>,
+  ): Promise<{ readonly snapshot: AsyncMessageRunSnapshot; readonly replayed: boolean; readonly conflict: boolean; readonly work?: Promise<void> }> {
+    const fingerprint = `sha256:${createHash("sha256").update(JSON.stringify(message)).digest("hex")}`;
     const idempotencyScope = idempotencyKey
-      ? `${message.surfaceId}\0${message.senderId}\0${idempotencyKey}`
+      ? createHash("sha256")
+          .update(message.surfaceId).update("\0")
+          .update(message.senderId).update("\0")
+          .update(idempotencyKey).digest("hex")
       : undefined;
-    const existingId = idempotencyScope ? this.#idempotency.get(idempotencyScope) : undefined;
-    const existing = existingId ? this.#runs.get(existingId) : undefined;
-    if (existing) {
-      return {
-        snapshot: this.#snapshot(existing),
-        replayed: true,
-        conflict: existing.fingerprint !== fingerprint,
-      };
-    }
-
-    const now = new Date().toISOString();
-    const record: AsyncMessageRunRecord = {
-      runId: `msg_${randomUUID()}`,
-      status: "queued",
-      createdAt: now,
-      updatedAt: now,
+    const claim = await this.#store.claim({
       fingerprint,
       idempotencyScope,
-      settled: Promise.resolve(),
-    };
-    this.#runs.set(record.runId, record);
-    if (idempotencyScope) this.#idempotency.set(idempotencyScope, record.runId);
+      artifactRoots: artifactRoots.map((root) => resolve(root)),
+      leaseMs: ASYNC_MESSAGE_LEASE_MS,
+    });
+    if (claim.status !== "claimed") {
+      return {
+        snapshot: this.#snapshot(claim.record),
+        replayed: true,
+        conflict: claim.status === "conflict",
+      };
+    }
+    const ownerToken = claim.ownerToken as string;
+    const runId = claim.record.runId;
 
     const work = (async () => {
-      record.status = "running";
-      record.updatedAt = new Date().toISOString();
+      if (!await this.#store.markRunning(runId, ownerToken, Date.now(), ASYNC_MESSAGE_LEASE_MS)) return;
+      let persistence = Promise.resolve();
+      let leaseError: unknown;
+      const pendingPreview = { partialText: "", reasoningText: "" };
+      const acceptedPreviewChars = { partialText: 0, reasoningText: 0 };
+      let previewTimer: ReturnType<typeof setTimeout> | undefined;
+      const flushPreview = (): Promise<void> => {
+        if (previewTimer) {
+          clearTimeout(previewTimer);
+          previewTimer = undefined;
+        }
+        const writes = (["partialText", "reasoningText"] as const)
+          .map((field) => ({ field, text: pendingPreview[field] }))
+          .filter((entry) => entry.text.length > 0);
+        pendingPreview.partialText = "";
+        pendingPreview.reasoningText = "";
+        if (!writes.length) return persistence;
+        persistence = persistence.then(async () => {
+          for (const { field, text } of writes) {
+            const updated = await this.#store.appendPreview(
+              runId,
+              ownerToken,
+              field,
+              text,
+              ASYNC_MESSAGE_PREVIEW_MAX_CHARS,
+            );
+            if (!updated) throw new Error("Async message run ownership expired while streaming.");
+          }
+        }).catch((error) => { leaseError = error; });
+        return persistence;
+      };
+      const appendPreview = (field: "partialText" | "reasoningText", text: string): void => {
+        if (!text) return;
+        const remaining = ASYNC_MESSAGE_PREVIEW_MAX_CHARS - acceptedPreviewChars[field];
+        if (remaining <= 0) return;
+        const boundedText = text.slice(0, remaining);
+        acceptedPreviewChars[field] += boundedText.length;
+        pendingPreview[field] += boundedText;
+        if (!previewTimer) {
+          previewTimer = setTimeout(() => { void flushPreview(); }, ASYNC_MESSAGE_PREVIEW_FLUSH_MS);
+          previewTimer.unref?.();
+        }
+      };
+      let heartbeatRunning = false;
+      const heartbeat = setInterval(() => {
+        if (heartbeatRunning || leaseError) return;
+        heartbeatRunning = true;
+        void this.#store.renew(runId, ownerToken, Date.now(), ASYNC_MESSAGE_LEASE_MS)
+          .then((renewed) => { if (!renewed) leaseError = new Error("Async message run ownership expired."); })
+          .catch((error) => { leaseError = error; })
+          .finally(() => { heartbeatRunning = false; });
+      }, Math.floor(ASYNC_MESSAGE_LEASE_MS / 4));
+      heartbeat.unref?.();
       try {
-        record.reply = await execute();
-        record.status = "completed";
+        const reply = await execute({
+          onDelta: (text) => appendPreview("partialText", text),
+          onReasoningDelta: (text) => appendPreview("reasoningText", text),
+        });
+        await flushPreview();
+        if (leaseError) {
+          throw new Error(`Async message run lease failed: ${leaseError instanceof Error ? leaseError.message : String(leaseError)}`);
+        }
+        if (!await this.#store.complete(runId, ownerToken, reply)) {
+          throw new Error("Async message run result could not be committed by its owning worker.");
+        }
       } catch (error) {
-        record.error = error instanceof Error ? error.message : String(error);
-        record.status = "failed";
+        await flushPreview();
+        await this.#store.fail(runId, ownerToken, error instanceof Error ? error.message : String(error)).catch(() => false);
       } finally {
-        record.updatedAt = new Date().toISOString();
+        if (previewTimer) clearTimeout(previewTimer);
+        clearInterval(heartbeat);
       }
     })();
-    record.settled = work;
-    return { snapshot: this.#snapshot(record), replayed: false, conflict: false, work };
+    return { snapshot: this.#snapshot(claim.record), replayed: false, conflict: false, work };
   }
 
   async read(runId: string, waitMs = 0): Promise<AsyncMessageRunSnapshot | undefined> {
-    this.#prune();
-    const record = this.#runs.get(runId);
+    const record = await this.#store.read(runId);
     if (!record) return undefined;
     const boundedWait = Math.max(0, Math.min(ASYNC_MESSAGE_LONG_POLL_MAX_MS, Math.trunc(waitMs)));
     if (boundedWait && (record.status === "queued" || record.status === "running")) {
-      await new Promise<void>((resolvePromise) => {
-        const timer = setTimeout(resolvePromise, boundedWait);
-        void record.settled.finally(() => {
-          clearTimeout(timer);
-          resolvePromise();
-        });
-      });
+      const deadline = Date.now() + boundedWait;
+      const initialPartial = record.partialText ?? "";
+      const initialReasoning = record.reasoningText ?? "";
+      while (Date.now() < deadline) {
+        await new Promise((resolvePromise) => setTimeout(
+          resolvePromise,
+          Math.max(0, Math.min(ASYNC_MESSAGE_POLL_INTERVAL_MS, deadline - Date.now())),
+        ));
+        const current = await this.#store.read(runId);
+        if (!current) return undefined;
+        if (current.status === "completed" || current.status === "failed"
+          || (current.partialText ?? "") !== initialPartial
+          || (current.reasoningText ?? "") !== initialReasoning) {
+          return this.#snapshot(current);
+        }
+      }
     }
-    return this.#snapshot(record);
+    return this.#snapshot(await this.#store.read(runId) ?? record);
   }
 
-  #snapshot(record: AsyncMessageRunRecord): AsyncMessageRunSnapshot {
+  async readArtifact(runId: string, index: number): Promise<AsyncMessageArtifactDownload | undefined> {
+    const record = await this.#store.read(runId);
+    if (!record || record.status !== "completed" || !record.reply || isPairingChallenge(record.reply)) return undefined;
+    const artifact = record.reply.artifacts?.[index];
+    if (!artifact || isHttpArtifact(artifact.path)) return undefined;
+    const canonical = await realpath(artifact.path).catch(() => undefined);
+    if (!canonical) return undefined;
+    const roots = await Promise.all(record.artifactRoots.map((root) => realpath(root).catch(() => resolve(root))));
+    if (!roots.some((root) => insideDirectory(root, canonical))) return undefined;
+    const handle = await open(canonical, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW).catch(() => undefined);
+    if (!handle) return undefined;
+    try {
+      const info = await handle.stat();
+      if (!info.isFile() || info.size > ASYNC_MESSAGE_ARTIFACT_MAX_BYTES) return undefined;
+      if (process.platform === "linux") {
+        const openedPath = await realpath(`/proc/self/fd/${handle.fd}`).catch(() => undefined);
+        if (!openedPath || !roots.some((root) => insideDirectory(root, openedPath))) return undefined;
+      }
+      return {
+        name: basename(artifact.name || canonical),
+        mime: artifact.mime || artifactMime(canonical),
+        bytes: await handle.readFile(),
+      };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  #snapshot(record: StoredAsyncMessageRun): AsyncMessageRunSnapshot {
     return {
       runId: record.runId,
       status: record.status,
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
-      reply: record.reply,
+      reply: sanitizeAsyncReply(record.runId, record.reply),
+      partialText: record.partialText ? extractMediaTags(record.partialText).text : undefined,
+      reasoningText: record.reasoningText,
       error: record.error,
     };
   }
 
-  #prune(now = Date.now()): void {
-    const terminal = (record: AsyncMessageRunRecord): boolean => record.status === "completed" || record.status === "failed";
-    for (const [runId, record] of this.#runs) {
-      if (!terminal(record) || now - Date.parse(record.updatedAt) < ASYNC_MESSAGE_RUN_TTL_MS) continue;
-      this.#runs.delete(runId);
-      if (record.idempotencyScope && this.#idempotency.get(record.idempotencyScope) === runId) {
-        this.#idempotency.delete(record.idempotencyScope);
-      }
-    }
-    if (this.#runs.size < ASYNC_MESSAGE_RUN_LIMIT) return;
-    for (const [runId, record] of this.#runs) {
-      if (!terminal(record)) continue;
-      this.#runs.delete(runId);
-      if (record.idempotencyScope && this.#idempotency.get(record.idempotencyScope) === runId) {
-        this.#idempotency.delete(record.idempotencyScope);
-      }
-      if (this.#runs.size < ASYNC_MESSAGE_RUN_LIMIT) break;
-    }
-  }
+}
+
+function sanitizeAsyncReply(
+  runId: string,
+  reply: SurfaceReply | PairingChallenge | undefined,
+): SurfaceReply | PairingChallenge | undefined {
+  if (!reply || isPairingChallenge(reply) || !reply.artifacts?.length) return reply;
+  return {
+    ...reply,
+    artifacts: reply.artifacts.map((artifact, index) => ({
+      ...artifact,
+      path: isHttpArtifact(artifact.path) ? artifact.path : `/v1/messages/runs/${runId}/artifacts/${index}`,
+    })),
+  };
 }
 
 /** Duplicate deliveries (webhook retries) with the same key return the cached reply. */
@@ -680,6 +825,10 @@ export async function handleSurfaceMessage(
      * log it, but it has already been delivered by the sink.
      */
     readonly sink?: DraftSink;
+    /** Assistant text emitted by the provider, forwarded unchanged. */
+    readonly onDelta?: (text: string) => void;
+    /** Provider-visible reasoning summary, forwarded unchanged. */
+    readonly onReasoningDelta?: (text: string) => void;
   },
 ): Promise<SurfaceReply | PairingChallenge> {
   const cwd = options.cwd ?? process.cwd();
@@ -717,7 +866,8 @@ export async function handleSurfaceMessage(
       enterprise: options.enterprise,
     });
   }
-  const command = await dispatchCommand(message, {
+  const parsedCommand = parseCommand(message.text);
+  const dispatchBuiltin = () => dispatchCommand(message, {
     config: options.config,
     profile,
     paired,
@@ -727,6 +877,11 @@ export async function handleSurfaceMessage(
     conversationKey: sessionKey,
     legacyConversationKey: `${message.surfaceId}:${message.conversationId}`,
   });
+  // Session-mutating commands must wait for an active provider turn to finish,
+  // otherwise its final session-handle save can silently undo the reset.
+  const command = parsedCommand && ["new", "reset"].includes(parsedCommand.name)
+    ? await runConversationExclusive(sessionKey, dispatchBuiltin, options.enterprise)
+    : await dispatchBuiltin();
   if (command) return command;
   const preflight = await gatewayGovernancePreflight(message, paired, assignment, profile, options.gateway, options.enterprise);
   if (preflight.reply) {
@@ -746,7 +901,6 @@ export async function handleSurfaceMessage(
     return preflight.reply;
   }
   const customCommand = resolveCustomCommand(message, options.gateway);
-  const parsedCommand = parseCommand(message.text);
   let runText = customCommand?.prompt ?? maybeAddChannelArtifactInstructions(message.text);
   if (parsedCommand && !customCommand) {
     const skillCommand = await resolveSkillCommand(parsedCommand.name, parsedCommand.args, cwd, {
@@ -775,7 +929,7 @@ export async function handleSurfaceMessage(
     ? runDraftLoop(channel.events, options.sink)
     : undefined;
   try {
-    const outcome = await executeRun(options.config, {
+    const outcome = await runConversationExclusive(sessionKey, () => executeRun(options.config, {
       prompt: runText,
       cwd,
       workspaceDir,
@@ -783,6 +937,8 @@ export async function handleSurfaceMessage(
       conversationKey: sessionKey,
       nativeTransport: "warm",
       nativeSessionKeepAlive: true,
+      nativeSessionMaxTurns: NATIVE_SESSION_MAX_TURNS,
+      nativeSessionMaxAgeMs: NATIVE_SESSION_MAX_AGE_MS,
       nativeTransportOwner: options.nativeTransportOwner,
       agentId: profile,
       ...(process.env.MUSTER_CODEX_HOME ? { codexHome: process.env.MUSTER_CODEX_HOME } : {}),
@@ -791,10 +947,12 @@ export async function handleSurfaceMessage(
         ...pairingScopes(paired),
         { kind: "session", id: sessionKey },
       ],
-      onDelta: streamRun ? (text) => {
-        if (streamRun.state === "streaming") streamRun.pushDelta(text);
+      onDelta: streamRun || options.onDelta ? (text) => {
+        if (streamRun?.state === "streaming") streamRun.pushDelta(text);
+        options.onDelta?.(text);
       } : undefined,
-    });
+      onReasoningDelta: options.onReasoningDelta,
+    }), options.enterprise);
     if (outcome.episode.outcome?.kind !== "completed") {
       throw new Error(outcome.episode.outcome?.detail ?? "Run failed");
     }
@@ -2881,13 +3039,19 @@ async function route(
       sendJson(response, 400, { error: "Idempotency-Key must contain at most 200 characters." });
       return;
     }
-    const started = messageRuns.start(message, idempotencyKey, () => handleSurfaceMessage(message, {
+    const artifactRoots = [
+      profileWorkspaceDir(cwd, activeProfile(cwd)),
+      join(dataDir(cwd), "artifacts"),
+    ];
+    const started = await messageRuns.start(message, idempotencyKey, artifactRoots, (stream) => handleSurfaceMessage(message, {
       config: options.config,
       gateway: options.gateway,
       enterprise: options.enterprise,
       approvalStore: options.approvalStore,
       cwd,
       registry: options.registry,
+      onDelta: stream.onDelta,
+      onReasoningDelta: stream.onReasoningDelta,
     }));
     if (started.conflict) {
       sendJson(response, 409, { error: "Idempotency-Key was already used for a different message.", runId: started.snapshot.runId });
@@ -2914,6 +3078,24 @@ async function route(
     }
     if (snapshot.status === "queued" || snapshot.status === "running") response.setHeader("retry-after", "2");
     sendJson(response, 200, snapshot);
+    return;
+  }
+
+  const asyncMessageArtifactMatch = url.pathname.match(/^\/v1\/messages\/runs\/(msg_[A-Za-z0-9-]+)\/artifacts\/(\d+)$/);
+  if (request.method === "GET" && asyncMessageArtifactMatch) {
+    const artifact = await messageRuns.readArtifact(asyncMessageArtifactMatch[1], Number(asyncMessageArtifactMatch[2]));
+    if (!artifact) {
+      sendJson(response, 404, { error: "Run artifact not found, expired, or outside its verified workspace." });
+      return;
+    }
+    const fallbackName = artifact.name.replace(/[^\x20-\x7E]+/g, "_").replace(/["\\]/g, "_") || "artifact";
+    response.writeHead(200, {
+      "cache-control": "private, no-store",
+      "content-disposition": `attachment; filename="${fallbackName}"; filename*=UTF-8''${encodeURIComponent(artifact.name)}`,
+      "content-length": String(artifact.bytes.length),
+      "content-type": artifact.mime || "application/octet-stream",
+    });
+    response.end(artifact.bytes);
     return;
   }
 
@@ -2996,12 +3178,26 @@ export function startGatewayServer(options: GatewayServerOptions, port = 0): Pro
     secret: createHash("sha256").update(`muster-approval:${options.gateway.token}`).digest(),
     store: approvalStore,
   });
+  const ownsMessageRunStore = options.messageRunStore === undefined;
+  const messageRunStore = options.messageRunStore ?? new SqliteAsyncMessageRunStore(
+    join(dataDir(cwd), "gateway-message-runs.db"),
+  );
   const nativeTransportOwner = options.nativeTransportOwner ?? `gateway:${randomUUID()}`;
-  const effectiveOptions: GatewayServerOptions = { ...options, enterprise, gchatVerifier, ingress, ingressSpool, approvalStore, approvalActions, nativeTransportOwner };
+  const effectiveOptions: GatewayServerOptions = {
+    ...options,
+    enterprise,
+    gchatVerifier,
+    ingress,
+    ingressSpool,
+    approvalStore,
+    approvalActions,
+    messageRunStore,
+    nativeTransportOwner,
+  };
   // One outbound queue per gateway: chat keys share retry_after backoff state.
   const queue = createOutboundQueue();
   const backgroundTasks = new Set<Promise<void>>();
-  const messageRuns = new AsyncMessageRunRegistry();
+  const messageRuns = new AsyncMessageRunRegistry(messageRunStore);
   const server = createServer((request, response) => {
     route(request, response, effectiveOptions, queue, backgroundTasks, messageRuns).catch((error) => {
       const detail = error instanceof Error ? error.message : String(error);
@@ -3021,6 +3217,7 @@ export function startGatewayServer(options: GatewayServerOptions, port = 0): Pro
         await new Promise<void>((done) => server.close(() => done()));
       }
       closeWarmProviderTransports(nativeTransportOwner);
+      if (ownsMessageRunStore) await messageRunStore.close?.();
       if (ownsApprovalStore) approvalStore.close();
       if (ownsEnterpriseRuntime) await enterprise.close?.();
     };

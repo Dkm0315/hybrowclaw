@@ -217,4 +217,20 @@ test("runPiEmbeddedAgent returns persistent session metadata even when provider 
   assert.match(buildPiSessionLabel(result), /mode=create/);
   assert.match(buildPiSessionLabel(result), /tools=read,grep,find,ls/);
   assert.match(summarizePiEventTrace(result.eventTrace ?? []), /session_created/);
+  assert.equal(result.fallbackEligible, false, "a submitted Pi prompt must never be replayed");
+});
+
+test("runPiEmbeddedAgent marks model-resolution setup failures as fallback-safe", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-pi-safe-fallback-"));
+  const result = await runPiEmbeddedAgent({
+    prompt: "hello",
+    cwd,
+    agentDir: join(cwd, ".agent"),
+    provider: "provider-that-does-not-exist",
+    model: "model-that-does-not-exist",
+  });
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.fallbackEligible, true);
+  assert.ok(!result.eventTrace?.some((event) => event.type === "prompt_start"));
 });

@@ -113,6 +113,8 @@ export interface PiAgentRunResult {
   readonly eventCounts?: Record<string, number>;
   readonly eventTrace?: PiEventTrace[];
   readonly errorMessage?: string;
+  /** True only when setup failed before session.prompt() could dispatch the turn. */
+  readonly fallbackEligible?: boolean;
 }
 
 export type PiSessionMode = "memory" | "create" | "continue";
@@ -435,6 +437,7 @@ export async function runPiEmbeddedAgent(input: PiAgentRunInput): Promise<PiAgen
     eventTrace.push({ index: ++traceIndex, at: new Date().toISOString(), ...item });
   };
   const sessionMode = input.sessionMode ?? "memory";
+  let promptDispatched = false;
   try {
     const pi = await import("@earendil-works/pi-coding-agent");
     const cwd = input.cwd ?? process.cwd();
@@ -507,6 +510,7 @@ export async function runPiEmbeddedAgent(input: PiAgentRunInput): Promise<PiAgen
         message: "Prompt submitted to Pi AgentSession"
       });
       try {
+        promptDispatched = true;
         await session.prompt(input.prompt);
         responseText = extractLatestAssistantText(session.messages);
       } catch (error) {
@@ -540,7 +544,8 @@ export async function runPiEmbeddedAgent(input: PiAgentRunInput): Promise<PiAgen
         eventTypes,
         eventCounts,
         eventTrace,
-        errorMessage: promptError ?? (responseText ? undefined : session.state.errorMessage ?? "Pi SDK completed without assistant text.")
+        errorMessage: promptError ?? (responseText ? undefined : session.state.errorMessage ?? "Pi SDK completed without assistant text."),
+        fallbackEligible: false,
       };
     } finally {
       unsubscribe();
@@ -559,7 +564,8 @@ export async function runPiEmbeddedAgent(input: PiAgentRunInput): Promise<PiAgen
       eventTypes,
       eventCounts,
       eventTrace,
-      errorMessage: error instanceof Error ? error.message : String(error)
+      errorMessage: error instanceof Error ? error.message : String(error),
+      fallbackEligible: !promptDispatched,
     };
   }
 }

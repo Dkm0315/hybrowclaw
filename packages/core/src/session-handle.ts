@@ -23,7 +23,17 @@ export interface SessionHandleRecord {
    * carry stale instructions and must not be resumed.
    */
   readonly contextHash?: string;
+  /** First turn persisted for this provider thread. Used to rotate stale native context. */
+  readonly createdAt?: string;
+  /** Completed turns carried by this provider thread. Missing on legacy records. */
+  readonly turnCount?: number;
   readonly updatedAt: string;
+}
+
+export interface SessionReuseBudget {
+  readonly maxAgeMs?: number;
+  readonly maxTurns?: number;
+  readonly nowMs?: number;
 }
 
 export function sessionHandlesPath(cwd = process.cwd()): string {
@@ -121,9 +131,20 @@ export function canReuseHandle(
   cwd: string,
   model: string,
   contextHash?: string,
+  budget?: SessionReuseBudget,
 ): record is SessionHandleRecord {
-  return Boolean(record)
+  const compatible = Boolean(record)
     && record!.cwd === cwd
     && record!.model === model
     && (contextHash === undefined || record!.contextHash === contextHash);
+  if (!compatible || !record || !budget) return compatible;
+  if (budget.maxTurns !== undefined) {
+    if (!Number.isSafeInteger(record.turnCount) || record.turnCount! < 0 || record.turnCount! >= budget.maxTurns) return false;
+  }
+  if (budget.maxAgeMs !== undefined) {
+    const createdAt = record.createdAt ? Date.parse(record.createdAt) : Number.NaN;
+    const now = budget.nowMs ?? Date.now();
+    if (!Number.isFinite(createdAt) || now - createdAt >= budget.maxAgeMs) return false;
+  }
+  return true;
 }

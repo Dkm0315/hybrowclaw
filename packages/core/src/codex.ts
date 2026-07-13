@@ -6,7 +6,7 @@ import { join as pathJoin } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { runSubprocess } from "./subprocess.js";
+import { isPreDispatchSpawnError, runSubprocess } from "./subprocess.js";
 
 const execFileAsync = promisify(execFile);
 const CODEX_EXEC_SUPPORT_CACHE = new Map<string, boolean>();
@@ -63,6 +63,7 @@ export interface CodexRunResult {
   readonly stderr: string;
   readonly durationMs: number;
   readonly errorMessage?: string;
+  readonly fallbackEligible?: boolean;
 }
 
 export async function inspectCodex(command = "codex"): Promise<{ readonly available: boolean; readonly version?: string; readonly supportsExec?: boolean }> {
@@ -166,6 +167,7 @@ export async function runCodex(input: CodexRunInput): Promise<CodexRunResult> {
       stderr: "",
       durationMs: Date.now() - started,
       errorMessage: "Installed Codex CLI does not support `codex exec --json`. Update Codex or use the app-server transport; refusing to pass modern exec flags to a legacy interactive Codex binary.",
+      fallbackEligible: true,
     };
   }
   // Inherit the real environment (so CODEX_HOME / auth resolve) and overlay
@@ -207,6 +209,7 @@ export async function runCodex(input: CodexRunInput): Promise<CodexRunResult> {
       stderr,
       durationMs: Date.now() - started,
       errorMessage,
+      fallbackEligible: isPreDispatchSpawnError(error),
     };
   } finally {
     await rm(outputFile, { force: true }).catch(() => {});

@@ -21,7 +21,11 @@ export interface CodexAppServerRunInput {
   /** Long-lived host that owns the warm process (gateway, RPC server, or TUI). */
   readonly transportOwner?: string;
   readonly keepAlive?: boolean;
+  /** Start a fresh provider thread while retaining the already-warm app-server process. */
+  readonly rotateThread?: boolean;
   readonly onDelta?: (text: string) => void;
+  /** Provider-visible reasoning summary deltas. Raw hidden reasoning is never forwarded. */
+  readonly onReasoningDelta?: (text: string) => void;
 }
 
 export type CodexAppServerCacheState = "hit" | "miss" | "shared-miss" | "disabled";
@@ -43,6 +47,9 @@ export interface CodexAppServerRunResult {
   readonly firstDeltaMs?: number;
   readonly timings?: CodexAppServerTimings;
   readonly errorMessage?: string;
+  /** A cold app-server failure may safely fall back; an active turn may not be replayed. */
+  readonly fallbackEligible?: boolean;
+  readonly hadActivity?: boolean;
   readonly tokenUsage?: {
     readonly inputTokens?: number;
     readonly cachedInputTokens?: number;
@@ -59,7 +66,7 @@ interface PendingRequest {
 
 interface CachedSession {
   readonly client: CodexAppServerClient;
-  readonly threadId: string;
+  threadId: string;
   readonly cacheKey: string;
   readonly conversationKey?: string;
   readonly transportOwner?: string;
@@ -151,21 +158,38 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
       finalMessage: "",
       durationMs: Date.now() - started,
       errorMessage: error instanceof Error ? error.message : String(error),
+      fallbackEligible: true,
+      hadActivity: false,
     };
   }
 
   let queueMs = 0;
+  let firstDeltaAt: number | undefined;
+  let providerActivity = false;
+  let effectiveThreadOpenMs = lease.threadOpenMs;
+  let effectiveThreadOpenState: CodexAppServerTimings["threadOpenState"] = lease.cacheState === "hit" ? "cached" : lease.threadOpenState;
   return await runExclusive(lease.session, async (measuredQueueMs) => {
     queueMs = measuredQueueMs;
-    let firstDeltaAt: number | undefined;
+    if (input.rotateThread && lease.cacheState === "hit") {
+      const threadOpenStartedAt = Date.now();
+      lease.session.threadId = await lease.session.client.startThread(input.cwd);
+      effectiveThreadOpenMs += Date.now() - threadOpenStartedAt;
+      effectiveThreadOpenState = "started";
+    }
     const turn = await lease.session.client.runTurn({
       threadId: lease.session.threadId,
       prompt: input.prompt,
       timeoutMs: input.timeoutMs ?? 180_000,
       onDelta: (text) => {
+        providerActivity = true;
         firstDeltaAt ??= Date.now();
         input.onDelta?.(text);
       },
+      onReasoningDelta: (text) => {
+        providerActivity = true;
+        input.onReasoningDelta?.(text);
+      },
+      onActivity: () => { providerActivity = true; },
     });
     const requestToFirstDeltaMs = firstDeltaAt === undefined ? undefined : firstDeltaAt - started;
     const result = {
@@ -174,10 +198,22 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
       threadId: lease.session.threadId,
       durationMs: Date.now() - started,
       firstDeltaMs: turn.firstDeltaMs,
-      timings: appServerTimings(lease, queueMs, requestToFirstDeltaMs),
+      timings: appServerTimings(
+        lease,
+        queueMs,
+        requestToFirstDeltaMs,
+        effectiveThreadOpenMs,
+        effectiveThreadOpenState,
+      ),
       errorMessage: turn.errorMessage,
+      fallbackEligible: turn.errorMessage ? !providerActivity : false,
+      hadActivity: providerActivity,
       tokenUsage: turn.tokenUsage,
     } as const;
+    if (turn.errorMessage) {
+      lease.session.client.close();
+      if (SESSION_CACHE.get(key) === lease.session) SESSION_CACHE.delete(key);
+    }
     if (SESSION_CACHE.get(key) === lease.session) pruneSessionCache(Date.now(), key);
     return result;
   }).catch((error: unknown) => {
@@ -188,20 +224,34 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
         finalMessage: "",
         threadId: lease.session.threadId,
         durationMs: Date.now() - started,
-        timings: appServerTimings(lease, queueMs),
+        timings: appServerTimings(
+          lease,
+          queueMs,
+          firstDeltaAt === undefined ? undefined : firstDeltaAt - started,
+          effectiveThreadOpenMs,
+          effectiveThreadOpenState,
+        ),
         errorMessage: error instanceof Error ? error.message : String(error),
+        fallbackEligible: !providerActivity,
+        hadActivity: providerActivity,
       };
     });
 }
 
-function appServerTimings(lease: SessionLease, queueMs: number, requestToFirstDeltaMs?: number): CodexAppServerTimings {
+function appServerTimings(
+  lease: SessionLease,
+  queueMs: number,
+  requestToFirstDeltaMs?: number,
+  threadOpenMs = lease.threadOpenMs,
+  threadOpenState: CodexAppServerTimings["threadOpenState"] = lease.cacheState === "hit" ? "cached" : lease.threadOpenState,
+): CodexAppServerTimings {
   return {
     startupMs: lease.startupMs,
     queueMs,
-    threadOpenMs: lease.threadOpenMs,
+    threadOpenMs,
     requestToFirstDeltaMs,
     cacheState: lease.cacheState,
-    threadOpenState: lease.cacheState === "hit" ? "cached" : lease.threadOpenState,
+    threadOpenState,
   };
 }
 
@@ -448,7 +498,11 @@ class CodexAppServerClient {
   }
 
   async startThread(cwd: string): Promise<string> {
-    const result = await this.request("thread/start", { cwd }, 15_000);
+    const result = await this.request("thread/start", {
+      cwd,
+      approvalPolicy: "never",
+      sandbox: "workspace-write",
+    }, 15_000);
     const thread = asRecord(result.thread);
     const threadId = stringValue(thread.id) ?? stringValue(thread.sessionId) ?? stringValue(result.sessionId) ?? stringValue(result.threadId);
     if (!threadId) throw new Error("codex app-server thread/start returned no thread id");
@@ -456,7 +510,13 @@ class CodexAppServerClient {
   }
 
   async resumeThread(threadId: string, cwd: string): Promise<string> {
-    const result = await this.request("thread/resume", { threadId, cwd, excludeTurns: true }, 30_000);
+    const result = await this.request("thread/resume", {
+      threadId,
+      cwd,
+      excludeTurns: true,
+      approvalPolicy: "never",
+      sandbox: "workspace-write",
+    }, 30_000);
     const thread = asRecord(result.thread);
     const resumedId = stringValue(thread.id) ?? stringValue(thread.sessionId) ?? stringValue(result.sessionId) ?? stringValue(result.threadId);
     if (!resumedId) throw new Error("codex app-server thread/resume returned no thread id");
@@ -469,6 +529,8 @@ class CodexAppServerClient {
     readonly prompt: string;
     readonly timeoutMs: number;
     readonly onDelta?: (text: string) => void;
+    readonly onReasoningDelta?: (text: string) => void;
+    readonly onActivity?: () => void;
   }): Promise<{
     readonly finalMessage: string;
     readonly firstDeltaMs?: number;
@@ -476,6 +538,9 @@ class CodexAppServerClient {
     readonly tokenUsage?: CodexAppServerRunResult["tokenUsage"];
   }> {
     const started = Date.now();
+    // Dispatch is the replay boundary: a lost acknowledgement does not prove
+    // that the provider rejected the turn or skipped its tool calls.
+    input.onActivity?.();
     const turnStart = await this.request("turn/start", {
       threadId: input.threadId,
       input: [{ type: "text", text: input.prompt }],
@@ -491,6 +556,7 @@ class CodexAppServerClient {
       if (!message) continue;
       const method = stringValue(message.method) ?? "";
       const params = asRecord(message.params);
+      if (method.startsWith("item/")) input.onActivity?.();
       if (method.endsWith("/request")) {
         this.respond(message.id, { decision: "decline", action: "decline", content: null, _meta: null });
         continue;
@@ -501,6 +567,11 @@ class CodexAppServerClient {
           firstDeltaMs ??= Date.now() - started;
           input.onDelta?.(delta);
         }
+        continue;
+      }
+      if (method === "item/reasoning/summaryTextDelta") {
+        const delta = stringValue(params.delta) ?? "";
+        if (delta) input.onReasoningDelta?.(delta);
         continue;
       }
       if (method === "item/completed") {

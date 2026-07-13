@@ -80,3 +80,35 @@ test("canReuseHandle: resume only when workspace, model, and injected context ar
   assert.equal(canReuseHandle(rec(), "/ws/tg", "gpt-5.5", "ctx-a"), false, "old records without context hash are not reused when context-aware callers opt in");
   assert.equal(canReuseHandle(undefined, "/ws/tg", "gpt-5.5"), false, "no stored handle → fresh thread");
 });
+
+test("canReuseHandle: rotates legacy, old, and over-budget provider threads", () => {
+  const createdAt = "2026-07-13T08:00:00.000Z";
+  const nowMs = Date.parse("2026-07-13T09:00:00.000Z");
+  const budget = { maxTurns: 12, maxAgeMs: 2 * 60 * 60_000, nowMs };
+
+  assert.equal(
+    canReuseHandle(rec({ contextHash: "ctx-a" }), "/ws/tg", "gpt-5.5", "ctx-a", budget),
+    false,
+    "legacy records without bounded-session metadata rotate instead of carrying unbounded history",
+  );
+  assert.equal(
+    canReuseHandle(rec({ contextHash: "ctx-a", createdAt, turnCount: 11 }), "/ws/tg", "gpt-5.5", "ctx-a", budget),
+    true,
+  );
+  assert.equal(
+    canReuseHandle(rec({ contextHash: "ctx-a", createdAt, turnCount: 12 }), "/ws/tg", "gpt-5.5", "ctx-a", budget),
+    false,
+    "turn budget is exclusive",
+  );
+  assert.equal(
+    canReuseHandle(
+      rec({ contextHash: "ctx-a", createdAt: "2026-07-13T06:59:59.999Z", turnCount: 1 }),
+      "/ws/tg",
+      "gpt-5.5",
+      "ctx-a",
+      budget,
+    ),
+    false,
+    "age budget rotates old context",
+  );
+});

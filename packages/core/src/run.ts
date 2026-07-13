@@ -29,7 +29,7 @@ function hashSystemContext(system: string): string {
 import { applySkillEnvForRun, exportClaudeSkillSnapshot, recordSkillUse, resolveAgentSkillAllowlist, selectSkills } from "./skills.js";
 import { addMemory, searchMemoryWithReceipts, type SearchMemoryReceiptResult } from "./memory.js";
 import { runPiEmbeddedAgent, type PiAgentRunResult, type PiSessionMode } from "./pi.js";
-import { completeChat } from "./provider.js";
+import { completeChat, ProviderCompletionError } from "./provider.js";
 import { classifyTask, planRun } from "./router.js";
 import { appendEpisode } from "./store.js";
 import { synthesizeDeltas } from "./stream.js";
@@ -76,6 +76,10 @@ export interface RunOptions {
   readonly nativeSession?: boolean;
   /** Keep native app-server transports alive after the turn. Interactive chat uses this; one-shot commands should not. */
   readonly nativeSessionKeepAlive?: boolean;
+  /** Rotate native provider context after this many completed turns. */
+  readonly nativeSessionMaxTurns?: number;
+  /** Rotate native provider context after this wall-clock age. */
+  readonly nativeSessionMaxAgeMs?: number;
   /** Native transport preference. "warm" reuses app-server/session transports where supported; "exec" forces one process per turn. */
   readonly nativeTransport?: "auto" | "warm" | "exec";
   /** Long-lived host that owns warm native transports, for targeted shutdown. */
@@ -108,6 +112,8 @@ export interface RunOptions {
    * synthetic deltas so the same coalescer/draft pipeline runs everywhere.
    */
   readonly onDelta?: (text: string) => void;
+  /** Provider-visible reasoning summary deltas. Raw hidden reasoning is never forwarded. */
+  readonly onReasoningDelta?: (text: string) => void;
 }
 
 export interface RunOutcome {
@@ -254,6 +260,8 @@ interface AttemptResult {
   readonly providerCacheState?: string;
   readonly providerThreadOpenState?: string;
   readonly backendFallbackMs?: number;
+  /** False once a provider turn may have executed tools; unsafe attempts must never be replayed. */
+  readonly fallbackEligible?: boolean;
   readonly tokenUsage?: {
     readonly inputTokens?: number;
     readonly cachedInputTokens?: number;
@@ -265,6 +273,20 @@ function normalizeNativeTransport(value: string | undefined): "auto" | "warm" | 
   if (value === "exec") return "exec";
   if (value === "warm" || value === "app-server") return "warm";
   return "auto";
+}
+
+function defaultTaskTimeoutMs(taskKind: TaskKind): number {
+  if (taskKind === "simple_qa") return 45_000;
+  if (taskKind === "artifact" || taskKind === "workflow" || taskKind === "coding" || taskKind === "debugging") return 300_000;
+  return 180_000;
+}
+
+function nativeSessionBudget(options: RunOptions): { readonly maxAgeMs?: number; readonly maxTurns?: number } | undefined {
+  if (options.nativeSessionMaxAgeMs === undefined && options.nativeSessionMaxTurns === undefined) return undefined;
+  return {
+    maxAgeMs: options.nativeSessionMaxAgeMs,
+    maxTurns: options.nativeSessionMaxTurns,
+  };
 }
 
 interface PromptParts {
@@ -314,7 +336,7 @@ const runClaudeCodeBackend: CliBackendRunner = async (route, prompts, options) =
     ? await loadSessionHandle(options.conversationKey, "claude", stateCwd)
     : undefined;
   const contextHash = hashSystemContext(prompts.stableSystem);
-  const reuse = canReuseHandle(stored, claudeCwd, route.model, contextHash);
+  const reuse = canReuseHandle(stored, claudeCwd, route.model, contextHash, nativeSessionBudget(options));
   const sessionId = options.conversationKey
     ? (reuse ? stored.handle : (options.sessionId ?? randomUUID()))
     : options.sessionId;
@@ -332,6 +354,7 @@ const runClaudeCodeBackend: CliBackendRunner = async (route, prompts, options) =
   // Persist the session for next turn on success; drop a broken one on failure.
   if (options.conversationKey && sessionId) {
     if (claudeResult.status === "completed") {
+      const updatedAt = new Date().toISOString();
       await saveSessionHandle({
         conversationKey: options.conversationKey,
         backendId: "claude",
@@ -339,7 +362,9 @@ const runClaudeCodeBackend: CliBackendRunner = async (route, prompts, options) =
         cwd: claudeCwd,
         model: route.model,
         contextHash,
-        updatedAt: new Date().toISOString(),
+        createdAt: reuse ? (stored.createdAt ?? stored.updatedAt) : updatedAt,
+        turnCount: reuse ? (stored.turnCount ?? 0) + 1 : 1,
+        updatedAt,
       }, stateCwd);
     } else {
       await clearSessionHandle(options.conversationKey, "claude", stateCwd);
@@ -353,10 +378,11 @@ const runClaudeCodeBackend: CliBackendRunner = async (route, prompts, options) =
     responseText,
     status: claudeResult.status,
     errorMessage: claudeResult.status === "failed" ? (claudeResult.errorMessage || claudeResult.stderr.trim() || "claude command failed") : undefined,
-      route,
-      sessionMode: sessionId ? (reuse ? "continue" : "create") : undefined,
-      sessionId,
-    };
+    route,
+    sessionMode: sessionId ? (reuse ? "continue" : "create") : undefined,
+    sessionId,
+    fallbackEligible: claudeResult.status === "failed" ? (claudeResult.fallbackEligible ?? false) : undefined,
+  };
 };
 
 const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
@@ -378,7 +404,9 @@ const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
     ? await loadSessionHandle(options.conversationKey, "codex", stateCwd)
     : undefined;
   const contextHash = hashSystemContext(prompts.stableSystem);
-  const reuse = canReuseHandle(stored, workspaceDir, route.model, contextHash);
+  const compatible = canReuseHandle(stored, workspaceDir, route.model, contextHash);
+  const reuse = canReuseHandle(stored, workspaceDir, route.model, contextHash, nativeSessionBudget(options));
+  const rotateWarmThread = Boolean(stored && compatible && !reuse);
   try {
     const codexEnv = options.codexHome ? { CODEX_HOME: options.codexHome } : undefined;
     const nativeTransport = normalizeNativeTransport(options.nativeTransport ?? process.env.MUSTER_NATIVE_TRANSPORT ?? process.env.MUSTER_CODEX_TRANSPORT);
@@ -399,7 +427,9 @@ const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
           keepAlive: options.nativeSessionKeepAlive ?? true,
           cacheKey: options.conversationKey,
           transportOwner: options.nativeTransportOwner,
+          rotateThread: rotateWarmThread,
           onDelta: options.onDelta,
+          onReasoningDelta: options.onReasoningDelta,
         })
       : await runCodex({
           prompt: prompts.user,
@@ -415,8 +445,11 @@ const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
           env: codexEnv,
           timeoutMs: options.timeoutMs,
         });
+    const useBackendFallback = useAppServer
+      && codexResult.status === "failed"
+      && codexResult.fallbackEligible === true;
     const backendFallbackStartedAt = Date.now();
-    const finalCodexResult = useAppServer && codexResult.status === "failed"
+    const finalCodexResult = useBackendFallback
       ? await runCodex({
           prompt: prompts.user,
           cwd: workspaceDir,
@@ -432,12 +465,13 @@ const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
           timeoutMs: options.timeoutMs,
         })
       : codexResult;
-    const backendFallbackMs = useAppServer && codexResult.status === "failed" ? Date.now() - backendFallbackStartedAt : 0;
+    const backendFallbackMs = useBackendFallback ? Date.now() - backendFallbackStartedAt : 0;
     const appServerTimings = useAppServer && "timings" in codexResult ? codexResult.timings : undefined;
     // Persist the thread for next turn on success; drop a broken thread on
     // failure so it is never resumed into a dead end.
     if (useNativeSession && options.conversationKey) {
       if (finalCodexResult.status === "completed" && finalCodexResult.threadId) {
+        const updatedAt = new Date().toISOString();
         await saveSessionHandle({
           conversationKey: options.conversationKey,
           backendId: "codex",
@@ -445,14 +479,16 @@ const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
           cwd: workspaceDir,
           model: route.model,
           contextHash,
-          updatedAt: new Date().toISOString(),
+          createdAt: reuse ? (stored.createdAt ?? stored.updatedAt) : updatedAt,
+          turnCount: reuse ? (stored.turnCount ?? 0) + 1 : 1,
+          updatedAt,
         }, stateCwd);
       } else if (finalCodexResult.status === "failed") {
         await clearSessionHandle(options.conversationKey, "codex", stateCwd);
       }
     }
     const responseText = finalCodexResult.finalMessage.trim();
-    if ((!useAppServer || codexResult.status === "failed") && options.onDelta && finalCodexResult.status === "completed" && responseText) {
+    if ((!useAppServer || useBackendFallback) && options.onDelta && finalCodexResult.status === "completed" && responseText) {
       for (const chunk of synthesizeDeltas(responseText)) options.onDelta(chunk);
     }
     return {
@@ -465,7 +501,7 @@ const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
       sessionId: finalCodexResult.threadId,
       firstTokenMs: "firstDeltaMs" in finalCodexResult ? finalCodexResult.firstDeltaMs : undefined,
       providerTransport: useAppServer
-        ? (codexResult.status === "failed" ? "warm-fallback-exec" : "warm")
+        ? (useBackendFallback ? "warm-fallback-exec" : "warm")
         : "exec",
       providerStartupMs: appServerTimings?.startupMs,
       providerQueueMs: appServerTimings?.queueMs,
@@ -474,6 +510,9 @@ const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
       providerCacheState: appServerTimings?.cacheState,
       providerThreadOpenState: appServerTimings?.threadOpenState,
       backendFallbackMs,
+      fallbackEligible: finalCodexResult.status === "failed"
+        ? ("fallbackEligible" in finalCodexResult ? (finalCodexResult.fallbackEligible ?? false) : false)
+        : undefined,
       tokenUsage: "tokenUsage" in finalCodexResult ? finalCodexResult.tokenUsage : undefined,
     };
   } finally {
@@ -521,6 +560,7 @@ async function attemptRoute(
       sessionMode: piResult.sessionMode,
       sessionId: piResult.sessionId,
       providerTransport: "pi",
+      fallbackEligible: piResult.status === "failed" ? (piResult.fallbackEligible ?? false) : undefined,
     };
   }
   const provider = config.providers[route.provider];
@@ -556,7 +596,7 @@ async function attemptRoute(
       });
       messages = rendered.map((message) => ({ role: message.role === "tool" ? "user" : message.role, content: message.content }));
     }
-    const text = await completeChat({ provider, route, messages });
+    const text = await completeChat({ provider, route, messages, timeoutMs: options.timeoutMs });
     if (options.onDelta && text) {
       for (const chunk of synthesizeDeltas(text)) options.onDelta(chunk);
     }
@@ -564,9 +604,22 @@ async function attemptRoute(
       store.appendMessage(sessionId, "user", prompts.user);
       store.appendMessage(sessionId, "assistant", text);
     }
-    return { responseText: text, status: text ? "completed" : "failed", errorMessage: text ? undefined : "Empty response", route, providerTransport: "http" };
+    return {
+      responseText: text,
+      status: text ? "completed" : "failed",
+      errorMessage: text ? undefined : "Empty response",
+      route,
+      providerTransport: "http",
+      fallbackEligible: text ? undefined : false,
+    };
   } catch (error) {
-    return { responseText: "", status: "failed", errorMessage: error instanceof Error ? error.message : String(error), route };
+    return {
+      responseText: "",
+      status: "failed",
+      errorMessage: error instanceof Error ? error.message : String(error),
+      route,
+      fallbackEligible: error instanceof ProviderCompletionError ? error.fallbackEligible : false,
+    };
   } finally {
     store?.close();
   }
@@ -769,7 +822,10 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
       attributes: genAiAttributes({ operation: "chat", system: route.provider, requestModel: route.model }),
     });
     try {
-      const result = await attemptRoute(config, plan, route, prompts, options);
+      const result = await attemptRoute(config, plan, route, prompts, {
+        ...options,
+        timeoutMs: options.timeoutMs ?? defaultTaskTimeoutMs(plan.taskKind),
+      });
       await endSpan(span, {
         status: result.status === "completed" ? "ok" : "error",
         statusMessage: result.errorMessage,
@@ -795,7 +851,7 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
     providerAttemptCount += 1;
     attempt = await tracedAttempt(plan.route);
 
-    if (attempt.status === "failed" && config.routing.fallbacks?.length) {
+    if (attempt.status === "failed" && attempt.fallbackEligible !== false && config.routing.fallbacks?.length) {
       for (const fallbackRoute of config.routing.fallbacks) {
         const fallbackStartedAt = Date.now();
         evidence.push({
@@ -813,6 +869,7 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
           break;
         }
         attempt = fallbackAttempt;
+        if (fallbackAttempt.fallbackEligible === false) break;
       }
     }
   } finally {

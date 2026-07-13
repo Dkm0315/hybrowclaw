@@ -5,6 +5,8 @@ export * from "./commands.js";
 export * from "./enterprise-runtime.js";
 export * from "./durable-ingress.js";
 export * from "./ingress-spool.js";
+export * from "./async-message-store.js";
+export * from "./conversation-lease.js";
 export * from "./approval-store.js";
 export * from "./pairing.js";
 export * from "./gateway-config.js";

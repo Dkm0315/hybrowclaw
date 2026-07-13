@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { chmod, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { clearCodexAppServerSessions, defaultConfig, loadSessionHandle, promoteSkill, runCodexAppServer, runFlow, saveSessionHandle, writeCandidateSkill } from "@musterhq/core";
+import { clearCodexAppServerSessions, defaultConfig, loadSessionHandle, profileWorkspaceDir, promoteSkill, runCodexAppServer, runFlow, saveSessionHandle, writeCandidateSkill } from "@musterhq/core";
 import type { EvolveReport, MusterConfig } from "@musterhq/core";
-import { approvePairing, initGatewayConfig, pollTelegram, startGatewayServer } from "../src/index.js";
+import { approvePairing, initGatewayConfig, pollTelegram, SqliteAsyncMessageRunStore, startGatewayServer } from "../src/index.js";
 import type { GatewayConfig, PairingChallenge, SurfaceReply } from "../src/index.js";
 
 function stubConfig(baseUrl: string): MusterConfig {
@@ -52,6 +52,17 @@ function report(): EvolveReport {
     harnessChecks: [],
     converged: true,
   };
+}
+
+class CountingAsyncMessageRunStore extends SqliteAsyncMessageRunStore {
+  previewWrites = 0;
+
+  override appendPreview(
+    ...args: Parameters<SqliteAsyncMessageRunStore["appendPreview"]>
+  ): ReturnType<SqliteAsyncMessageRunStore["appendPreview"]> {
+    this.previewWrites += 1;
+    return super.appendPreview(...args);
+  }
 }
 
 async function startTestGateway(cwd: string, llmUrl: string): Promise<{ url: string; gateway: GatewayConfig; close: () => Promise<void> }> {
@@ -190,9 +201,161 @@ test("async message runs acknowledge quickly, poll to completion, and reject con
       headers: { authorization: `Bearer ${gw.gateway.token}` },
     });
     assert.equal(completedResponse.status, 200);
-    const completed = await completedResponse.json() as { status: string; reply?: SurfaceReply };
+    const completed = await completedResponse.json() as { status: string; reply?: SurfaceReply; partialText?: string };
     assert.equal(completed.status, "completed");
     assert.equal(completed.reply?.text, "slow governed reply");
+    assert.equal(completed.partialText, "slow governed reply");
+  } finally {
+    await gw.close();
+    llm.close();
+  }
+});
+
+test("async streaming coalesces durable preview writes without losing response text", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-gw-preview-batch-"));
+  const responseText = Array.from({ length: 2_000 }, (_, index) => `token-${index}`).join(" ");
+  const llm = await startStubServer(() => ({
+    status: 200,
+    payload: { choices: [{ message: { content: responseText } }] },
+  }));
+  const init = await initGatewayConfig(cwd);
+  const messageRunStore = new CountingAsyncMessageRunStore(":memory:");
+  const running = await startGatewayServer({
+    config: stubConfig(llm.url),
+    gateway: init.config,
+    cwd,
+    messageRunStore,
+  }, 0);
+  const url = `http://127.0.0.1:${running.port}`;
+  const message = { surfaceId: "web:preview-demo", conversationId: "c1", senderId: "alice", text: "stream a long answer" };
+  const post = () => fetch(`${url}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${init.config.token}` },
+    body: JSON.stringify(message),
+  });
+  try {
+    const challenge = await (await post()).json() as PairingChallenge;
+    await approvePairing(challenge.code, cwd);
+    const accepted = await (await fetch(`${url}/v1/messages/async`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${init.config.token}` },
+      body: JSON.stringify(message),
+    })).json() as { pollUrl: string };
+    const completed = await (await fetch(`${url}${accepted.pollUrl}?waitMs=2000`, {
+      headers: { authorization: `Bearer ${init.config.token}` },
+    })).json() as { status: string; partialText?: string; reply?: SurfaceReply };
+
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.partialText, responseText);
+    assert.equal(completed.reply?.text, responseText);
+    assert.ok(messageRunStore.previewWrites > 0);
+    assert.ok(messageRunStore.previewWrites <= 2, `expected batched preview writes, got ${messageRunStore.previewWrites}`);
+  } finally {
+    await running.close();
+    messageRunStore.close();
+    llm.close();
+  }
+});
+
+test("async runs serialize provider work within one conversation", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-gw-async-serial-"));
+  let active = 0;
+  let maxActive = 0;
+  let calls = 0;
+  const llm = await startStubServer(async () => {
+    calls += 1;
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await delay(100);
+    active -= 1;
+    return { status: 200, payload: { choices: [{ message: { content: `reply-${calls}` } }] } };
+  });
+  const gw = await startTestGateway(cwd, llm.url);
+  const baseMessage = { surfaceId: "web:serial-demo", conversationId: "same-chat", senderId: "alice" };
+  const post = (body: unknown, idempotencyKey?: string) => fetch(`${gw.url}/v1/messages${idempotencyKey ? "/async" : ""}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${gw.gateway.token}`,
+      ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  try {
+    const challenge = await (await post({ ...baseMessage, text: "pair me" })).json() as PairingChallenge;
+    await approvePairing(challenge.code, cwd);
+
+    const [firstResponse, secondResponse] = await Promise.all([
+      post({ ...baseMessage, text: "first" }, "serial-1"),
+      post({ ...baseMessage, text: "second" }, "serial-2"),
+    ]);
+    const first = await firstResponse.json() as { pollUrl: string };
+    const second = await secondResponse.json() as { pollUrl: string };
+    const poll = (pollUrl: string) => fetch(`${gw.url}${pollUrl}?waitMs=2000`, {
+      headers: { authorization: `Bearer ${gw.gateway.token}` },
+    }).then((response) => response.json()) as Promise<{ status: string }>;
+    const [firstDone, secondDone] = await Promise.all([poll(first.pollUrl), poll(second.pollUrl)]);
+
+    assert.equal(firstDone.status, "completed");
+    assert.equal(secondDone.status, "completed");
+    assert.equal(calls, 2);
+    assert.equal(maxActive, 1, "one conversation must never dispatch overlapping provider turns");
+  } finally {
+    await gw.close();
+    llm.close();
+  }
+});
+
+test("completed async runs expose verified artifacts through an authenticated download", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-gw-async-artifact-"));
+  const workspace = profileWorkspaceDir(cwd, "default");
+  const artifactDir = join(workspace, "artifacts");
+  await mkdir(artifactDir, { recursive: true });
+  await writeFile(join(artifactDir, "evidence.txt"), "verified artifact evidence\n", "utf8");
+  const llm = await startStubServer(() => ({
+    status: 200,
+    payload: { choices: [{ message: { content: "Created the evidence file.\nMEDIA:artifacts/evidence.txt" } }] },
+  }));
+  const gw = await startTestGateway(cwd, llm.url);
+  const message = { surfaceId: "web:artifact-demo", conversationId: "c1", senderId: "alice", text: "create an artifact" };
+  try {
+    const challengeResponse = await fetch(`${gw.url}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${gw.gateway.token}` },
+      body: JSON.stringify(message),
+    });
+    const challenge = await challengeResponse.json() as PairingChallenge;
+    await approvePairing(challenge.code, cwd);
+
+    const acceptedResponse = await fetch(`${gw.url}/v1/messages/async`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${gw.gateway.token}` },
+      body: JSON.stringify(message),
+    });
+    const accepted = await acceptedResponse.json() as { runId: string; pollUrl: string };
+    const completedResponse = await fetch(`${gw.url}${accepted.pollUrl}?waitMs=1000`, {
+      headers: { authorization: `Bearer ${gw.gateway.token}` },
+    });
+    const completed = await completedResponse.json() as { status: string; reply?: SurfaceReply; partialText?: string };
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.reply?.artifacts?.[0]?.name, "evidence.txt");
+    assert.equal(completed.reply?.artifacts?.[0]?.path, `/v1/messages/runs/${accepted.runId}/artifacts/0`);
+    assert.equal(completed.partialText, "Created the evidence file.");
+    assert.doesNotMatch(completed.partialText ?? "", /MEDIA:|artifacts\/evidence\.txt/);
+
+    const artifactUrl = `${gw.url}/v1/messages/runs/${accepted.runId}/artifacts/0`;
+    assert.equal((await fetch(artifactUrl)).status, 401);
+    const artifactResponse = await fetch(artifactUrl, {
+      headers: { authorization: `Bearer ${gw.gateway.token}` },
+    });
+    assert.equal(artifactResponse.status, 200);
+    assert.equal(await artifactResponse.text(), "verified artifact evidence\n");
+    assert.match(artifactResponse.headers.get("content-disposition") ?? "", /evidence\.txt/);
+
+    const missingResponse = await fetch(`${gw.url}/v1/messages/runs/${accepted.runId}/artifacts/1`, {
+      headers: { authorization: `Bearer ${gw.gateway.token}` },
+    });
+    assert.equal(missingResponse.status, 404);
   } finally {
     await gw.close();
     llm.close();
@@ -473,6 +636,50 @@ rl.on("line", (line) => {
     await gw.close();
     llm.close();
     clearCodexAppServerSessions();
+  }
+});
+
+test("/reset waits for an in-flight turn in the same conversation", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-gw-reset-queue-"));
+  let signalProviderStarted!: () => void;
+  let releaseProvider!: () => void;
+  const providerStarted = new Promise<void>((resolve) => { signalProviderStarted = resolve; });
+  const providerReleased = new Promise<void>((resolve) => { releaseProvider = resolve; });
+  const llm = await startStubServer(async () => {
+    signalProviderStarted();
+    await providerReleased;
+    return { status: 200, payload: { choices: [{ message: { content: "turn completed" } }] } };
+  });
+  const gw = await startTestGateway(cwd, llm.url);
+  const send = (text: string) => fetch(`${gw.url}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${gw.gateway.token}` },
+    body: JSON.stringify({ surfaceId: "web:demo", conversationId: "c1", senderId: "visitor-1", text }),
+  });
+  try {
+    const challenge = await (await send("hi")).json() as PairingChallenge;
+    await approvePairing(challenge.code, cwd);
+
+    const turnResponse = send("hold this turn open");
+    await providerStarted;
+    let resetSettled = false;
+    const resetResponse = send("/reset").then((response) => {
+      resetSettled = true;
+      return response;
+    });
+
+    await delay(75);
+    assert.equal(resetSettled, false, "reset must not race the active provider turn");
+    releaseProvider();
+
+    const turnReply = await (await turnResponse).json() as SurfaceReply;
+    const resetReply = await (await resetResponse).json() as SurfaceReply;
+    assert.equal(turnReply.text, "turn completed");
+    assert.match(resetReply.text, /Reset this chat/i);
+  } finally {
+    releaseProvider();
+    await gw.close();
+    llm.close();
   }
 });
 

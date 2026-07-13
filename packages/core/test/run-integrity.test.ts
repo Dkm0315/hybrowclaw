@@ -49,15 +49,16 @@ function stubConfig(baseUrl: string): MusterConfig {
   };
 }
 
-function startStubServer(handler: (body: string) => { status: number; payload: unknown }): Promise<{ url: string; close: () => void }> {
+function startStubServer(handler: (body: string) => { status: number; payload: unknown } | Promise<{ status: number; payload: unknown }>): Promise<{ url: string; close: () => void }> {
   return import("node:http").then(({ createServer }) => new Promise((resolvePromise) => {
     const server = createServer((request, response) => {
       let body = "";
       request.on("data", (chunk) => { body += chunk; });
       request.on("end", () => {
-        const result = handler(body);
-        response.writeHead(result.status, { "content-type": "application/json" });
-        response.end(JSON.stringify(result.payload));
+        void Promise.resolve(handler(body)).then((result) => {
+          response.writeHead(result.status, { "content-type": "application/json" });
+          response.end(JSON.stringify(result.payload));
+        });
       });
     });
     server.listen(0, "127.0.0.1", () => {
@@ -636,6 +637,45 @@ test("governed fallback is recorded as evidence and never silent", async () => {
 
     const integrity = await verifyIntegrity(cwd);
     assert.equal(integrity.ok, true, "recorded fallback is not silent drift");
+  } finally {
+    server.close();
+  }
+});
+
+test("fallback chain stops after a dispatched provider request times out", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-run-fallback-replay-"));
+  let calls = 0;
+  const server = await startStubServer(async () => {
+    calls += 1;
+    if (calls === 1) return { status: 500, payload: { error: "primary rejected" } };
+    if (calls === 2) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return { status: 200, payload: { choices: [{ message: { content: "late answer" } }] } };
+    }
+    return { status: 200, payload: { choices: [{ message: { content: "must not replay" } }] } };
+  });
+  try {
+    const config = stubConfig(server.url);
+    const withFallbacks: MusterConfig = {
+      ...config,
+      routing: {
+        ...config.routing,
+        fallbacks: [
+          { provider: "stub", model: "slow-fallback" },
+          { provider: "stub", model: "unsafe-replay" },
+        ],
+      },
+    };
+    const outcome = await executeRun(withFallbacks, {
+      prompt: "perform a bounded provider request",
+      cwd,
+      timeoutMs: 25,
+      skipMemoryWrite: true,
+      skipAgentRules: true,
+    });
+
+    assert.equal(outcome.episode.outcome?.kind, "failed");
+    assert.equal(calls, 2, "the third route must not replay an uncertain dispatched request");
   } finally {
     server.close();
   }
