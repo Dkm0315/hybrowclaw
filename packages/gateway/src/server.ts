@@ -125,6 +125,136 @@ const deliveryCache = new Map<string, { at: number; result: unknown }>();
 const activeConversationRuns = new Map<string, Promise<unknown>>();
 const TELEGRAM_POLL_OFFSET_FILE = "telegram-poll-offset.json";
 
+type AsyncMessageRunStatus = "queued" | "running" | "completed" | "failed";
+
+interface AsyncMessageRunSnapshot {
+  readonly runId: string;
+  readonly status: AsyncMessageRunStatus;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly reply?: SurfaceReply | PairingChallenge;
+  readonly error?: string;
+}
+
+interface AsyncMessageRunRecord {
+  runId: string;
+  status: AsyncMessageRunStatus;
+  createdAt: string;
+  updatedAt: string;
+  reply?: SurfaceReply | PairingChallenge;
+  error?: string;
+  readonly fingerprint: string;
+  readonly idempotencyScope?: string;
+  settled: Promise<void>;
+}
+
+const ASYNC_MESSAGE_RUN_TTL_MS = 60 * 60_000;
+const ASYNC_MESSAGE_RUN_LIMIT = 1_000;
+const ASYNC_MESSAGE_LONG_POLL_MAX_MS = 25_000;
+
+class AsyncMessageRunRegistry {
+  readonly #runs = new Map<string, AsyncMessageRunRecord>();
+  readonly #idempotency = new Map<string, string>();
+
+  start(
+    message: SurfaceMessage,
+    idempotencyKey: string | undefined,
+    execute: () => Promise<SurfaceReply | PairingChallenge>,
+  ): { readonly snapshot: AsyncMessageRunSnapshot; readonly replayed: boolean; readonly conflict: boolean; readonly work?: Promise<void> } {
+    this.#prune();
+    const fingerprint = createHash("sha256").update(JSON.stringify(message)).digest("hex");
+    const idempotencyScope = idempotencyKey
+      ? `${message.surfaceId}\0${message.senderId}\0${idempotencyKey}`
+      : undefined;
+    const existingId = idempotencyScope ? this.#idempotency.get(idempotencyScope) : undefined;
+    const existing = existingId ? this.#runs.get(existingId) : undefined;
+    if (existing) {
+      return {
+        snapshot: this.#snapshot(existing),
+        replayed: true,
+        conflict: existing.fingerprint !== fingerprint,
+      };
+    }
+
+    const now = new Date().toISOString();
+    const record: AsyncMessageRunRecord = {
+      runId: `msg_${randomUUID()}`,
+      status: "queued",
+      createdAt: now,
+      updatedAt: now,
+      fingerprint,
+      idempotencyScope,
+      settled: Promise.resolve(),
+    };
+    this.#runs.set(record.runId, record);
+    if (idempotencyScope) this.#idempotency.set(idempotencyScope, record.runId);
+
+    const work = (async () => {
+      record.status = "running";
+      record.updatedAt = new Date().toISOString();
+      try {
+        record.reply = await execute();
+        record.status = "completed";
+      } catch (error) {
+        record.error = error instanceof Error ? error.message : String(error);
+        record.status = "failed";
+      } finally {
+        record.updatedAt = new Date().toISOString();
+      }
+    })();
+    record.settled = work;
+    return { snapshot: this.#snapshot(record), replayed: false, conflict: false, work };
+  }
+
+  async read(runId: string, waitMs = 0): Promise<AsyncMessageRunSnapshot | undefined> {
+    this.#prune();
+    const record = this.#runs.get(runId);
+    if (!record) return undefined;
+    const boundedWait = Math.max(0, Math.min(ASYNC_MESSAGE_LONG_POLL_MAX_MS, Math.trunc(waitMs)));
+    if (boundedWait && (record.status === "queued" || record.status === "running")) {
+      await new Promise<void>((resolvePromise) => {
+        const timer = setTimeout(resolvePromise, boundedWait);
+        void record.settled.finally(() => {
+          clearTimeout(timer);
+          resolvePromise();
+        });
+      });
+    }
+    return this.#snapshot(record);
+  }
+
+  #snapshot(record: AsyncMessageRunRecord): AsyncMessageRunSnapshot {
+    return {
+      runId: record.runId,
+      status: record.status,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+      reply: record.reply,
+      error: record.error,
+    };
+  }
+
+  #prune(now = Date.now()): void {
+    const terminal = (record: AsyncMessageRunRecord): boolean => record.status === "completed" || record.status === "failed";
+    for (const [runId, record] of this.#runs) {
+      if (!terminal(record) || now - Date.parse(record.updatedAt) < ASYNC_MESSAGE_RUN_TTL_MS) continue;
+      this.#runs.delete(runId);
+      if (record.idempotencyScope && this.#idempotency.get(record.idempotencyScope) === runId) {
+        this.#idempotency.delete(record.idempotencyScope);
+      }
+    }
+    if (this.#runs.size < ASYNC_MESSAGE_RUN_LIMIT) return;
+    for (const [runId, record] of this.#runs) {
+      if (!terminal(record)) continue;
+      this.#runs.delete(runId);
+      if (record.idempotencyScope && this.#idempotency.get(record.idempotencyScope) === runId) {
+        this.#idempotency.delete(record.idempotencyScope);
+      }
+      if (this.#runs.size < ASYNC_MESSAGE_RUN_LIMIT) break;
+    }
+  }
+}
+
 /** Duplicate deliveries (webhook retries) with the same key return the cached reply. */
 export function idempotencyLookup(key: string | undefined): (SurfaceReply | PairingChallenge) | undefined {
   if (!key) return undefined;
@@ -2562,6 +2692,7 @@ async function route(
   options: GatewayServerOptions,
   queue: OutboundQueue,
   backgroundTasks: Set<Promise<void>>,
+  messageRuns: AsyncMessageRunRegistry,
 ): Promise<void> {
   const cwd = options.cwd ?? process.cwd();
   const url = new URL(request.url ?? "/", "http://gateway.local");
@@ -2735,6 +2866,57 @@ async function route(
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/v1/messages/async") {
+    const body = await readBody(request);
+    let message: SurfaceMessage;
+    try {
+      message = parseSurfaceMessage(JSON.parse(body));
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
+      return;
+    }
+    const rawIdempotencyKey = request.headers["idempotency-key"];
+    const idempotencyKey = (Array.isArray(rawIdempotencyKey) ? rawIdempotencyKey[0] : rawIdempotencyKey)?.trim();
+    if (idempotencyKey && idempotencyKey.length > 200) {
+      sendJson(response, 400, { error: "Idempotency-Key must contain at most 200 characters." });
+      return;
+    }
+    const started = messageRuns.start(message, idempotencyKey, () => handleSurfaceMessage(message, {
+      config: options.config,
+      gateway: options.gateway,
+      enterprise: options.enterprise,
+      approvalStore: options.approvalStore,
+      cwd,
+      registry: options.registry,
+    }));
+    if (started.conflict) {
+      sendJson(response, 409, { error: "Idempotency-Key was already used for a different message.", runId: started.snapshot.runId });
+      return;
+    }
+    if (started.work) trackBackgroundTask(backgroundTasks, started.work);
+    response.setHeader("location", `/v1/messages/runs/${started.snapshot.runId}`);
+    response.setHeader("retry-after", "2");
+    sendJson(response, started.replayed ? 200 : 202, {
+      ...started.snapshot,
+      replayed: started.replayed,
+      pollUrl: `/v1/messages/runs/${started.snapshot.runId}`,
+    });
+    return;
+  }
+
+  const asyncMessageRunMatch = url.pathname.match(/^\/v1\/messages\/runs\/(msg_[A-Za-z0-9-]+)$/);
+  if (request.method === "GET" && asyncMessageRunMatch) {
+    const waitMs = Number(url.searchParams.get("waitMs") ?? 0);
+    const snapshot = await messageRuns.read(asyncMessageRunMatch[1], Number.isFinite(waitMs) ? waitMs : 0);
+    if (!snapshot) {
+      sendJson(response, 404, { error: "Message run not found or expired." });
+      return;
+    }
+    if (snapshot.status === "queued" || snapshot.status === "running") response.setHeader("retry-after", "2");
+    sendJson(response, 200, snapshot);
+    return;
+  }
+
   if (request.method === "GET" && url.pathname === "/v1/catalog") {
     sendJson(response, 200, {
       commands: gatewayCommandCatalog(options.gateway),
@@ -2819,8 +3001,9 @@ export function startGatewayServer(options: GatewayServerOptions, port = 0): Pro
   // One outbound queue per gateway: chat keys share retry_after backoff state.
   const queue = createOutboundQueue();
   const backgroundTasks = new Set<Promise<void>>();
+  const messageRuns = new AsyncMessageRunRegistry();
   const server = createServer((request, response) => {
-    route(request, response, effectiveOptions, queue, backgroundTasks).catch((error) => {
+    route(request, response, effectiveOptions, queue, backgroundTasks, messageRuns).catch((error) => {
       const detail = error instanceof Error ? error.message : String(error);
       const status = error instanceof GatewayHttpError ? error.status : 500;
       log(`error ${request.method} ${request.url}: ${detail}`);

@@ -25,15 +25,16 @@ function stubConfig(baseUrl: string): MusterConfig {
   };
 }
 
-function startStubServer(handler: (body: string) => { status: number; payload: unknown }): Promise<{ url: string; close: () => void }> {
+function startStubServer(handler: (body: string) => { status: number; payload: unknown } | Promise<{ status: number; payload: unknown }>): Promise<{ url: string; close: () => void }> {
   return import("node:http").then(({ createServer }) => new Promise((resolvePromise) => {
     const server = createServer((request, response) => {
       let body = "";
       request.on("data", (chunk) => { body += chunk; });
       request.on("end", () => {
-        const result = handler(body);
-        response.writeHead(result.status, { "content-type": "application/json" });
-        response.end(JSON.stringify(result.payload));
+        void Promise.resolve(handler(body)).then((result) => {
+          response.writeHead(result.status, { "content-type": "application/json" });
+          response.end(JSON.stringify(result.payload));
+        });
       });
     });
     server.listen(0, "127.0.0.1", () => {
@@ -143,6 +144,55 @@ test("POST /v1/messages requires the gateway bearer token", async () => {
       body: JSON.stringify({ surfaceId: "web:demo", conversationId: "c1", senderId: "s1", text: "hi" }),
     });
     assert.equal(response.status, 401);
+  } finally {
+    await gw.close();
+    llm.close();
+  }
+});
+
+test("async message runs acknowledge quickly, poll to completion, and reject conflicting retries", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-gw-async-message-"));
+  const llm = await startStubServer(async () => {
+    await delay(250);
+    return { status: 200, payload: { choices: [{ message: { content: "slow governed reply" } }] } };
+  });
+  const gw = await startTestGateway(cwd, llm.url);
+  const message = { surfaceId: "web:async-demo", conversationId: "c1", senderId: "alice", text: "do slow work" };
+  const send = (path: string, body: unknown, headers: Record<string, string> = {}) => fetch(`${gw.url}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${gw.gateway.token}`, ...headers },
+    body: JSON.stringify(body),
+  });
+  try {
+    const challengeResponse = await send("/v1/messages", message);
+    const challenge = await challengeResponse.json() as PairingChallenge;
+    await approvePairing(challenge.code, cwd);
+
+    const startedAt = Date.now();
+    const acceptedResponse = await send("/v1/messages/async", message, { "idempotency-key": "frappe-run-1" });
+    assert.equal(acceptedResponse.status, 202);
+    assert.ok(Date.now() - startedAt < 200, "async submission returns before the delayed provider");
+    const accepted = await acceptedResponse.json() as { runId: string; status: string; pollUrl: string; replayed: boolean };
+    assert.match(accepted.runId, /^msg_/);
+    assert.equal(accepted.replayed, false);
+    assert.equal(accepted.pollUrl, `/v1/messages/runs/${accepted.runId}`);
+
+    const replayResponse = await send("/v1/messages/async", message, { "idempotency-key": "frappe-run-1" });
+    assert.equal(replayResponse.status, 200);
+    const replay = await replayResponse.json() as { runId: string; replayed: boolean };
+    assert.equal(replay.runId, accepted.runId);
+    assert.equal(replay.replayed, true);
+
+    const conflictResponse = await send("/v1/messages/async", { ...message, text: "different work" }, { "idempotency-key": "frappe-run-1" });
+    assert.equal(conflictResponse.status, 409);
+
+    const completedResponse = await fetch(`${gw.url}${accepted.pollUrl}?waitMs=1000`, {
+      headers: { authorization: `Bearer ${gw.gateway.token}` },
+    });
+    assert.equal(completedResponse.status, 200);
+    const completed = await completedResponse.json() as { status: string; reply?: SurfaceReply };
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.reply?.text, "slow governed reply");
   } finally {
     await gw.close();
     llm.close();
