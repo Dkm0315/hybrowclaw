@@ -7981,7 +7981,7 @@ async function runPtyTuiQaSuite(args: string[], stamp: string): Promise<void> {
   for (const testCase of result.cases) {
     console.log(`case=${testCase.id} status=${testCase.status} summary=${testCase.summary}`);
     if (testCase.status === "failed" && typeof testCase.evidence.error === "string") {
-      console.log(`case=${testCase.id} detail=${testCase.evidence.error}`);
+      console.log(`case=${testCase.id} stage=${String(testCase.evidence.stage ?? "unknown")} detail=${testCase.evidence.error}`);
     }
   }
   if (result.status === "failed") process.exitCode = 1;

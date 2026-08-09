@@ -358,14 +358,16 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
     });
     screens.push(`overlay\n${stripAnsi(overlay)}`, `navigated\n${stripAnsi(navigated)}`);
 
-    await tmux(["send-keys", "-t", session, "Escape"]);
-    const escaped = await waitForPtyScreen(session, (screen) => !screen.includes("suggestions") && composerValue(screen) === "");
-    screens.push(`escaped\n${stripAnsi(escaped)}`);
+    await tmux(["send-keys", "-t", session, "C-u"]);
+    await waitForPtyScreen(session, (screen) => !screen.includes("suggestions") && composerValue(screen) === "");
 
+    evidence.stage = "submit-first-history-command";
     await submitPtyText(session, "/name pty-one");
     await waitForPtyScreen(session, (screen) => stripAnsi(screen).includes("session=pty-one") && composerValue(screen) === "");
+    evidence.stage = "submit-second-history-command";
     await submitPtyText(session, "/name pty-two");
     await waitForPtyScreen(session, (screen) => stripAnsi(screen).includes("session=pty-two") && composerValue(screen) === "");
+    evidence.stage = "navigate-history";
     await tmux(["send-keys", "-t", session, "Up"]);
     const historyLatest = await waitForPtyScreen(session, (screen) => composerValue(screen) === "/name pty-two");
     await tmux(["send-keys", "-t", session, "Up"]);
@@ -373,6 +375,16 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
     await tmux(["send-keys", "-t", session, "Down"]);
     const historyForward = await waitForPtyScreen(session, (screen) => composerValue(screen) === "/name pty-two");
     screens.push(`history\n${stripAnsi(historyForward)}`);
+
+    evidence.stage = "escape-completion";
+    await tmux(["send-keys", "-t", session, "C-u"]);
+    await tmux(["send-keys", "-t", session, "-l", "/"]);
+    await waitForPtyScreen(session, (screen) => screen.includes("suggestions") && screen.includes("/help"));
+    await tmux(["send-keys", "-t", session, "Escape"]);
+    const escaped = await waitForPtyScreen(session, (screen) => !screen.includes("suggestions") && composerValue(screen) === "");
+    await delay(500);
+    const afterEscape = await capturePtyScreen(session);
+    screens.push(`escaped\n${stripAnsi(afterEscape)}`);
 
     Object.assign(evidence, {
       overlayCount: count(stripAnsi(persistentOverlay), "suggestions"),
@@ -384,6 +396,7 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
       historyOlder: composerValue(historyOlder),
       historyForward: composerValue(historyForward),
       bottomRailVisible: /╰─+╯/.test(stripAnsi(navigated)),
+      composerAliveAfterEscape: composerValue(afterEscape) === "" && /╰─+╯/.test(stripAnsi(afterEscape)),
     });
     const passed = evidence.overlayCount === 1
       && evidence.overlayPersisted === true
@@ -394,7 +407,8 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
       && evidence.historyLatest === "/name pty-two"
       && evidence.historyOlder === "/name pty-one"
       && evidence.historyForward === "/name pty-two"
-      && evidence.bottomRailVisible === true;
+      && evidence.bottomRailVisible === true
+      && evidence.composerAliveAfterEscape === true;
     return makeCase(
       "real_pty_interaction",
       passed,
