@@ -425,7 +425,7 @@ async function submitPtyText(session: string, value: string): Promise<void> {
 async function waitForPtyScreen(
   session: string,
   predicate: (screen: string) => boolean,
-  timeoutMs = process.env.CI ? 30_000 : 15_000,
+  timeoutMs = process.env.CI ? 60_000 : 15_000,
 ): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   let latest = "";
@@ -434,7 +434,10 @@ async function waitForPtyScreen(
     if (predicate(latest)) return latest;
     await delay(50);
   } while (Date.now() < deadline);
-  throw new Error(`Timed out waiting for terminal state. Last composer=${JSON.stringify(composerValue(latest))}`);
+  const tail = stripAnsi(latest).split("\n").slice(-12).join("\n").trim();
+  throw new Error(
+    `Timed out waiting for terminal state. Last composer=${JSON.stringify(composerValue(latest))}; screen tail=${JSON.stringify(tail)}`,
+  );
 }
 
 async function capturePtyScreen(session: string): Promise<string> {
