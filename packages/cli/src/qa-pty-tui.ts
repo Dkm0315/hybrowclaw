@@ -362,16 +362,16 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
     const escaped = await waitForPtyScreen(session, (screen) => !screen.includes("suggestions") && composerValue(screen) === "");
     screens.push(`escaped\n${stripAnsi(escaped)}`);
 
-    await submitPtyText(session, "/commands");
-    await waitForPtyScreen(session, (screen) => stripAnsi(screen).includes("› /commands") && composerValue(screen) === "");
-    await submitPtyText(session, "/shortcuts");
-    await waitForPtyScreen(session, (screen) => stripAnsi(screen).includes("› /shortcuts") && composerValue(screen) === "");
+    await submitPtyText(session, "/name pty-one");
+    await waitForPtyScreen(session, (screen) => stripAnsi(screen).includes("session=pty-one") && composerValue(screen) === "");
+    await submitPtyText(session, "/name pty-two");
+    await waitForPtyScreen(session, (screen) => stripAnsi(screen).includes("session=pty-two") && composerValue(screen) === "");
     await tmux(["send-keys", "-t", session, "Up"]);
-    const historyLatest = await waitForPtyScreen(session, (screen) => composerValue(screen) === "/shortcuts");
+    const historyLatest = await waitForPtyScreen(session, (screen) => composerValue(screen) === "/name pty-two");
     await tmux(["send-keys", "-t", session, "Up"]);
-    const historyOlder = await waitForPtyScreen(session, (screen) => composerValue(screen) === "/commands");
+    const historyOlder = await waitForPtyScreen(session, (screen) => composerValue(screen) === "/name pty-one");
     await tmux(["send-keys", "-t", session, "Down"]);
-    const historyForward = await waitForPtyScreen(session, (screen) => composerValue(screen) === "/shortcuts");
+    const historyForward = await waitForPtyScreen(session, (screen) => composerValue(screen) === "/name pty-two");
     screens.push(`history\n${stripAnsi(historyForward)}`);
 
     Object.assign(evidence, {
@@ -391,9 +391,9 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
       && typeof evidence.selectedAfter === "string"
       && evidence.selectedAfter !== "/help"
       && evidence.escapedComposer === ""
-      && evidence.historyLatest === "/shortcuts"
-      && evidence.historyOlder === "/commands"
-      && evidence.historyForward === "/shortcuts"
+      && evidence.historyLatest === "/name pty-two"
+      && evidence.historyOlder === "/name pty-one"
+      && evidence.historyForward === "/name pty-two"
       && evidence.bottomRailVisible === true;
     return makeCase(
       "real_pty_interaction",
