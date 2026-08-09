@@ -343,14 +343,18 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
       shellQuote(cliEntry),
       "--skip-onboarding",
     ].join(" ");
+    evidence.stage = "start-session";
     await tmux(["new-session", "-d", "-s", session, "-x", "120", "-y", "40", "-c", workspace, command]);
+    evidence.stage = "wait-baseline";
     const baseline = await waitForPtyScreen(session, (screen) => screen.includes("╭─ chat") && screen.includes("│ ›"));
     screens.push(`baseline\n${stripAnsi(baseline)}`);
 
+    evidence.stage = "open-completion";
     await tmux(["send-keys", "-t", session, "-l", "/"]);
     const overlay = await waitForPtyScreen(session, (screen) => screen.includes("suggestions") && screen.includes("/help"));
     await delay(250);
     const persistentOverlay = await capturePtyScreen(session);
+    evidence.stage = "navigate-completion";
     for (let index = 0; index < 5; index += 1) await tmux(["send-keys", "-t", session, "Down"]);
     const navigated = await waitForPtyScreen(session, (screen) => {
       const selected = selectedSuggestion(screen);
@@ -358,6 +362,7 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
     });
     screens.push(`overlay\n${stripAnsi(overlay)}`, `navigated\n${stripAnsi(navigated)}`);
 
+    evidence.stage = "clear-completion";
     await tmux(["send-keys", "-t", session, "C-u"]);
     await waitForPtyScreen(session, (screen) => !screen.includes("suggestions") && composerValue(screen) === "");
 

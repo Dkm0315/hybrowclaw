@@ -36,6 +36,12 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
+      - name: PTY/TUI interaction evidence
+        run: >-
+          pnpm exec tsx packages/cli/src/index.ts qa run pty_tui
+          --artifact-dir .qa-artifacts/pty-tui
+          --evidence .qa-artifacts/pty-tui-evidence.json
+
       - name: Test
         run: pnpm test
 
