@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "pnpm --dir capability-packs/frappe build && pnpm -r build",
-    "typecheck": "pnpm --filter @musterhq/core build && pnpm --filter @musterhq/gateway build && pnpm --filter @musterhq/core typecheck && pnpm --filter @musterhq/gateway typecheck && pnpm --filter @musterhq/cli typecheck && pnpm --filter @musterhq/ui typecheck",
+    "typecheck": "pnpm --dir capability-packs/frappe build && pnpm --filter @musterhq/core build && pnpm --filter @musterhq/gateway build && pnpm --filter @musterhq/core typecheck && pnpm --filter @musterhq/gateway typecheck && pnpm --filter @musterhq/cli typecheck && pnpm --filter @musterhq/ui typecheck",
     "test": "pnpm -r test",
     "hc": "tsx packages/cli/src/index.ts",
     "portal:data": "node scripts/generate-portal-data.mjs",
