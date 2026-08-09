@@ -1,0 +1,845 @@
+{
+  "clips": [
+    {
+      "scenario_id": "cfg-01-create-user-and-role",
+      "product": "muster",
+      "outcome": "allow",
+      "claim": "Administrator creates and saves the enabled System User used by the governed Muster demonstrations.",
+      "actor": {
+        "id": "Administrator",
+        "roles": [
+          "System Manager"
+        ]
+      },
+      "site": {
+        "id": "muster.local",
+        "revision": "unrecorded-in-capture"
+      },
+      "build_revision": "056f5679ca4d95075ef49f3781c9c710588c6135",
+      "routes": [
+        "/desk/user/video.sales.operator.a%40example.com"
+      ],
+      "expected_result": "The enabled user is saved as a System User and the change is visible in the form activity timeline.",
+      "viewport": {
+        "class": "desktop",
+        "width": 1440,
+        "height": 900
+      },
+      "timestamps": {
+        "started_at": "2026-07-19T11:19:32.686Z",
+        "finished_at": "2026-07-19T11:21:31.566Z",
+        "basis": "filesystem_mtime_minus_ffprobe_duration"
+      },
+      "duration_seconds": 118.88,
+      "chapters": [
+        {
+          "runbook_id": "CFG-01",
+          "title": "Create Frappe user and effective role",
+          "start_seconds": 0,
+          "end_seconds": 118.88,
+          "claim": "The recording reaches the saved System User state required by CFG-01."
+        }
+      ],
+      "coverage_cells": [],
+      "video": {
+        "path": "output/evidence/videos/CFG-01-create-user-and-role-2.webm"
+      },
+      "screenshots": [
+        {
+          "path": "output/evidence/videos/thumbnails/CFG-01-create-user-and-role-2.png"
+        }
+      ],
+      "traces": [],
+      "test_receipts": []
+    },
+    {
+      "scenario_id": "cfg-03-user-permission-territory",
+      "product": "erpnext",
+      "outcome": "allow",
+      "claim": "Administrator creates and saves the India Territory User Permission for the governed sales operator.",
+      "actor": {
+        "id": "Administrator",
+        "roles": [
+          "System Manager"
+        ]
+      },
+      "site": {
+        "id": "muster.local",
+        "revision": "unrecorded-in-capture"
+      },
+      "build_revision": "056f5679ca4d95075ef49f3781c9c710588c6135",
+      "routes": [
+        "/desk/user-permission"
+      ],
+      "expected_result": "A Territory User Permission for India is saved for video.sales.operator.a@example.com.",
+      "viewport": {
+        "class": "desktop",
+        "width": 1440,
+        "height": 900
+      },
+      "timestamps": {
+        "started_at": "2026-07-19T11:31:14.684Z",
+        "finished_at": "2026-07-19T11:32:09.204Z",
+        "basis": "filesystem_mtime_minus_ffprobe_duration"
+      },
+      "duration_seconds": 54.52,
+      "chapters": [
+        {
+          "runbook_id": "CFG-03",
+          "title": "Territory restriction",
+          "start_seconds": 0,
+          "end_seconds": 54.52,
+          "claim": "The recording reaches the saved Territory User Permission state required by CFG-03."
+        }
+      ],
+      "coverage_cells": [],
+      "video": {
+        "path": "output/evidence/videos/CFG-02-user-permission-territory.webm"
+      },
+      "screenshots": [
+        {
+          "path": "output/evidence/screenshots/CFG-02-user-permission-territory.png"
+        }
+      ],
+      "traces": [],
+      "test_receipts": []
+    },
+    {
+      "scenario_id": "cfg-08-muster-role-binding",
+      "product": "muster",
+      "outcome": "allow",
+      "claim": "Administrator saves a company-scoped Muster Role Binding with mission and record capabilities.",
+      "actor": {
+        "id": "Administrator",
+        "roles": [
+          "System Manager"
+        ]
+      },
+      "site": {
+        "id": "muster.local",
+        "revision": "unrecorded-in-capture"
+      },
+      "build_revision": "056f5679ca4d95075ef49f3781c9c710588c6135",
+      "routes": [
+        "/desk/muster-role-binding"
+      ],
+      "expected_result": "The active Muster Role Binding is saved with the visible company scope and capability set.",
+      "viewport": {
+        "class": "desktop",
+        "width": 1440,
+        "height": 900
+      },
+      "timestamps": {
+        "started_at": "2026-07-19T11:49:21.338Z",
+        "finished_at": "2026-07-19T11:50:24.939Z",
+        "basis": "filesystem_mtime_minus_ffprobe_duration"
+      },
+      "duration_seconds": 63.6,
+      "chapters": [
+        {
+          "runbook_id": "CFG-08",
+          "title": "Muster Role Binding",
+          "start_seconds": 0,
+          "end_seconds": 63.6,
+          "claim": "The recording reaches the saved scoped binding state required by CFG-08."
+        }
+      ],
+      "coverage_cells": [],
+      "video": {
+        "path": "output/evidence/videos/CFG-04-muster-role-binding.webm"
+      },
+      "screenshots": [
+        {
+          "path": "output/evidence/screenshots/CFG-04-muster-role-binding.png"
+        }
+      ],
+      "traces": [],
+      "test_receipts": []
+    },
+    {
+      "scenario_id": "cfg-09-muster-policy-deny-first",
+      "product": "muster",
+      "outcome": "allow",
+      "claim": "Administrator saves an enabled priority policy containing a destructive deny rule and governed allow rule.",
+      "actor": {
+        "id": "Administrator",
+        "roles": [
+          "System Manager"
+        ]
+      },
+      "site": {
+        "id": "muster.local",
+        "revision": "unrecorded-in-capture"
+      },
+      "build_revision": "056f5679ca4d95075ef49f3781c9c710588c6135",
+      "routes": [
+        "/desk/muster-policy"
+      ],
+      "expected_result": "The enabled priority-50 policy is saved with visible deny and allow rule rows.",
+      "viewport": {
+        "class": "desktop",
+        "width": 1440,
+        "height": 900
+      },
+      "timestamps": {
+        "started_at": "2026-07-19T11:50:59.353Z",
+        "finished_at": "2026-07-19T11:53:39.394Z",
+        "basis": "filesystem_mtime_minus_ffprobe_duration"
+      },
+      "duration_seconds": 160.04,
+      "chapters": [
+        {
+          "runbook_id": "CFG-09",
+          "title": "Deny-first Muster policy",
+          "start_seconds": 0,
+          "end_seconds": 160.04,
+          "claim": "The recording reaches the saved deny-first policy state required by CFG-09."
+        }
+      ],
+      "coverage_cells": [],
+      "video": {
+        "path": "output/evidence/videos/CFG-05-muster-policy-deny-first.webm"
+      },
+      "screenshots": [
+        {
+          "path": "output/evidence/screenshots/CFG-05-muster-policy-deny-first.png"
+        }
+      ],
+      "traces": [],
+      "test_receipts": []
+    },
+    {
+      "scenario_id": "erp-01-sales-customer-deny-desktop",
+      "product": "erpnext",
+      "outcome": "deny",
+      "claim": "The sales operator is denied direct read access to the West Retail Cooperative Customer on desktop.",
+      "actor": {
+        "id": "muster.video.sales_operator.musterlocal.46a176c3@example.com",
+        "roles": [
+          "Sales User"
+        ]
+      },
+      "site": {
+        "id": "muster.local",
+        "revision": "unrecorded-in-capture"
+      },
+      "build_revision": "056f5679ca4d95075ef49f3781c9c710588c6135",
+      "routes": [
+        "/desk/customer"
+      ],
+      "expected_result": "A direct out-of-scope Customer route displays a read-permission denial and does not reveal the record.",
+      "viewport": {
+        "class": "desktop",
+        "width": 1440,
+        "height": 900
+      },
+      "timestamps": {
+        "started_at": "2026-07-19T11:54:24.002Z",
+        "finished_at": "2026-07-19T11:56:18.643Z",
+        "basis": "filesystem_mtime_minus_ffprobe_duration"
+      },
+      "duration_seconds": 114.64,
+      "chapters": [
+        {
+          "runbook_id": "ERP-01",
+          "title": "Sales Customer direct-route denial",
+          "start_seconds": 0,
+          "end_seconds": 114.64,
+          "claim": "The recording ends with the out-of-scope Customer read denial required by ERP-01."
+        }
+      ],
+      "coverage_cells": [
+        {
+          "product": "erpnext",
+          "viewport": "desktop",
+          "outcome": "deny"
+        }
+      ],
+      "video": {
+        "path": "output/evidence/videos/ERP-01-sales-customer-rbac-desktop.webm"
+      },
+      "screenshots": [
+        {
+          "path": "output/evidence/screenshots/ERP-01-sales-customer-rbac-desktop-deny.png"
+        }
+      ],
+      "traces": [],
+      "test_receipts": []
+    },
+    {
+      "scenario_id": "erp-01-sales-customer-deny-mobile",
+      "product": "erpnext",
+      "outcome": "deny",
+      "claim": "The sales operator is denied direct read access to the West Retail Cooperative Customer on mobile.",
+      "actor": {
+        "id": "muster.video.sales_operator.musterlocal.46a176c3@example.com",
+        "roles": [
+          "Sales User"
+        ]
+      },
+      "site": {
+        "id": "muster.local",
+        "revision": "unrecorded-in-capture"
+      },
+      "build_revision": "056f5679ca4d95075ef49f3781c9c710588c6135",
+      "routes": [
+        "/desk/customer"
+      ],
+      "expected_result": "A direct out-of-scope Customer route displays a read-permission denial in the mobile viewport.",
+      "viewport": {
+        "class": "mobile",
+        "width": 390,
+        "height": 844
+      },
+      "timestamps": {
+        "started_at": "2026-07-19T11:56:33.618Z",
+        "finished_at": "2026-07-19T11:59:10.978Z",
+        "basis": "filesystem_mtime_minus_ffprobe_duration"
+      },
+      "duration_seconds": 157.36,
+      "chapters": [
+        {
+          "runbook_id": "ERP-01",
+          "title": "Mobile Sales Customer direct-route denial",
+          "start_seconds": 0,
+          "end_seconds": 157.36,
+          "claim": "The recording ends with the mobile out-of-scope Customer read denial required by ERP-01."
+        }
+      ],
+      "coverage_cells": [
+        {
+          "product": "erpnext",
+          "viewport": "mobile",
+          "outcome": "deny"
+        }
+      ],
+      "video": {
+        "path": "output/evidence/videos/ERP-02-sales-customer-rbac-mobile.webm"
+      },
+      "screenshots": [
+        {
+          "path": "output/evidence/screenshots/ERP-02-sales-customer-rbac-mobile-list.png"
+        },
+        {
+          "path": "output/evidence/screenshots/ERP-02-sales-customer-rbac-mobile-deny.png"
+        }
+      ],
+      "traces": [],
+      "test_receipts": []
+    },
+    {
+      "scenario_id": "hrm-01-employee-visibility-paired-desktop-hd",
+      "product": "hrms",
+      "outcome": "paired",
+      "claim": "The 1440x900 retake shows the employee persona opening the permitted East Field Coordinator and being denied the other employee record.",
+      "actor": {
+        "id": "Vikram Patel",
+        "roles": [
+          "Employee"
+        ]
+      },
+      "site": {
+        "id": "muster.local",
+        "revision": "unrecorded-in-capture"
+      },
+      "build_revision": "056f5679ca4d95075ef49f3781c9c710588c6135",
+      "routes": [
+        "/desk/employee"
+      ],
+      "expected_result": "At the required desktop viewport, the scoped Employee list and own record are readable while the direct out-of-scope Employee route is denied.",
+      "viewport": {
+        "class": "desktop",
+        "width": 1440,
+        "height": 900
+      },
+      "timestamps": {
+        "started_at": "2026-07-19T12:09:33.046Z",
+        "finished_at": "2026-07-19T12:10:30.766Z",
+        "basis": "filesystem_mtime_minus_ffprobe_duration"
+      },
+      "duration_seconds": 57.72,
+      "chapters": [
+        {
+          "runbook_id": "HRM-01",
+          "title": "Employee deny, scoped list, and permitted detail",
+          "start_seconds": 0,
+          "end_seconds": 37,
+          "claim": "The retake shows an out-of-scope denial, the restricted Employee list, and the permitted East Field Coordinator detail."
+        },
+        {
+          "runbook_id": "HRM-01",
+          "title": "Repeated out-of-scope Employee denial",
+          "start_seconds": 37,
+          "end_seconds": 57.72,
+          "claim": "The retake ends with the direct out-of-scope Employee read denial still enforced."
+        }
+      ],
+      "coverage_cells": [
+        {
+          "product": "hrms",
+          "viewport": "desktop",
+          "outcome": "allow"
+        },
+        {
+          "product": "hrms",
+          "viewport": "desktop",
+          "outcome": "deny"
+        }
+      ],
+      "video": {
+        "path": "output/evidence/videos/HRM-01-employee-rbac-desktop-hd.webm"
+      },
+      "screenshots": [
+        {
+          "path": "output/evidence/screenshots/HRM-01-employee-desktop-list.png"
+        },
+        {
+          "path": "output/evidence/screenshots/HRM-01-employee-desktop-allow.png"
+        },
+        {
+          "path": "output/evidence/screenshots/HRM-01-employee-desktop-deny.png"
+        }
+      ],
+      "traces": [],
+      "test_receipts": []
+    },
+    {
+      "scenario_id": "crm-01-lead-visibility-paired-desktop-hd",
+      "product": "crm",
+      "outcome": "paired",
+      "claim": "The 1440x900 retake shows the Sales User opening the permitted East Growth Contact Lead and being denied the out-of-scope Lead.",
+      "actor": {
+        "id": "Sara Khan",
+        "roles": [
+          "Sales User"
+        ]
+      },
+      "site": {
+        "id": "muster.local",
+        "revision": "unrecorded-in-capture"
+      },
+      "build_revision": "056f5679ca4d95075ef49f3781c9c710588c6135",
+      "routes": [
+        "/crm/leads"
+      ],
+      "expected_result": "At the required desktop viewport, the scoped Lead list and East detail are readable while a direct out-of-scope Lead route is denied.",
+      "viewport": {
+        "class": "desktop",
+        "width": 1440,
+        "height": 900
+      },
+      "timestamps": {
+        "started_at": "2026-07-19T12:10:45.958Z",
+        "finished_at": "2026-07-19T12:11:43.318Z",
+        "basis": "filesystem_mtime_minus_ffprobe_duration"
+      },
+      "duration_seconds": 57.36,
+      "chapters": [
+        {
+          "runbook_id": "CRM-01",
+          "title": "Lead deny, scoped list, and permitted detail",
+          "start_seconds": 0,
+          "end_seconds": 37,
+          "claim": "The retake shows an out-of-scope denial, the restricted Lead list, and the permitted East Growth Contact detail."
+        },
+        {
+          "runbook_id": "CRM-01",
+          "title": "Repeated out-of-scope Lead denial",
+          "start_seconds": 37,
+          "end_seconds": 57.36,
+          "claim": "The retake ends with the direct out-of-scope Lead read denial still enforced."
+        }
+      ],
+      "coverage_cells": [
+        {
+          "product": "crm",
+          "viewport": "desktop",
+          "outcome": "allow"
+        },
+        {
+          "product": "crm",
+          "viewport": "desktop",
+          "outcome": "deny"
+        }
+      ],
+      "video": {
+        "path": "output/evidence/videos/CRM-01-lead-rbac-desktop-hd.webm"
+      },
+      "screenshots": [
+        {
+          "path": "output/evidence/screenshots/CRM-01-lead-desktop-list.png"
+        },
+        {
+          "path": "output/evidence/screenshots/CRM-01-lead-desktop-allow.png"
+        },
+        {
+          "path": "output/evidence/screenshots/CRM-01-lead-desktop-deny.png"
+        }
+      ],
+      "traces": [],
+      "test_receipts": []
+    },
+    {
+      "scenario_id": "erp-03-buying-supplier-paired-desktop-hd",
+      "product": "erpnext",
+      "outcome": "paired",
+      "claim": "The 1440x900 retake shows the Purchase User's scoped Supplier list and denies direct access to West Components Partner.",
+      "actor": {
+        "id": "Rohan Das",
+        "roles": [
+          "Purchase User"
+        ]
+      },
+      "site": {
+        "id": "muster.local",
+        "revision": "unrecorded-in-capture"
+      },
+      "build_revision": "056f5679ca4d95075ef49f3781c9c710588c6135",
+      "routes": [
+        "/desk/supplier"
+      ],
+      "expected_result": "At the required desktop viewport, the scoped Supplier list is readable while the direct West Supplier route is denied.",
+      "viewport": {
+        "class": "desktop",
+        "width": 1440,
+        "height": 900
+      },
+      "timestamps": {
+        "started_at": "2026-07-19T12:12:08.765Z",
+        "finished_at": "2026-07-19T12:12:58.845Z",
+        "basis": "filesystem_mtime_minus_ffprobe_duration"
+      },
+      "duration_seconds": 50.08,
+      "chapters": [
+        {
+          "runbook_id": "ERP-03",
+          "title": "Supplier denial and scoped list",
+          "start_seconds": 0,
+          "end_seconds": 27,
+          "claim": "The retake shows the West Supplier denial followed by the restricted Supplier list containing East Components Partner."
+        },
+        {
+          "runbook_id": "ERP-03",
+          "title": "Repeated out-of-scope Supplier denial",
+          "start_seconds": 27,
+          "end_seconds": 50.08,
+          "claim": "The retake ends with the direct West Supplier read denial still enforced."
+        }
+      ],
+      "coverage_cells": [
+        {
+          "product": "erpnext",
+          "viewport": "desktop",
+          "outcome": "allow"
+        },
+        {
+          "product": "erpnext",
+          "viewport": "desktop",
+          "outcome": "deny"
+        }
+      ],
+      "video": {
+        "path": "output/evidence/videos/ERP-03-buying-supplier-rbac-desktop-hd.webm"
+      },
+      "screenshots": [
+        {
+          "path": "output/evidence/screenshots/ERP-03-buying-supplier-desktop-list.png"
+        },
+        {
+          "path": "output/evidence/screenshots/ERP-03-buying-supplier-desktop-allow.png"
+        },
+        {
+          "path": "output/evidence/screenshots/ERP-03-buying-supplier-desktop-deny.png"
+        }
+      ],
+      "traces": [],
+      "test_receipts": []
+    },
+    {
+      "scenario_id": "mus-01-mission-approval-paired-desktop",
+      "product": "muster",
+      "outcome": "paired",
+      "claim": "The participant sees exactly one governed Muster Mission and is denied an ungranted mission administrative action.",
+      "actor": {
+        "id": "muster.video.sales_operator.musterlocal.46a176c3@example.com",
+        "roles": [
+          "Muster Operator"
+        ]
+      },
+      "site": {
+        "id": "muster.local",
+        "revision": "unrecorded-in-capture"
+      },
+      "build_revision": "056f5679ca4d95075ef49f3781c9c710588c6135",
+      "routes": [
+        "/desk/muster-mission"
+      ],
+      "expected_result": "The participant can list and open the one governed mission while the ungranted administrative action is denied.",
+      "viewport": {
+        "class": "desktop",
+        "width": 1440,
+        "height": 900
+      },
+      "timestamps": {
+        "started_at": "2026-07-19T12:13:24.939Z",
+        "finished_at": "2026-07-19T12:14:37.379Z",
+        "basis": "filesystem_mtime_minus_ffprobe_duration"
+      },
+      "duration_seconds": 72.44,
+      "chapters": [
+        {
+          "runbook_id": "MUS-01",
+          "title": "Governed mission visibility",
+          "start_seconds": 0,
+          "end_seconds": 42,
+          "claim": "The video shows a single scoped mission in the list and opens its governed mission form."
+        },
+        {
+          "runbook_id": "MUS-01",
+          "title": "Ungrantable mission action denial",
+          "start_seconds": 42,
+          "end_seconds": 72.44,
+          "claim": "The video ends with a visible Not permitted result for the ungranted action."
+        }
+      ],
+      "coverage_cells": [
+        {
+          "product": "muster",
+          "viewport": "desktop",
+          "outcome": "allow"
+        },
+        {
+          "product": "muster",
+          "viewport": "desktop",
+          "outcome": "deny"
+        }
+      ],
+      "video": {
+        "path": "output/evidence/videos/MUS-01-mission-approval-rbac-desktop.webm"
+      },
+      "screenshots": [
+        {
+          "path": "output/evidence/screenshots/MUS-01-mission-desktop-list.png"
+        },
+        {
+          "path": "output/evidence/screenshots/MUS-01-mission-desktop-allow.png"
+        },
+        {
+          "path": "output/evidence/screenshots/MUS-01-mission-desktop-deny.png"
+        }
+      ],
+      "traces": [],
+      "test_receipts": []
+    },
+    {
+      "scenario_id": "hrm-01-employee-visibility-paired-mobile",
+      "product": "hrms",
+      "outcome": "paired",
+      "claim": "In the required mobile viewport, the employee persona sees and opens the permitted employee and is denied the out-of-scope employee.",
+      "actor": {
+        "id": "Vikram Patel",
+        "roles": [
+          "Employee"
+        ]
+      },
+      "site": {
+        "id": "muster.local",
+        "revision": "unrecorded-in-capture"
+      },
+      "build_revision": "056f5679ca4d95075ef49f3781c9c710588c6135",
+      "routes": [
+        "/desk/employee"
+      ],
+      "expected_result": "The mobile scoped Employee list and own detail are readable while a direct out-of-scope Employee route is denied.",
+      "viewport": {
+        "class": "mobile",
+        "width": 390,
+        "height": 844
+      },
+      "timestamps": {
+        "started_at": "2026-07-19T12:14:52.572Z",
+        "finished_at": "2026-07-19T12:15:56.092Z",
+        "basis": "filesystem_mtime_minus_ffprobe_duration"
+      },
+      "duration_seconds": 63.52,
+      "chapters": [
+        {
+          "runbook_id": "HRM-01",
+          "title": "Mobile employee denial and scoped visibility",
+          "start_seconds": 0,
+          "end_seconds": 47,
+          "claim": "The video shows an out-of-scope denial, the filtered Employee list, and the permitted employee detail on mobile."
+        },
+        {
+          "runbook_id": "HRM-01",
+          "title": "Repeated mobile employee denial",
+          "start_seconds": 47,
+          "end_seconds": 63.52,
+          "claim": "The video ends with the out-of-scope Employee read denial still enforced on mobile."
+        }
+      ],
+      "coverage_cells": [
+        {
+          "product": "hrms",
+          "viewport": "mobile",
+          "outcome": "allow"
+        },
+        {
+          "product": "hrms",
+          "viewport": "mobile",
+          "outcome": "deny"
+        }
+      ],
+      "video": {
+        "path": "output/evidence/videos/HRM-02-employee-rbac-mobile.webm"
+      },
+      "screenshots": [
+        {
+          "path": "output/evidence/screenshots/HRM-02-employee-mobile-deny.png"
+        }
+      ],
+      "traces": [],
+      "test_receipts": []
+    },
+    {
+      "scenario_id": "crm-01-lead-visibility-paired-mobile",
+      "product": "crm",
+      "outcome": "paired",
+      "claim": "In the required mobile viewport, the Sales User sees and opens the permitted Lead and is denied the out-of-scope Lead.",
+      "actor": {
+        "id": "Sara Khan",
+        "roles": [
+          "Sales User"
+        ]
+      },
+      "site": {
+        "id": "muster.local",
+        "revision": "unrecorded-in-capture"
+      },
+      "build_revision": "056f5679ca4d95075ef49f3781c9c710588c6135",
+      "routes": [
+        "/crm/leads"
+      ],
+      "expected_result": "The mobile scoped Lead list and permitted detail are readable while a direct out-of-scope Lead route is denied.",
+      "viewport": {
+        "class": "mobile",
+        "width": 390,
+        "height": 844
+      },
+      "timestamps": {
+        "started_at": "2026-07-19T12:16:20.869Z",
+        "finished_at": "2026-07-19T12:17:26.430Z",
+        "basis": "filesystem_mtime_minus_ffprobe_duration"
+      },
+      "duration_seconds": 65.56,
+      "chapters": [
+        {
+          "runbook_id": "CRM-01",
+          "title": "Mobile Lead denial and scoped visibility",
+          "start_seconds": 0,
+          "end_seconds": 47,
+          "claim": "The video shows an out-of-scope denial, the restricted Lead list, and the permitted Lead detail on mobile."
+        },
+        {
+          "runbook_id": "CRM-01",
+          "title": "Repeated mobile Lead denial",
+          "start_seconds": 47,
+          "end_seconds": 65.56,
+          "claim": "The video ends with the out-of-scope Lead read denial still enforced on mobile."
+        }
+      ],
+      "coverage_cells": [
+        {
+          "product": "crm",
+          "viewport": "mobile",
+          "outcome": "allow"
+        },
+        {
+          "product": "crm",
+          "viewport": "mobile",
+          "outcome": "deny"
+        }
+      ],
+      "video": {
+        "path": "output/evidence/videos/CRM-02-lead-rbac-mobile.webm"
+      },
+      "screenshots": [
+        {
+          "path": "output/evidence/screenshots/CRM-02-lead-mobile-deny.png"
+        }
+      ],
+      "traces": [],
+      "test_receipts": []
+    },
+    {
+      "scenario_id": "mus-01-mission-approval-paired-mobile",
+      "product": "muster",
+      "outcome": "paired",
+      "claim": "In the required mobile viewport, the participant sees the one governed Muster Mission and is denied an ungranted administrative action.",
+      "actor": {
+        "id": "muster.video.sales_operator.musterlocal.46a176c3@example.com",
+        "roles": [
+          "Muster Operator"
+        ]
+      },
+      "site": {
+        "id": "muster.local",
+        "revision": "unrecorded-in-capture"
+      },
+      "build_revision": "056f5679ca4d95075ef49f3781c9c710588c6135",
+      "routes": [
+        "/desk/muster-mission"
+      ],
+      "expected_result": "The mobile participant can see the one governed mission while the ungranted administrative action is denied.",
+      "viewport": {
+        "class": "mobile",
+        "width": 390,
+        "height": 844
+      },
+      "timestamps": {
+        "started_at": "2026-07-19T12:17:47.874Z",
+        "finished_at": "2026-07-19T12:18:34.074Z",
+        "basis": "filesystem_mtime_minus_ffprobe_duration"
+      },
+      "duration_seconds": 46.2,
+      "chapters": [
+        {
+          "runbook_id": "MUS-01",
+          "title": "Mobile mission denial and governed visibility",
+          "start_seconds": 0,
+          "end_seconds": 28,
+          "claim": "The video shows the ungranted action denial followed by the single scoped Mission list on mobile."
+        },
+        {
+          "runbook_id": "MUS-01",
+          "title": "Repeated mobile mission denial",
+          "start_seconds": 28,
+          "end_seconds": 46.2,
+          "claim": "The video ends with the ungranted mission administrative action still denied on mobile."
+        }
+      ],
+      "coverage_cells": [
+        {
+          "product": "muster",
+          "viewport": "mobile",
+          "outcome": "allow"
+        },
+        {
+          "product": "muster",
+          "viewport": "mobile",
+          "outcome": "deny"
+        }
+      ],
+      "video": {
+        "path": "output/evidence/videos/MUS-02-mission-approval-rbac-mobile.webm"
+      },
+      "screenshots": [
+        {
+          "path": "output/evidence/screenshots/MUS-02-mission-mobile-deny.png"
+        }
+      ],
+      "traces": [],
+      "test_receipts": []
+    }
+  ]
+}

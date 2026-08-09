@@ -9,6 +9,7 @@ import {
   pairingScopes,
   requestPairing,
   resolvePairing,
+  upsertTrustedFrappePairing,
 } from "../src/index.js";
 
 test("unpaired sender gets a stable pairing code until approved", async () => {
@@ -90,13 +91,50 @@ test("approved pairings can carry Frappe user and employee identity scopes", asy
   assert.deepEqual(paired.identity?.roles, ["Employee", "HR User"]);
 
   const scopes = pairingScopes(paired);
-  assert.deepEqual(scopes, [
+  assert.deepEqual(scopes.slice(0, 5), [
     { kind: "pairing", id: "slack:T024:U1" },
     { kind: "user", id: paired.pairingId },
     { kind: "tenant", id: "https://erp.example.test" },
     { kind: "user", id: "frappe:dhairya@example.test" },
     { kind: "user", id: "frappe-employee:EMP-0001" },
-    { kind: "role", id: "frappe:https://erp.example.test:Employee" },
-    { kind: "role", id: "frappe:https://erp.example.test:HR User" },
   ]);
+  assert.equal(scopes[5]?.kind, "persona");
+  assert.match(scopes[5]?.id ?? "", /^frappe-permissions:[a-f0-9]{64}$/);
+  assert.equal(scopes.length, 6);
+});
+
+test("trusted Frappe ingress creates and refreshes one identity-bound pairing", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-pairing-trusted-frappe-"));
+  const enterpriseRoles = ["Employee", ...Array.from({ length: 233 }, (_, index) => `Custom Role ${index + 1}`)];
+  const pending = await requestPairing("frappe:erp.example.test", "employee@example.test", cwd);
+  assert.ok(pending.code);
+
+  const first = await upsertTrustedFrappePairing("frappe:erp.example.test", "employee@example.test", {
+    site: "https://erp.example.test/",
+    user: "employee@example.test",
+    employee: "EMP-0042",
+    roles: ["Employee", "Employee"],
+    department: "Operations",
+    authMode: "frappe_session",
+  }, cwd);
+  const refreshed = await upsertTrustedFrappePairing("frappe:erp.example.test", "employee@example.test", {
+    site: "https://erp.example.test",
+    user: "employee@example.test",
+    employee: "EMP-0042",
+    roles: enterpriseRoles,
+    department: "Operations",
+    authMode: "frappe_session",
+  }, cwd);
+
+  assert.equal(refreshed.pairingId, first.pairingId);
+  assert.equal(refreshed.identity?.roles.length, 234);
+  assert.ok(refreshed.identity?.roles.includes("Custom Role 233"));
+  assert.equal(pairingScopes(refreshed).length, 6, "role-heavy identities use one permission epoch scope");
+  assert.equal((await loadPairings(cwd)).pending.length, 0);
+  await assert.rejects(() => upsertTrustedFrappePairing("frappe:erp.example.test", "employee@example.test", {
+    site: "https://erp.example.test",
+    user: "someone-else@example.test",
+    roles: ["Employee"],
+    authMode: "frappe_session",
+  }, cwd), /different Frappe identity/);
 });

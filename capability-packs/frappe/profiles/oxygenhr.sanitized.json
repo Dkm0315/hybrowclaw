@@ -31,7 +31,10 @@
       "server_script",
       "funnel",
       "flow_config",
-      "dynamic_assignment"
+      "dynamic_assignment",
+      "permission_rule",
+      "workspace",
+      "notification"
     ],
     "additionalDoctypes": [
       "Funnel",

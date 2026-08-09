@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import { printBanner, renderBanner } from "./banner.js";
-import { createMusterAutocompleteProvider, runMusterChatTui, type MusterChatSink, type MusterCompletionCatalog, type PickerOption } from "./chat-tui.js";
+import { createMusterAutocompleteProvider, formatWorkingIndicator, runMusterChatTui, type MusterChatSink, type MusterCompletionCatalog, type PickerOption } from "./chat-tui.js";
 import { hasCompletedMusterOnboarding, runMusterOnboardingTui } from "./onboarding-tui.js";
 import { runFrappe2RealPromptsQa } from "./qa-frappe2.js";
+import { runFrappeConnectCommand } from "./frappe-connect-command.js";
 import { runPtyTuiQa } from "./qa-pty-tui.js";
+import { loadConfiguredGatewayPacks, startConfiguredFrappeIndexing } from "./gateway-registry.js";
 import {
   openSessionStore,
   clearConversationSessionHandles,
@@ -90,6 +92,7 @@ import {
   listBuiltinMcpServers,
   loadRosterIndex,
   resolveBuiltinCapabilityMentions,
+  resolveBuiltinPluginPackPath,
   type BuiltinMcpCatalogEntry,
   type BuiltinCapabilityMention,
   type BuiltinSkillCatalogEntry,
@@ -196,6 +199,9 @@ import {
   approvePairing,
   DEFAULT_GATEWAY_PORT,
   discordInteractionToInbound,
+  FrappeOAuthCoordinator,
+  FrappeSiteBindingCoordinator,
+  inspectFrappeOAuthConnection,
   gchatEventToSurfaceMessage,
   googleChatAudienceIsValid,
   gatewayConfigPath,
@@ -212,7 +218,7 @@ import {
   telegramUpdateToSurfaceMessage,
   whatsAppWebhookToSurfaceMessages
 } from "@musterhq/gateway";
-import { existsSync, openSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { access, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -410,6 +416,9 @@ async function main(): Promise<void> {
     case "pairing":
       await pairingCommand(args);
       return;
+    case "frappe":
+      await frappeCommand(args);
+      return;
     default:
       throw new Error(`Unknown command: ${command}`);
   }
@@ -520,6 +529,9 @@ Usage:
   muster gateway webhook telegram --public-url https://your-domain.example
   muster gateway poll                 # local Telegram long-poll fallback; daemonize with gateway daemon start --with-telegram-poll
   muster pairing list | approve <code> [--frappe-site URL --frappe-token-env ENV | --frappe-user USER] [--employee EMP --role ROLE]
+  muster frappe setup --site-url URL --oauth-credential-file PATH [--callback-mode gateway|frappe] [--result-path /api/method/...] [--identity-path /api/method/...] [--identity-ttl-ms 60000]
+  muster frappe connect <https-site-origin> [--muster-url https://muster.example] [--wait|--no-wait] [--no-open] [--no-qr] [--timeout-ms 300000]
+  muster frappe doctor [--connection-id ID]
   muster flow replay <run-id> [--live-agents]
   muster flow diff <run-id-a> <run-id-b>
   muster flow loop <flow-id> --cron "0 9 * * 1"
@@ -528,6 +540,166 @@ Usage:
 Design rule:
   One active runtime per run. Providers/models can route dynamically by task.
 `);
+}
+
+async function frappeCommand(args: string[]): Promise<void> {
+  const [action] = args;
+  if (action === "connect") {
+    const site = args[1];
+    if (!site || site.startsWith("--")) throw new Error("Usage: muster frappe connect <https-site-origin> [--muster-url https://muster.example] [--wait|--no-wait] [--no-open] [--no-qr] [--timeout-ms 300000]");
+    if (args.includes("--wait") && args.includes("--no-wait")) throw new Error("Choose either --wait or --no-wait, not both.");
+    await ensureDefaultConfig(process.cwd());
+    await enableBuiltinPlugin("frappe-federated-bridge", process.cwd(), { allowHighRisk: true });
+    const connection = await runFrappeConnectCommand({
+      site,
+      musterOrigin: readFlag(args, "--muster-url"),
+      openBrowser: !args.includes("--no-open"),
+      qr: !args.includes("--no-qr"),
+      waitForVerification: args.includes("--wait") ? true : args.includes("--no-wait") ? false : undefined,
+      timeoutMs: readNumberFlag(args, "--timeout-ms"),
+      color: args.includes("--color=always") ? true : args.includes("--color=never") ? false : undefined,
+    });
+    console.log("capability_pack=frappe-federated-bridge enabled=true");
+    console.log(`frappe_binding=${connection.connected ? "verified" : "pending"}`);
+    console.log(connection.connected ? "next=Return to Frappe and ask Muster for a workflow." : "next=Finish Frappe consent, then rerun this command with --wait.");
+    return;
+  }
+  if (action === "doctor") {
+    await frappeDoctor(args);
+    return;
+  }
+  if (action !== "setup") {
+    throw new Error("Usage: muster frappe setup --site-url URL --oauth-credential-file PATH [--callback-mode gateway|frappe] [--result-path /api/method/...] [--identity-path /api/method/...] [--identity-ttl-ms 60000] | muster frappe doctor [--connection-id ID]");
+  }
+
+  const site = readFlag(args, "--site-url");
+  const credentialFile = readFlag(args, "--oauth-credential-file");
+  const connectionId = readFlag(args, "--connection-id") ?? "frappe-default";
+  const assistantName = readFlag(args, "--assistant-name") ?? "Muster Frappe assistant";
+  const organization = readFlag(args, "--organization");
+  const domain = readFlag(args, "--domain");
+  if (!credentialFile || !site) {
+    throw new Error("Provide --site-url and --oauth-credential-file so OAuth is configured by reference; secrets are never accepted on this command.");
+  }
+  let requestedSite: string;
+  try {
+    const parsed = new URL(site);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash || !["", "/"].includes(parsed.pathname)) {
+      throw new Error("must be an HTTPS origin");
+    }
+    requestedSite = parsed.origin;
+  } catch {
+    throw new Error("--site-url must be a valid HTTPS origin without a path, query, or credentials.");
+  }
+  const callbackModeRaw = readFlag(args, "--callback-mode") ?? "gateway";
+  if (callbackModeRaw !== "gateway" && callbackModeRaw !== "frappe") {
+    throw new Error("--callback-mode must be gateway or frappe.");
+  }
+  const resultPath = readFlag(args, "--result-path");
+  const identityPath = readFlag(args, "--identity-path");
+  const identityTtlMs = readNumberFlag(args, "--identity-ttl-ms");
+  if (identityTtlMs !== undefined && (identityTtlMs < 5_000 || identityTtlMs > 300_000)) {
+    throw new Error("--identity-ttl-ms must be between 5000 and 300000.");
+  }
+  if (callbackModeRaw === "frappe" && !resultPath) {
+    throw new Error("Frappe-hosted callback mode requires --result-path /api/method/...; gateway mode needs no Frappe callback app.");
+  }
+  if (callbackModeRaw === "gateway" && resultPath) {
+    throw new Error("--result-path is only valid with --callback-mode frappe.");
+  }
+  const connection = {
+    id: connectionId,
+    credentialFile,
+    callbackMode: callbackModeRaw,
+    ...(resultPath ? { resultPath } : {}),
+    ...(identityPath ? { identityPath } : {}),
+    ...(identityTtlMs !== undefined ? { identityTtlMs } : {}),
+  } as const;
+  let inspection: Awaited<ReturnType<typeof inspectFrappeOAuthConnection>>;
+  try {
+    inspection = await inspectFrappeOAuthConnection(connection, process.cwd());
+  } catch (error) {
+    throw new Error(`OAuth credential or callback configuration is unsafe: ${error instanceof Error ? error.message : String(error)} Create the private mode-0600 JSON file from the Frappe OAuth registration; secrets are never accepted on argv.`);
+  }
+  if (inspection.site !== requestedSite) {
+    throw new Error(`OAuth credential site mismatch: --site-url is ${requestedSite}, credential.site is ${inspection.site}.`);
+  }
+
+  const gatewayResult = await initGatewayConfig();
+  const existing = gatewayResult.config;
+  const existingFrappe = existing.frappe;
+  const connections = [...(existingFrappe?.oauth?.connections ?? [])].filter((entry) => entry.id !== connectionId);
+  const nextGateway = {
+    ...existing,
+    frappe: {
+      ...existingFrappe,
+      assistant: {
+        ...existingFrappe?.assistant,
+        name: assistantName,
+        ...(organization ? { organization } : {}),
+        ...(domain ? { domains: [domain] } : {}),
+        description: "Permission-scoped Frappe/OxygenHR assistant; Frappe remains the authorization authority.",
+      },
+      oauth: {
+        ...existingFrappe?.oauth,
+        defaultConnection: connectionId,
+        connections: [...connections, connection],
+      },
+    },
+  };
+  await saveGatewayConfig(nextGateway as GatewayConfig);
+  await ensureDefaultConfig(process.cwd());
+  await enableBuiltinPlugin("frappe-federated-bridge", process.cwd(), { allowHighRisk: true });
+
+  console.log(`frappe_setup=configured site=${inspection.site}`);
+  console.log("capability_pack=frappe-federated-bridge enabled=true");
+  console.log(`assistant=${assistantName} organization=${organization ?? "-"} domain=${domain ?? "-"}`);
+  console.log(`oauth_connection=${connectionId} credential_file=configured callback_mode=${inspection.callbackMode}`);
+  console.log(`oauth_redirect=${inspection.redirectUri} identity_refresh_ms=${inspection.identityTtlMs}`);
+  console.log("oauth_secrets=not_printed not_accepted_on_command_line=true");
+  console.log(`oauth_registration=${requestedSite}/app/oauth-client`);
+  console.log(`oauth_registration_step=Register the exact redirect URI above for client_id in the private credential file.`);
+  console.log("next_channel=muster channels ready telegram --bot-token-env TELEGRAM_BOT_TOKEN");
+  console.log("next_channel_alternative=muster channels ready slack --bot-token-env SLACK_BOT_TOKEN --app-token-env SLACK_APP_TOKEN");
+  console.log("next_verify=muster frappe doctor");
+  console.log("rbac=per-user OAuth identity and Frappe permissions remain authoritative");
+}
+
+async function frappeDoctor(args: string[]): Promise<void> {
+  const gateway = await loadGatewayConfig().catch(() => undefined);
+  if (!gateway?.frappe?.oauth?.connections.length) {
+    if (gateway?.frappe?.publicOrigin) {
+      const bindings = new FrappeSiteBindingCoordinator({
+        storePath: join(dataDir(process.cwd()), "frappe-site-bindings.v1.enc.json"),
+        encryptionSecret: gateway.token,
+      }).verifiedBindings();
+      console.log(`frappe_doctor=${bindings.length ? "ready" : "awaiting_consent"}`);
+      console.log(`gateway_origin=${gateway.frappe.publicOrigin} verified_site_bindings=${bindings.length}`);
+      for (const binding of bindings) console.log(`site=${binding.siteOrigin} tenant=${binding.tenantId} binding=${binding.bindingId}`);
+      console.log("secret_check=encrypted_registry secrets_printed=false");
+      console.log(bindings.length ? "live_authorization=site_binding_verified" : "next=Complete consent in the Frappe /muster-connect page, then rerun muster frappe doctor.");
+      return;
+    }
+    throw new Error("Frappe OAuth is not configured. Run muster frappe setup --site-url URL --oauth-credential-file PATH.");
+  }
+  const connectionId = readFlag(args, "--connection-id") ?? gateway.frappe.oauth.defaultConnection ?? gateway.frappe.oauth.connections[0]?.id;
+  const connection = gateway.frappe.oauth.connections.find((entry) => entry.id === connectionId);
+  if (!connection) throw new Error(`Frappe OAuth connection "${connectionId ?? "-"}" is not configured.`);
+  const inspection = await inspectFrappeOAuthConnection(connection, process.cwd());
+  const config = await loadConfig();
+  const enabled = config.plugins?.entries?.["frappe-federated-bridge"]?.enabled === true
+    && config.plugins?.allow?.includes("frappe-federated-bridge");
+  const packPath = await resolveBuiltinPluginPackPath("frappe-federated-bridge");
+  const ready = enabled && Boolean(packPath);
+  console.log(`frappe_doctor=${ready ? "ready" : "blocked"}`);
+  console.log(`site=${inspection.site} connection=${inspection.id} callback_mode=${inspection.callbackMode}`);
+  console.log(`oauth_redirect=${inspection.redirectUri} identity_refresh_ms=${inspection.identityTtlMs}`);
+  if (inspection.resultPath) console.log(`oauth_result_path=${inspection.resultPath}`);
+  if (inspection.identityPath) console.log(`oauth_identity_path=${inspection.identityPath}`);
+  console.log(`capability_pack=${packPath ? "available" : "missing"} enabled=${enabled}`);
+  console.log("secret_check=private_file_valid secrets_printed=false");
+  console.log("live_authorization=not_tested next=Use /pair in the connected channel to prove consent, identity, and Frappe RBAC.");
+  if (!ready) throw new Error("Frappe capability pack is not available and explicitly enabled in this installation.");
 }
 
 function printVersion(): void {
@@ -1784,8 +1956,7 @@ async function runChatTurn(text: string, state: ChatState, options: { timeoutMs?
   const agentId = routed?.agentId;
   const config = await loadConfig();
   const mentionedCapabilities = await printMentionedCapabilityChecks(prompt, config, { interactive: Boolean(state.statusSink) });
-  const started = Date.now();
-  const stopWorking = state.statusSink ? startTuiWorkingStatus(state.statusSink, agentId, started) : startWorkingStatus(agentId, started);
+  const stopWorking = state.statusSink ? startTuiWorkingStatus(state.statusSink, agentId) : startWorkingStatus(agentId);
   let outcome: RunOutcome;
   try {
     outcome = await executeRun(config, {
@@ -1815,13 +1986,10 @@ async function runChatTurn(text: string, state: ChatState, options: { timeoutMs?
   openMentionedCapabilityPicker(state, mentionedCapabilities, config);
 }
 
-function startTuiWorkingStatus(sink: MusterChatSink, agentId: string | undefined, started: number): () => void {
-  const label = agentId ? `@${agentId} working` : "working";
-  const frames = ["|", "/", "-", "\\"];
+function startTuiWorkingStatus(sink: MusterChatSink, agentId: string | undefined): () => void {
   let frame = 0;
   const render = (): void => {
-    const elapsed = Math.max(0, Math.floor((Date.now() - started) / 1000));
-    sink.setStatus(`${frames[frame % frames.length]} ${label} ${elapsed}s`);
+    sink.setStatus(formatWorkingIndicator(agentId, frame));
     frame += 1;
   };
   render();
@@ -1832,18 +2000,16 @@ function startTuiWorkingStatus(sink: MusterChatSink, agentId: string | undefined
   };
 }
 
-function startWorkingStatus(agentId: string | undefined, started: number): () => void {
+function startWorkingStatus(agentId: string | undefined): () => void {
   const label = agentId ? `@${agentId} working` : "working";
   if (!process.stdout.isTTY) {
     console.log(`\n${label}`);
     return () => {};
   }
-  const frames = ["|", "/", "-", "\\"];
   let frame = 0;
   let lastLength = 0;
   const render = (): void => {
-    const elapsed = Math.max(0, Math.floor((Date.now() - started) / 1000));
-    const text = `${frames[frame % frames.length]} ${label} ${elapsed}s`;
+    const text = formatWorkingIndicator(agentId, frame);
     frame += 1;
     lastLength = Math.max(lastLength, stripAnsi(text).length);
     process.stdout.write(`\r${color(text, "accent")}${" ".repeat(Math.max(0, lastLength - stripAnsi(text).length))}`);
@@ -3343,7 +3509,7 @@ function missingMcpEnv(entry: BuiltinMcpCatalogEntry | undefined): string[] {
 
 async function printPluginSetupStatus(
   plugin: BuiltinPluginCatalogEntry,
-  options: { readonly configureDefaults?: boolean } = {},
+  options: { readonly configureDefaults?: boolean; readonly enabled?: boolean } = {},
 ): Promise<void> {
   const setup = plugin.setup;
   if (!setup) return;
@@ -3379,7 +3545,7 @@ async function printPluginSetupStatus(
   }
   for (const url of setup.setupUrls ?? []) console.log(`setup_url=${url}`);
   for (const note of setup.notes ?? []) console.log(`note=${note}`);
-  for (const action of pluginNextActions(plugin)) console.log(action);
+  for (const action of pluginNextActions(plugin, { enabled: options.enabled })) console.log(action);
 }
 
 function cliRepoRoot(): string {
@@ -3408,6 +3574,8 @@ async function capabilityManifestPath(packPath: string): Promise<string> {
 
 async function resolveBuiltinPackPath(plugin: BuiltinPluginCatalogEntry): Promise<string | undefined> {
   if (!plugin.packPath) return undefined;
+  const bundled = await resolveBuiltinPluginPackPath(plugin.id);
+  if (bundled) return bundled;
   for (const candidate of [
     resolve(process.cwd(), plugin.packPath),
     resolve(cliRepoRoot(), plugin.packPath),
@@ -3459,9 +3627,18 @@ async function printPluginCheck(plugin: BuiltinPluginCatalogEntry): Promise<void
   const enabled = entry ? entry.enabled !== false : false;
   console.log(`plugin=${plugin.id} source=${plugin.source} risk=${plugin.risk} enabled=${enabled} action=${plugin.actionability}`);
   await printPluginPackStatus(plugin);
+  if (plugin.id === "frappe-federated-bridge") {
+    const gateway = await loadGatewayConfig().catch(() => undefined);
+    const connections = gateway?.frappe?.oauth?.connections ?? [];
+    console.log("plugin_env=not_required");
+    console.log(`plugin_auth=${connections.length ? "per_user_oauth" : "needs_setup"} connections=${connections.length} default=${gateway?.frappe?.oauth?.defaultConnection ?? "-"}`);
+    await printPluginSetupStatus(plugin, { enabled });
+    console.log(`next="${connections.length ? "muster frappe doctor" : "muster frappe setup --site-url URL --oauth-credential-file PATH"}"`);
+    return;
+  }
   const missing = missingSetupEnv(plugin.setup);
   console.log(`plugin_env=${missing.length ? "needs_env" : "ready"}${missing.length ? ` missing=${missing.join(",")}` : ""}`);
-  await printPluginSetupStatus(plugin);
+  await printPluginSetupStatus(plugin, { enabled });
   if (plugin.setup?.mcpServers?.length) {
     for (const id of plugin.setup.mcpServers) {
       const mcp = findBuiltinMcpEntry(id);
@@ -3540,7 +3717,10 @@ function chatPluginSetupLines(plugin: BuiltinPluginCatalogEntry): string[] {
   return lines.slice(0, 8);
 }
 
-function pluginNextActions(plugin: BuiltinPluginCatalogEntry): string[] {
+function pluginNextActions(
+  plugin: BuiltinPluginCatalogEntry,
+  options: { readonly enabled?: boolean } = {},
+): string[] {
   const actions: string[] = [];
   const providerPreset = pluginProviderPresetId(plugin);
   const setupUrl = plugin.setup?.setupUrls?.[0] ?? pluginSetupUrl(plugin.id);
@@ -3571,7 +3751,7 @@ function pluginNextActions(plugin: BuiltinPluginCatalogEntry): string[] {
     }
   }
 
-  if (plugin.packPath) {
+  if (plugin.packPath && options.enabled !== true) {
     actions.push(`next_action=enable_pack command="muster plugins enable ${plugin.id}${plugin.risk === "high" ? " --allow-high-risk" : ""}"`);
   }
 
@@ -5112,7 +5292,7 @@ async function pluginsCommand(args: string[]): Promise<void> {
     const plugin = await enableBuiltinPlugin(path, process.cwd(), { allowHighRisk: args.includes("--allow-high-risk") });
     console.log(`enabled plugin=${plugin.id} source=${plugin.source} risk=${plugin.risk} action=${plugin.actionability}`);
     if (!plugin.packPath) console.log("note=policy enabled; executable loading still requires a local capability pack.");
-    await printPluginSetupStatus(plugin, { configureDefaults: true });
+    await printPluginSetupStatus(plugin, { configureDefaults: true, enabled: true });
     return;
   }
   if (action === "disable" && path) {
@@ -9021,6 +9201,22 @@ async function gatewayCommand(commandArgs: string[]): Promise<void> {
     const config = await loadConfig();
     const port = readNumberFlag(commandArgs, "--port") ?? gateway.port ?? DEFAULT_GATEWAY_PORT;
     const enterprise = openSqliteGatewayEnterpriseRuntime(process.cwd());
+    const frappeOAuthConnections = gateway.frappe?.oauth?.connections ?? [];
+    const frappeOAuth = frappeOAuthConnections.length
+      ? new FrappeOAuthCoordinator({ connections: frappeOAuthConnections, cwd: process.cwd() })
+      : undefined;
+    const registry = builtinFlowRegistry(commandArgs);
+    await loadConfiguredGatewayPacks(config, registry, {
+      cwd: process.cwd(),
+      log: (line) => console.log(line),
+      env: gatewayCapabilityEnvironment(gateway),
+    });
+    const frappeIndexing = startConfiguredFrappeIndexing(registry, frappeOAuth, {
+      cwd: process.cwd(),
+      log: (line) => console.log(line),
+      intervalMs: 15 * 60_000,
+      deferInitialMs: 60_000,
+    });
     const controller = new AbortController();
     const stop = () => controller.abort();
     process.once("SIGINT", stop);
@@ -9028,16 +9224,16 @@ async function gatewayCommand(commandArgs: string[]): Promise<void> {
     let running: Awaited<ReturnType<typeof startGatewayServer>> | undefined;
     const workers: Promise<void>[] = [];
     try {
-      running = await startGatewayServer({ config, gateway, enterprise, cwd: process.cwd(), log: (line) => console.log(line) }, port);
+      running = await startGatewayServer({ config, gateway, registry, enterprise, frappeOAuth, cwd: process.cwd(), log: (line) => console.log(line) }, port);
       console.log("routes: GET /v1/health | POST /v1/messages | POST /v1/flows/<run>/approve|reject | POST /v1/adapters/telegram|slack|discord|whatsapp|gchat|teams");
       if (commandArgs.includes("--with-telegram-poll")) {
-        workers.push(pollTelegram({ config, gateway, enterprise, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) }).catch((error) => {
+        workers.push(pollTelegram({ config, gateway, registry, enterprise, frappeOAuth, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) }).catch((error) => {
           console.error(`telegram poll failed: ${error instanceof Error ? error.message : String(error)}`);
         }));
         console.log("telegram_poll=background_in_process");
       }
       if (commandArgs.includes("--with-slack-socket")) {
-        workers.push(pollSlackSocket({ config, gateway, enterprise, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) }).catch((error) => {
+        workers.push(pollSlackSocket({ config, gateway, registry, enterprise, frappeOAuth, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) }).catch((error) => {
           console.error(`slack socket failed: ${error instanceof Error ? error.message : String(error)}`);
         }));
         console.log("slack_socket=background_in_process");
@@ -9048,7 +9244,9 @@ async function gatewayCommand(commandArgs: string[]): Promise<void> {
       }
     } finally {
       controller.abort();
+      frappeIndexing.stop();
       await Promise.allSettled(workers);
+      await frappeIndexing.ready;
       await running?.close();
       await enterprise.close?.();
       process.off("SIGINT", stop);
@@ -9069,13 +9267,31 @@ async function gatewayCommand(commandArgs: string[]): Promise<void> {
     // needed. Uses the active profile's config + .muster/gateway.json telegram.botToken.
     const gateway = await loadGatewayConfig();
     const config = await loadConfig();
+    const frappeOAuthConnections = gateway.frappe?.oauth?.connections ?? [];
+    const frappeOAuth = frappeOAuthConnections.length
+      ? new FrappeOAuthCoordinator({ connections: frappeOAuthConnections, cwd: process.cwd() })
+      : undefined;
+    const registry = builtinFlowRegistry(commandArgs);
+    await loadConfiguredGatewayPacks(config, registry, {
+      cwd: process.cwd(),
+      log: (line) => console.log(line),
+      env: gatewayCapabilityEnvironment(gateway),
+    });
+    const frappeIndexing = startConfiguredFrappeIndexing(registry, frappeOAuth, {
+      cwd: process.cwd(),
+      log: (line) => console.log(line),
+      intervalMs: 15 * 60_000,
+      deferInitialMs: 60_000,
+    });
     const enterprise = openSqliteGatewayEnterpriseRuntime(process.cwd());
     const controller = new AbortController();
     process.on("SIGINT", () => controller.abort());
     console.log("telegram long-poll (no webhook). Message the bot; stop with Ctrl-C.");
     try {
-      await pollTelegram({ config, gateway, enterprise, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) });
+      await pollTelegram({ config, gateway, registry, enterprise, frappeOAuth, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) });
     } finally {
+      frappeIndexing.stop();
+      await frappeIndexing.ready;
       await enterprise.close?.();
     }
     return;
@@ -9149,9 +9365,10 @@ async function gatewayDaemonCommand(args: string[]): Promise<void> {
       return;
     }
     await mkdir(dirname(pidPath), { recursive: true, mode: 0o700 });
+    await ensureDefaultConfig(process.cwd());
     const gateway = await loadGatewayConfig();
     const port = readNumberFlag(args, "--port") ?? gateway.port ?? DEFAULT_GATEWAY_PORT;
-    const childArgs = [process.argv[1], "gateway", "start", "--port", String(port)];
+    const childArgs = [...process.execArgv, process.argv[1], "gateway", "start", "--port", String(port)];
     if (args.includes("--with-telegram-poll")) childArgs.push("--with-telegram-poll");
     if (args.includes("--with-slack-socket")) childArgs.push("--with-slack-socket");
     const out = openSync(logPath, "a", 0o600);
@@ -9161,9 +9378,18 @@ async function gatewayDaemonCommand(args: string[]): Promise<void> {
       stdio: ["ignore", out, out],
       env: process.env,
     });
+    closeSync(out);
+    const pid = child.pid;
+    if (!pid) throw new Error(`Gateway daemon did not start. See ${logPath}`);
+    const healthy = await waitForGatewayDaemonHealth(port, pid);
+    if (!healthy) {
+      if (processIsAlive(pid)) process.kill(pid, "SIGTERM");
+      await unlink(pidPath).catch(() => undefined);
+      throw new Error(`Gateway daemon failed its startup health check. See ${logPath}`);
+    }
     child.unref();
-    await writeFile(pidPath, `${child.pid}\n`, { encoding: "utf8", mode: 0o600 });
-    console.log(`gateway_daemon=started pid=${child.pid}`);
+    await writeFile(pidPath, `${pid}\n`, { encoding: "utf8", mode: 0o600 });
+    console.log(`gateway_daemon=started pid=${pid} health=verified`);
     console.log(`port=${port}`);
     console.log(`pid_file=${pidPath}`);
     console.log(`log_file=${logPath}`);
@@ -9171,6 +9397,28 @@ async function gatewayDaemonCommand(args: string[]): Promise<void> {
     return;
   }
   throw new Error("Usage: muster gateway daemon start|stop|status|restart [--with-telegram-poll] [--with-slack-socket] [--port 7460]");
+}
+
+async function waitForGatewayDaemonHealth(port: number, pid: number, timeoutMs = 8000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  let consecutiveHealthyChecks = 0;
+  while (Date.now() < deadline) {
+    if (!processIsAlive(pid)) return false;
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/v1/health`, { signal: AbortSignal.timeout(750) });
+      const body = await response.json().catch(() => undefined) as { ok?: boolean; service?: string } | undefined;
+      if (response.ok && body?.ok === true && body.service === "muster-gateway") {
+        consecutiveHealthyChecks += 1;
+        if (consecutiveHealthyChecks >= 2 && processIsAlive(pid)) return true;
+      } else {
+        consecutiveHealthyChecks = 0;
+      }
+    } catch {
+      consecutiveHealthyChecks = 0;
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 125));
+  }
+  return false;
 }
 
 async function gatewayWebhookCommand(args: string[]): Promise<void> {
@@ -9191,7 +9439,7 @@ async function gatewayWebhookCommand(args: string[]): Promise<void> {
       url,
       secret_token: secretToken,
       drop_pending_updates: false,
-      allowed_updates: ["message"],
+      allowed_updates: ["message", "callback_query"],
     }),
     signal: AbortSignal.timeout(12_000),
   });
@@ -9353,8 +9601,13 @@ async function runChannelReady(spec: ChannelSetupSpec, args: readonly string[]):
   const publicUrl = readFlag([...args], "--public-url")?.replace(/\/$/, "");
   const noStart = args.includes("--no-start");
   const setWebhook = args.includes("--set-webhook");
+  await ensureDefaultConfig(process.cwd());
   const config = await loadOrInitGatewayConfig();
-  const updated = applyChannelSetup(spec.id, config, args);
+  const channelConfig = applyChannelSetup(spec.id, config, args);
+  const requestedPort = readNumberFlag([...args], "--port");
+  const updated = requestedPort && requestedPort !== channelConfig.port
+    ? { ...channelConfig, port: requestedPort }
+    : channelConfig;
   if (updated !== config) {
     const path = await saveGatewayConfig(updated);
     console.log(`gateway_config=${path}`);
@@ -9362,7 +9615,7 @@ async function runChannelReady(spec: ChannelSetupSpec, args: readonly string[]):
   const missing = channelMissingSetup(spec.id, updated);
   const ready = missing.length === 0;
   console.log(`channel_ready=${spec.id} status=${ready ? "ready" : "needs_setup"}`);
-  console.log(`single_command=true`);
+  console.log(`single_command=${noStart ? "false reason=no-start" : "true"}`);
   if (missing.length) console.log(`missing_setup=${missing.join(",")}`);
   printChannelSetup(spec, updated, args, { friendly: true });
   await printChannelDoctor(spec, updated, { live: args.includes("--live") });
@@ -9428,7 +9681,7 @@ function printChannelOperatorPlan(spec: ChannelSetupSpec, config: GatewayConfig,
   console.log(`operator_contract=inbound_normalize -> scoped_memory_recall -> policy_gate -> draft_or_reply -> token_ledger`);
   console.log(`local_simulation=muster channels simulate ${spec.id} --message "hello"`);
   console.log(`setup_command=muster channels ready ${spec.id}${spec.id === "slack" && requestedSlackMode ? ` --mode ${requestedSlackMode}` : ""}${publicUrl ? ` --public-url ${publicUrl}` : ""}`);
-  console.log(`doctor_command=muster channels doctor ${spec.id}${spec.id === "telegram" ? " --live" : ""}`);
+  console.log(`doctor_command=muster channels doctor ${spec.id}${channelHasLiveDoctor(spec.id) ? " --live" : ""}`);
   const socketFlag = spec.id === "slack" && slackMode(config, requestedSlackMode) === "socket" ? " --with-slack-socket" : "";
   console.log(`start_command=muster gateway daemon start${socketFlag} --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
   if (spec.id === "telegram" && publicUrl) console.log(`webhook_command=muster gateway webhook telegram --public-url ${publicUrl}`);
@@ -9620,7 +9873,7 @@ function printChannelDoctorSummary(config: GatewayConfig, options: { readonly in
     const next = !options.initialized && row.spec.id === "web"
       ? "muster gateway init"
       : row.ready
-      ? row.warnings.length ? `muster channels doctor ${row.spec.id}${row.spec.id === "telegram" || row.spec.id === "slack" ? " --live" : ""}` : `muster gateway daemon start${row.spec.id === "slack" && slackMode(config) === "socket" ? " --with-slack-socket" : ""} --port ${config.port ?? DEFAULT_GATEWAY_PORT}`
+      ? row.warnings.length ? `muster channels doctor ${row.spec.id}${channelHasLiveDoctor(row.spec.id) ? " --live" : ""}` : `muster gateway daemon start${row.spec.id === "slack" && slackMode(config) === "socket" ? " --with-slack-socket" : ""} --port ${config.port ?? DEFAULT_GATEWAY_PORT}`
       : `muster channels ready ${row.spec.id}`;
     console.log(`  channel=${row.spec.id} status=${channelStatus} missing=${missing} warnings=${warnings} auth=${channelAuthModeForConfig(row.spec.id, config)} reply=${channelReplyMode(row.spec.id, config)} next="${next}"`);
   }
@@ -9629,7 +9882,7 @@ function printChannelDoctorSummary(config: GatewayConfig, options: { readonly in
   const firstWarning = rows.find((row) => row.ready && row.warnings.length);
   if (!options.initialized) console.log("next=muster gateway init");
   else if (firstBlocked) console.log(`next=muster channels ready ${firstBlocked.spec.id}`);
-  else if (firstWarning) console.log(`next=muster channels doctor ${firstWarning.spec.id}${firstWarning.spec.id === "telegram" || firstWarning.spec.id === "slack" ? " --live" : ""}`);
+  else if (firstWarning) console.log(`next=muster channels doctor ${firstWarning.spec.id}${channelHasLiveDoctor(firstWarning.spec.id) ? " --live" : ""}`);
   else console.log(`next=muster gateway daemon start --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
 }
 
@@ -9646,7 +9899,14 @@ function channelDoctorWarnings(channel: ChannelId, config: GatewayConfig): strin
       config.slack?.botToken ? "slack.files_write_live_check_available" : "",
     ].filter(Boolean);
   }
+  if (channel === "gchat" && config.gchat?.verification?.audience) {
+    return ["gchat.live_unsigned_rejection_check_available"];
+  }
   return [];
+}
+
+function channelHasLiveDoctor(channel: ChannelId): boolean {
+  return channel === "telegram" || channel === "slack" || channel === "gchat";
 }
 
 async function printChannelDoctor(
@@ -9696,8 +9956,21 @@ async function printChannelDoctor(
     });
     if (options.live) checks.push(...await slackLiveDoctor(config.slack?.botToken, mode === "socket" ? config.slack?.appToken : undefined));
     else checks.push({ name: "slack_live", status: "warning", detail: "not run; add --live to call auth.test and Socket Mode connection checks without printing tokens" });
+  } else if (spec.id === "gchat") {
+    const audience = config.gchat?.verification?.audience;
+    checks.push({
+      name: "gchat_auth",
+      status: audience ? "passed" : config.gchat?.verificationToken ? "warning" : "needs_setup",
+      detail: audience
+        ? "Google-signed bearer verification is configured"
+        : config.gchat?.verificationToken
+          ? "Legacy verification token is configured; migrate to a Google-signed bearer audience"
+          : "set the exact HTTPS endpoint or Cloud project number with --audience",
+    });
+    if (options.live) checks.push(await gchatLiveDoctor(audience));
+    else if (audience) checks.push({ name: "gchat_endpoint", status: "warning", detail: "not run; add --live to verify the endpoint rejects unsigned requests" });
   } else if (options.live) {
-    checks.push({ name: "live_check", status: "warning", detail: "live doctor is currently implemented for telegram only" });
+    checks.push({ name: "live_check", status: "warning", detail: `no safe live doctor is implemented for ${spec.id}; local configuration checks only` });
   }
   const failed = checks.filter((check) => check.status === "needs_setup").length;
   const warnings = checks.filter((check) => check.status === "warning").length;
@@ -9712,6 +9985,8 @@ async function printChannelDoctor(
       ? "muster channels doctor telegram --live"
     : warnings && spec.id === "slack" && !options.live
         ? "muster channels doctor slack --live"
+    : warnings && spec.id === "gchat" && !options.live
+        ? "muster channels doctor gchat --live"
       : `muster gateway daemon start${spec.id === "slack" && slackMode(config) === "socket" ? " --with-slack-socket" : ""} --port ${config.port ?? DEFAULT_GATEWAY_PORT}`;
   console.log(`next=${next}`);
 }
@@ -9767,6 +10042,39 @@ async function slackLiveDoctor(botToken: string | undefined, appToken: string | 
   }
 }
 
+async function gchatLiveDoctor(audience: string | undefined): Promise<{ name: string; status: "passed" | "needs_setup" | "warning"; detail: string }> {
+  if (!audience) return { name: "gchat_endpoint", status: "needs_setup", detail: "Google Chat bearer audience is not configured" };
+  if (/^[1-9]\d{5,29}$/.test(audience)) {
+    return {
+      name: "gchat_endpoint",
+      status: "warning",
+      detail: "Cloud project audience is valid, but endpoint reachability cannot be inferred; use the exact HTTPS /v1/adapters/gchat URL as the audience for a live rejection probe",
+    };
+  }
+  try {
+    const response = await fetch(audience, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        type: "APP_HOME",
+        eventTime: new Date().toISOString(),
+        user: { name: "users/muster-doctor", type: "HUMAN" },
+        space: { name: "spaces/muster-doctor" },
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (response.status === 401) {
+      return { name: "gchat_endpoint", status: "passed", detail: "endpoint is reachable and rejected an unsigned request" };
+    }
+    if (response.ok) {
+      return { name: "gchat_endpoint", status: "warning", detail: `endpoint returned HTTP ${response.status} to an unsigned request; verify Google bearer authentication before enabling the app` };
+    }
+    return { name: "gchat_endpoint", status: "warning", detail: `endpoint reached but returned HTTP ${response.status}; expected HTTP 401 for the unsigned probe` };
+  } catch (error) {
+    return { name: "gchat_endpoint", status: "warning", detail: `endpoint probe failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
 async function slackFileUploadScopeDoctor(botToken: string, oauthScopesHeader: string | null): Promise<{ name: string; status: "passed" | "needs_setup" | "warning"; detail: string }> {
   const headerScopes = oauthScopesHeader
     ?.split(",")
@@ -9815,7 +10123,7 @@ function printChannelSetup(spec: ChannelSetupSpec, config: GatewayConfig, args: 
   if (spec.id === "telegram" && !publicUrl) console.log(`start=muster gateway daemon start --with-telegram-poll --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
   else if (spec.id === "slack" && slackMode(config) === "socket") console.log(`start=muster gateway daemon start --with-slack-socket --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
   else if (spec.id !== "web") console.log(`start=muster gateway daemon start --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
-  if (options.friendly) console.log(`verify=muster channels doctor ${spec.id}${spec.id === "telegram" || spec.id === "slack" ? " --live" : ""}`);
+  if (options.friendly) console.log(`verify=muster channels doctor ${spec.id}${channelHasLiveDoctor(spec.id) ? " --live" : ""}`);
 }
 
 async function loadOrInitGatewayConfig(): Promise<GatewayConfig> {
@@ -9825,6 +10133,21 @@ async function loadOrInitGatewayConfig(): Promise<GatewayConfig> {
 
 function emptyGatewayConfig(): GatewayConfig {
   return { port: DEFAULT_GATEWAY_PORT } as GatewayConfig;
+}
+
+function gatewayCapabilityEnvironment(gateway: GatewayConfig): Record<string, string | undefined> {
+  return {
+    ...process.env,
+    ...(gateway.frappe?.businessApis?.length
+      ? { FRAPPE_BUSINESS_API_CATALOG: JSON.stringify(gateway.frappe.businessApis) }
+      : {}),
+    ...(gateway.frappe?.readModelPath?.trim()
+      ? { FRAPPE_READ_MODEL_PATH: gateway.frappe.readModelPath.trim() }
+      : {}),
+    ...(gateway.frappe?.approvalSigningKey?.trim()
+      ? { FRAPPE_APPROVAL_SIGNING_KEY: gateway.frappe.approvalSigningKey.trim() }
+      : {}),
+  };
 }
 
 function applyChannelSetup(channel: ChannelId, config: GatewayConfig, args: readonly string[]): GatewayConfig {
@@ -10161,7 +10484,7 @@ async function integrationsCommand(args: string[]): Promise<void> {
   console.log("");
   console.log("For non-technical setup, start with a channel, then add capabilities:");
   console.log("1. muster integrations");
-  console.log("2. muster channels ready gchat --public-url https://your-domain.example");
+  console.log("2. muster channels ready gchat --audience https://your-domain.example/v1/adapters/gchat --no-start");
   console.log("3. muster plugins enable web-search");
   console.log("4. muster mcp install parallel-search");
 }
@@ -10189,11 +10512,17 @@ async function runChannelIntegrationAction(action: "setup" | "verify" | "enable"
   console.log(`integration_action=${action} target=${spec.id} kind=channel`);
   if (action === "setup") {
     await channelsCommand(["setup", spec.id]);
+    const gateway = await loadGatewayConfig().catch(() => undefined);
+    if (!gateway || !channelReady(spec.id, gateway)) {
+      console.log(`setup_required=${channelReadySetupCommand(spec.id)}`);
+      console.log(`integration_next=${channelReadySetupCommand(spec.id)}`);
+      return;
+    }
     console.log(`integration_next=muster integrations verify ${spec.id}`);
     return;
   }
   if (action === "verify") {
-    await channelsCommand(["doctor", spec.id, ...(spec.id === "telegram" ? ["--live"] : [])]);
+    await channelsCommand(["doctor", spec.id, ...(channelHasLiveDoctor(spec.id) ? ["--live"] : [])]);
     const gateway = await loadGatewayConfig().catch(() => undefined);
     console.log(`integration_next=muster integrations ${gateway && channelReady(spec.id, gateway) ? "sample" : "setup"} ${spec.id}`);
     return;
@@ -10319,13 +10648,23 @@ async function printChannelIntegrationWorkflow(spec: ChannelSetupSpec): Promise<
   console.log(`impact=turns ${spec.label} messages into governed Muster runs with scoped memory, policy gates, token ledger, and draft/send controls`);
   console.log(`auth=${channelAuthModeForConfig(spec.id, gateway)} missing=${missing.length ? missing.join(",") : "-"}`);
   console.log(`setup=muster channels ready ${spec.id}`);
-  console.log(`verify=muster channels doctor ${spec.id}${spec.id === "telegram" ? " --live" : ""}`);
+  console.log(`verify=muster channels doctor ${spec.id}${channelHasLiveDoctor(spec.id) ? " --live" : ""}`);
   console.log(`enable=${ready ? `muster gateway daemon start --port ${gateway.port ?? DEFAULT_GATEWAY_PORT}` : `muster channels ready ${spec.id}`}`);
   console.log(`sample=muster channels simulate ${spec.id} --message "hello from ${spec.id}"`);
   console.log(`failure_behavior=${ready ? "doctor reports warnings without printing secrets" : "blocked until required setup is present; local simulation still works"}`);
   for (const url of spec.setupUrls) console.log(`setup_url=${url}`);
   console.log("steps=pick -> explain impact -> authenticate/setup -> verify -> enable gateway -> run local sample");
   console.log("guardrails=no_secret_echo, scoped_memory, token_ledger, approval_required_for_mutations");
+}
+
+function channelReadySetupCommand(channel: ChannelId): string {
+  if (channel === "telegram") return "muster channels ready telegram --name <bot-name> --bot-token <bot-token>";
+  if (channel === "slack") return "muster channels ready slack --bot-token <xoxb-token> --app-token <xapp-token>";
+  if (channel === "gchat") return "muster channels ready gchat --audience https://your-domain.example/v1/adapters/gchat";
+  if (channel === "discord") return "muster channels ready discord --bot-token <bot-token> --public-key <application-public-key>";
+  if (channel === "whatsapp") return "muster channels ready whatsapp --access-token <access-token> --verify-token <verify-token> --phone-number-id <phone-number-id> --app-secret <app-secret>";
+  if (channel === "teams") return "muster channels ready teams --hmac-secret <hmac-secret>";
+  return "muster channels ready web";
 }
 
 async function printPluginIntegrationWorkflow(plugin: BuiltinPluginCatalogEntry): Promise<void> {

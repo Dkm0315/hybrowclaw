@@ -1,0 +1,16 @@
+{
+  "doctype": "Page",
+  "name": "muster-evidence",
+  "page_name": "muster-evidence",
+  "title": "Muster Evidence Registry",
+  "module": "Muster",
+  "standard": "Yes",
+  "roles": [
+    {"role":"Muster Administrator"},
+    {"role":"Muster Automation Manager"},
+    {"role":"Muster Auditor"},
+    {"role":"Muster Operator"},
+    {"role":"Muster Approver"},
+    {"role":"Muster Viewer"}
+  ]
+}

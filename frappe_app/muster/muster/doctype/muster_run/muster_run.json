@@ -1,0 +1,157 @@
+{
+    "doctype": "DocType",
+    "name": "Muster Run",
+    "module": "Muster",
+    "autoname": "hash",
+    "track_changes": 1,
+    "field_order": [
+        "run_tab",
+        "external_run_id",
+        "mission",
+        "work_unit",
+        "attempt",
+        "status",
+        "execution_user",
+        "job_id",
+        "gateway_poll_path",
+        "timing_section",
+        "started_at",
+        "heartbeat_at",
+        "completed_at",
+        "cursor",
+        "usage_json",
+        "result_json",
+        "error_summary"
+    ],
+    "fields": [
+        {
+            "fieldname": "run_tab",
+            "fieldtype": "Tab Break",
+            "label": "Run"
+        },
+        {
+            "fieldname": "external_run_id",
+            "fieldtype": "Data",
+            "label": "External Run ID",
+            "unique": 1,
+            "in_list_view": 1
+        },
+        {
+            "fieldname": "mission",
+            "fieldtype": "Link",
+            "label": "Mission",
+            "options": "Muster Mission",
+            "reqd": 1,
+            "in_list_view": 1
+        },
+        {
+            "fieldname": "work_unit",
+            "fieldtype": "Link",
+            "label": "Work Unit",
+            "options": "Muster Work Unit"
+        },
+        {
+            "fieldname": "attempt",
+            "fieldtype": "Int",
+            "label": "Attempt",
+            "default": "1",
+            "reqd": 1
+        },
+        {
+            "fieldname": "status",
+            "fieldtype": "Select",
+            "label": "Status",
+            "options": "Queued\nRunning\nWaiting\nSucceeded\nFailed\nCancelled\nNeeds Intervention",
+            "reqd": 1,
+            "in_list_view": 1
+        },
+        {
+            "fieldname": "execution_user",
+            "fieldtype": "Link",
+            "label": "Execution User",
+            "options": "User",
+            "reqd": 1
+        },
+        {
+            "fieldname": "job_id",
+            "fieldtype": "Data",
+            "label": "Background Job"
+        },
+        {
+            "fieldname": "gateway_poll_path",
+            "fieldtype": "Data",
+            "label": "Gateway Poll Path",
+            "read_only": 1,
+            "hidden": 1
+        },
+        {
+            "fieldname": "timing_section",
+            "fieldtype": "Section Break",
+            "label": "Timing and Result"
+        },
+        {
+            "fieldname": "started_at",
+            "fieldtype": "Datetime",
+            "label": "Started At"
+        },
+        {
+            "fieldname": "heartbeat_at",
+            "fieldtype": "Datetime",
+            "label": "Heartbeat At"
+        },
+        {
+            "fieldname": "completed_at",
+            "fieldtype": "Datetime",
+            "label": "Completed At"
+        },
+        {
+            "fieldname": "cursor",
+            "fieldtype": "Int",
+            "label": "Event Cursor",
+            "default": "0"
+        },
+        {
+            "fieldname": "usage_json",
+            "fieldtype": "Code",
+            "label": "Usage",
+            "options": "JSON",
+            "read_only": 1
+        },
+        {
+            "fieldname": "result_json",
+            "fieldtype": "Code",
+            "label": "Redacted Result",
+            "options": "JSON",
+            "read_only": 1
+        },
+        {
+            "fieldname": "error_summary",
+            "fieldtype": "Long Text",
+            "label": "Error Summary",
+            "read_only": 1
+        }
+    ],
+    "permissions": [
+        {
+            "role": "Muster Administrator",
+            "read": 1
+        },
+        {
+            "role": "Muster Automation Manager",
+            "read": 1
+        },
+        {
+            "role": "Muster Operator",
+            "read": 1
+        },
+        {
+            "role": "Muster Auditor",
+            "read": 1,
+            "export": 1
+        },
+        {
+            "role": "Muster Viewer",
+            "read": 1
+        }
+    ]
+}

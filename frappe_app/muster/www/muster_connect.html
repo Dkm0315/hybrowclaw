@@ -1,0 +1,62 @@
+{% extends "templates/web.html" %}
+
+{% block title %}Muster connection{% endblock %}
+
+{% block page_content %}
+<main class="container py-5" style="max-width: 680px">
+  <div class="card shadow-sm"><div class="card-body p-5">
+    {% if mode == "consent" and requires_login %}
+      <h1 class="h3">Connect this site to Muster</h1>
+      <p>Sign in as Administrator or a System Manager to authorize this connection.</p>
+      <a class="btn btn-primary" href="{{ login_url }}">Sign in and continue</a>
+    {% elif mode == "consent" and consent_ready %}
+      <h1 class="h3">Connect this site to Muster</h1>
+      <p>Muster will create a tenant binding for <strong>{{ site_url }}</strong> and verify both ends before enabling AI work.</p>
+      <dl class="row small">
+        <dt class="col-sm-4">Frappe site</dt><dd class="col-sm-8">{{ site_url }}</dd>
+        <dt class="col-sm-4">Muster gateway</dt><dd class="col-sm-8">{{ gateway_url }}</dd>
+      </dl>
+      <p class="text-muted">No API secret is displayed or stored by this browser flow.</p>
+      <button
+        class="btn btn-primary"
+        id="muster-authorize"
+        data-gateway-url="{{ gateway_url }}"
+        data-site-url="{{ site_url }}"
+      >Authorize and connect</button>
+      <p class="text-danger mt-3 d-none" id="muster-connect-error" role="alert"></p>
+      <script>
+        document.getElementById("muster-authorize").addEventListener("click", async function () {
+          const button = this;
+          const error = document.getElementById("muster-connect-error");
+          button.disabled = true;
+          error.classList.add("d-none");
+          try {
+            const result = await frappe.call({
+              method: "muster.api.onboarding.begin",
+              args: { gateway_url: button.dataset.gatewayUrl, site_url: button.dataset.siteUrl },
+              freeze: true,
+              freeze_message: "Preparing secure connection…"
+            });
+            window.location.assign(result.message.authorization_url);
+          } catch (exception) {
+            error.textContent = "Muster could not start the secure connection. Check both HTTPS origins and try again.";
+            error.classList.remove("d-none");
+            button.disabled = false;
+          }
+        });
+      </script>
+    {% elif mode == "consent" %}
+      <h1 class="h3">Connection cannot start</h1>
+      <p>{{ error }}</p>
+      <a class="btn btn-primary" href="/app/muster-settings">Open Muster Settings</a>
+    {% elif success %}
+      <h1 class="h3">Muster is connected</h1>
+      <p>The gateway and this site completed reciprocal trust verification. You can now give Muster a goal from Mission Control.</p>
+    {% else %}
+      <h1 class="h3">Connection not created</h1>
+      <p>{{ error }}</p>
+    {% endif %}
+    <a class="btn btn-primary" href="/app/muster-settings">Return to Muster Settings</a>
+  </div></div>
+</main>
+{% endblock %}

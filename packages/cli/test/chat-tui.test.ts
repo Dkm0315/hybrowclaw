@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createMusterAutocompleteProvider, createMusterChatEditor, createMusterChatHarness, isBareCompletionTrigger, isClearComposerKey, renderHeaderWindow, renderMusterComposer, renderTranscriptWindow } from "../src/chat-tui.js";
+import { createMusterAutocompleteProvider, createMusterChatEditor, createMusterChatHarness, formatWorkingIndicator, isBareCompletionTrigger, isClearComposerKey, renderHeaderWindow, renderMusterComposer, renderTranscriptWindow } from "../src/chat-tui.js";
 
 const commands = [
   { name: "help", usage: "/help", description: "show full chat help", aliases: ["?"] },
@@ -14,6 +14,13 @@ const commands = [
   { name: "tools", usage: "/tools [toolset]", description: "list built-in toolsets and tools" },
   { name: "integrations", usage: "/integrations [id]", description: "guided channel/plugin/MCP setup workflow", aliases: ["integration"] },
 ] as const;
+
+test("ordinary working status stays alive without exposing elapsed time", () => {
+  const frames = Array.from({ length: 8 }, (_, index) => formatWorkingIndicator(undefined, index));
+  assert.ok(frames.every((frame) => frame.includes("working")));
+  assert.equal(new Set(frames).size, 4, "the activity indicator still animates");
+  assert.doesNotMatch(frames.join(" "), /\b\d+(?:\.\d+)?(?:ms|s)\b|latency|p50|p95|cache/i);
+});
 
 test("muster TUI completion provider filters slash commands and applies selected command", async () => {
   const provider = createMusterAutocompleteProvider({

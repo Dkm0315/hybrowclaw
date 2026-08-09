@@ -1,0 +1,65 @@
+{
+  "schema_version": "1.0",
+  "scenario_id": "CODE-LIFECYCLE-ORM-JINJA-01",
+  "request_id": "track3-live-lifecycle-orm-jinja-v5",
+  "registered_app": "field_ops_demo",
+  "source_file": "frappeverse_coding_ladder_prd.md",
+  "source_citations": ["CL002", "CL003", "CL006", "CL007"],
+  "objective": "In the registered Field Ops Demo app, add a fixed Service Visit on_update hook that reads the permitted Customer through Frappe ORM, idempotently writes a disposable customer snapshot marker through frappe.db.set_value, and installs a translated and escaped Jinja Print Format fixture. Include focused Document API, idempotency, escaping, reread and rollback tests.",
+  "disposable": {
+    "doctype": "Service Visit",
+    "customer_prefix": "Muster Demo Hook Customer",
+    "visit_prefix": "Muster Demo Hook Visit",
+    "note_marker_prefix": "[Muster Demo Customer Snapshot]",
+    "print_format": "Muster Demo Service Visit Brief"
+  },
+  "doc_event": {
+    "doctype": "Service Visit",
+    "event": "on_update",
+    "handler": "field_ops_demo.automation.service_visit.update_customer_snapshot"
+  },
+  "orm_contract": {
+    "read": "frappe.get_list with permission filtering, bound filters and a one-row limit",
+    "write": "frappe.db.set_value on the current Service Visit name with update_modified disabled",
+    "idempotency": "replace the single fixed marker line; never append a duplicate",
+    "no_raw_sql": true
+  },
+  "jinja_contract": {
+    "surface": "Print Format",
+    "doctype": "Service Visit",
+    "translation": "_()",
+    "escaping": "Jinja | e filter",
+    "unsafe_globals": false
+  },
+  "allowed_paths": [
+    "field_ops_demo/hooks.py",
+    "field_ops_demo/automation/__init__.py",
+    "field_ops_demo/automation/service_visit.py",
+    "field_ops_demo/fixtures/muster_demo_service_visit_brief.json",
+    "field_ops_demo/tests/test_service_visit_automation.py"
+  ],
+  "evidence": [
+    "registered source revision and status hash",
+    "private reviewed patch and SHA-256",
+    "private test manifest",
+    "private rollback-contract receipt",
+    "independent Git diff after apply",
+    "Document API reread after hook write",
+    "rendered escaped Jinja output",
+    "exact reverse patch restores the registered revision"
+  ],
+  "negative_probes": [
+    "a second on_update does not duplicate the marker",
+    "an unavailable Customer produces no cross-record lookup result",
+    "HTML in notes is escaped by the rendered template",
+    "post-apply source drift blocks rollback",
+    "migrate, build and restart remain outside this proposal"
+  ],
+  "rollback": {
+    "request": "muster.api.development.request_rollback",
+    "review": "muster.api.development.review_rollback",
+    "execute": "muster.api.development.rollback",
+    "guard": "registered revision plus exact applied patch hash",
+    "expected_result": "all five reviewed paths return to the pre-apply Git state"
+  }
+}

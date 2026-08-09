@@ -42,7 +42,7 @@
           "type": "array",
           "uniqueItems": true,
           "items": {
-            "enum": ["app", "module", "doctype", "field", "custom_field", "property_setter", "workflow", "report", "print_format", "client_script", "server_script", "funnel", "flow_config", "dynamic_assignment"]
+            "enum": ["app", "module", "doctype", "field", "custom_field", "property_setter", "workflow", "report", "print_format", "client_script", "server_script", "funnel", "flow_config", "dynamic_assignment", "permission_rule", "workspace", "notification"]
           }
         },
         "additionalDoctypes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },

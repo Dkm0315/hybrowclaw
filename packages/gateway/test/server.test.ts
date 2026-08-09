@@ -7,8 +7,13 @@ import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { clearCodexAppServerSessions, defaultConfig, loadSessionHandle, profileWorkspaceDir, promoteSkill, runCodexAppServer, runFlow, saveSessionHandle, writeCandidateSkill } from "@musterhq/core";
 import type { EvolveReport, MusterConfig } from "@musterhq/core";
-import { approvePairing, initGatewayConfig, pollTelegram, SqliteAsyncMessageRunStore, startGatewayServer } from "../src/index.js";
+import { approvePairing, FrappeOAuthCoordinator, initGatewayConfig, pollTelegram, requestPairing, SqliteAsyncMessageRunStore, startGatewayServer, startTelegramTyping } from "../src/index.js";
 import type { GatewayConfig, PairingChallenge, SurfaceReply } from "../src/index.js";
+
+async function waitForCondition(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) await delay(10);
+}
 
 function stubConfig(baseUrl: string): MusterConfig {
   const config = defaultConfig();
@@ -69,6 +74,23 @@ async function startTestGateway(cwd: string, llmUrl: string): Promise<{ url: str
   const init = await initGatewayConfig(cwd);
   const running = await startGatewayServer({ config: stubConfig(llmUrl), gateway: init.config, cwd }, 0);
   return { url: `http://127.0.0.1:${running.port}`, gateway: init.config, close: running.close };
+}
+
+async function waitForAsyncRun(
+  url: string,
+  token: string,
+  timeoutMs = 5_000,
+): Promise<{ status: string; reply?: SurfaceReply; partialText?: string }> {
+  const deadline = Date.now() + timeoutMs;
+  let snapshot: { status: string; reply?: SurfaceReply; partialText?: string } = { status: "running" };
+  while ((snapshot.status === "queued" || snapshot.status === "running") && Date.now() < deadline) {
+    const response = await fetch(`${url}?waitMs=1000`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(response.status, 200);
+    snapshot = await response.json() as typeof snapshot;
+  }
+  return snapshot;
 }
 
 test("gateway health endpoint answers without auth", async () => {
@@ -197,11 +219,7 @@ test("async message runs acknowledge quickly, poll to completion, and reject con
     const conflictResponse = await send("/v1/messages/async", { ...message, text: "different work" }, { "idempotency-key": "frappe-run-1" });
     assert.equal(conflictResponse.status, 409);
 
-    const completedResponse = await fetch(`${gw.url}${accepted.pollUrl}?waitMs=1000`, {
-      headers: { authorization: `Bearer ${gw.gateway.token}` },
-    });
-    assert.equal(completedResponse.status, 200);
-    const completed = await completedResponse.json() as { status: string; reply?: SurfaceReply; partialText?: string };
+    const completed = await waitForAsyncRun(`${gw.url}${accepted.pollUrl}`, gw.gateway.token);
     assert.equal(completed.status, "completed");
     assert.equal(completed.reply?.text, "slow governed reply");
     assert.equal(completed.partialText, "slow governed reply");
@@ -241,9 +259,7 @@ test("async streaming coalesces durable preview writes without losing response t
       headers: { "content-type": "application/json", authorization: `Bearer ${init.config.token}` },
       body: JSON.stringify(message),
     })).json() as { pollUrl: string };
-    const completed = await (await fetch(`${url}${accepted.pollUrl}?waitMs=2000`, {
-      headers: { authorization: `Bearer ${init.config.token}` },
-    })).json() as { status: string; partialText?: string; reply?: SurfaceReply };
+    const completed = await waitForAsyncRun(`${url}${accepted.pollUrl}`, init.config.token);
 
     assert.equal(completed.status, "completed");
     assert.equal(completed.partialText, responseText);
@@ -291,10 +307,10 @@ test("async runs serialize provider work within one conversation", async () => {
     ]);
     const first = await firstResponse.json() as { pollUrl: string };
     const second = await secondResponse.json() as { pollUrl: string };
-    const poll = (pollUrl: string) => fetch(`${gw.url}${pollUrl}?waitMs=2000`, {
-      headers: { authorization: `Bearer ${gw.gateway.token}` },
-    }).then((response) => response.json()) as Promise<{ status: string }>;
-    const [firstDone, secondDone] = await Promise.all([poll(first.pollUrl), poll(second.pollUrl)]);
+    const [firstDone, secondDone] = await Promise.all([
+      waitForAsyncRun(`${gw.url}${first.pollUrl}`, gw.gateway.token),
+      waitForAsyncRun(`${gw.url}${second.pollUrl}`, gw.gateway.token),
+    ]);
 
     assert.equal(firstDone.status, "completed");
     assert.equal(secondDone.status, "completed");
@@ -333,10 +349,7 @@ test("completed async runs expose verified artifacts through an authenticated do
       body: JSON.stringify(message),
     });
     const accepted = await acceptedResponse.json() as { runId: string; pollUrl: string };
-    const completedResponse = await fetch(`${gw.url}${accepted.pollUrl}?waitMs=1000`, {
-      headers: { authorization: `Bearer ${gw.gateway.token}` },
-    });
-    const completed = await completedResponse.json() as { status: string; reply?: SurfaceReply; partialText?: string };
+    const completed = await waitForAsyncRun(`${gw.url}${accepted.pollUrl}`, gw.gateway.token);
     assert.equal(completed.status, "completed");
     assert.equal(completed.reply?.artifacts?.[0]?.name, "evidence.txt");
     assert.equal(completed.reply?.artifacts?.[0]?.path, `/v1/messages/runs/${accepted.runId}/artifacts/0`);
@@ -380,14 +393,22 @@ test("GET /v1/catalog exposes universal commands and runtimes without a model ca
     assert.equal(response.status, 200);
     const payload = await response.json() as {
       commands: Array<{ name: string; source: string }>;
-      personas: Record<string, unknown>;
+      personas: Record<string, { label: string; description: string }>;
+      skills: Array<{ name: string; label: string; description: string }>;
+      mcp_servers: Array<{ name: string; label: string; description: string }>;
       source: string;
     };
     const names = new Set(payload.commands.map((command) => command.name));
     for (const name of ["tokens", "usage", "limits", "evals", "plugins", "skills", "mcp", "memory"]) {
       assert.ok(names.has(name), `catalog includes /${name}`);
     }
+    assert.equal(names.has("pair"), false, "trusted Frappe catalog omits redundant /pair");
+    assert.equal(names.has("connect"), false, "trusted Frappe catalog omits redundant /connect");
     assert.ok(payload.personas.native);
+    assert.equal(payload.personas.native.description, "Configured Muster agent");
+    assert.doesNotMatch(payload.personas.native.description, /provider/i);
+    assert.ok(Array.isArray(payload.skills));
+    assert.ok(Array.isArray(payload.mcp_servers));
     assert.equal(payload.source, "muster_native_http");
     assert.equal(modelCalls, 0);
   } finally {
@@ -517,10 +538,11 @@ test("POST /v1/flows/:runId/approve resumes a gated flow run", async () => {
 
 test("pollTelegram clears the webhook, polls getUpdates, and replies via sendMessage", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-poll-"));
-  const calls = { deleteWebhook: 0, getUpdates: 0, sendMessage: [] as string[] };
+  const calls = { setMyCommands: [] as string[], deleteWebhook: 0, getUpdates: 0, sendMessage: [] as string[] };
   let getUpdatesCall = 0;
   const fetcher = (async (url: string | URL, init?: { body?: string }) => {
     const u = String(url);
+    if (u.includes("/setMyCommands")) { calls.setMyCommands.push(String(init?.body ?? "")); return { ok: true, json: async () => ({ ok: true }) } as Response; }
     if (u.includes("/deleteWebhook")) { calls.deleteWebhook += 1; return { ok: true, json: async () => ({}) } as Response; }
     if (u.includes("/getUpdates")) {
       calls.getUpdates += 1;
@@ -537,11 +559,80 @@ test("pollTelegram clears the webhook, polls getUpdates, and replies via sendMes
   const gateway: GatewayConfig = { token: "t", telegram: { botToken: "BOT" } };
   await pollTelegram({ config: defaultConfig(), gateway, cwd, fetcher, log: () => {}, maxIterations: 1 });
 
+  assert.equal(calls.setMyCommands.length, 1, "publishes the governed command catalog to Telegram");
+  assert.match(calls.setMyCommands[0], /\"command\":\"pair\"/);
+  assert.match(calls.setMyCommands[0], /\"command\":\"reports\"/);
   assert.equal(calls.deleteWebhook, 1, "clears any webhook before long-polling");
   assert.ok(calls.getUpdates >= 1, "polls getUpdates");
   assert.equal(calls.sendMessage.length, 1, "replies to the single update");
   // The unpaired sender gets a pairing challenge delivered to their chat (555).
   assert.match(calls.sendMessage[0], /555/);
+});
+
+test("Telegram typing reasserts after progress writes and stops cleanly", async () => {
+  const { setTimeout: delay } = await import("node:timers/promises");
+  let actionCalls = 0;
+  let release!: () => void;
+  const slowAction = new Promise<Response>((resolve) => { release = () => resolve({ ok: true, status: 200 } as Response); });
+  const typing = startTelegramTyping({
+    botToken: "BOT", chatId: "555", apiBase: "https://telegram.test", log: () => {},
+    fetcher: (async (url: string | URL) => {
+      assert.match(String(url), /sendChatAction/);
+      actionCalls += 1;
+      return slowAction;
+    }) as typeof fetch,
+  });
+  try {
+    typing.pulse();
+    assert.equal(actionCalls, 1, "does not overlap an in-flight Telegram action");
+    release();
+    await waitForCondition(() => actionCalls === 2);
+    assert.equal(actionCalls, 2, "reasserts typing after a progress write even when the prior action was still in flight");
+  } finally {
+    typing.stop();
+  }
+  const callsAtStop = actionCalls;
+  await delay(50);
+  assert.equal(actionCalls, callsAtStop, "does not send actions after completion");
+});
+
+test("pollTelegram passes the shared Frappe OAuth coordinator to /pair", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-poll-oauth-"));
+  const credentialFile = join(cwd, "frappe-oauth.json");
+  await writeFile(credentialFile, JSON.stringify({
+    site: "https://frappe.example.test",
+    clientId: "client-id",
+    clientSecret: "client-secret",
+    redirectUri: "https://gateway.example.test/frappe2/oauth/callback",
+  }), { mode: 0o600 });
+  await chmod(credentialFile, 0o600);
+  const pending = await requestPairing("telegram:bot", "777", cwd);
+  await approvePairing(pending.code, cwd);
+  const calls: string[] = [];
+  const fetcher = (async (url: string | URL, init?: { body?: string }) => {
+    const value = String(url);
+    if (value.includes("/getUpdates")) {
+      return { ok: true, json: async () => ({
+        ok: true,
+        result: [{ update_id: 20, message: { message_id: 1, text: "/pair", chat: { id: 555, type: "private" }, from: { id: 777 } } }],
+      }) } as Response;
+    }
+    if (value.includes("/sendMessage")) calls.push(String(init?.body ?? ""));
+    return { ok: true, json: async () => ({ ok: true }) } as Response;
+  }) as typeof fetch;
+  const connections = [{ id: "frappe", credentialFile }];
+  const gateway: GatewayConfig = {
+    token: "t",
+    telegram: { botToken: "BOT" },
+    frappe: { oauth: { defaultConnection: "frappe", connections } },
+  };
+  const frappeOAuth = new FrappeOAuthCoordinator({ connections, cwd, fetcher });
+
+  await pollTelegram({ config: defaultConfig(), gateway, frappeOAuth, cwd, fetcher, log: () => {}, maxIterations: 1 });
+
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /frappe\.integrations\.oauth2\.authorize/);
+  assert.doesNotMatch(calls[0], /connection unavailable/i);
 });
 
 test("a paired sender's /help is answered by the gateway dispatcher, never the model", async () => {

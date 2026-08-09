@@ -1,0 +1,31 @@
+{
+ "doctype": "DocType", "name": "Muster Settings", "module": "Muster", "issingle": 1,
+ "track_changes": 1, "field_order": ["connection_tab", "connection_help", "enabled", "binding_status", "gateway_url", "site_binding", "gateway_auth_section", "gateway_bearer_token", "run_event_hmac_secret", "oauth_section", "oauth_client_id", "oauth_client_secret", "webhook_secret", "limits_tab", "max_depth", "max_fan_out", "max_active_nodes", "max_retries", "channels_tab", "telegram_enabled", "telegram_bot_token", "diagnostics_section", "last_health_check", "last_health_status"],
+ "fields": [
+  {"fieldname":"connection_tab","fieldtype":"Tab Break","label":"Connection"},
+  {"fieldname":"connection_help","fieldtype":"HTML","label":"Connect Muster"},
+  {"fieldname":"enabled","fieldtype":"Check","label":"Enable Muster","default":"0"},
+  {"fieldname":"binding_status","fieldtype":"Select","label":"Binding Status","options":"Unconfigured\nPending\nTrusted\nSuspended\nRevoked","default":"Unconfigured","read_only":1},
+  {"fieldname":"gateway_url","fieldtype":"Data","label":"Gateway URL","options":"URL","description":"HTTPS origin of the trusted Muster gateway."},
+  {"fieldname":"site_binding","fieldtype":"Link","label":"Site Binding","options":"Muster Site Binding"},
+  {"fieldname":"gateway_auth_section","fieldtype":"Section Break","label":"Gateway Authentication"},
+  {"fieldname":"gateway_bearer_token","fieldtype":"Password","label":"Gateway Bearer Token","description":"Server-to-server credential. Never exposed in boot info or browser responses."},
+  {"fieldname":"run_event_hmac_secret","fieldtype":"Password","label":"Run Event HMAC Secret","description":"Optional dedicated authority proof secret. Defaults to the gateway bearer only when omitted."},
+  {"fieldname":"oauth_section","fieldtype":"Section Break","label":"OAuth Trust"},
+  {"fieldname":"oauth_client_id","fieldtype":"Data","label":"OAuth Client ID"},
+  {"fieldname":"oauth_client_secret","fieldtype":"Password","label":"OAuth Client Secret"},
+  {"fieldname":"webhook_secret","fieldtype":"Password","label":"Webhook Signing Secret"},
+  {"fieldname":"limits_tab","fieldtype":"Tab Break","label":"Limits"},
+  {"fieldname":"max_depth","fieldtype":"Int","label":"Maximum Delegation Depth","default":"3","reqd":1},
+  {"fieldname":"max_fan_out","fieldtype":"Int","label":"Maximum Fan-out","default":"8","reqd":1},
+  {"fieldname":"max_active_nodes","fieldtype":"Int","label":"Maximum Active Nodes","default":"32","reqd":1},
+  {"fieldname":"max_retries","fieldtype":"Int","label":"Maximum Retries","default":"3","reqd":1},
+  {"fieldname":"channels_tab","fieldtype":"Tab Break","label":"Channels"},
+  {"fieldname":"telegram_enabled","fieldtype":"Check","label":"Enable Telegram","default":"0"},
+  {"fieldname":"telegram_bot_token","fieldtype":"Password","label":"Telegram Bot Token","depends_on":"telegram_enabled"},
+  {"fieldname":"diagnostics_section","fieldtype":"Section Break","label":"Diagnostics"},
+  {"fieldname":"last_health_check","fieldtype":"Datetime","label":"Last Health Check","read_only":1},
+  {"fieldname":"last_health_status","fieldtype":"Small Text","label":"Last Health Status","read_only":1}
+ ],
+ "permissions": [{"role":"Muster Administrator","read":1,"write":1},{"role":"System Manager","read":1,"write":1}]
+}

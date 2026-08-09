@@ -12,7 +12,6 @@ import {
   frappe_identity_resolve,
   frappe_read_model_plan,
   frappe_user_identity_resolve,
-  frappe_records_create,
   frappe_semantic_data_resolve_lite,
   computeFrappePermissionEpoch,
   deriveFrappeHierarchyScope,
@@ -46,8 +45,15 @@ function frappeTool(name: string): FrappePackTool {
 }
 
 /** Stub Frappe site: logged-user endpoint, resource list, resource create, and a 403 PermissionError doctype. */
-function startFrappeStub(): Promise<{ url: string; requests: RecordedRequest[]; close: () => void }> {
+function startFrappeStub(options: { readonly rolesMethodStatus?: number; readonly rejectedQueryField?: string } = {}): Promise<{ url: string; requests: RecordedRequest[]; close: () => void }> {
   const requests: RecordedRequest[] = [];
+  let leaveApplication: Record<string, unknown> = {
+    name: "HR-LAP-0001",
+    doctype: "Leave Application",
+    employee: "EMP-0001",
+    leave_type: "Annual Leave",
+    modified: "2026-07-14 09:00:00.000000",
+  };
   return new Promise((resolvePromise) => {
     const server = createServer((request: IncomingMessage, response: ServerResponse) => {
       let body = "";
@@ -66,7 +72,21 @@ function startFrappeStub(): Promise<{ url: string; requests: RecordedRequest[]; 
           return respond(200, { message: "dhairya@hybrowlabs.com" });
         }
         if (url.startsWith("/api/method/frappe.core.doctype.user.user.get_roles")) {
+          if (options.rolesMethodStatus) return respond(options.rolesMethodStatus, { exc_type: "KeyError", exception: "KeyError: custom role helper" });
           return respond(200, { message: ["Employee", "HR User"] });
+        }
+        if (url.startsWith("/api/method/cn_leave_shift_managment.api.custom_get_leave_details")) {
+          return respond(200, { message: { leave_balance: [
+            { leave_type_name: "Earned Leave", available_leaves: 5.5, leaves_taken: 2, dont_show_in_frontend: 0 },
+            { leave_type_name: "Casual Leave", available_leaves: 3, leaves_taken: 1, dont_show_in_frontend: 0 },
+            { leave_type_name: "Internal Adjustment", available_leaves: 99, leaves_taken: 0, dont_show_in_frontend: 1 },
+          ] } });
+        }
+        if (url.startsWith("/api/method/test.application_error")) {
+          return respond(200, { message: { success: false, error: "Permission scope is unavailable" } });
+        }
+        if (url.startsWith("/api/resource/Has%20Role")) {
+          return respond(200, { data: [{ role: "Employee" }, { role: "HR User" }] });
         }
         if (url.startsWith("/api/resource/Employee")) {
           return respond(200, { data: [{
@@ -84,12 +104,20 @@ function startFrappeStub(): Promise<{ url: string; requests: RecordedRequest[]; 
         if (url.startsWith("/api/method/frappe.desk.desktop.get_workspace_sidebar_items")) {
           return respond(200, { message: { pages: [{ title: "HR" }, { title: "Payroll" }] } });
         }
+        if (url.startsWith("/api/method/frappe.desk.form.load.getdoctype")) {
+          const parsed = new URL(`http://frappe.test${url}`);
+          const doctype = parsed.searchParams.get("doctype");
+          const meta = doctype === "Salary Slip" ? salarySlipDoctype() : doctype === "Leave Application" ? leaveApplicationDoctype() : undefined;
+          return meta
+            ? respond(200, { docs: [meta] })
+            : respond(404, { exc_type: "DoesNotExistError", exception: `frappe.exceptions.DoesNotExistError: ${doctype ?? "unknown"}` });
+        }
         if (url.startsWith("/api/method/frappe.client.has_permission")) {
           const parsed = new URL(`http://frappe.test${url}`);
           const doctype = parsed.searchParams.get("doctype");
           const ptype = parsed.searchParams.get("ptype") ?? parsed.searchParams.get("perm_type") ?? "read";
           const allowed = doctype === "Leave Application" && ["create", "write", "read"].includes(ptype);
-          return respond(200, { message: allowed });
+          return respond(200, { message: { has_permission: allowed } });
         }
         if (url.startsWith("/api/resource/Salary%20Slip")) {
           // exact Frappe PermissionError shape, passed through verbatim
@@ -101,6 +129,13 @@ function startFrappeStub(): Promise<{ url: string; requests: RecordedRequest[]; 
         }
         if (url.startsWith("/api/resource/HD%20Ticket") && request.method === "GET") {
           return respond(200, { data: [{ name: "T-1", status: "Open" }, { name: "T-2", status: "Open" }] });
+        }
+        if (url.startsWith("/api/resource/Leave%20Application?") && request.method === "GET") {
+          const fields = JSON.parse(new URL(`http://frappe.test${url}`).searchParams.get("fields") ?? "[]") as string[];
+          if (options.rejectedQueryField && fields.includes(options.rejectedQueryField)) {
+            return respond(417, { exc_type: "ValidationError", exception: `Field not permitted in query: ${options.rejectedQueryField}` });
+          }
+          return respond(200, { data: [{ name: "HR-LAP-0001", employee: "EMP-0001", leave_type: "Annual Leave", custom_shift_group: "North", modified: "2026-07-14 09:00:00.000000" }] });
         }
         if (url.startsWith("/api/resource/DocType/Leave%20Application")) {
           return respond(200, { data: leaveApplicationDoctype() });
@@ -158,7 +193,12 @@ function startFrappeStub(): Promise<{ url: string; requests: RecordedRequest[]; 
           return respond(200, { data: [{ name: "Employee" }, { name: "HR Manager" }] });
         }
         if (url.startsWith("/api/resource/Leave%20Application/HR-LAP-0001") && request.method === "GET") {
-          return respond(200, { data: { name: "HR-LAP-0001", doctype: "Leave Application", employee: "EMP-0001", leave_type: "Annual Leave" } });
+          return respond(200, { data: leaveApplication });
+        }
+        if (url.startsWith("/api/resource/Leave%20Application/HR-LAP-0001") && request.method === "PUT") {
+          const changes = JSON.parse(body) as Record<string, unknown>;
+          leaveApplication = { ...leaveApplication, ...changes, modified: "2026-07-14 09:05:00.000000" };
+          return respond(200, { data: leaveApplication });
         }
         if (url.startsWith("/api/resource/Leave%20Application") && request.method === "POST") {
           const doc = JSON.parse(body) as Record<string, unknown>;
@@ -187,9 +227,13 @@ function leaveApplicationDoctype(): Record<string, unknown> {
     istable: 0,
     autoname: "HR-LAP-.YYYY.-.#####",
     fields: [
-      { fieldname: "naming_series", label: "Series", fieldtype: "Select", options: "HR-LAP-.YYYY.-.#####\nHR-SICK-.YYYY.-.#####" },
+      { fieldname: "naming_series", label: "Series", fieldtype: "Select", options: "HR-LAP-.YYYY.-.#####\nHR-SICK-.YYYY.-.#####", reqd: 1, default: "HR-LAP-.YYYY.-.#####" },
       { fieldname: "employee", label: "Employee", fieldtype: "Link", options: "Employee", reqd: 1 },
+      { fieldname: "department", label: "Department", fieldtype: "Link", options: "Department", reqd: 1, fetch_from: "employee.department" },
       { fieldname: "leave_type", label: "Leave Type", fieldtype: "Link", options: "Leave Type", reqd: 1 },
+      { fieldname: "posting_date", label: "Posting Date", fieldtype: "Date", reqd: 1, default: "Today" },
+      { fieldname: "status", label: "Status", fieldtype: "Select", options: "Open\nApproved\nRejected\nCancelled", reqd: 1, default: "Open" },
+      { fieldname: "custom_shift_group", label: "Shift Group", fieldtype: "Data", in_list_view: 1 },
       { fieldname: "leave_reason", label: "Leave Reason", fieldtype: "Small Text" },
       { fieldname: "details", label: "Details", fieldtype: "Table", options: "Leave Application Detail" },
     ],
@@ -249,6 +293,9 @@ function enterpriseSnapshot(
     funnels: [{ name: "Request Fulfilment", document_type: "Service Request" }],
     flowConfigs: [{ name: "Request Flow", document_type: "Service Request" }],
     dynamicAssignments: [{ name: "Request Rotation", document_type: "Service Request", assignment_basis: "Round Robin" }],
+    permissionRules: [{ name: "Service Request-Employee-0", parent: "Service Request", role: "Employee", permlevel: 0, read: 1, create: 1 }],
+    workspaces: [{ name: "Operations", title: "Operations", module: "Operations", public: 1 }],
+    notifications: [{ name: "Service Request Assigned", document_type: "Service Request", enabled: 1, event: "Value Change" }],
     ...overrides,
   };
 }
@@ -257,6 +304,22 @@ function contextFor(siteUrl: string, token = "api-key:api-secret", extra: Record
   return Object.freeze({
     fetch: globalThis.fetch.bind(globalThis),
     config: Object.freeze({ FRAPPE_SITE_URL: siteUrl, FRAPPE_API_TOKEN: token, ...extra }),
+  });
+}
+
+function effectiveMetadataContext(
+  doctype: string,
+  fields: readonly Readonly<Record<string, unknown>>[],
+): FrappeToolContext {
+  return Object.freeze({
+    fetch: async (url, init) => {
+      assert.match(String(url), /frappe\.desk\.form\.load\.getdoctype/);
+      assert.equal(new Headers(init?.headers).get("authorization"), "token api-key:api-secret");
+      return new Response(JSON.stringify({
+        docs: [{ name: doctype, fields, permissions: [{ role: "Employee", create: 1 }] }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+    config: Object.freeze({ FRAPPE_SITE_URL: "https://erp.example.test", FRAPPE_API_TOKEN: "api-key:api-secret" }),
   });
 }
 
@@ -303,6 +366,45 @@ test("frappe_user_identity_resolve proves OAuth/API identity and maps Employee p
   }
 });
 
+test("frappe_user_identity_resolve falls back to Has Role when a custom get_roles helper fails", async () => {
+  const site = await startFrappeStub({ rolesMethodStatus: 500 });
+  try {
+    const result = await frappe_user_identity_resolve({}, {
+      fetch,
+      config: { FRAPPE_SITE_URL: site.url, FRAPPE_API_TOKEN: "oauth-access-token" },
+    });
+    assert.equal("error" in result, false);
+    if ("error" in result) return;
+    assert.deepEqual(result.roles, ["Employee", "HR User"]);
+    assert.equal(site.requests.some((request) => request.url.startsWith("/api/resource/Has%20Role")), true);
+  } finally {
+    site.close();
+  }
+});
+
+test("frappe_semantic_data_resolve_lite removes a field Frappe marks as non-queryable", async () => {
+  const site = await startFrappeStub({ rejectedQueryField: "workflow_state" });
+  try {
+    const result = await frappe_semantic_data_resolve_lite({
+      doctype: "Leave Application",
+      prompt: "Show my leave requests",
+      scope: { mode: "self", user: "dhairya@hybrowlabs.com", employee: "EMP-0001" },
+      siteUrl: site.url,
+      apiToken: "oauth-access-token",
+      user: "dhairya@hybrowlabs.com",
+    }, { fetch, config: {} });
+    assert.equal("error" in result, false);
+    if ("error" in result) return;
+    assert.equal(result.count, 1);
+    const reads = site.requests.filter((request) => request.url.startsWith("/api/resource/Leave%20Application?"));
+    assert.equal(reads.length, 2);
+    assert.match(reads[0]?.url ?? "", /workflow_state/);
+    assert.doesNotMatch(reads[1]?.url ?? "", /workflow_state/);
+  } finally {
+    site.close();
+  }
+});
+
 test("frappe_fast_route keeps greetings off the provider path", async () => {
   const result = await frappe_fast_route(
     { prompt: "hi", site: "https://uat-erp.pwhr.in", user: "pradip.irkar@pw.live", hasFreshIndex: true },
@@ -338,6 +440,90 @@ test("frappe_fast_route maps department language to Frappe actions without hardc
   assert.deepEqual(result.candidateDoctypes, ["Expense Claim"]);
   assert.match(result.requiredChecks.join(","), /write_preflight/);
   assert.equal(result.targetLatencyMs <= 3000, true);
+});
+
+test("frappe_fast_route learns arbitrary site vocabulary from the persisted metadata revision", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-frappe-route-index-"));
+  const path = join(cwd, "frappe.db");
+  const store = new SqliteFrappeReadModel(path);
+  try {
+    const observedAt = new Date().toISOString();
+    store.replaceSnapshot(enterpriseSnapshot("https://tenant-a.example.test", {
+      observedAt,
+      validUntil: new Date(Date.parse(observedAt) + 300_000).toISOString(),
+      doctypes: [{
+        name: "Incident Dispatch Grid",
+        module: "Field Operations",
+        fields: [{ fieldname: "dispatch_window", label: "Dispatch Window", fieldtype: "Duration", in_list_view: 1 }],
+      }],
+      customFields: [],
+      propertySetters: [],
+      reports: [{ name: "Dispatch Window Overview", ref_doctype: "Incident Dispatch Grid", report_type: "Query Report" }],
+    }));
+  } finally {
+    store.close();
+  }
+
+  const result = await frappe_fast_route({
+    prompt: "Show my dispatch windows",
+    site: "https://tenant-a.example.test",
+    hasLiveCredentials: true,
+  }, contextFor("http://127.0.0.1:9", "test", { FRAPPE_READ_MODEL_PATH: path }));
+  assert.equal("error" in result, false);
+  if ("error" in result) return;
+  assert.equal(result.answerPath, "indexed_data");
+  assert.equal(result.candidateDoctypes.includes("Incident Dispatch Grid"), true);
+  assert.equal(result.minimalContext.installedApps instanceof Array, true);
+});
+
+test("repeated incidental custom fields cannot outvote an exact standard business noun", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-frappe-route-volume-"));
+  const path = join(cwd, "frappe.db");
+  const observedAt = new Date().toISOString();
+  const store = new SqliteFrappeReadModel(path);
+  try {
+    store.replaceSnapshot(enterpriseSnapshot("https://tenant-a.example.test", {
+      observedAt,
+      validUntil: new Date(Date.parse(observedAt) + 300_000).toISOString(),
+      doctypes: [
+        { name: "Task", module: "Projects", fields: [{ fieldname: "subject", label: "Subject", fieldtype: "Data" }] },
+        { name: "Employee", module: "HR", fields: Array.from({ length: 40 }, (_, index) => ({ fieldname: `review_task_${index}`, label: `Review Task ${index}`, fieldtype: "Data" })) },
+      ],
+      customFields: Array.from({ length: 40 }, (_, index) => ({ name: `Employee-review_task_${index}`, dt: "Employee", fieldname: `review_task_${index}`, label: `Review Task ${index}` })),
+      propertySetters: [],
+      reports: [],
+    }));
+  } finally {
+    store.close();
+  }
+  const result = await frappe_fast_route({
+    prompt: "How many open tasks do I have?",
+    site: "https://tenant-a.example.test",
+    hasLiveCredentials: true,
+  }, contextFor("http://127.0.0.1:9", "test", { FRAPPE_READ_MODEL_PATH: path }));
+  assert.equal("error" in result, false);
+  if ("error" in result) return;
+  assert.equal(result.candidateDoctypes[0], "Task");
+});
+
+test("frappe_fast_route does not confuse a connected employee with a connection-status request", async () => {
+  const result = await frappe_fast_route(
+    {
+      prompt: "Give me a plan to apply leave next Monday for my connected employee, but do not create anything.",
+      site: "https://uat-erp.pwhr.in",
+      user: "employee@example.test",
+      roles: ["Employee"],
+      hasFreshIndex: false,
+      hasLiveCredentials: true,
+    },
+    contextFor("http://127.0.0.1:9"),
+  );
+  assert.equal("error" in result, false);
+  if ("error" in result) return;
+  assert.equal(result.intent, "record_create");
+  assert.equal(result.answerPath, "live_frappe");
+  assert.deepEqual(result.candidateDoctypes, ["Leave Application"]);
+  assert.match(result.requiredChecks.join(","), /required_fields_check/);
 });
 
 test("frappe_read_model_plan defines Postgres-backed operational indexes and cron", async () => {
@@ -376,6 +562,102 @@ test("frappe_fast_route treats custom apps like NextAI as available Frappe surfa
   assert.match(JSON.stringify(result.minimalContext.matchedAliases), /NextAI/);
 });
 
+test("frappe_fast_route understands common conversational workplace language without a provider turn", async () => {
+  const result = await frappe_fast_route(
+    {
+      prompt: "meri chutti kitni bachi hai?",
+      site: "https://erp.example.test",
+      user: "worker@example.test",
+      hasFreshIndex: true,
+      hasLiveCredentials: true,
+    },
+    contextFor("http://127.0.0.1:9"),
+  );
+  assert.equal("error" in result, false);
+  if ("error" in result) return;
+  assert.deepEqual(result.candidateDoctypes, ["Leave Application"]);
+  assert.equal(result.invokeProvider, false);
+
+  const configured = await frappe_fast_route(
+    {
+      prompt: "what shift am I on?",
+      site: "https://erp.example.test",
+      user: "worker@example.test",
+      hasFreshIndex: true,
+      hasLiveCredentials: true,
+    },
+    contextFor("http://127.0.0.1:9", "test-token", {
+      FRAPPE_BUSINESS_API_CATALOG: JSON.stringify([{
+        id: "current_shift",
+        operation: "read",
+        doctype: "Attendance",
+        phrases: ["what shift am i on"],
+        method: "custom.shift.current",
+        params: { user: "$user" },
+        responsePath: "message",
+      }]),
+    }),
+  );
+  assert.equal("error" in configured, false);
+  if ("error" in configured) return;
+  assert.deepEqual(configured.candidateDoctypes, ["Attendance"]);
+  assert.equal(configured.invokeProvider, false);
+
+  const catalogRead = await frappe_fast_route(
+    {
+      prompt: "What jobs can I apply for internally?",
+      site: "https://erp.example.test",
+      user: "worker@example.test",
+      hasFreshIndex: true,
+      hasLiveCredentials: true,
+    },
+    contextFor("http://127.0.0.1:9", "test-token", {
+      FRAPPE_BUSINESS_API_CATALOG: JSON.stringify([{
+        id: "internal_jobs",
+        operation: "read",
+        doctype: "Job Opening",
+        phrases: ["jobs i can apply for internally"],
+        method: "custom.jobs.open",
+        params: { employee: "$employee" },
+        responsePath: "message",
+      }]),
+    }),
+  );
+  assert.equal("error" in catalogRead, false);
+  if ("error" in catalogRead) return;
+  assert.equal(catalogRead.intent, "record_lookup");
+  assert.deepEqual(catalogRead.candidateDoctypes, ["Job Opening"]);
+});
+
+test("OxygenHR profile routes ordinary employee English without a provider turn", async () => {
+  const catalog = JSON.parse(await readFile(resolve(packDir, "profiles", "oxygenhr.business-apis.json"), "utf8"));
+  const environment = { FRAPPE_BUSINESS_API_CATALOG: JSON.stringify(catalog) };
+  const cases = [
+    ["Do I have office today?", "Leave Application"],
+    ["Anything assigned to me?", "ToDo"],
+    ["Any openings for me?", "Job Opening"],
+    ["Did I check in today?", "Attendance"],
+    ["Do I have any expense claims pending?", "Expense Claim"],
+    ["Show me my work profile.", "Employee"],
+    ["Who reports to me?", "Employee"],
+  ] as const;
+
+  for (const [prompt, doctype] of cases) {
+    const result = await frappe_fast_route({
+      prompt,
+      site: "https://erp.example.test",
+      user: "worker@example.test",
+      hasFreshIndex: true,
+      hasLiveCredentials: true,
+    }, contextFor("http://127.0.0.1:9", "test-token", environment));
+    assert.equal("error" in result, false, prompt);
+    if ("error" in result) continue;
+    assert.equal(result.candidateDoctypes[0], doctype, prompt);
+    assert.equal(result.minimalContext.matchedAliases.some((alias) => alias.source === "admin_curated"), true, prompt);
+    assert.equal(result.invokeProvider, false, prompt);
+  }
+});
+
 test("frappe_semantic_data_resolve_lite lists resources with fields/filters/limit", async () => {
   const site = await startFrappeStub();
   try {
@@ -400,32 +682,227 @@ test("frappe_semantic_data_resolve_lite lists resources with fields/filters/limi
   }
 });
 
-test("frappe_records_create posts the doc and returns the created document", async () => {
+test("frappe_semantic_data_resolve_lite selects a configured business API using the caller identity", async () => {
   const site = await startFrappeStub();
   try {
-    const result = await frappe_records_create(
-      { doctype: "ToDo", doc: { description: "Follow up on T-1", priority: "High" }, trustedFixture: true },
-      contextFor(site.url),
-    );
+    const cwd = await mkdtemp(join(tmpdir(), "muster-frappe-business-api-"));
+    const catalog = JSON.stringify([{
+      id: "leave_balance",
+      operation: "read",
+      doctype: "Leave Application",
+      phrases: ["leave balance", "how many leaves", "leaves do i have", "remaining leave"],
+      method: "cn_leave_shift_managment.api.custom_get_leave_details",
+      params: { employee: "$employee", date: "$today" },
+      responsePath: "message.leave_balance",
+      resultLabel: "Leave balance",
+      view: {
+        title: "Your leave balance",
+        summary: "Here is the leave currently available to you.",
+        columns: [
+          { field: "title", label: "Leave type" },
+          { field: "available", label: "Available" },
+          { field: "used", label: "Used" },
+        ],
+      },
+      includeWhen: { field: "dont_show_in_frontend", equals: 0 },
+      fields: [
+        { target: "title", sources: ["leave_type_name", "custom_leave_type_name", "leave_type"] },
+        { target: "available", sources: ["available_leaves", "remaining_leaves", "leave_balance"] },
+        { target: "used", sources: ["leaves_taken", "used_leaves"] },
+      ],
+    }]);
+    const result = await frappe_semantic_data_resolve_lite({
+      user: "dhairya@hybrowlabs.com",
+      doctype: "Leave Application",
+      prompt: "How many leaves do I have?",
+      scope: { mode: "self", employee: "EMP-0001" },
+    }, contextFor(site.url, "user-oauth-token", {
+      FRAPPE_BUSINESS_API_CATALOG: catalog,
+      FRAPPE_READ_MODEL_PATH: join(cwd, "read-model.db"),
+    }));
+
     assert.deepEqual(result, {
-      created: { name: "TODO-0001", doctype: "ToDo", description: "Follow up on T-1", priority: "High" },
+      doctype: "Leave balance",
+      rows: [
+        { title: "Earned Leave", available: 5.5, used: 2 },
+        { title: "Casual Leave", available: 3, used: 1 },
+      ],
+      count: 2,
+      scope: { mode: "self", authority: "frappe_permissions", api: "leave_balance" },
+      view: {
+        title: "Your leave balance",
+        summary: "Here is the leave currently available to you.",
+        columns: [
+          { field: "title", label: "Leave type" },
+          { field: "available", label: "Available" },
+          { field: "used", label: "Used" },
+        ],
+      },
     });
-    assert.equal(site.requests[0].method, "POST");
-    assert.deepEqual(JSON.parse(site.requests[0].body), { description: "Follow up on T-1", priority: "High" });
+    const apiRequest = site.requests.find((request) => request.url.includes("custom_get_leave_details"));
+    assert.equal(apiRequest?.authorization, "Bearer user-oauth-token");
+    assert.match(apiRequest?.body ?? "", /"employee":"EMP-0001"/);
+    assert.equal(site.requests.some((request) => request.url.startsWith("/api/resource/Leave%20Application?")), false);
+
+    await frappe_semantic_data_resolve_lite({
+      user: "dhairya@hybrowlabs.com",
+      doctype: "Leave Application",
+      prompt: "What is my remaining leave?",
+      scope: { mode: "self", employee: "EMP-0001" },
+    }, contextFor(site.url, "user-oauth-token", {
+      FRAPPE_BUSINESS_API_CATALOG: catalog,
+      FRAPPE_READ_MODEL_PATH: join(cwd, "read-model.db"),
+    }));
+    const conversational = await frappe_semantic_data_resolve_lite({
+      user: "dhairya@hybrowlabs.com",
+      doctype: "Leave Application",
+      prompt: "meri chutti kitni bachi hai?",
+      scope: { mode: "self", employee: "EMP-0001" },
+    }, contextFor(site.url, "user-oauth-token", {
+      FRAPPE_BUSINESS_API_CATALOG: catalog,
+      FRAPPE_READ_MODEL_PATH: join(cwd, "read-model.db"),
+    }));
+    assert.equal("error" in conversational, false, "common conversational workplace language resolves to the same live API");
+    assert.equal(site.requests.filter((request) => request.url.includes("custom_get_leave_details")).length, 1, "equivalent reads reuse the permission-scoped API result");
   } finally {
     site.close();
   }
 });
 
-test("frappe_records_create refuses ungated writes outside an explicit trusted fixture", async () => {
+test("configured business APIs fail closed on application errors and ambiguous intent", async () => {
   const site = await startFrappeStub();
   try {
-    const result = await frappe_records_create(
-      { doctype: "ToDo", doc: { description: "Follow up on T-1" } },
-      contextFor(site.url),
-    );
-    assert.match((result as { error: string }).error, /Direct Frappe create is disabled/);
-    assert.ok(!site.requests.some((request) => request.method === "POST" && request.url.startsWith("/api/resource/ToDo")));
+    const base = {
+      operation: "read",
+      doctype: "Leave Application",
+      phrases: ["leave overview"],
+      params: { employee: "$employee" },
+      responsePath: "message.data",
+    };
+    const failed = await frappe_semantic_data_resolve_lite({
+      user: "dhairya@hybrowlabs.com",
+      doctype: "Leave Application",
+      prompt: "Show my leave overview",
+      scope: { mode: "self", employee: "EMP-0001" },
+    }, contextFor(site.url, "user-oauth-token", {
+      FRAPPE_BUSINESS_API_CATALOG: JSON.stringify([{ ...base, id: "failed-read", method: "test.application_error" }]),
+    })) as { error?: string };
+    assert.match(failed.error ?? "", /could not complete this read/i);
+
+    const requestsBeforeAmbiguous = site.requests.length;
+    await frappe_semantic_data_resolve_lite({
+      user: "dhairya@hybrowlabs.com",
+      doctype: "Leave Application",
+      prompt: "Show my leave overview",
+      scope: { mode: "self", employee: "EMP-0001" },
+    }, contextFor(site.url, "user-oauth-token", {
+      FRAPPE_BUSINESS_API_CATALOG: JSON.stringify([
+        { ...base, id: "first", method: "test.first" },
+        { ...base, id: "second", method: "test.second" },
+      ]),
+    }));
+    const ambiguousRequests = site.requests.slice(requestsBeforeAmbiguous);
+    assert.equal(ambiguousRequests.some((request) => /\/api\/method\/test\.(?:first|second)/.test(request.url)), false);
+  } finally {
+    site.close();
+  }
+});
+
+test("frappe_semantic_data_resolve_lite reuses only a permission-bound warm read", async () => {
+  const site = await startFrappeStub();
+  const cwd = await mkdtemp(join(tmpdir(), "muster-frappe-read-cache-"));
+  try {
+    const context = contextFor(site.url, "api-key:api-secret", {
+      FRAPPE_READ_MODEL_PATH: join(cwd, "frappe-read-model.db"),
+    });
+    const args = {
+      user: "dhairya@hybrowlabs.com",
+      doctype: "HD Ticket",
+      fields: ["name", "status"],
+      filters: { status: "Open" },
+      limit: 5,
+    };
+    const first = await frappe_semantic_data_resolve_lite(args, context);
+    assert.equal("error" in first, false);
+    const requestsAfterFirst = site.requests.length;
+    const second = await frappe_semantic_data_resolve_lite(args, context);
+    assert.deepEqual(second, first);
+    assert.equal(site.requests.length, requestsAfterFirst, "warm read should not repeat Frappe identity or data calls");
+
+    const mismatched = await frappe_semantic_data_resolve_lite({ ...args, user: "someone-else@example.test" }, context);
+    assert.equal("error" in mismatched, true);
+    assert.match((mismatched as { error: string }).error, /no longer matches this chat identity/i);
+  } finally {
+    site.close();
+  }
+});
+
+test("frappe_semantic_data_resolve_lite never reuses a cached query across requested scopes", async () => {
+  const site = await startFrappeStub();
+  const cwd = await mkdtemp(join(tmpdir(), "muster-frappe-scope-cache-"));
+  try {
+    const context = contextFor(site.url, "api-key:api-secret", {
+      FRAPPE_READ_MODEL_PATH: join(cwd, "frappe-read-model.db"),
+    });
+    const base = {
+      user: "dhairya@hybrowlabs.com",
+      doctype: "HD Ticket",
+      prompt: "show open work",
+      limit: 5,
+    };
+    await frappe_semantic_data_resolve_lite({ ...base, scope: { mode: "self", user: base.user } }, context);
+    const afterSelf = site.requests.length;
+    await frappe_semantic_data_resolve_lite({ ...base, scope: { mode: "team", authority: "frappe_permissions" } }, context);
+    assert.ok(site.requests.length > afterSelf, "team scope must execute independently from a warm self-scoped query");
+  } finally {
+    site.close();
+  }
+});
+
+test("frappe_semantic_data_resolve_lite reuses a compiled read plan across paraphrases", async () => {
+  const site = await startFrappeStub();
+  const cwd = await mkdtemp(join(tmpdir(), "muster-frappe-plan-cache-"));
+  try {
+    const context = contextFor(site.url, "api-key:api-secret", {
+      FRAPPE_READ_MODEL_PATH: join(cwd, "frappe-read-model.db"),
+    });
+    const base = {
+      user: "dhairya@hybrowlabs.com",
+      doctype: "Leave Application",
+      scope: { mode: "self", user: "dhairya@hybrowlabs.com", employee: "EMP-0001" },
+      limit: 12,
+    };
+    const first = await frappe_semantic_data_resolve_lite({ ...base, prompt: "Show my leave requests" }, context);
+    assert.equal("error" in first, false);
+    const requestsAfterFirst = site.requests.length;
+    const second = await frappe_semantic_data_resolve_lite({ ...base, prompt: "List my leave requests" }, context);
+    assert.deepEqual(second, first);
+    assert.equal(site.requests.length, requestsAfterFirst, "equivalent wording should reuse the compiled permission-scoped query");
+  } finally {
+    site.close();
+  }
+});
+
+test("frappe_semantic_data_resolve_lite projects fields from current effective metadata", async () => {
+  const site = await startFrappeStub();
+  const cwd = await mkdtemp(join(tmpdir(), "muster-frappe-effective-projection-"));
+  try {
+    const result = await frappe_semantic_data_resolve_lite({
+      user: "dhairya@hybrowlabs.com",
+      doctype: "Leave Application",
+      prompt: "show my shift group and leave type",
+      filters: [["employee", "=", "EMP-0001"]],
+      limit: 5,
+    }, contextFor(site.url, "api-key:api-secret", {
+      FRAPPE_READ_MODEL_PATH: join(cwd, "frappe-read-model.db"),
+    }));
+    assert.equal("error" in result, false);
+    const request = site.requests.find((entry) => entry.url.startsWith("/api/resource/Leave%20Application?"));
+    assert.ok(request, "the permission-filtered live list must run");
+    const fields = JSON.parse(new URL(`http://frappe.test${request.url}`).searchParams.get("fields") ?? "[]") as string[];
+    assert.ok(fields.includes("custom_shift_group"), "a current custom list field should be selected without customer-specific code");
+    assert.ok(fields.includes("leave_type"), "prompt-relevant effective fields should be selected");
+    assert.ok(fields.length <= 12, "the provider context projection stays bounded");
   } finally {
     site.close();
   }
@@ -480,7 +957,11 @@ test("frappe_site_induction indexes site identity, DocType graph, permissions, c
     const leave = doctypes.find((doctype) => doctype.name === "Leave Application");
     assert.ok(leave, "Leave Application should be indexed");
     assert.deepEqual(leave?.namingSeries, ["HR-LAP-.YYYY.-.#####", "HR-SICK-.YYYY.-.#####"]);
-    assert.deepEqual(leave?.links, [{ fieldname: "employee", target: "Employee" }, { fieldname: "leave_type", target: "Leave Type" }]);
+    assert.deepEqual(leave?.links, [
+      { fieldname: "employee", target: "Employee" },
+      { fieldname: "department", target: "Department" },
+      { fieldname: "leave_type", target: "Leave Type" },
+    ]);
     assert.deepEqual(leave?.childTables, [{ fieldname: "details", target: "Leave Application Detail" }]);
     assert.deepEqual((leave?.permissions as Array<Record<string, unknown>>).map((perm) => perm.role), ["Employee", "HR Manager"]);
 
@@ -490,7 +971,7 @@ test("frappe_site_induction indexes site identity, DocType graph, permissions, c
     assert.equal(customizations.clientScripts.length, 1);
     assert.equal(customizations.serverScripts.length, 1);
 
-    assert.ok((induction.graph as { edges: Array<Record<string, unknown>> }).edges.some((edge) => edge.type === "doctype_link" && edge.to === "Employee"));
+    assert.ok((induction.graph as { edges: Array<Record<string, unknown>> }).edges.some((edge) => edge.type === "doctype_link" && edge.to === "doctype:Employee"));
     assert.ok((induction.docs as Array<Record<string, unknown>>).some((doc) => String(doc.url).includes("frappeframework.com/docs")));
     assert.deepEqual(induction.warnings, []);
   } finally {
@@ -597,11 +1078,18 @@ test("frappe_safe_write gates creates with permission preflight, dry-run proposa
     });
     const mutation = { operation: "create", doctype: "Leave Application", doc: { employee: "EMP-0001", leave_type: "Annual Leave" } };
 
-    const missingDynamicField = await safeWrite({
+    const missingEffectiveField = await safeWrite({
+      operation: "create",
+      doctype: "Leave Application",
+      doc: { employee: "EMP-0001" },
+    }, context) as Record<string, unknown>;
+    assert.match(String(missingEffectiveField.error), /provide.*Leave Type/i);
+
+    const callerSuppliedRequirement = await safeWrite({
       ...mutation,
       fields: [{ fieldname: "backup_person", label: "Backup person", reqd: 1 }],
     }, context) as Record<string, unknown>;
-    assert.match(String(missingDynamicField.error), /provide.*Backup person/i);
+    assert.equal(callerSuppliedRequirement.status, "approval_required", "caller-supplied fields cannot manufacture effective requirements");
 
     const proposal = await safeWrite(
       mutation,
@@ -620,7 +1108,7 @@ test("frappe_safe_write gates creates with permission preflight, dry-run proposa
       context,
     ) as Record<string, unknown>;
     assert.equal(denied.status, "denied");
-    assert.match(String((denied.preflight as Record<string, unknown>).reason), /Frappe denied create/);
+    assert.match(String((denied.preflight as Record<string, unknown>).reason), /effective metadata does not permit create/);
 
     const approval = signFrappeApproval(
       proposal.approvalProposal as Parameters<typeof signFrappeApproval>[0],
@@ -647,6 +1135,44 @@ test("frappe_safe_write gates creates with permission preflight, dry-run proposa
 
     const replay = await safeWrite({ ...mutation, approvalReceipt: approval }, context) as Record<string, unknown>;
     assert.match(String(replay.error), /already consumed/);
+  } finally {
+    site.close();
+  }
+});
+
+test("frappe_safe_write uses Frappe's document permission result for governed updates", async () => {
+  const site = await startFrappeStub();
+  try {
+    const safeWrite = frappeTool("frappe_safe_write");
+    const cwd = await mkdtemp(join(tmpdir(), "muster-frappe-update-"));
+    const signingKey = "test-only-frappe-update-key";
+    const context = contextFor(site.url, "api-key:api-secret", {
+      FRAPPE_APPROVAL_SIGNING_KEY: signingKey,
+      FRAPPE_READ_MODEL_PATH: join(cwd, "frappe-read-model.db"),
+    });
+    const mutation = {
+      operation: "update",
+      doctype: "Leave Application",
+      docname: "HR-LAP-0001",
+      expected_modified: "2026-07-14 09:00:00.000000",
+      doc: { leave_type: "Sick Leave" },
+    };
+
+    const proposal = await safeWrite(mutation, context) as Record<string, unknown>;
+    assert.equal(proposal.status, "approval_required");
+    assert.equal((proposal.preflight as Record<string, unknown>).allowed, true);
+    assert.ok(site.requests.some((request) => request.url.includes("frappe.client.has_permission") && request.url.includes("perm_type=write")));
+
+    const approval = signFrappeApproval(
+      proposal.approvalProposal as Parameters<typeof signFrappeApproval>[0],
+      "approver@example.test",
+      signingKey,
+      String((proposal.approvalProposal as Record<string, unknown>).issuedAt),
+    );
+    const approved = await safeWrite({ ...mutation, approvalReceipt: approval }, context) as Record<string, unknown>;
+    assert.equal(approved.status, "executed");
+    assert.equal(((approved.verification as Record<string, unknown>).fetched as Record<string, unknown>).leave_type, "Sick Leave");
+    assert.equal((approved.verification as Record<string, unknown>).verified, true);
   } finally {
     site.close();
   }
@@ -683,41 +1209,43 @@ test("frappe_artifact_brief emits fixture/live metadata linking site, user, DocT
 });
 
 test("frappe_chat_interaction_plan asks humane missing-field questions for leave CRUD", async () => {
-  const plan = await frappe_chat_interaction_plan({
-    prompt: "I want to apply leave for 9th",
-    doctype: "Leave Application",
-    siteUrl: "https://erp.example.test",
-    values: { from_date: "2026-07-09", to_date: "2026-07-09" },
-    fields: [
-      { fieldname: "leave_type", label: "Leave type", fieldtype: "Select", options: "Casual Leave\nSick Leave", reqd: 1 },
-      { fieldname: "from_date", label: "From date", fieldtype: "Date", reqd: 1 },
-      { fieldname: "to_date", label: "To date", fieldtype: "Date", reqd: 1 },
-      { fieldname: "description", label: "Reason", fieldtype: "Small Text", reqd: 1 },
-    ],
-  }, { config: {} });
+  const site = await startFrappeStub();
+  try {
+    const plan = await frappe_chat_interaction_plan({
+      prompt: "I want to apply leave for 9th",
+      doctype: "Leave Application",
+      siteUrl: site.url,
+      values: { from_date: "2026-07-09", to_date: "2026-07-09" },
+    }, contextFor(site.url));
 
-  assert.equal(plan.kind, "guided_crud");
-  assert.equal(plan.doctype, "Leave Application");
-  assert.equal(plan.operation, "create");
-  assert.match(plan.message, /To move forward with your request/);
-  assert.deepEqual(plan.requiredFields.map((field) => field.fieldname), ["leave_type", "description"]);
-  assert.deepEqual(plan.requiredFields[0].options, ["Casual Leave", "Sick Leave"]);
-  assert.equal(plan.safety.previewBeforeWrite, true);
-  assert.equal(plan.renderHints.phone, "native_buttons_when_available");
+    assert.equal(plan.kind, "guided_crud");
+    assert.equal(plan.doctype, "Leave Application");
+    assert.equal(plan.operation, "create");
+    assert.match(plan.message, /ask only for the information still needed/i);
+    assert.deepEqual(plan.requiredFields.map((field) => field.fieldname), ["employee", "leave_type"]);
+    assert.match(plan.requiredFields[0].reason, /required before this request can be saved/i);
+    assert.equal(plan.safety.previewBeforeWrite, true);
+    assert.equal(plan.renderHints.phone, "native_buttons_when_available");
+  } finally {
+    site.close();
+  }
 });
 
-test("frappe_chat_interaction_plan respects metadata and property-setter mandatory fields", async () => {
+test("frappe_chat_interaction_plan uses effective custom overlays and ignores caller-supplied requirement arrays", async () => {
   const plan = await frappe_chat_interaction_plan({
     prompt: "create a leave request",
     doctype: "Leave Application",
     values: { leave_type: "Casual Leave", from_date: "2026-07-09", to_date: "2026-07-09", description: "Personal work" },
     fields: [{ fieldname: "employee", label: "Employee", reqd: 1 }],
     propertySetters: [{ field_name: "backup_person", property: "reqd", value: "1" }],
-  }, { config: {} });
+  }, effectiveMetadataContext("Leave Application", [
+    { fieldname: "employee", label: "Employee", fieldtype: "Link", reqd: 0 },
+    { fieldname: "custom_handover_note", label: "Handover Note", fieldtype: "Small Text", reqd: 1 },
+  ]));
 
   assert.equal(plan.kind, "guided_crud");
-  assert.deepEqual(plan.requiredFields.map((field) => field.fieldname), ["employee", "backup_person"]);
-  assert.match(plan.requiredFields[1].reason, /Property Setter/);
+  assert.deepEqual(plan.requiredFields.map((field) => field.fieldname), ["custom_handover_note"]);
+  assert.match(plan.requiredFields[0].reason, /required before this request can be saved/i);
 });
 
 test("frappe_chat_interaction_plan attaches Frappe document links and report next steps", async () => {
@@ -879,6 +1407,37 @@ test("customization drift changes schema revision and removes stale cached answe
   }
 });
 
+test("an unchanged metadata refresh preserves permission-scoped live-result caches", async () => {
+  const store = new SqliteFrappeReadModel(":memory:");
+  try {
+    const first = store.replaceSnapshot(enterpriseSnapshot());
+    const permission = computeFrappePermissionEpoch({ site: first.site, principal: "user@example.test", roles: ["Employee"] });
+    const identity: FrappeCacheIdentity = {
+      site: first.site,
+      principal: permission.principal,
+      permissionEpoch: permission.epoch,
+      schemaRevision: first.schemaRevision,
+      dataRevision: first.dataRevision,
+    };
+    await resolveFrappeRead({
+      store,
+      identity,
+      querySignature: "my current work",
+      ttlMs: 60_000,
+      now: "2026-07-10T08:00:00.000Z",
+      live: async () => ({ value: [{ subject: "Visible only to this user" }] }),
+    });
+
+    const refreshed = store.replaceSnapshot(enterpriseSnapshot(first.site, {
+      observedAt: "2026-07-10T08:01:00.000Z",
+    }));
+    assert.equal(refreshed.schemaRevision, first.schemaRevision);
+    assert.deepEqual(store.getCache(identity, "my current work")?.value, [{ subject: "Visible only to this user" }]);
+  } finally {
+    store.close();
+  }
+});
+
 test("manager hierarchy scope comes only from configured live Frappe fields", () => {
   const rows = [
     { name: "EMP-1", user_id: "manager@example.test", reports_to: "", status: "Active" },
@@ -1021,6 +1580,103 @@ test("zero-app OAuth polling builds a field-hydrated snapshot from standard Frap
   assert.equal(requests.some((url) => url.includes("/api/resource/DocType/Service%20Request")), true);
 });
 
+test("recurring enterprise polling requests only metadata changed since the prior revision", async () => {
+  const requests: string[] = [];
+  const result = await pollFrappeEnterpriseSnapshot({
+    site: "https://erp.example.test",
+    fetch: async (url) => {
+      requests.push(String(url));
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    },
+    authorization: "Bearer test-token",
+    observedAt: "2026-07-10T08:15:00.000Z",
+    modifiedAfter: "2026-07-10T08:00:00.000Z",
+    resources: [
+      { snapshotKey: "doctypes", kind: "doctype", doctype: "DocType", optional: false },
+      { snapshotKey: "propertySetters", kind: "property_setter", doctype: "Property Setter", optional: false },
+    ],
+  });
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests.some((url) => url.includes("change_log.get_versions")), false);
+  assert.equal(requests.every((url) => decodeURIComponent(url).includes('[["modified",">","2026-07-10T08:00:00.000Z"]]')), true);
+  assert.deepEqual(result.snapshot.apps, []);
+});
+
+test("enterprise polling hydrates only priority DocTypes and drops rejected list fields", async () => {
+  const requests: string[] = [];
+  const fetchStub: typeof globalThis.fetch = async (url) => {
+    const value = String(url);
+    requests.push(value);
+    if (value.includes("frappe.utils.change_log.get_versions")) return new Response(JSON.stringify({ message: {} }), { status: 200 });
+    if (value.includes("/api/resource/Module%20Def")) {
+      const fields = JSON.parse(new URL(value).searchParams.get("fields") ?? "[]") as string[];
+      if (fields.includes("forbidden")) return new Response(JSON.stringify({ exception: "Field not permitted in query: forbidden" }), { status: 417 });
+      return new Response(JSON.stringify({ data: [{ name: "Operations" }] }), { status: 200 });
+    }
+    if (value.includes("/api/resource/DocType/Service%20Request")) return new Response(JSON.stringify({ data: { name: "Service Request", module: "Operations", fields: [{ fieldname: "subject", label: "Subject" }] } }), { status: 200 });
+    if (value.includes("/api/resource/DocType/Background%20Record")) throw new Error("non-priority DocType must not be hydrated");
+    if (value.includes("/api/resource/DocType")) return new Response(JSON.stringify({ data: [{ name: "Service Request", module: "Operations" }, { name: "Background Record", module: "Operations" }] }), { status: 200 });
+    if (value.includes("/api/resource/Custom%20Field")) return new Response(JSON.stringify({ data: [{ name: "Service Request-priority", dt: "Service Request", fieldname: "priority" }] }), { status: 200 });
+    return new Response(JSON.stringify({ data: [] }), { status: 200 });
+  };
+  const result = await pollFrappeEnterpriseSnapshot({
+    site: "https://erp.example.test",
+    fetch: fetchStub,
+    authorization: "Bearer test",
+    hydrateDoctypes: "priority",
+    maxHydratedDoctypes: 1,
+    resources: [
+      { snapshotKey: "modules", kind: "module", doctype: "Module Def", optional: false, fields: ["name", "forbidden"] },
+      { snapshotKey: "doctypes", kind: "doctype", doctype: "DocType", optional: false, fields: ["name", "module"] },
+      { snapshotKey: "customFields", kind: "custom_field", doctype: "Custom Field", optional: false, fields: ["name", "dt", "fieldname"] },
+    ],
+  });
+  assert.ok(result.warnings.includes("Module Def:field_unavailable:forbidden"));
+  assert.equal((result.snapshot.doctypes?.[0] as Record<string, unknown>).fields instanceof Array, true);
+  assert.equal((result.snapshot.doctypes?.[1] as Record<string, unknown>).fields, undefined);
+  assert.equal(requests.some((url) => url.includes("Background%20Record")), false);
+});
+
+test("enterprise polling preserves representative schema coverage across modules", async () => {
+  const hydrated: string[] = [];
+  const fetchStub: typeof globalThis.fetch = async (url) => {
+    const value = String(url);
+    if (value.includes("frappe.utils.change_log.get_versions")) return new Response(JSON.stringify({ message: {} }), { status: 200 });
+    const detail = /\/api\/resource\/DocType\/([^?]+)/.exec(value)?.[1];
+    if (detail) {
+      const name = decodeURIComponent(detail);
+      hydrated.push(name);
+      return new Response(JSON.stringify({ data: { name, module: name === "Recruitment Request" ? "Recruitment" : "HR", fields: [] } }), { status: 200 });
+    }
+    if (value.includes("/api/resource/DocType")) {
+      return new Response(JSON.stringify({ data: [
+        { name: "Employee", module: "HR" },
+        { name: "Leave Request", module: "HR" },
+        { name: "Recruitment Request", module: "Recruitment" },
+      ] }), { status: 200 });
+    }
+    if (value.includes("/api/resource/Custom%20Field")) {
+      return new Response(JSON.stringify({ data: Array.from({ length: 30 }, (_, index) => ({ name: `Employee-field-${index}`, dt: "Employee", fieldname: `field_${index}` })) }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ data: [] }), { status: 200 });
+  };
+  await pollFrappeEnterpriseSnapshot({
+    site: "https://erp.example.test",
+    fetch: fetchStub,
+    authorization: "Bearer test",
+    hydrateDoctypes: "priority",
+    maxHydratedDoctypes: 2,
+    resources: [
+      { snapshotKey: "doctypes", kind: "doctype", doctype: "DocType", optional: false, fields: ["name", "module"] },
+      { snapshotKey: "customFields", kind: "custom_field", doctype: "Custom Field", optional: false, fields: ["name", "dt", "fieldname"] },
+    ],
+  });
+  assert.equal(hydrated.includes("Employee"), true);
+  assert.equal(hydrated.includes("Recruitment Request"), true);
+  assert.equal(hydrated.includes("Leave Request"), false);
+});
+
 test("sanitized OxygenHR profile is valid data and contains no deployment secrets", async () => {
   const path = resolve(packDir, "profiles", "oxygenhr.sanitized.json");
   const raw = await readFile(path, "utf8");
@@ -1051,6 +1707,7 @@ test("the frappe pack loads through loadCapabilityPack and runs inside a flow", 
         "frappe-federated-bridge__frappe_customer_profile_validate",
         "frappe-federated-bridge__frappe_docs_context",
         "frappe-federated-bridge__frappe_enterprise_contract",
+        "frappe-federated-bridge__frappe_enterprise_sync",
         "frappe-federated-bridge__frappe_fast_route",
         "frappe-federated-bridge__frappe_hierarchy_scope",
         "frappe-federated-bridge__frappe_hybrid_retrieve",
@@ -1060,7 +1717,6 @@ test("the frappe pack loads through loadCapabilityPack and runs inside a flow", 
         "frappe-federated-bridge__frappe_permission_check",
         "frappe-federated-bridge__frappe_query_classify",
         "frappe-federated-bridge__frappe_read_model_plan",
-        "frappe-federated-bridge__frappe_records_create",
         "frappe-federated-bridge__frappe_safe_write",
         "frappe-federated-bridge__frappe_semantic_data_resolve_lite",
         "frappe-federated-bridge__frappe_site_induction",
@@ -1074,15 +1730,11 @@ test("the frappe pack loads through loadCapabilityPack and runs inside a flow", 
       steps: [
         { id: "who", kind: "tool", tool: "frappe-federated-bridge__frappe_identity_resolve" },
         { id: "tickets", kind: "tool", tool: "frappe-federated-bridge__frappe_semantic_data_resolve_lite", args: { doctype: "HD Ticket", limit: 10 } },
-        { id: "todo", kind: "tool", tool: "frappe-federated-bridge__frappe_records_create", args: { doctype: "ToDo", doc: { description: "{{who.user}} has {{tickets.count}} open tickets" }, trustedFixture: true } },
       ],
     });
     const result = await runFlow(flow, { config: defaultConfig(), registry, cwd });
     assert.equal(result.status, "completed");
-    assert.equal(
-      ((result.outputs.todo as { created: { description: string } }).created).description,
-      "dhairya@hybrowlabs.com has 2 open tickets",
-    );
+    assert.equal((result.outputs.tickets as { count: number }).count, 2);
   } finally {
     site.close();
   }

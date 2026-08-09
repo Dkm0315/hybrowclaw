@@ -17,10 +17,12 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "tsx --test test/*.test.ts",
+    "test:artifact-sandbox-live": "node scripts/verify-frappe-ask-artifact-sandbox.mjs",
     "prepublishOnly": "rm -rf dist && tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@musterhq/core": "workspace:*"
+    "@musterhq/core": "workspace:*",
+    "playwright": "1.54.1"
   },
   "description": "Muster surface gateway: one governed envelope for Telegram, Slack, Discord, WhatsApp, Teams, and web.",
   "license": "MIT",

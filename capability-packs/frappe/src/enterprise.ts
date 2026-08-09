@@ -18,6 +18,9 @@ export const FRAPPE_INDEX_KINDS = [
   "funnel",
   "flow_config",
   "dynamic_assignment",
+  "permission_rule",
+  "workspace",
+  "notification",
 ] as const;
 
 export type FrappeIndexKind = (typeof FRAPPE_INDEX_KINDS)[number];
@@ -58,6 +61,9 @@ export interface FrappeEnterpriseSnapshot {
   readonly funnels?: readonly unknown[];
   readonly flowConfigs?: readonly unknown[];
   readonly dynamicAssignments?: readonly unknown[];
+  readonly permissionRules?: readonly unknown[];
+  readonly workspaces?: readonly unknown[];
+  readonly notifications?: readonly unknown[];
 }
 
 export interface FrappeSiteRevision {
@@ -92,6 +98,11 @@ export interface FrappePermissionEpoch {
   };
 }
 
+export interface FrappePermissionEpochState extends FrappePermissionEpoch {
+  readonly observedAt: string;
+  readonly validUntil: string;
+}
+
 export interface FrappeCacheIdentity {
   readonly site: string;
   readonly principal: string;
@@ -124,11 +135,12 @@ export interface FrappeProvenanceReceipt {
   readonly servedAt: string;
   readonly validUntil: string;
   readonly objectRefs: readonly string[];
+  readonly fallback?: "stale_if_unavailable";
 }
 
 export interface FrappeHumaneFreshness {
   readonly message: string;
-  readonly status: "current" | "refreshed";
+  readonly status: "current" | "refreshed" | "temporarily_stale";
   readonly updatedAt: string;
 }
 
@@ -198,6 +210,10 @@ export interface FrappeIndexEvent {
   readonly revision: string;
   readonly observedAt: string;
   readonly validUntil?: string;
+  readonly principal?: string;
+  readonly permissionEpoch?: string;
+  readonly objectRefs?: readonly string[];
+  readonly querySignatures?: readonly string[];
 }
 
 export interface FrappeIndexEventReceipt {
@@ -207,19 +223,32 @@ export interface FrappeIndexEventReceipt {
   readonly invalidatedCacheEntries: number;
 }
 
+export interface FrappeCacheInvalidation {
+  readonly site: string;
+  readonly principal?: string;
+  readonly permissionEpoch?: string;
+  readonly objectRefs?: readonly string[];
+  readonly querySignatures?: readonly string[];
+}
+
 export interface FrappeReadModelStore {
   readonly backend: "sqlite" | "postgres";
   replaceSnapshot(snapshot: FrappeEnterpriseSnapshot): FrappeSiteRevision;
   upsertIndex(records: readonly FrappeIndexRecord[]): void;
   deleteIndex(site: string, kind: FrappeIndexKind, objectId: string): void;
   searchIndex(site: string, query?: string, kinds?: readonly FrappeIndexKind[], limit?: number): FrappeIndexRecord[];
-  putPermissionEpoch(epoch: FrappePermissionEpoch, observedAt?: string): void;
+  putPermissionEpoch(epoch: FrappePermissionEpoch, observedAt?: string, validUntil?: string): void;
   getPermissionEpoch(site: string, principal: string): FrappePermissionEpoch | undefined;
+  getPermissionEpochState(site: string, principal: string): FrappePermissionEpochState | undefined;
+  invalidatePermissionEpoch(site: string, principal: string): number;
+  invalidatePermissionEpochs(site: string, principal?: string): number;
   getRevision(site: string): FrappeSiteRevision | undefined;
   setRevision(revision: FrappeSiteRevision): void;
   putCache<T>(entry: FrappeCachedValue<T>): void;
   getCache<T>(identity: FrappeCacheIdentity, querySignature: string): FrappeCachedValue<T> | undefined;
+  invalidateCache(input: FrappeCacheInvalidation): number;
   invalidateSiteCache(site: string): number;
+  pruneCache(expiredBefore: string, site?: string): number;
   applyEvent(event: FrappeIndexEvent): FrappeIndexEventReceipt;
   consumeApproval(proposalId: string, signature: string, consumedAt?: string): boolean;
   close(): void;
@@ -311,6 +340,7 @@ export class SqliteFrappeReadModel implements FrappeReadModelStore {
         epoch TEXT NOT NULL,
         components_json TEXT NOT NULL,
         observed_at TEXT NOT NULL,
+        valid_until TEXT NOT NULL,
         PRIMARY KEY (site, principal)
       );
       CREATE TABLE IF NOT EXISTS frappe_response_cache (
@@ -341,17 +371,26 @@ export class SqliteFrappeReadModel implements FrappeReadModelStore {
         consumed_at TEXT NOT NULL
       );
     `);
+    const permissionColumns = this.#db.prepare("PRAGMA table_info(frappe_permission_epoch)").all() as Array<{ name?: string }>;
+    if (!permissionColumns.some((column) => column.name === "valid_until")) {
+      this.#db.exec("ALTER TABLE frappe_permission_epoch ADD COLUMN valid_until TEXT");
+      this.#db.exec("UPDATE frappe_permission_epoch SET valid_until = observed_at WHERE valid_until IS NULL");
+    }
   }
 
   replaceSnapshot(snapshot: FrappeEnterpriseSnapshot): FrappeSiteRevision {
     const records = buildFrappeIndexRecords(snapshot);
     const revision = snapshotRevision(snapshot, records);
+    const previous = this.getRevision(revision.site);
+    const changed = !previous
+      || previous.schemaRevision !== revision.schemaRevision
+      || previous.dataRevision !== revision.dataRevision;
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       this.#db.prepare("DELETE FROM frappe_index_object WHERE site = ?").run(snapshot.site);
       this.upsertIndex(records);
       this.setRevision(revision);
-      this.invalidateSiteCache(snapshot.site);
+      if (changed) this.invalidateSiteCache(snapshot.site);
       this.#db.exec("COMMIT");
       return revision;
     } catch (error) {
@@ -426,22 +465,56 @@ export class SqliteFrappeReadModel implements FrappeReadModelStore {
     return rows.map(indexRow);
   }
 
-  putPermissionEpoch(epoch: FrappePermissionEpoch, observedAt = new Date().toISOString()): void {
+  putPermissionEpoch(epoch: FrappePermissionEpoch, observedAt = new Date().toISOString(), validUntil = observedAt): void {
+    assertIsoTimestamp(observedAt, "Frappe permission epoch observedAt");
+    assertIsoTimestamp(validUntil, "Frappe permission epoch validUntil");
     this.#db.prepare(`
-      INSERT INTO frappe_permission_epoch(site, principal, epoch, components_json, observed_at)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO frappe_permission_epoch(site, principal, epoch, components_json, observed_at, valid_until)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(site, principal) DO UPDATE SET
         epoch = excluded.epoch,
         components_json = excluded.components_json,
-        observed_at = excluded.observed_at
-    `).run(epoch.site, epoch.principal, epoch.epoch, stableJson(epoch.components), observedAt);
+        observed_at = excluded.observed_at,
+        valid_until = excluded.valid_until
+    `).run(normalizeSite(epoch.site), normalizePrincipal(epoch.principal), epoch.epoch, stableJson(epoch.components), observedAt, validUntil);
   }
 
   getPermissionEpoch(site: string, principal: string): FrappePermissionEpoch | undefined {
     const row = this.#db.prepare("SELECT epoch, components_json FROM frappe_permission_epoch WHERE site = ? AND principal = ?")
-      .get(site, principal) as { epoch: string; components_json: string } | undefined;
+      .get(normalizeSite(site), normalizePrincipal(principal)) as { epoch: string; components_json: string } | undefined;
     if (!row) return undefined;
-    return { site, principal, epoch: row.epoch, components: JSON.parse(row.components_json) as FrappePermissionEpoch["components"] };
+    return { site: normalizeSite(site), principal: normalizePrincipal(principal), epoch: row.epoch, components: JSON.parse(row.components_json) as FrappePermissionEpoch["components"] };
+  }
+
+  getPermissionEpochState(site: string, principal: string): FrappePermissionEpochState | undefined {
+    const normalizedSite = normalizeSite(site);
+    const normalizedPrincipal = normalizePrincipal(principal);
+    const row = this.#db.prepare(`
+      SELECT epoch, components_json, observed_at, valid_until
+      FROM frappe_permission_epoch
+      WHERE site = ? AND principal = ?
+    `).get(normalizedSite, normalizedPrincipal) as { epoch: string; components_json: string; observed_at: string; valid_until: string | null } | undefined;
+    if (!row) return undefined;
+    return {
+      site: normalizedSite,
+      principal: normalizedPrincipal,
+      epoch: row.epoch,
+      components: JSON.parse(row.components_json) as FrappePermissionEpoch["components"],
+      observedAt: row.observed_at,
+      validUntil: row.valid_until ?? row.observed_at,
+    };
+  }
+
+  invalidatePermissionEpoch(site: string, principal: string): number {
+    return this.invalidatePermissionEpochs(site, principal);
+  }
+
+  invalidatePermissionEpochs(site: string, principal?: string): number {
+    const result = principal
+      ? this.#db.prepare("DELETE FROM frappe_permission_epoch WHERE site = ? AND principal = ?")
+          .run(normalizeSite(site), normalizePrincipal(principal))
+      : this.#db.prepare("DELETE FROM frappe_permission_epoch WHERE site = ?").run(normalizeSite(site));
+    return Number(result.changes ?? 0);
   }
 
   getRevision(site: string): FrappeSiteRevision | undefined {
@@ -464,6 +537,8 @@ export class SqliteFrappeReadModel implements FrappeReadModelStore {
   putCache<T>(entry: FrappeCachedValue<T>): void {
     const expectedKey = frappeCacheKey(entry.identity, entry.querySignature);
     if (entry.cacheKey !== expectedKey) throw new Error("Frappe cache entry key does not match its permission and revision scope.");
+    assertIsoTimestamp(entry.observedAt, "Frappe cache observedAt");
+    assertIsoTimestamp(entry.validUntil, "Frappe cache validUntil");
     this.#db.prepare(`
       INSERT INTO frappe_response_cache(
         cache_key, site, principal, permission_epoch, schema_revision, data_revision,
@@ -477,8 +552,8 @@ export class SqliteFrappeReadModel implements FrappeReadModelStore {
         object_refs_json = excluded.object_refs_json
     `).run(
       entry.cacheKey,
-      entry.identity.site,
-      entry.identity.principal,
+      normalizeSite(entry.identity.site),
+      normalizePrincipal(entry.identity.principal),
       entry.identity.permissionEpoch,
       entry.identity.schemaRevision,
       entry.identity.dataRevision,
@@ -487,12 +562,14 @@ export class SqliteFrappeReadModel implements FrappeReadModelStore {
       entry.observedAt,
       entry.validUntil,
       entry.source,
-      stableJson(entry.objectRefs),
+      stableJson([...new Set(entry.objectRefs.map(normalizeObjectRef).filter(Boolean))].sort()),
     );
   }
 
   getCache<T>(identity: FrappeCacheIdentity, querySignature: string): FrappeCachedValue<T> | undefined {
     const cacheKey = frappeCacheKey(identity, querySignature);
+    const normalizedSite = normalizeSite(identity.site);
+    const normalizedPrincipal = normalizePrincipal(identity.principal);
     const row = this.#db.prepare(`
       SELECT cache_key, site, principal, permission_epoch, schema_revision, data_revision,
              query_signature, value_json, observed_at, valid_until, source, object_refs_json
@@ -501,8 +578,8 @@ export class SqliteFrappeReadModel implements FrappeReadModelStore {
         AND schema_revision = ? AND data_revision = ? AND query_signature = ?
     `).get(
       cacheKey,
-      identity.site,
-      identity.principal,
+      normalizedSite,
+      normalizedPrincipal,
       identity.permissionEpoch,
       identity.schemaRevision,
       identity.dataRevision,
@@ -527,8 +604,44 @@ export class SqliteFrappeReadModel implements FrappeReadModelStore {
     };
   }
 
+  invalidateCache(input: FrappeCacheInvalidation): number {
+    const clauses = ["site = ?"];
+    const values: unknown[] = [normalizeSite(input.site)];
+    if (input.principal) {
+      clauses.push("principal = ?");
+      values.push(normalizePrincipal(input.principal));
+    }
+    if (input.permissionEpoch) {
+      clauses.push("permission_epoch = ?");
+      values.push(input.permissionEpoch);
+    }
+    const querySignatures = boundedInvalidationSelectors(input.querySignatures, normalizeQuerySignature, "query signatures");
+    if (querySignatures.length) {
+      clauses.push(`query_signature IN (${querySignatures.map(() => "?").join(",")})`);
+      values.push(...querySignatures);
+    }
+    const objectRefs = boundedInvalidationSelectors(input.objectRefs, normalizeObjectRef, "object references");
+    if (objectRefs.length) {
+      clauses.push(`EXISTS (
+        SELECT 1 FROM json_each(frappe_response_cache.object_refs_json) AS cache_ref
+        WHERE cache_ref.value IN (${objectRefs.map(() => "?").join(",")})
+      )`);
+      values.push(...objectRefs);
+    }
+    const result = this.#db.prepare(`DELETE FROM frappe_response_cache WHERE ${clauses.join(" AND ")}`).run(...values);
+    return Number(result.changes ?? 0);
+  }
+
   invalidateSiteCache(site: string): number {
-    const result = this.#db.prepare("DELETE FROM frappe_response_cache WHERE site = ?").run(site);
+    return this.invalidateCache({ site });
+  }
+
+  pruneCache(expiredBefore: string, site?: string): number {
+    assertIsoTimestamp(expiredBefore, "Frappe cache prune cutoff");
+    const result = site
+      ? this.#db.prepare("DELETE FROM frappe_response_cache WHERE site = ? AND valid_until <= ?")
+          .run(normalizeSite(site), expiredBefore)
+      : this.#db.prepare("DELETE FROM frappe_response_cache WHERE valid_until <= ?").run(expiredBefore);
     return Number(result.changes ?? 0);
   }
 
@@ -548,7 +661,19 @@ export class SqliteFrappeReadModel implements FrappeReadModelStore {
         if (!event.kind || !event.objectId) throw new Error("Frappe delete events require kind and objectId.");
         this.deleteIndex(event.site, event.kind, event.objectId);
       }
-      invalidatedCacheEntries = this.invalidateSiteCache(event.site);
+      const targeted = Boolean(event.principal || event.permissionEpoch || event.objectRefs?.length || event.querySignatures?.length);
+      invalidatedCacheEntries = targeted
+        ? this.invalidateCache({
+            site: event.site,
+            ...(event.principal ? { principal: event.principal } : {}),
+            ...(event.permissionEpoch ? { permissionEpoch: event.permissionEpoch } : {}),
+            ...(event.objectRefs?.length ? { objectRefs: event.objectRefs } : {}),
+            ...(event.querySignatures?.length ? { querySignatures: event.querySignatures } : {}),
+          })
+        : this.invalidateSiteCache(event.site);
+      if (event.operation === "permission_changed") {
+        this.invalidatePermissionEpochs(event.site, event.principal);
+      }
       const current = this.getRevision(event.site) ?? { site: event.site, schemaRevision: "unindexed", dataRevision: "unindexed", observedAt: event.observedAt };
       this.setRevision({
         site: event.site,
@@ -716,6 +841,9 @@ export function buildFrappeIndexRecords(snapshot: FrappeEnterpriseSnapshot): Fra
     ["funnel", snapshot.funnels],
     ["flow_config", snapshot.flowConfigs],
     ["dynamic_assignment", snapshot.dynamicAssignments],
+    ["permission_rule", snapshot.permissionRules],
+    ["workspace", snapshot.workspaces],
+    ["notification", snapshot.notifications],
   ];
   const records: FrappeIndexRecord[] = [];
   for (const [kind, values] of buckets) {
@@ -770,19 +898,23 @@ export function buildFrappeIndexRecords(snapshot: FrappeEnterpriseSnapshot): Fra
 }
 
 export const FRAPPE_ZERO_APP_RESOURCE_SPECS = [
-  resourceSpec("modules", "module", "Module Def", false),
-  resourceSpec("doctypes", "doctype", "DocType", false),
-  resourceSpec("customFields", "custom_field", "Custom Field", false),
-  resourceSpec("propertySetters", "property_setter", "Property Setter", false),
-  resourceSpec("workflows", "workflow", "Workflow", false),
-  resourceSpec("reports", "report", "Report", false),
-  resourceSpec("printFormats", "print_format", "Print Format", false),
-  resourceSpec("clientScripts", "client_script", "Client Script", true),
-  resourceSpec("serverScripts", "server_script", "Server Script", true),
-  resourceSpec("funnels", "funnel", "Funnel", true),
-  resourceSpec("flowConfigs", "flow_config", "Flow Config", true),
-  resourceSpec("dynamicAssignments", "dynamic_assignment", "Assignment Rule", false),
-  resourceSpec("dynamicAssignments", "dynamic_assignment", "Dynamic User Assignment", true),
+  resourceSpec("modules", "module", "Module Def", false, ["name", "module_name", "app_name", "custom", "modified"]),
+  resourceSpec("doctypes", "doctype", "DocType", false, ["name", "module", "custom", "istable", "is_submittable", "autoname", "title_field", "search_fields", "modified"]),
+  resourceSpec("customFields", "custom_field", "Custom Field", false, ["name", "dt", "fieldname", "label", "fieldtype", "options", "reqd", "mandatory_depends_on", "depends_on", "read_only_depends_on", "permlevel", "in_list_view", "in_standard_filter", "modified"]),
+  resourceSpec("propertySetters", "property_setter", "Property Setter", false, ["name", "doc_type", "field_name", "property", "value", "property_type", "modified"]),
+  resourceSpec("workflows", "workflow", "Workflow", false, ["name", "document_type", "is_active", "workflow_state_field", "override_status", "modified"]),
+  resourceSpec("reports", "report", "Report", false, ["name", "ref_doctype", "report_type", "module", "is_standard", "disabled", "modified"]),
+  resourceSpec("printFormats", "print_format", "Print Format", false, ["name", "doc_type", "module", "standard", "disabled", "print_format_type", "modified"]),
+  // Never poll script bodies into the shared read model. Runtime execution remains in Frappe.
+  resourceSpec("clientScripts", "client_script", "Client Script", true, ["name", "dt", "view", "enabled", "modified"]),
+  resourceSpec("serverScripts", "server_script", "Server Script", true, ["name", "reference_doctype", "script_type", "event_frequency", "disabled", "modified"]),
+  resourceSpec("funnels", "funnel", "Funnel", true, ["name", "title", "module", "modified"]),
+  resourceSpec("flowConfigs", "flow_config", "Flow Config", true, ["name", "flow_title", "flow_status", "trigger_type", "triggering_event", "module_transaction", "modified"]),
+  resourceSpec("dynamicAssignments", "dynamic_assignment", "Assignment Rule", false, ["name", "document_type", "rule", "disabled", "priority", "modified"]),
+  resourceSpec("dynamicAssignments", "dynamic_assignment", "Dynamic User Assignment", true, ["name", "title", "document_type", "disabled", "modified"]),
+  resourceSpec("permissionRules", "permission_rule", "Custom DocPerm", false, ["name", "parent", "role", "permlevel", "if_owner", "select", "read", "write", "create", "delete", "submit", "cancel", "amend", "report", "export", "import", "print", "email", "share", "modified"]),
+  resourceSpec("workspaces", "workspace", "Workspace", false, ["name", "title", "label", "module", "public", "for_user", "is_hidden", "parent_page", "modified"]),
+  resourceSpec("notifications", "notification", "Notification", false, ["name", "document_type", "enabled", "event", "channel", "send_system_notification", "modified"]),
 ] as const;
 
 export interface FrappePollResourceSpec {
@@ -790,6 +922,7 @@ export interface FrappePollResourceSpec {
   readonly kind: FrappeIndexKind;
   readonly doctype: string;
   readonly optional: boolean;
+  readonly fields?: readonly string[];
 }
 
 export interface FrappeOAuthTokenProvider {
@@ -799,10 +932,14 @@ export interface FrappeOAuthTokenProvider {
 export async function pollFrappeEnterpriseSnapshot(input: {
   readonly site: string;
   readonly fetch: typeof globalThis.fetch;
+  readonly signal?: AbortSignal;
+  readonly modifiedAfter?: string;
   readonly authorization?: string;
   readonly oauth?: FrappeOAuthTokenProvider;
   readonly pageSize?: number;
-  readonly hydrateDoctypes?: boolean;
+  readonly hydrateDoctypes?: boolean | "priority" | readonly string[];
+  readonly priorityDoctypes?: readonly string[];
+  readonly maxHydratedDoctypes?: number;
   readonly resources?: readonly FrappePollResourceSpec[];
   readonly observedAt?: string;
 }): Promise<{ readonly snapshot: FrappeEnterpriseSnapshot; readonly warnings: readonly string[]; readonly requests: number }> {
@@ -815,22 +952,39 @@ export async function pollFrappeEnterpriseSnapshot(input: {
   const authHeader = async (): Promise<string> => input.authorization ?? `Bearer ${(await input.oauth!.getAccessToken()).accessToken}`;
   const requestJson = async (path: string): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; status: number; detail: string }> => {
     requests += 1;
-    const response = await input.fetch(`${site}${path}`, { headers: { Authorization: await authHeader(), Accept: "application/json" } });
+    const response = await input.fetch(`${site}${path}`, {
+      headers: { Authorization: await authHeader(), Accept: "application/json" },
+      ...(input.signal ? { signal: input.signal } : {}),
+    });
     const text = await response.text();
     let parsed: unknown;
     try { parsed = text ? JSON.parse(text) : {}; } catch { parsed = undefined; }
     if (!response.ok) return { ok: false, status: response.status, detail: frappePollError(parsed, text) };
     return { ok: true, body: objectValue(parsed) ?? {} };
   };
-  const appsResponse = await requestJson("/api/method/frappe.utils.change_log.get_versions");
-  const apps = appsResponse.ok ? versionRows(appsResponse.body.message) : [];
-  if (!appsResponse.ok) warnings.push(`apps:${appsResponse.status}:${appsResponse.detail}`);
+  const appsResponse = input.modifiedAfter
+    ? undefined
+    : await requestJson("/api/method/frappe.utils.change_log.get_versions");
+  const apps = appsResponse?.ok ? versionRows(appsResponse.body.message) : [];
+  if (appsResponse && !appsResponse.ok) warnings.push(`apps:${appsResponse.status}:${appsResponse.detail}`);
   const snapshotRows: Partial<Record<FrappePollResourceSpec["snapshotKey"], unknown[]>> = {};
   for (const spec of input.resources ?? FRAPPE_ZERO_APP_RESOURCE_SPECS) {
     const rows: unknown[] = [];
+    let fields = [...(spec.fields ?? ["*"])];
     for (let start = 0; ; start += pageSize) {
-      const query = new URLSearchParams({ fields: JSON.stringify(["*"]), limit_start: String(start), limit_page_length: String(pageSize), order_by: "modified asc" });
-      const result = await requestJson(`/api/resource/${encodeURIComponent(spec.doctype)}?${query.toString()}`);
+      let result: Awaited<ReturnType<typeof requestJson>> | undefined;
+      for (let attempt = 0; attempt <= fields.length; attempt += 1) {
+        const query = new URLSearchParams({ fields: JSON.stringify(fields), limit_start: String(start), limit_page_length: String(pageSize), order_by: "modified asc" });
+        if (input.modifiedAfter) query.set("filters", JSON.stringify([["modified", ">", input.modifiedAfter]]));
+        result = await requestJson(`/api/resource/${encodeURIComponent(spec.doctype)}?${query.toString()}`);
+        if (result.ok) break;
+        const rejected = rejectedPollField(result.status, result.detail, fields);
+        if (!rejected) break;
+        fields = fields.filter((field) => field !== rejected);
+        warnings.push(`${spec.doctype}:field_unavailable:${rejected}`);
+        if (!fields.length) break;
+      }
+      if (!result) throw new Error(`Frappe poll produced no result for ${spec.doctype}.`);
       if (!result.ok) {
         if (!spec.optional) warnings.push(`${spec.doctype}:${result.status}:${result.detail}`);
         else warnings.push(`${spec.doctype}:optional_unavailable:${result.status}`);
@@ -844,11 +998,16 @@ export async function pollFrappeEnterpriseSnapshot(input: {
   }
   if (input.hydrateDoctypes !== false) {
     const doctypes = snapshotRows.doctypes ?? [];
+    const selected = selectedHydrationDoctypes(input, snapshotRows, doctypes);
     const hydrated: unknown[] = [];
     for (const raw of doctypes) {
       const summary = objectValue(raw);
       const name = summary ? optionalString(summary.name) : undefined;
       if (!name) continue;
+      if (!selected.has(name)) {
+        hydrated.push(summary);
+        continue;
+      }
       const detail = await requestJson(`/api/resource/DocType/${encodeURIComponent(name)}`);
       if (detail.ok && objectValue(detail.body.data)) hydrated.push(detail.body.data);
       else {
@@ -875,6 +1034,9 @@ export async function pollFrappeEnterpriseSnapshot(input: {
     funnels: snapshotRows.funnels ?? [],
     flowConfigs: snapshotRows.flowConfigs ?? [],
     dynamicAssignments: snapshotRows.dynamicAssignments ?? [],
+    permissionRules: snapshotRows.permissionRules ?? [],
+    workspaces: snapshotRows.workspaces ?? [],
+    notifications: snapshotRows.notifications ?? [],
   };
   const records = buildFrappeIndexRecords(snapshot);
   const revision = snapshotRevision(snapshot, records);
@@ -886,7 +1048,7 @@ export interface FrappeApprovalProposal {
   readonly mutationHash: string;
   readonly site: string;
   readonly principal: string;
-  readonly operation: "create" | "update";
+  readonly operation: "create" | "update" | "delete" | "submit" | "cancel" | "apply_workflow";
   readonly doctype: string;
   readonly docname?: string;
   readonly fields: readonly string[];
@@ -910,7 +1072,7 @@ export interface FrappeApprovalReceipt {
 export function createFrappeApprovalProposal(input: {
   readonly site: string;
   readonly principal: string;
-  readonly operation: "create" | "update";
+  readonly operation: "create" | "update" | "delete" | "submit" | "cancel" | "apply_workflow";
   readonly doctype: string;
   readonly docname?: string;
   readonly doc: Readonly<Record<string, unknown>>;
@@ -948,7 +1110,7 @@ export function createFrappeApprovalProposal(input: {
   return {
     proposalId: `frappe-approval:${hashCanonical(base)}`,
     ...base,
-    humanSummary: `${input.operation === "create" ? "Create" : "Update"} ${input.doctype}${input.docname ? ` ${input.docname}` : ""} with ${base.fields.length} field${base.fields.length === 1 ? "" : "s"}.`,
+    humanSummary: `${({ create: "Create", update: "Update", delete: "Delete", submit: "Submit", cancel: "Cancel", apply_workflow: "Apply workflow" } as const)[input.operation]} ${input.doctype}${input.docname ? ` ${input.docname}` : ""}${input.operation === "create" || input.operation === "update" ? ` with ${base.fields.length} field${base.fields.length === 1 ? "" : "s"}` : ""}.`,
     bindingRequirements: [
       "The approving actor must be authenticated separately from the model request.",
       "The receipt is valid only for this principal, mutation hash, permission epoch, and schema/data revision.",
@@ -1031,9 +1193,14 @@ export const FRAPPE_POSTGRES_DEPLOYMENT_CONTRACT = {
     "searchIndex",
     "putPermissionEpoch",
     "getPermissionEpoch",
+    "getPermissionEpochState",
+    "invalidatePermissionEpoch",
+    "invalidatePermissionEpochs",
     "putCache",
     "getCache",
+    "invalidateCache",
     "invalidateSiteCache",
+    "pruneCache",
     "applyEvent",
     "consumeApproval",
   ],
@@ -1192,6 +1359,20 @@ function normalizeQuerySignature(value: string): string {
   return value.toLowerCase().replace(/[^\p{L}\p{N}\s_.:/-]/gu, " ").replace(/\s+/g, " ").trim();
 }
 
+function normalizeObjectRef(value: string): string {
+  return value.trim();
+}
+
+function boundedInvalidationSelectors(
+  values: readonly string[] | undefined,
+  normalize: (value: string) => string,
+  label: string,
+): string[] {
+  if (!values) return [];
+  if (values.length > 100) throw new Error(`Frappe cache invalidation accepts at most 100 ${label}.`);
+  return [...new Set(values.map(normalize).filter(Boolean))];
+}
+
 function normalizeSearch(value: string): string[] {
   return [...new Set(normalizeQuerySignature(value).split(" ").filter((term) => term.length > 1))].slice(0, 12);
 }
@@ -1208,6 +1389,10 @@ function normalizeSite(value: string): string {
 
 function normalizePrincipal(value: string): string {
   return value.trim().toLowerCase();
+}
+
+function assertIsoTimestamp(value: string, label: string): void {
+  if (!Number.isFinite(Date.parse(value))) throw new Error(`${label} must be an ISO timestamp.`);
 }
 
 function hashCanonical(value: unknown): string {
@@ -1257,13 +1442,73 @@ function safeHexEqual(expected: string, actual: string): boolean {
   return timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(actual, "hex"));
 }
 
+function selectedHydrationDoctypes(
+  input: {
+    readonly hydrateDoctypes?: boolean | "priority" | readonly string[];
+    readonly priorityDoctypes?: readonly string[];
+    readonly maxHydratedDoctypes?: number;
+  },
+  rows: Partial<Record<FrappePollResourceSpec["snapshotKey"], unknown[]>>,
+  doctypes: readonly unknown[],
+): ReadonlySet<string> {
+  if (Array.isArray(input.hydrateDoctypes)) {
+    return new Set(input.hydrateDoctypes.map((value) => value.trim()).filter(Boolean));
+  }
+  if (input.hydrateDoctypes !== "priority") {
+    return new Set(doctypes.flatMap((raw) => optionalString(objectValue(raw)?.name) ?? []));
+  }
+
+  const available = new Set(doctypes.flatMap((raw) => optionalString(objectValue(raw)?.name) ?? []));
+  const doctypeRows = doctypes.flatMap((raw): Array<{ name: string; module: string; isTable: boolean }> => {
+    const row = objectValue(raw);
+    const name = optionalString(row?.name);
+    if (!name) return [];
+    const tableValue = row?.istable;
+    return [{ name, module: optionalString(row?.module) ?? "Unassigned", isTable: tableValue === true || tableValue === 1 || tableValue === "1" }];
+  });
+  const score = new Map<string, number>();
+  const add = (value: unknown, weight: number): void => {
+    const name = optionalString(value);
+    if (!name || !available.has(name)) return;
+    score.set(name, (score.get(name) ?? 0) + weight);
+  };
+  for (const name of input.priorityDoctypes ?? []) add(name, 10_000);
+  for (const raw of rows.customFields ?? []) add(objectValue(raw)?.dt, 8);
+  for (const raw of rows.propertySetters ?? []) add(objectValue(raw)?.doc_type, 10);
+  for (const raw of rows.permissionRules ?? []) add(objectValue(raw)?.parent, 4);
+  for (const raw of rows.workflows ?? []) add(objectValue(raw)?.document_type, 20);
+  for (const raw of rows.reports ?? []) add(objectValue(raw)?.ref_doctype, 2);
+  for (const raw of rows.dynamicAssignments ?? []) add(objectValue(raw)?.document_type, 12);
+  for (const raw of rows.notifications ?? []) add(objectValue(raw)?.document_type, 6);
+  for (const row of doctypeRows) add(row.name, row.isTable ? 1 : 3);
+  const limit = Math.max(1, Math.min(input.maxHydratedDoctypes ?? 64, 256));
+  const ranked = [...score.entries()]
+    .sort(([leftName, left], [rightName, right]) => right - left || leftName.localeCompare(rightName));
+  const selected: string[] = [];
+  const take = (name: string): void => {
+    if (selected.length < limit && !selected.includes(name)) selected.push(name);
+  };
+  for (const name of input.priorityDoctypes ?? []) if (available.has(name)) take(name);
+  const byModule = new Map<string, Array<[string, number]>>();
+  for (const row of doctypeRows.filter((item) => !item.isTable)) {
+    byModule.set(row.module, [...(byModule.get(row.module) ?? []), [row.name, score.get(row.name) ?? 0]]);
+  }
+  for (const candidates of [...byModule.values()].sort((left, right) => (right[0]?.[1] ?? 0) - (left[0]?.[1] ?? 0))) {
+    candidates.sort(([leftName, left], [rightName, right]) => right - left || leftName.localeCompare(rightName));
+    if (candidates[0]) take(candidates[0][0]);
+  }
+  for (const [name] of ranked) take(name);
+  return new Set(selected);
+}
+
 function resourceSpec(
   snapshotKey: FrappePollResourceSpec["snapshotKey"],
   kind: FrappeIndexKind,
   doctype: string,
   optional: boolean,
+  fields?: readonly string[],
 ): FrappePollResourceSpec {
-  return { snapshotKey, kind, doctype, optional };
+  return { snapshotKey, kind, doctype, optional, ...(fields ? { fields } : {}) };
 }
 
 function versionRows(value: unknown): Array<Record<string, unknown>> {
@@ -1278,4 +1523,10 @@ function versionRows(value: unknown): Array<Record<string, unknown>> {
 function frappePollError(value: unknown, text: string): string {
   const body = objectValue(value);
   return optionalString(body?.exception) ?? optionalString(body?.message) ?? (text.slice(0, 200) || "unknown Frappe error");
+}
+
+function rejectedPollField(status: number, detail: string, fields: readonly string[]): string | undefined {
+  if (status !== 417 || fields.length <= 1) return undefined;
+  const match = /Field not permitted in query:\s*([A-Za-z0-9_]+)/i.exec(detail);
+  return match?.[1] && fields.includes(match[1]) ? match[1] : undefined;
 }

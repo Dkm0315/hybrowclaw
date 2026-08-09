@@ -22,21 +22,34 @@ import { createHash, randomUUID } from "node:crypto";
  *                    bearer token ("Bearer ..." auth)
  */
 
-import { frappeFastRoute, frappeReadModelPlan } from "./read-model.js";
+import { frappeFastRoute, frappeReadModelPlan, type FrappeSemanticAlias } from "./read-model.js";
 import {
+  buildFrappeIndexRecords,
   createFrappeApprovalProposal,
+  computeFrappePermissionEpoch,
   deriveFrappeHierarchyScope,
   FRAPPE_POSTGRES_DEPLOYMENT_CONTRACT,
   FRAPPE_ZERO_APP_RESOURCE_SPECS,
+  pollFrappeEnterpriseSnapshot,
   SqliteFrappeReadModel,
   validateFrappeCustomerProfile,
   verifyFrappeApproval,
   type FrappeApprovalProposal,
   type FrappeApprovalReceipt,
   type FrappeHierarchyConfig,
+  type FrappeIndexRecord,
 } from "./enterprise.js";
+import {
+  FrappeReadService,
+  FrappeReadServiceError,
+  hydrateFrappeEffectiveDocTypeMetadata,
+  requiredFieldsFromEffectiveMetadata,
+  type FrappeEffectiveDocTypeMetadata,
+} from "./read-service.js";
 
 export * from "./enterprise.js";
+export * from "./read-service.js";
+export * from "./change-set.js";
 
 export interface FrappeToolContext {
   readonly fetch?: typeof globalThis.fetch;
@@ -55,8 +68,65 @@ interface FrappeCallOk {
   readonly headers?: Headers;
 }
 
+interface FrappeBusinessApiSpec {
+  readonly id: string;
+  readonly operation: "read";
+  readonly doctype: string;
+  readonly phrases: readonly string[];
+  readonly method: string;
+  readonly params: Readonly<Record<string, "$employee" | "$user" | "$company" | "$today">>;
+  readonly responsePath: string;
+  readonly resultLabel?: string;
+  readonly view?: {
+    readonly title?: string;
+    readonly summary?: string;
+    readonly emptyTitle?: string;
+    readonly emptySummary?: string;
+    readonly columns?: readonly { readonly field: string; readonly label: string }[];
+  };
+  readonly includeWhen?: { readonly field: string; readonly equals: string | number | boolean };
+  readonly fields?: readonly { readonly target: string; readonly sources: readonly string[] }[];
+}
+
 type FrappeCallResult = FrappeCallOk | (FrappeError & { readonly ok?: undefined });
-type FrappeHttpMethod = "GET" | "POST" | "PUT";
+type FrappeHttpMethod = "GET" | "POST" | "PUT" | "DELETE";
+
+const frappeReadServices = new Map<string, { readonly service: FrappeReadService; readonly store: SqliteFrappeReadModel }>();
+const frappeEffectiveMetadataCache = new Map<string, { readonly expiresAt: number; readonly value: FrappeEffectiveDocTypeMetadata }>();
+const FRAPPE_EFFECTIVE_METADATA_TTL_MS = 60_000;
+const SENSITIVE_READ_DOCTYPES = new Set([
+  "Employee",
+  "Employee Checkin",
+  "Attendance",
+  "Attendance Request",
+  "Leave Application",
+  "Leave Allocation",
+  "Expense Claim",
+  "Salary Slip",
+  "Payroll Entry",
+  "Bank Account",
+  "Employee Tax Exemption Declaration",
+]);
+const PERMISSION_AFFECTING_DOCTYPES = new Set([
+  "User",
+  "Role",
+  "Has Role",
+  "User Permission",
+  "DocShare",
+  "Custom DocPerm",
+  "Role Permission for Page and Report",
+  "Employee",
+]);
+const METADATA_AFFECTING_DOCTYPES = new Set([
+  ...PERMISSION_AFFECTING_DOCTYPES,
+  "DocType",
+  "DocField",
+  "Custom Field",
+  "Property Setter",
+  "Workflow",
+  "Workflow State",
+  "Workflow Action Master",
+]);
 
 type FrappeAuth =
   | { readonly kind: "token"; readonly value: string }
@@ -357,6 +427,7 @@ async function frappeAuthedRequest(
   method: FrappeHttpMethod,
   path: string,
   body?: Record<string, unknown>,
+  idempotencyKey?: string,
 ): Promise<FrappeCallResult> {
   const url = `${siteUrl.replace(/\/$/, "")}${path}`;
   let response: Response;
@@ -366,6 +437,7 @@ async function frappeAuthedRequest(
       headers: {
         ...(auth.kind === "token" ? { Authorization: authorizationHeader(auth.value) } : { Cookie: auth.value }),
         Accept: "application/json",
+        ...(idempotencyKey ? { "X-Frappe-Idempotency-Key": idempotencyKey } : {}),
         ...(body ? { "Content-Type": "application/json" } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
@@ -509,42 +581,745 @@ export async function frappe_user_identity_resolve(
 export async function frappe_semantic_data_resolve_lite(
   args: Record<string, unknown>,
   context: FrappeToolContext,
-): Promise<{ doctype: string; rows: unknown[]; count: number } | FrappeError> {
+): Promise<{ doctype: string; rows: unknown[]; count: number; total?: number; scope?: Record<string, unknown>; view?: FrappeBusinessApiSpec["view"] } | FrappeError> {
   const doctype = typeof args.doctype === "string" ? args.doctype.trim() : "";
   if (!doctype) return { error: 'frappe_semantic_data_resolve_lite requires a "doctype" argument.' };
   const query = new URLSearchParams();
-  if (Array.isArray(args.fields) && args.fields.length) query.set("fields", JSON.stringify(args.fields));
+  const explicitFields = Array.isArray(args.fields)
+    ? args.fields.map(String).map((field) => field.trim()).filter(Boolean)
+    : [];
+  if (explicitFields.length) query.set("fields", JSON.stringify(explicitFields));
   if (args.filters !== undefined) query.set("filters", JSON.stringify(args.filters));
+  if (args.orFilters !== undefined) query.set("or_filters", JSON.stringify(args.orFilters));
   const limit = typeof args.limit === "number" && Number.isFinite(args.limit) && args.limit > 0 ? Math.floor(args.limit) : 20;
   query.set("limit_page_length", String(limit));
 
-  const result = await frappeRequest(context, "GET", `/api/resource/${encodeURIComponent(doctype)}?${query.toString()}`);
-  if (!result.ok) return result;
-  const rows = Array.isArray(result.data.data) ? result.data.data : [];
-  return { doctype, rows, count: rows.length };
+  const auth = await resolveRuntimeAuth(args, context);
+  if ("error" in auth) return auth;
+  const prompt = argString(args, "prompt") ?? "";
+  const requestedScope = recordObject(args.scope);
+  const readModelPath = context.config.FRAPPE_READ_MODEL_PATH;
+  const businessApi = selectFrappeBusinessApi(context.config.FRAPPE_BUSINESS_API_CATALOG, prompt, doctype);
+  if (!businessApi && !readModelPath && explicitFields.length && !requestedScope && !booleanArg(args.includeTotal)) {
+    return executeFrappeListRead(context, auth, doctype, `/api/resource/${encodeURIComponent(doctype)}?${query.toString()}`);
+  }
+  const expectedPrincipal = argString(args, "user") ?? await resolveAuthenticatedPrincipal(context, auth);
+  if (typeof expectedPrincipal !== "string") return expectedPrincipal;
+  if (businessApi) {
+    if (!readModelPath) {
+      const actualPrincipal = await resolveAuthenticatedPrincipal(context, auth);
+      if (typeof actualPrincipal !== "string") return actualPrincipal;
+      if (actualPrincipal.toLowerCase() !== expectedPrincipal.toLowerCase()) {
+        return { error: "The connected Frappe account no longer matches this chat identity. Reconnect before continuing." };
+      }
+      return executeFrappeBusinessRead(context, auth, businessApi, actualPrincipal, requestedScope);
+    }
+    const { service } = frappeReadService(readModelPath);
+    const querySignature = JSON.stringify({
+      operation: "business_api",
+      api: businessApi.id,
+      method: businessApi.method,
+      responsePath: businessApi.responsePath,
+      params: businessApi.params,
+      scope: requestedScope ?? null,
+      date: Object.values(businessApi.params).includes("$today") ? new Date().toISOString().slice(0, 10) : null,
+    });
+    try {
+      const resolved = await service.read({
+        site: auth.siteUrl,
+        principal: expectedPrincipal,
+        querySignature,
+        resolveIdentity: async () => resolveFrappePermissionEpoch(context, auth, expectedPrincipal),
+        live: async () => {
+          const value = await executeFrappeBusinessRead(context, auth, businessApi, expectedPrincipal, requestedScope);
+          if ("error" in value) throw frappeReadError(value);
+          return { site: auth.siteUrl, principal: expectedPrincipal, value };
+        },
+        ttlMs: 5_000,
+      });
+      return resolved.value;
+    } catch (error) {
+      return frappeReadServiceFailure(error);
+    }
+  }
+  if (!readModelPath) {
+    const actualPrincipal = await resolveAuthenticatedPrincipal(context, auth);
+    if (typeof actualPrincipal !== "string") return actualPrincipal;
+    const expectedPrincipal = argString(args, "user");
+    if (expectedPrincipal && expectedPrincipal.toLowerCase() !== actualPrincipal.toLowerCase()) {
+      return { error: "The connected Frappe account no longer matches this chat identity. Reconnect before continuing." };
+    }
+    const plan = await frappeListReadPlan(context, auth, actualPrincipal, doctype, query, argString(args, "prompt") ?? "", requestedScope);
+    if ("error" in plan) return plan;
+    return executeFrappeListRead(context, auth, doctype, plan.path, booleanArg(args.includeTotal) ? plan.countPath : undefined, plan.scope);
+  }
+
+  const includeTotal = booleanArg(args.includeTotal);
+  const readPlan = explicitFields.length && !requestedScope && !includeTotal
+    ? {
+        path: `/api/resource/${encodeURIComponent(doctype)}?${query.toString()}`,
+        countPath: undefined,
+        scope: undefined,
+      }
+    : await frappeListReadPlan(
+        context,
+        auth,
+        expectedPrincipal,
+        doctype,
+        query,
+        argString(args, "prompt") ?? "",
+        requestedScope,
+        explicitFields,
+      );
+  if ("error" in readPlan) return readPlan;
+  const { service } = frappeReadService(readModelPath);
+  // Cache the compiled, permission-scoped read plan rather than user wording.
+  // Paraphrases and site-specific aliases that resolve to the same query can
+  // share a fresh result without caching generated answers.
+  const querySignature = JSON.stringify({
+    operation: "resource_list",
+    doctype,
+    path: readPlan.path,
+    countPath: includeTotal ? readPlan.countPath ?? null : null,
+    scope: readPlan.scope ?? null,
+  });
+  try {
+    const resolved = await service.read({
+      site: auth.siteUrl,
+      principal: expectedPrincipal,
+      querySignature,
+      resolveIdentity: async () => resolveFrappePermissionEpoch(context, auth, expectedPrincipal),
+      live: async (identity) => {
+        const value = await executeFrappeListRead(
+          context,
+          auth,
+          doctype,
+          readPlan.path,
+          includeTotal ? readPlan.countPath : undefined,
+          readPlan.scope,
+        );
+        if ("error" in value) throw frappeReadError(value);
+        return {
+          site: auth.siteUrl,
+          principal: expectedPrincipal,
+          value,
+          objectRefs: value.rows.flatMap((row) => {
+            const name = recordString(row, "name");
+            return name ? [`${doctype}:${name}`] : [];
+          }),
+        };
+      },
+      ttlMs: SENSITIVE_READ_DOCTYPES.has(doctype) ? 5_000 : 30_000,
+      ...(SENSITIVE_READ_DOCTYPES.has(doctype)
+        ? {}
+        : { fallback: { mode: "stale_if_unavailable" as const, maxStaleMs: 30_000 } }),
+    });
+    return resolved.value;
+  } catch (error) {
+    return frappeReadServiceFailure(error);
+  }
 }
 
-/** POST /api/resource/:doctype — create one document as the paired Frappe user. */
-export async function frappe_records_create(
+function selectFrappeBusinessApi(
+  rawCatalog: string | undefined,
+  prompt: string,
+  doctype: string,
+): FrappeBusinessApiSpec | undefined {
+  if (!rawCatalog?.trim() || !prompt.trim()) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawCatalog);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(parsed)) return undefined;
+  const promptWords = normalizedBusinessWords(prompt);
+  const normalizedPrompt = promptWords.join(" ");
+  const candidates = parsed.flatMap((value): Array<{ readonly spec: FrappeBusinessApiSpec; readonly score: number }> => {
+    const spec = parseFrappeBusinessApiSpec(value);
+    if (!spec || spec.doctype.toLowerCase() !== doctype.toLowerCase()) return [];
+    let score = 0;
+    for (const phrase of spec.phrases) {
+      const phraseWords = normalizedBusinessWords(phrase);
+      if (!phraseWords.length) continue;
+      if (normalizedPrompt.includes(phraseWords.join(" "))) score = Math.max(score, 200 + phraseWords.length);
+      else if (phraseWords.every((word) => promptWords.includes(word))) score = Math.max(score, 100 + phraseWords.length);
+    }
+    return score ? [{ spec, score }] : [];
+  }).sort((left, right) => right.score - left.score || left.spec.id.localeCompare(right.spec.id));
+  if (candidates.length > 1 && candidates[0]?.score === candidates[1]?.score && candidates[0]?.spec.id !== candidates[1]?.spec.id) {
+    return undefined;
+  }
+  return candidates[0]?.spec;
+}
+
+function parseFrappeBusinessApiSpec(value: unknown): FrappeBusinessApiSpec | undefined {
+  const input = recordObject(value);
+  if (!input || input.operation !== "read") return undefined;
+  const id = recordString(input, "id");
+  const doctype = recordString(input, "doctype");
+  const method = recordString(input, "method");
+  const responsePath = recordString(input, "responsePath");
+  const phrases = Array.isArray(input.phrases)
+    ? input.phrases.filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
+    : [];
+  if (!id || !doctype || !method || !responsePath || !phrases.length || !/^[A-Za-z0-9_.]+$/.test(method)) return undefined;
+  const rawParams = recordObject(input.params) ?? {};
+  const params: Record<string, "$employee" | "$user" | "$company" | "$today"> = {};
+  for (const [key, source] of Object.entries(rawParams)) {
+    if (/^[A-Za-z][A-Za-z0-9_]*$/.test(key) && (source === "$employee" || source === "$user" || source === "$company" || source === "$today")) params[key] = source;
+  }
+  const rawView = recordObject(input.view);
+  const fields = Array.isArray(input.fields) ? input.fields.flatMap((field) => {
+    const item = recordObject(field);
+    const target = item ? recordString(item, "target") : undefined;
+    const sources = item && Array.isArray(item.sources)
+      ? item.sources.filter((source): source is string => typeof source === "string" && Boolean(source.trim()))
+      : [];
+    return target && /^[A-Za-z][A-Za-z0-9_]*$/.test(target) && sources.length ? [{ target, sources }] : [];
+  }) : undefined;
+  const resultLabel = recordString(input, "resultLabel");
+  const title = rawView ? recordString(rawView, "title") : undefined;
+  const summary = rawView ? recordString(rawView, "summary") : undefined;
+  const emptyTitle = rawView ? recordString(rawView, "emptyTitle") : undefined;
+  const emptySummary = rawView ? recordString(rawView, "emptySummary") : undefined;
+  const columns = rawView && Array.isArray(rawView.columns) ? rawView.columns.flatMap((column) => {
+    const item = recordObject(column);
+    const field = item ? recordString(item, "field") : undefined;
+    const label = item ? recordString(item, "label") : undefined;
+    return field && label && /^[A-Za-z][A-Za-z0-9_]*$/.test(field) ? [{ field, label }] : [];
+  }) : undefined;
+  const rawIncludeWhen = recordObject(input.includeWhen);
+  const includeField = rawIncludeWhen ? recordString(rawIncludeWhen, "field") : undefined;
+  const includeEquals = rawIncludeWhen?.equals;
+  const includeWhen = includeField
+    && /^[A-Za-z][A-Za-z0-9_]*$/.test(includeField)
+    && (typeof includeEquals === "string" || typeof includeEquals === "number" || typeof includeEquals === "boolean")
+    ? { field: includeField, equals: includeEquals }
+    : undefined;
+  return {
+    id,
+    operation: "read",
+    doctype,
+    phrases,
+    method,
+    params,
+    responsePath,
+    ...(resultLabel ? { resultLabel } : {}),
+    ...(title || summary || emptyTitle || emptySummary || columns?.length ? { view: {
+      ...(title ? { title } : {}),
+      ...(summary ? { summary } : {}),
+      ...(emptyTitle ? { emptyTitle } : {}),
+      ...(emptySummary ? { emptySummary } : {}),
+      ...(columns?.length ? { columns } : {}),
+    } } : {}),
+    ...(includeWhen ? { includeWhen } : {}),
+    ...(fields?.length ? { fields } : {}),
+  };
+}
+
+async function executeFrappeBusinessRead(
+  context: FrappeToolContext,
+  auth: { readonly siteUrl: string; readonly auth: FrappeAuth },
+  spec: FrappeBusinessApiSpec,
+  principal: string,
+  scope?: Record<string, unknown>,
+): Promise<{ doctype: string; rows: unknown[]; count: number; scope: Record<string, unknown>; view?: FrappeBusinessApiSpec["view"] } | FrappeError> {
+  const employee = recordString(scope, "employee");
+  const params: Record<string, unknown> = {};
+  for (const [name, source] of Object.entries(spec.params)) {
+    if (source === "$employee") {
+      if (!employee) return { error: "The connected Frappe account does not have an employee record available for this request." };
+      params[name] = employee;
+    } else if (source === "$user") params[name] = principal;
+    else if (source === "$company") {
+      const company = recordString(scope, "company");
+      if (!company) return { error: "The connected Frappe account does not have a company available for this request." };
+      params[name] = company;
+    }
+    else params[name] = new Date().toISOString().slice(0, 10);
+  }
+  const result = await frappeAuthedRequest(
+    context.fetch!,
+    auth.siteUrl,
+    auth.auth,
+    "POST",
+    `/api/method/${spec.method}`,
+    params,
+  );
+  if (!result.ok) return result;
+  const applicationError = frappeBusinessApplicationError(result.data);
+  if (applicationError) return { error: applicationError };
+  const resolved = valueAtPath(result.data, spec.responsePath);
+  if (resolved === undefined) {
+    return { error: `Frappe API "${spec.id}" returned an unexpected response. No data was shown.` };
+  }
+  const values = (Array.isArray(resolved) ? resolved : resolved === undefined || resolved === null ? [] : [resolved])
+    .filter((value) => {
+      if (!spec.includeWhen) return true;
+      return recordObject(value)?.[spec.includeWhen.field] === spec.includeWhen.equals;
+    });
+  const rows = values.map((value) => projectBusinessApiRow(value, spec.fields))
+    .filter((row) => Object.values(row).some(hasRenderableBusinessValue));
+  return {
+    doctype: spec.resultLabel ?? spec.doctype,
+    rows,
+    count: rows.length,
+    scope: { mode: "self", authority: "frappe_permissions", api: spec.id },
+    ...(spec.view ? { view: spec.view } : {}),
+  };
+}
+
+function hasRenderableBusinessValue(value: unknown): boolean {
+  if (typeof value === "string") return Boolean(value.trim());
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "boolean") return true;
+  if (Array.isArray(value)) return value.some(hasRenderableBusinessValue);
+  const record = recordObject(value);
+  return record ? Object.values(record).some(hasRenderableBusinessValue) : false;
+}
+
+function frappeBusinessApplicationError(payload: Record<string, unknown>): string | undefined {
+  const message = recordObject(payload.message);
+  const failed = payload.success === false || message?.success === false;
+  const status = String(payload.status ?? message?.status ?? "").toLowerCase();
+  const error = recordString(payload, "error")
+    ?? recordString(payload, "exception")
+    ?? recordString(payload, "exc_type")
+    ?? (message ? recordString(message, "error") ?? recordString(message, "exception") : undefined);
+  if (!failed && status !== "error" && status !== "failed" && !error) return undefined;
+  const detail = error?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 240);
+  return detail ? `Frappe could not complete this read: ${detail}` : "Frappe could not complete this read.";
+}
+
+function projectBusinessApiRow(value: unknown, fields: FrappeBusinessApiSpec["fields"]): Record<string, unknown> {
+  const row = recordObject(value);
+  if (!row) return { title: String(value) };
+  if (!fields?.length) return row;
+  const projected: Record<string, unknown> = {};
+  for (const field of fields) {
+    const source = field.sources.find((name) => row[name] !== undefined && row[name] !== null && String(row[name]).trim());
+    if (source) projected[field.target] = row[source];
+  }
+  return projected;
+}
+
+function valueAtPath(value: unknown, path: string): unknown {
+  return path.split(".").filter(Boolean).reduce<unknown>((current, key) => recordObject(current)?.[key], value);
+}
+
+function normalizedBusinessWords(value: string): string[] {
+  const aliases: Readonly<Record<string, string>> = {
+    chhutti: "leave",
+    chhuttiya: "leave",
+    chhuttiyan: "leave",
+    chutti: "leave",
+    chuttiya: "leave",
+    chuttiyan: "leave",
+    bacha: "balance",
+    bache: "balance",
+    bachi: "balance",
+    left: "balance",
+    remaining: "balance",
+  };
+  const filler = new Set([
+    "a", "am", "are", "can", "could", "do", "does", "hai", "hain", "have", "how", "i", "is", "it",
+    "kitna", "kitne", "kitni", "me", "mera", "mere", "meri", "mujhe", "my", "please", "show", "tell",
+    "the", "to", "what", "would", "you",
+  ]);
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(/\s+/).filter(Boolean)
+    .map((word) => aliases[word] ?? (word === "leaves" ? "leave" : word.endsWith("ies") ? `${word.slice(0, -3)}y` : word))
+    .filter((word) => !filler.has(word));
+}
+
+function frappeReadService(path: string): { readonly service: FrappeReadService; readonly store: SqliteFrappeReadModel } {
+  const existing = frappeReadServices.get(path);
+  if (existing) return existing;
+  const store = new SqliteFrappeReadModel(path);
+  const entry = {
+    store,
+    service: new FrappeReadService({
+      store,
+      identityTtlMs: 10_000,
+      queryTtlMs: 30_000,
+      maxQueryTtlMs: 30_000,
+      maxStaleMs: 30_000,
+      maxConcurrency: 8,
+      maxQueue: 128,
+    }),
+  };
+  frappeReadServices.set(path, entry);
+  return entry;
+}
+
+async function executeFrappeListRead(
+  context: FrappeToolContext,
+  auth: { readonly siteUrl: string; readonly auth: FrappeAuth },
+  doctype: string,
+  path: string,
+  countPath?: string,
+  scope?: Record<string, unknown>,
+): Promise<{ doctype: string; rows: unknown[]; count: number; total?: number; scope?: Record<string, unknown> } | FrappeError> {
+  let effectivePath = path;
+  let result: FrappeCallResult | undefined;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    result = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", effectivePath);
+    if (result.ok) break;
+    const fallback = queryPathWithoutRejectedField(effectivePath, result);
+    if (!fallback) return result;
+    effectivePath = fallback;
+  }
+  if (!result || !result.ok) return result ?? { error: "Frappe read did not return a result." };
+  const countResult = countPath
+    ? await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", countPath)
+    : undefined;
+  if (countResult && !countResult.ok) return countResult;
+  const rows = Array.isArray(result.data.data) ? result.data.data : [];
+  const totalValue = countResult?.data.message;
+  const total = typeof totalValue === "number" && Number.isFinite(totalValue)
+    ? totalValue
+    : typeof totalValue === "string" && Number.isFinite(Number(totalValue))
+      ? Number(totalValue)
+      : undefined;
+  return { doctype, rows, count: rows.length, ...(total !== undefined ? { total } : {}), ...(scope ? { scope } : {}) };
+}
+
+function queryPathWithoutRejectedField(path: string, error: FrappeError): string | undefined {
+  if (error.status !== 417) return undefined;
+  const match = /Field not permitted in query:\s*([A-Za-z0-9_]+)/i.exec(error.error);
+  if (!match?.[1]) return undefined;
+  const url = new URL(path, "https://muster.invalid");
+  const fields = jsonStringArrayQuery(url.searchParams.get("fields"))
+    .filter((field) => field !== match[1]);
+  if (!fields.length) return undefined;
+  url.searchParams.set("fields", JSON.stringify(fields));
+  return `${url.pathname}${url.search}`;
+}
+
+async function frappeListReadPlan(
+  context: FrappeToolContext,
+  auth: { readonly siteUrl: string; readonly auth: FrappeAuth },
+  principal: string,
+  doctype: string,
+  baseQuery: URLSearchParams,
+  prompt: string,
+  scopeInput?: Record<string, unknown>,
+  explicitFields: readonly string[] = [],
+): Promise<{ path: string; countPath: string; scope?: Record<string, unknown> } | FrappeError> {
+  const standard = standardSelfScopedReadPlan(doctype, baseQuery, principal, prompt, scopeInput, explicitFields);
+  if (standard) return standard;
+  const metadata = await cachedEffectiveMetadata(context, auth, principal, doctype);
+  if ("error" in metadata) {
+    const fallback = new URLSearchParams(baseQuery);
+    fallback.set("fields", JSON.stringify(explicitFields.length ? explicitFields : ["name", "modified"]));
+    return {
+      path: `/api/resource/${encodeURIComponent(doctype)}?${fallback.toString()}`,
+      countPath: `/api/method/frappe.desk.reportview.get_count?${new URLSearchParams({
+        doctype,
+        fields: JSON.stringify(["name"]),
+        filters: fallback.get("filters") ?? "[]",
+        or_filters: fallback.get("or_filters") ?? "[]",
+      }).toString()}`,
+      ...(scopeInput ? { scope: { mode: recordString(scopeInput, "mode") ?? "none", authority: "frappe_permissions" } } : {}),
+    };
+  }
+  const fields = explicitFields.length ? [...explicitFields] : effectiveReadProjection(metadata, prompt);
+  const query = new URLSearchParams(baseQuery);
+  query.set("fields", JSON.stringify(fields));
+  const scope = permissionScopedReadQuery(metadata, principal, prompt, scopeInput);
+  const existingFilters = jsonArrayQuery(query.get("filters"));
+  const existingOrFilters = jsonArrayQuery(query.get("or_filters"));
+  const filters = [...existingFilters, ...scope.filters];
+  const orFilters = [...existingOrFilters, ...scope.orFilters];
+  if (filters.length) query.set("filters", JSON.stringify(filters));
+  else query.delete("filters");
+  if (orFilters.length) query.set("or_filters", JSON.stringify(orFilters));
+  else query.delete("or_filters");
+  const countQuery = new URLSearchParams({
+    doctype,
+    fields: JSON.stringify(["name"]),
+    filters: JSON.stringify(filters),
+    or_filters: JSON.stringify(orFilters),
+  });
+  return {
+    path: `/api/resource/${encodeURIComponent(doctype)}?${query.toString()}`,
+    countPath: `/api/method/frappe.desk.reportview.get_count?${countQuery.toString()}`,
+    ...(scope.summary ? { scope: scope.summary } : {}),
+  };
+}
+
+function standardSelfScopedReadPlan(
+  doctype: string,
+  baseQuery: URLSearchParams,
+  principal: string,
+  prompt: string,
+  scopeInput?: Record<string, unknown>,
+  explicitFields: readonly string[] = [],
+): { path: string; countPath: string; scope?: Record<string, unknown> } | undefined {
+  if ((recordString(scopeInput, "mode") ?? "none") !== "self") return undefined;
+  const employee = recordString(scopeInput, "employee");
+  const normalized = doctype.toLowerCase();
+  const fields = explicitFields.length
+    ? [...explicitFields]
+    : normalized === "todo"
+      ? ["name", "description", "status", "priority", "reference_type", "reference_name", "date", "modified"]
+      : normalized === "task"
+        ? ["name", "subject", "status", "priority", "exp_start_date", "exp_end_date", "modified"]
+        : normalized === "leave application"
+          ? ["name", "leave_type", "status", "workflow_state", "from_date", "to_date", "employee", "employee_name", "modified"]
+          : [];
+  if (!fields.length) return undefined;
+  const filters: unknown[][] = jsonArrayQuery(baseQuery.get("filters"));
+  const orFilters: unknown[][] = jsonArrayQuery(baseQuery.get("or_filters"));
+  const scopeSummary: Record<string, unknown> = { mode: "self", authority: "frappe_permissions", fastPath: "standard_frappe" };
+  if (normalized === "todo") {
+    filters.push(["allocated_to", "=", principal]);
+    if (/\b(?:open|pending|todo|to do|to-do)\b/i.test(prompt)) filters.push(["status", "!=", "Closed"]);
+    scopeSummary.identityField = "allocated_to";
+  } else if (normalized === "task") {
+    if (/\b(?:open|pending|active|incomplete)\b/i.test(prompt)) filters.push(["status", "not in", ["Completed", "Cancelled", "Canceled", "Closed"]]);
+    orFilters.push(["owner", "=", principal], ["_assign", "like", `%${principal}%`]);
+    scopeSummary.identityField = "owner_or_assignment";
+  } else if (normalized === "leave application" && employee) {
+    filters.push(["employee", "=", employee]);
+    if (/\b(?:open|pending)\b/i.test(prompt)) filters.push(["status", "not in", ["Approved", "Rejected", "Cancelled", "Canceled"]]);
+    scopeSummary.identityField = "employee";
+  } else {
+    return undefined;
+  }
+  const query = new URLSearchParams(baseQuery);
+  query.set("fields", JSON.stringify([...new Set(fields)]));
+  if (filters.length) query.set("filters", JSON.stringify(filters));
+  else query.delete("filters");
+  if (orFilters.length) query.set("or_filters", JSON.stringify(orFilters));
+  else query.delete("or_filters");
+  const countQuery = new URLSearchParams({
+    doctype,
+    fields: JSON.stringify(["name"]),
+    filters: JSON.stringify(filters),
+    or_filters: JSON.stringify(orFilters),
+  });
+  return {
+    path: `/api/resource/${encodeURIComponent(doctype)}?${query.toString()}`,
+    countPath: `/api/method/frappe.desk.reportview.get_count?${countQuery.toString()}`,
+    scope: scopeSummary,
+  };
+}
+
+async function cachedEffectiveMetadata(
+  context: FrappeToolContext,
+  auth: { readonly siteUrl: string; readonly auth: FrappeAuth },
+  principal: string,
+  doctype: string,
+): Promise<FrappeEffectiveDocTypeMetadata | FrappeError> {
+  const key = `${auth.siteUrl.replace(/\/$/, "").toLowerCase()}\0${principal.toLowerCase()}\0${doctype}`;
+  const cached = frappeEffectiveMetadataCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const loaded = await loadFrappeEffectiveDocTypeMetadata(context, auth.siteUrl, auth.auth, doctype);
+  if ("error" in loaded) return loaded;
+  frappeEffectiveMetadataCache.set(key, { expiresAt: Date.now() + FRAPPE_EFFECTIVE_METADATA_TTL_MS, value: loaded });
+  return loaded;
+}
+
+function effectiveReadProjection(metadata: FrappeEffectiveDocTypeMetadata, prompt: string): string[] {
+  const promptTerms = new Set(prompt.toLowerCase().split(/[^a-z0-9]+/).filter((term) => term.length >= 3));
+  const commonBusinessField = /^(?:title|subject|status|workflow_state|employee|employee_name|department|company|designation|reports_to|owner|assigned_to|priority|from_date|to_date|posting_date|transaction_date|attendance_date|leave_type|total|grand_total|amount|total_claimed_amount)$/;
+  const excludedTypes = new Set([
+    "Button", "Column Break", "Fold", "Geolocation", "Heading", "HTML", "Image", "Section Break", "Tab Break",
+    "Table", "Table MultiSelect", "Password", "Code", "Text Editor", "Long Text", "Markdown Editor", "Signature",
+  ]);
+  const ranked = metadata.fields.flatMap((field): Array<{ readonly name: string; readonly score: number }> => {
+    if (field.hidden || field.permlevel > 0 || excludedTypes.has(field.fieldtype ?? "")) return [];
+    const fieldTerms = `${field.fieldname} ${field.label}`.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    const promptMatch = fieldTerms.some((term) => promptTerms.has(term));
+    const score = (promptMatch ? 160 : 0)
+      + (field.inListView ? 100 : 0)
+      + (field.inStandardFilter ? 70 : 0)
+      + (field.searchIndex ? 45 : 0)
+      + (commonBusinessField.test(field.fieldname) ? 40 : 0)
+      + (field.reqd ? 15 : 0);
+    return score > 0 ? [{ name: field.fieldname, score }] : [];
+  }).sort((left, right) => right.score - left.score || left.name.localeCompare(right.name));
+  return ["name", ...ranked.map((field) => field.name), "modified"]
+    .filter((field, index, values) => values.indexOf(field) === index)
+    .slice(0, 12);
+}
+
+function permissionScopedReadQuery(
+  metadata: FrappeEffectiveDocTypeMetadata,
+  principal: string,
+  prompt: string,
+  input: Record<string, unknown> | undefined,
+): {
+  readonly filters: unknown[][];
+  readonly orFilters: unknown[][];
+  readonly summary?: Record<string, unknown>;
+} {
+  const filters: unknown[][] = [];
+  const orFilters: unknown[][] = [];
+  const mode = recordString(input, "mode") ?? "none";
+  const statusFilter = operationalStatusFilter(metadata, prompt);
+  if (statusFilter) filters.push(statusFilter);
+  if (mode !== "self") {
+    return {
+      filters,
+      orFilters,
+      ...(mode !== "none" ? { summary: { mode, authority: "frappe_permissions" } } : {}),
+    };
+  }
+
+  const employee = recordString(input, "employee");
+  const usableFields = metadata.fields.filter((field) => !field.hidden && field.permlevel === 0);
+  const employeeField = employee
+    ? usableFields
+        .filter((field) => field.fieldtype === "Link" && field.options === "Employee")
+        .sort((left, right) => identityFieldScore(right.fieldname, "employee") - identityFieldScore(left.fieldname, "employee"))[0]
+    : undefined;
+  if (employee && employeeField) {
+    filters.push([employeeField.fieldname, "=", employee]);
+    return {
+      filters,
+      orFilters,
+      summary: { mode: "self", authority: "frappe_permissions", identityField: employeeField.fieldname },
+    };
+  }
+
+  const userField = usableFields
+    .filter((field) => field.fieldtype === "Link" && field.options === "User" && identityFieldScore(field.fieldname, "user") > 0)
+    .sort((left, right) => identityFieldScore(right.fieldname, "user") - identityFieldScore(left.fieldname, "user"))[0];
+  if (userField) {
+    filters.push([userField.fieldname, "=", principal]);
+    return {
+      filters,
+      orFilters,
+      summary: { mode: "self", authority: "frappe_permissions", identityField: userField.fieldname },
+    };
+  }
+
+  // Every Frappe record has owner and _assign columns. This fallback remains
+  // permission-filtered by Frappe and avoids assuming a customer-specific field.
+  orFilters.push(["owner", "=", principal], ["_assign", "like", `%${principal}%`]);
+  return {
+    filters,
+    orFilters,
+    summary: { mode: "self", authority: "frappe_permissions", identityField: "owner_or_assignment" },
+  };
+}
+
+function identityFieldScore(fieldname: string, kind: "employee" | "user"): number {
+  const normalized = fieldname.toLowerCase();
+  if (kind === "employee") {
+    if (normalized === "employee") return 100;
+    if (/^(?:employee_id|employee_number|requested_for_employee)$/.test(normalized)) return 80;
+    if (/(?:^|_)employee(?:_|$)/.test(normalized)) return 40;
+    return 0;
+  }
+  if (/^(?:allocated_to|assigned_to|requested_by|raised_by|user|user_id)$/.test(normalized)) return 100;
+  if (/(?:allocated|assigned|requested|raised|applicant|requestor|requester).*(?:user|to|by)$/.test(normalized)) return 60;
+  return 0;
+}
+
+function operationalStatusFilter(metadata: FrappeEffectiveDocTypeMetadata, prompt: string): unknown[] | undefined {
+  const requested = /\bopen\b/i.test(prompt) ? "open" : /\bpending\b/i.test(prompt) ? "pending" : undefined;
+  if (!requested) return undefined;
+  const statusField = metadata.fields.find((field) => field.fieldname === "status" && !field.hidden && field.permlevel === 0);
+  if (!statusField) return undefined;
+  const options = statusField.options?.split("\n").map((value) => value.trim()).filter(Boolean) ?? [];
+  const exact = options.find((value) => value.toLowerCase() === requested);
+  if (exact) return ["status", "=", exact];
+  const terminal = options.filter((value) => /^(?:completed|cancelled|canceled|closed|rejected|resolved)$/i.test(value));
+  return terminal.length ? ["status", "not in", terminal] : undefined;
+}
+
+function jsonArrayQuery(value: string | null): unknown[][] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((item): item is unknown[] => Array.isArray(item)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function jsonStringArrayQuery(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string" && item.length > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+async function resolveAuthenticatedPrincipal(
+  context: FrappeToolContext,
+  auth: { readonly siteUrl: string; readonly auth: FrappeAuth },
+): Promise<string | FrappeError> {
+  const result = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", "/api/method/frappe.auth.get_logged_user");
+  if (!result.ok) return result;
+  const principal = typeof result.data.message === "string" ? result.data.message.trim() : "";
+  return principal || { error: "The connected Frappe account did not return a user identity." };
+}
+
+async function resolveFrappePermissionEpoch(
+  context: FrappeToolContext,
+  auth: { readonly siteUrl: string; readonly auth: FrappeAuth },
+  expectedPrincipal: string,
+) {
+  const resolvedPrincipal = await resolveAuthenticatedPrincipal(context, auth);
+  if (typeof resolvedPrincipal !== "string") throw frappeReadError(resolvedPrincipal);
+  if (resolvedPrincipal.toLowerCase() !== expectedPrincipal.toLowerCase()) {
+    throw new FrappeReadServiceError(
+      "identity_mismatch",
+      "The connected Frappe account no longer matches this chat identity. Reconnect before continuing.",
+    );
+  }
+  const [employee, roles] = await Promise.all([
+    resolveEmployeeForUser(auth, context, resolvedPrincipal),
+    resolveRolesForUser(auth, context, resolvedPrincipal),
+  ]);
+  if (employee && "error" in employee) throw frappeReadError(employee);
+  if ("error" in roles) throw frappeReadError(roles);
+  return computeFrappePermissionEpoch({
+    site: auth.siteUrl,
+    principal: resolvedPrincipal,
+    roles: roles.roles,
+    hierarchyInputs: employee ? [employee] : [],
+  });
+}
+
+function frappeReadError(error: FrappeError): FrappeReadServiceError {
+  const kind = error.status === 401
+    ? "authentication_failed"
+    : error.status === 403
+      ? "permission_denied"
+      : "unavailable";
+  return new FrappeReadServiceError(kind, error.error, { cause: error });
+}
+
+function frappeReadServiceFailure(error: unknown): FrappeError {
+  if (error instanceof FrappeReadServiceError) {
+    const cause = error.cause;
+    if (typeof cause === "object" && cause !== null && "error" in cause) return cause as FrappeError;
+    if (error.kind === "overloaded") return { error: "The connected work system is busy. Please try again in a moment.", status: 503 };
+    if (error.kind === "invalidated") return { error: "Your work data changed during this request. Please try once more.", status: 409 };
+    return { error: error.message, status: error.kind === "permission_denied" ? 403 : error.kind === "authentication_failed" ? 401 : 503 };
+  }
+  return { error: error instanceof Error ? error.message : String(error), status: 503 };
+}
+
+/** Fetches Frappe's permission-filtered, customization-applied DocType metadata. */
+export async function frappeEffectiveDocTypeMetadata(
   args: Record<string, unknown>,
   context: FrappeToolContext,
-): Promise<{ created: Record<string, unknown> } | FrappeError> {
-  const doctype = typeof args.doctype === "string" ? args.doctype.trim() : "";
-  if (!doctype) return { error: 'frappe_records_create requires a "doctype" argument.' };
-  const doc = args.doc;
-  if (typeof doc !== "object" || doc === null || Array.isArray(doc)) {
-    return { error: 'frappe_records_create requires a "doc" object with the document fields.' };
-  }
-  if (!booleanArg(args.trustedFixture)) {
-    return { error: "Direct Frappe create is disabled for runtime requests. Use frappe_safe_write so Frappe permission, current mandatory fields, a mutation-bound human approval, atomic replay protection, execution, and verification remain one guarded path." };
-  }
-  const result = await frappeRequest(context, "POST", `/api/resource/${encodeURIComponent(doctype)}`, doc as Record<string, unknown>);
-  if (!result.ok) return result;
-  const created = result.data.data;
-  if (typeof created !== "object" || created === null) {
-    return { error: `Frappe create returned no document body: ${JSON.stringify(result.data).slice(0, 200)}` };
-  }
-  return { created: created as Record<string, unknown> };
+): Promise<FrappeEffectiveDocTypeMetadata | FrappeError> {
+  const doctype = argString(args, "doctype");
+  if (!doctype) return { error: 'Frappe effective metadata requires a "doctype" argument.' };
+  const auth = await resolveRuntimeAuth(args, context);
+  if ("error" in auth) return auth;
+  return loadFrappeEffectiveDocTypeMetadata(context, auth.siteUrl, auth.auth, doctype);
 }
 
 /**
@@ -718,8 +1493,13 @@ export async function frappe_module_context(
     return { module, docs: docs.docs, priors: docs.modules, doctypes: [], customFields: [], workflows: [], warnings };
   }
   const doctypes = await frappeList(context, auth.siteUrl, auth.auth, "DocType", ["name", "module", "custom", "istable"], [["module", "=", module]], 200, warnings);
-  const customFields = await frappeList(context, auth.siteUrl, auth.auth, "Custom Field", ["name", "dt", "fieldname", "fieldtype", "options"], [["dt", "like", `%${module}%`]], 100, warnings);
-  const workflows = await frappeList(context, auth.siteUrl, auth.auth, "Workflow", ["name", "document_type", "is_active"], [["document_type", "like", `%${module}%`]], 100, warnings);
+  const moduleDoctypes = doctypes.flatMap((row) => recordString(row, "name") ?? []);
+  const customFields = moduleDoctypes.length
+    ? await frappeList(context, auth.siteUrl, auth.auth, "Custom Field", ["name", "dt", "fieldname", "fieldtype", "options"], [["dt", "in", moduleDoctypes]], 500, warnings)
+    : [];
+  const workflows = moduleDoctypes.length
+    ? await frappeList(context, auth.siteUrl, auth.auth, "Workflow", ["name", "document_type", "is_active"], [["document_type", "in", moduleDoctypes]], 200, warnings)
+    : [];
   return {
     module,
     docs: docs.docs,
@@ -978,18 +1758,23 @@ export async function frappe_safe_write(
   args: Record<string, unknown>,
   context: FrappeToolContext,
 ): Promise<{
-  status: "approval_required" | "denied" | "executed";
-  operation: "create" | "update";
+  status: "approval_required" | "denied" | "executed" | "reconciled";
+  operation: "create" | "update" | "delete" | "submit" | "cancel" | "apply_workflow";
   doctype: string;
   preflight: { readonly allowed: boolean; readonly reason: string; readonly source: "frappe_api" };
-  proposedMutation: { readonly operation: "create" | "update"; readonly doctype: string; readonly docname?: string; readonly fields: string[]; readonly dryRun: boolean };
+  proposedMutation: { readonly operation: "create" | "update" | "delete" | "submit" | "cancel" | "apply_workflow"; readonly doctype: string; readonly docname?: string; readonly fields: string[]; readonly dryRun: boolean; readonly expectedModified?: string };
   approvalGate: { readonly required: boolean; readonly approved: boolean; readonly approvalNote?: string; readonly instruction: string };
   approvalProposal?: FrappeApprovalProposal;
-  result?: { readonly created?: Record<string, unknown>; readonly updated?: Record<string, unknown> };
+  result?: { readonly created?: Record<string, unknown>; readonly updated?: Record<string, unknown>; readonly deleted?: boolean; readonly action?: string };
   verification?: { readonly verified: boolean; readonly fetched?: Record<string, unknown>; readonly reason?: string };
   evidenceLog: string[];
 } | FrappeError> {
-  const operation = argString(args, "operation") === "update" ? "update" : "create";
+  const requestedOperation = argString(args, "operation") ?? "create";
+  const supportedOperations = ["create", "update", "delete", "submit", "cancel", "apply_workflow"] as const;
+  if (!supportedOperations.includes(requestedOperation as typeof supportedOperations[number])) {
+    return { error: `frappe_safe_write does not support operation "${requestedOperation}".` };
+  }
+  const operation = requestedOperation as typeof supportedOperations[number];
   const doctype = argString(args, "doctype");
   if (!doctype) return { error: 'frappe_safe_write requires a "doctype" argument.' };
   const doc = args.doc;
@@ -998,23 +1783,19 @@ export async function frappe_safe_write(
   }
   const docRecord = doc as Record<string, unknown>;
   const docname = argString(args, "docname");
-  if (operation === "update" && !docname) {
-    return { error: 'frappe_safe_write update requires a "docname" argument.' };
+  if (operation !== "create" && !docname) {
+    return { error: `frappe_safe_write ${operation} requires a "docname" argument.` };
   }
-  if (Array.isArray(args.fields) || Array.isArray(args.metaFields) || Array.isArray(args.propertySetters)) {
-    const missing = [...metadataRequiredFields(args), ...propertySetterRequiredFields(args)]
-      .filter((field) => !hasMeaningfulValue(docRecord[field.fieldname]));
-    if (missing.length) {
-      return {
-        error: `To move forward with this request, provide the fields Frappe currently marks as mandatory: ${missing.map((field) => field.label).join(", ")}.`,
-      };
-    }
-  }
+  const expectedModified = argString(args, "expected_modified");
+  const existingOperation = operation !== "create";
+  if (existingOperation && !expectedModified) return { error: `frappe_safe_write ${operation} requires expected_modified from a live document read.` };
   const auth = await resolveRuntimeAuth(args, context);
   if ("error" in auth) return auth;
-  const permission = operation === "create" ? "create" : "write";
-  const evidenceLog = ["resolve_identity:ok"];
-  const preflightResult = await livePermissionPreflight(context, auth.siteUrl, auth.auth, doctype, permission, docname);
+  const effectiveMetadata = await loadFrappeEffectiveDocTypeMetadata(context, auth.siteUrl, auth.auth, doctype);
+  if ("error" in effectiveMetadata) return effectiveMetadata;
+  const permission = operation === "create" ? "create" : operation === "delete" ? "delete" : operation === "submit" ? "submit" : operation === "cancel" ? "cancel" : "write";
+  const evidenceLog = ["resolve_identity:ok", "effective_metadata:hydrated"];
+  const preflightResult = await livePermissionPreflight(context, auth.siteUrl, auth.auth, doctype, permission, docname, effectiveMetadata);
   const preflight = {
     allowed: preflightResult.allowed,
     reason: preflightResult.reason,
@@ -1022,18 +1803,66 @@ export async function frappe_safe_write(
   };
   evidenceLog.push(preflight.allowed ? "permission_preflight:allowed" : "permission_preflight:denied");
   const proposedMutation: {
-    operation: "create" | "update";
+    operation: "create" | "update" | "delete" | "submit" | "cancel" | "apply_workflow";
     doctype: string;
     docname?: string;
     fields: string[];
     dryRun: boolean;
+    expectedModified?: string;
   } = {
     operation,
     doctype,
     ...(docname ? { docname } : {}),
     fields: Object.keys(docRecord).sort(),
     dryRun: true,
+    ...(expectedModified ? { expectedModified } : {}),
   };
+  let liveDoc: Record<string, unknown> | undefined;
+  if (existingOperation) {
+    const current = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(docname!)}`);
+    if (!current.ok) return current;
+    liveDoc = recordObject(current.data.data);
+    const modified = liveDoc && recordString(liveDoc, "modified");
+    if (!modified) return { error: "Frappe returned no modified timestamp for the governed mutation." };
+    if (modified !== expectedModified) return { error: `Frappe document changed since expected_modified (${expectedModified}); refresh and request approval again.` };
+    if (operation === "apply_workflow") {
+      const requestedAction = argString(args, "action");
+      if (!requestedAction) return { error: "To move forward with this request, choose the workflow action you want to apply." };
+      const transitionResult = await frappeAuthedRequest(
+        context.fetch!,
+        auth.siteUrl,
+        auth.auth,
+        "GET",
+        `/api/method/frappe.model.workflow.get_transitions?${new URLSearchParams({
+          doc: JSON.stringify({ doctype, name: docname }),
+        }).toString()}`,
+      );
+      if (!transitionResult.ok) return transitionResult;
+      const transitions = Array.isArray(transitionResult.data.message)
+        ? transitionResult.data.message.map(recordObject).filter((row): row is Record<string, unknown> => Boolean(row))
+        : [];
+      const permitted = transitions.some((transition) => recordString(transition, "action") === requestedAction);
+      if (!permitted) {
+        const available = transitions.map((transition) => recordString(transition, "action")).filter((value): value is string => Boolean(value));
+        return {
+          error: available.length
+            ? `That action is not available for this record right now. Available actions: ${available.join(", ")}.`
+            : "No workflow action is available for this record under the current user's permissions.",
+        };
+      }
+      evidenceLog.push("workflow_transition:allowed");
+    }
+  }
+  if (operation === "create" || operation === "update") {
+    const effectiveDocument = operation === "update" ? { ...(liveDoc ?? {}), ...docRecord } : docRecord;
+    const missing = requiredFieldsFromEffectiveMetadata(effectiveMetadata, effectiveDocument)
+      .filter((field) => !hasMeaningfulValue(effectiveDocument[field.fieldname]));
+    if (missing.length) {
+      return {
+        error: `To move forward, provide the information still required for this request: ${missing.map((field) => field.label).join(", ")}.`,
+      };
+    }
+  }
   const userResult = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", "/api/method/frappe.auth.get_logged_user");
   if (!userResult.ok) return userResult;
   const principal = typeof userResult.data.message === "string" ? userResult.data.message : "";
@@ -1045,7 +1874,7 @@ export async function frappe_safe_write(
     operation,
     doctype,
     ...(proposedMutation.docname ? { docname: proposedMutation.docname } : {}),
-    doc: docRecord,
+    doc: { ...docRecord, ...(expectedModified ? { expected_modified: expectedModified } : {}), ...(operation === "apply_workflow" ? { workflow_action: argString(args, "action") ?? "" } : {}) },
     permissionEpoch: argString(args, "permissionEpoch") ?? `live-preflight:${stableHash([auth.siteUrl, principal, doctype, permission].join("|"))}`,
     schemaRevision: argString(args, "schemaRevision") ?? "live",
     dataRevision: argString(args, "dataRevision") ?? "live",
@@ -1105,18 +1934,33 @@ export async function frappe_safe_write(
 
   const mutationPath = operation === "create"
     ? `/api/resource/${encodeURIComponent(doctype)}`
-    : `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(proposedMutation.docname ?? "")}`;
-  const mutation = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, operation === "create" ? "POST" : "PUT", mutationPath, docRecord);
+    : operation === "update" ? `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(proposedMutation.docname ?? "")}`
+    : operation === "delete" ? `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(proposedMutation.docname ?? "")}`
+    : `/api/method/${operation === "apply_workflow" ? "frappe.model.workflow.apply_workflow" : `frappe.client.${operation}`}`;
+  const mutationBody = operation === "create" || operation === "update" ? docRecord
+    : operation === "delete" ? undefined
+    : operation === "apply_workflow" ? { doc: JSON.stringify({ doctype, name: docname, ...docRecord }), action: argString(args, "action") ?? "" }
+    : { doc: JSON.stringify({ doctype, name: docname, ...docRecord }) };
+  const mutation = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, operation === "create" ? "POST" : operation === "update" ? "PUT" : operation === "delete" ? "DELETE" : "POST", mutationPath, mutationBody, suppliedReceipt.proposal.proposalId);
   if (!mutation.ok) return mutation;
   evidenceLog.push("execute_mutation:ok");
   const returnedDoc = recordObject(mutation.data.data) ?? {};
   const createdOrUpdatedName = recordString(returnedDoc, "name") ?? proposedMutation.docname;
   let verification: { verified: boolean; fetched?: Record<string, unknown>; reason?: string };
-  if (createdOrUpdatedName) {
+  if (operation === "delete") {
+    const deletedRead = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(docname!)}`);
+    const notFound = !deletedRead.ok && deletedRead.status === 404;
+    verification = notFound ? { verified: true, fetched: { name: docname!, deleted: true } } : { verified: false, reason: deletedRead.ok ? "Deleted document is still readable." : `Delete verification expected 404, received ${deletedRead.status ?? "an error"}: ${deletedRead.error}` };
+    evidenceLog.push(notFound ? "verify_delete:ok" : "verify_delete:failed");
+  } else if (createdOrUpdatedName) {
     const fetched = await frappeAuthedRequest(context.fetch!, auth.siteUrl, auth.auth, "GET", `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(createdOrUpdatedName)}`);
     if (fetched.ok && recordObject(fetched.data.data)) {
-      verification = { verified: true, fetched: recordObject(fetched.data.data) };
-      evidenceLog.push("verify_result:ok");
+      const fetchedDoc = recordObject(fetched.data.data)!;
+      const expectedState = argString(args, "expected_state") ?? argString(args, "expected_status");
+      const postcondition = Object.entries(docRecord).every(([key, value]) => JSON.stringify(fetchedDoc[key]) === JSON.stringify(value))
+        && (!expectedState || fetchedDoc.workflow_state === expectedState || fetchedDoc.status === expectedState || fetchedDoc.docstatus === expectedState);
+      verification = { verified: postcondition, fetched: fetchedDoc, ...(postcondition ? {} : { reason: "Frappe returned a document that does not satisfy the requested postcondition." }) };
+      evidenceLog.push(postcondition ? "verify_result:ok" : "verify_result:failed");
     } else {
       verification = { verified: false, reason: fetched.ok ? "Frappe verification returned no document." : fetched.error };
       evidenceLog.push("verify_result:failed");
@@ -1124,6 +1968,22 @@ export async function frappe_safe_write(
   } else {
     verification = { verified: false, reason: "Frappe mutation returned no document name to verify." };
     evidenceLog.push("verify_result:failed");
+  }
+
+  const cachedReads = frappeReadServices.get(readModelPath);
+  if (cachedReads) {
+    cachedReads.service.invalidate({
+      site: auth.siteUrl,
+      permissionChanged: PERMISSION_AFFECTING_DOCTYPES.has(doctype),
+    });
+    evidenceLog.push("read_cache:invalidated");
+  }
+  if (METADATA_AFFECTING_DOCTYPES.has(doctype)) {
+    const sitePrefix = `${auth.siteUrl.replace(/\/$/, "").toLowerCase()}\0`;
+    for (const key of frappeEffectiveMetadataCache.keys()) {
+      if (key.startsWith(sitePrefix)) frappeEffectiveMetadataCache.delete(key);
+    }
+    evidenceLog.push("effective_metadata_cache:invalidated");
   }
 
   return {
@@ -1134,7 +1994,7 @@ export async function frappe_safe_write(
     proposedMutation: { ...proposedMutation, dryRun: false },
     approvalGate,
     approvalProposal,
-    result: operation === "create" ? { created: returnedDoc } : { updated: returnedDoc },
+    result: operation === "create" ? { created: returnedDoc } : operation === "update" ? { updated: returnedDoc } : operation === "delete" ? { deleted: true } : { action: operation },
     verification,
     evidenceLog,
   };
@@ -1216,36 +2076,208 @@ export async function frappe_read_model_plan(
 
 export async function frappe_fast_route(
   args: Record<string, unknown>,
-  _context: FrappeToolContext,
+  context: FrappeToolContext,
 ): Promise<ReturnType<typeof frappeFastRoute> | FrappeError> {
   const prompt = argString(args, "prompt") ?? argString(args, "query");
   if (!prompt) return { error: 'frappe_fast_route requires a "prompt" or "query" argument.' };
+  const site = argString(args, "site") ?? argString(args, "siteUrl");
+  const indexed = indexedRouteContext(prompt, site, context.config.FRAPPE_READ_MODEL_PATH);
   return frappeFastRoute({
     prompt,
-    site: argString(args, "site") ?? argString(args, "siteUrl"),
+    site,
     user: argString(args, "user"),
     roles: stringList(args.roles),
     department: argString(args, "department"),
     channel: argString(args, "channel"),
-    installedApps: stringList(args.installedApps),
+    installedApps: uniqueSorted([...stringList(args.installedApps), ...indexed.installedApps]),
     heavyLifterApps: stringList(args.heavyLifterApps),
-    hasFreshIndex: args.hasFreshIndex === undefined ? undefined : booleanArg(args.hasFreshIndex),
+    hasFreshIndex: args.hasFreshIndex === undefined ? indexed.fresh : booleanArg(args.hasFreshIndex),
     hasLiveCredentials: booleanArg(args.hasLiveCredentials),
+    allowedDoctypes: stringList(args.allowedDoctypes),
+    aliases: [
+      ...businessApiRouteAliases(context.config.FRAPPE_BUSINESS_API_CATALOG),
+      ...indexed.aliases,
+      ...semanticAliasesFromArgs(args.aliases),
+    ],
+  });
+}
+
+function businessApiRouteAliases(rawCatalog: string | undefined): FrappeSemanticAlias[] {
+  if (!rawCatalog?.trim()) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawCatalog);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed.flatMap((value): FrappeSemanticAlias[] => {
+    const spec = parseFrappeBusinessApiSpec(value);
+    if (!spec) return [];
+    return spec.phrases.map((phrase) => ({
+      phrase,
+      canonical: spec.doctype,
+      module: "Configured business API",
+      confidence: 0.99,
+      source: "admin_curated",
+    }));
+  });
+}
+
+const ROUTE_STOP_WORDS = new Set([
+  "a", "an", "and", "are", "do", "for", "from", "have", "how", "i", "in", "is", "me", "my", "of", "on", "open", "please", "show", "the", "to", "what", "which", "with",
+]);
+
+function indexedRouteContext(
+  prompt: string,
+  site: string | undefined,
+  path: string | undefined,
+): { readonly fresh: boolean; readonly aliases: FrappeSemanticAlias[]; readonly installedApps: string[] } {
+  if (!site || !path) return { fresh: false, aliases: [], installedApps: [] };
+  try {
+    const { store } = frappeReadService(path);
+    const revision = store.getRevision(site.replace(/\/$/, "").toLowerCase());
+    const observedAt = revision ? Date.parse(revision.observedAt) : Number.NaN;
+    const fresh = Number.isFinite(observedAt) && Date.now() - observedAt <= 15 * 60_000;
+    if (!fresh) return { fresh: false, aliases: [], installedApps: [] };
+    const terms = [...new Set(prompt.toLowerCase().match(/[a-z0-9][a-z0-9_-]+/g) ?? [])]
+      .filter((term) => term.length > 2 && !ROUTE_STOP_WORDS.has(term))
+      .slice(0, 8);
+    const scores = new Map<string, { score: number; module: string; phrase: string }>();
+    for (const term of terms) {
+      for (const record of store.searchIndex(site, term, ["doctype", "field", "custom_field", "property_setter", "report", "funnel", "flow_config", "dynamic_assignment"], 40)) {
+        const doctype = indexedRecordDoctype(record);
+        if (!doctype) continue;
+        const weight = indexedRouteEvidence(record, term, doctype);
+        const current = scores.get(doctype);
+        // Repetition is not authority. A large customized DocType may contain
+        // the same business noun hundreds of times; only its strongest piece
+        // of semantic evidence should count for a term.
+        if (!current || weight > current.score) {
+          scores.set(doctype, {
+            score: weight,
+            module: record.module ?? current?.module ?? "Custom",
+            phrase: term,
+          });
+        }
+      }
+    }
+    const aliases = [...scores.entries()]
+      .sort(([leftName, left], [rightName, right]) => right.score - left.score || leftName.localeCompare(rightName))
+      .slice(0, 12)
+      .map(([canonical, value]): FrappeSemanticAlias => ({
+        phrase: value.phrase,
+        canonical,
+        module: value.module,
+        confidence: Math.min(0.99, 0.55 + value.score / 180),
+        source: "site_usage",
+      }));
+    const installedApps = store.searchIndex(site, "", ["app"], 100)
+      .flatMap((record) => record.label ?? (typeof record.payload.name === "string" ? record.payload.name : []));
+    return { fresh, aliases, installedApps: uniqueSorted(installedApps) };
+  } catch {
+    return { fresh: false, aliases: [], installedApps: [] };
+  }
+}
+
+function indexedRecordDoctype(record: FrappeIndexRecord): string | undefined {
+  if (record.kind === "doctype") return record.objectId;
+  if (record.kind === "funnel") return "Funnel";
+  if (record.kind === "flow_config") return "Flow Config";
+  const payload = record.payload;
+  for (const key of ["dt", "doc_type", "document_type", "ref_doctype", "doctype", "parent"]) {
+    const value = payload[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return record.doctype?.trim() || undefined;
+}
+
+function indexedRouteWeight(kind: FrappeIndexRecord["kind"]): number {
+  if (kind === "doctype") return 30;
+  if (kind === "custom_field" || kind === "property_setter") return 16;
+  if (kind === "dynamic_assignment" || kind === "flow_config") return 14;
+  if (kind === "field" || kind === "report") return 10;
+  return 6;
+}
+
+function indexedRouteEvidence(record: FrappeIndexRecord, term: string, doctype: string): number {
+  const normalizedTerm = lexicalKey(term);
+  const objectId = lexicalKey(record.objectId);
+  const label = lexicalKey(record.label ?? "");
+  const target = lexicalKey(doctype);
+  const payloadField = lexicalKey(
+    typeof record.payload.fieldname === "string"
+      ? record.payload.fieldname
+      : typeof record.payload.name === "string"
+        ? record.payload.name
+        : "",
+  );
+  const exact = (value: string): boolean => value === normalizedTerm || singularKey(value) === singularKey(normalizedTerm);
+  const tokenMatch = (value: string): boolean => value.split(" ").some((token) => exact(token));
+  return indexedRouteWeight(record.kind)
+    + (record.kind === "doctype" && exact(objectId) ? 120 : 0)
+    + (exact(target) ? 100 : 0)
+    + (exact(label) ? 90 : tokenMatch(label) ? 35 : 0)
+    + (exact(payloadField) ? 60 : 0);
+}
+
+function lexicalKey(value: string): string {
+  return value.toLowerCase().replace(/[_-]+/g, " ").replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function singularKey(value: string): string {
+  return value.endsWith("ies") ? `${value.slice(0, -3)}y` : value.endsWith("s") && !value.endsWith("ss") ? value.slice(0, -1) : value;
+}
+
+const SEMANTIC_ALIAS_SOURCES: readonly FrappeSemanticAlias["source"][] = [
+  "erpnext_prior",
+  "site_usage",
+  "admin_curated",
+  "field_label",
+  "report_name",
+];
+
+/**
+ * Site-specific vocabulary is authoritative for disambiguation, so it must reach
+ * the router. Callers (gateway/read service) pass discovered aliases as plain
+ * objects; coerce them into typed FrappeSemanticAlias entries and drop anything
+ * that lacks a real phrase/canonical pair.
+ */
+function semanticAliasesFromArgs(value: unknown): FrappeSemanticAlias[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): FrappeSemanticAlias[] => {
+    const row = recordObject(item);
+    if (!row) return [];
+    const phrase = recordString(row, "phrase");
+    const canonical = recordString(row, "canonical") ?? recordString(row, "doctype");
+    if (!phrase || !canonical) return [];
+    const confidence = numberLike(row.confidence);
+    const source = recordString(row, "source");
+    return [{
+      phrase,
+      canonical,
+      module: recordString(row, "module") ?? "",
+      confidence: confidence !== undefined && confidence >= 0 && confidence <= 1 ? confidence : 0.85,
+      source: SEMANTIC_ALIAS_SOURCES.includes(source as FrappeSemanticAlias["source"])
+        ? source as FrappeSemanticAlias["source"]
+        : "admin_curated",
+    }];
   });
 }
 
 export async function frappe_chat_interaction_plan(
   args: Record<string, unknown>,
-  _context: FrappeToolContext,
+  context: FrappeToolContext,
 ): Promise<FrappeInteractionPlan | FrappeError> {
   const prompt = argString(args, "prompt") ?? argString(args, "query") ?? "";
   if (!prompt) return { error: 'frappe_chat_interaction_plan requires a "prompt" or "query" argument.' };
   const siteUrl = argString(args, "site") ?? argString(args, "siteUrl") ?? argString(args, "frappeSiteUrl") ?? "";
   const doctype = inferDoctype(prompt, args);
-  const operation = inferOperation(prompt);
+  const requestedOperation = argString(args, "operation");
+  const operation = requestedOperation && ["read", "create", "update", "submit", "approve", "reject"].includes(requestedOperation)
+    ? requestedOperation as FrappeInteractionPlan["operation"]
+    : inferOperation(prompt);
   const supplied = recordObject(args.values) ?? recordObject(args.doc) ?? {};
-  const requiredFields = requiredFieldsForInteraction(doctype, operation, args)
-    .filter((field) => !hasMeaningfulValue(supplied[field.fieldname]));
   const documentLinks = documentLinksForInteraction(siteUrl, args);
 
   if (booleanArg(args.blocked)) {
@@ -1268,11 +2300,19 @@ export async function frappe_chat_interaction_plan(
     };
   }
 
+  let requiredFields: FrappeInteractionPlan["requiredFields"] = [];
+  if (operation !== "read") {
+    const metadata = await frappeEffectiveDocTypeMetadata({ ...args, doctype }, context);
+    if ("error" in metadata) return metadata;
+    requiredFields = requiredFieldsFromEffectiveMetadata(metadata, supplied)
+      .filter((field) => !hasMeaningfulValue(supplied[field.fieldname]));
+  }
+
   if (operation !== "read" && requiredFields.length) {
     return {
       kind: "guided_crud",
       title: `${operationTitle(operation)} ${doctype}`,
-      message: `I can help with this. To move forward with your request, I need the details Frappe requires before it will accept the ${doctype} ${operationLabel(operation)}.`,
+      message: "I can help with this. I will ask only for the information still needed, explain why it matters, and show you a review before anything changes.",
       doctype,
       operation,
       requiredFields,
@@ -1291,7 +2331,7 @@ export async function frappe_chat_interaction_plan(
     return {
       kind: "guided_crud",
       title: `Review ${doctype}`,
-      message: `I have the required details. Before changing Frappe, I should show a preview and ask for confirmation.`,
+      message: "I have the required details. I will show exactly what will change and ask for confirmation before saving it.",
       doctype,
       operation,
       requiredFields: [],
@@ -1346,6 +2386,114 @@ export async function frappe_enterprise_contract(
   };
 }
 
+const DEFAULT_OPERATIONAL_DOCTYPES = [
+  "Employee",
+  "Leave Application",
+  "Leave Allocation",
+  "Attendance",
+  "Attendance Request",
+  "Employee Checkin",
+  "Expense Claim",
+  "Salary Slip",
+  "Task",
+  "ToDo",
+  "Issue",
+  "HD Ticket",
+  "Project",
+  "Job Applicant",
+  "Job Opening",
+  "Purchase Order",
+  "Purchase Invoice",
+  "Sales Order",
+  "Sales Invoice",
+] as const;
+
+/**
+ * Refresh the metadata-only enterprise index used for routing and form
+ * planning. Record reads and writes never use this shared snapshot for
+ * authorization; they continue through the current sender's OAuth grant.
+ */
+export async function frappe_enterprise_sync(
+  args: Record<string, unknown>,
+  context: FrappeToolContext,
+): Promise<Record<string, unknown> | FrappeError> {
+  const auth = await resolveRuntimeAuth(args, context);
+  if ("error" in auth) return auth;
+  if (auth.auth.kind !== "token") return { error: "Frappe enterprise sync requires an OAuth or API token; session cookies are not persisted or reused." };
+  const readModelPath = argString(args, "readModelPath") ?? context.config.FRAPPE_READ_MODEL_PATH;
+  if (!readModelPath) return configError("FRAPPE_READ_MODEL_PATH");
+  const priorityDoctypes = uniqueSorted([...DEFAULT_OPERATIONAL_DOCTYPES, ...stringList(args.doctypes)]);
+  const maxHydratedDoctypes = Math.max(1, Math.min(positiveInteger(args.maxHydratedDoctypes, 64), 256));
+  const signal = args.signal && typeof args.signal === "object" && "aborted" in args.signal
+    ? args.signal as AbortSignal
+    : undefined;
+  const store = new SqliteFrappeReadModel(readModelPath);
+  try {
+    const normalizedSite = auth.siteUrl.replace(/\/$/, "").toLowerCase();
+    const previous = store.getRevision(normalizedSite);
+    const full = booleanArg(args.full) || !previous;
+    const result = await pollFrappeEnterpriseSnapshot({
+      site: auth.siteUrl,
+      fetch: context.fetch!,
+      ...(signal ? { signal } : {}),
+      ...(!full && previous ? { modifiedAfter: previous.observedAt } : {}),
+      authorization: authorizationHeader(auth.auth.value),
+      pageSize: Math.max(1, Math.min(positiveInteger(args.pageSize, 500), 500)),
+      hydrateDoctypes: "priority",
+      priorityDoctypes,
+      maxHydratedDoctypes,
+    });
+    const deltaRecords = full ? [] : buildFrappeIndexRecords(result.snapshot);
+    const revision = full
+      ? store.replaceSnapshot(result.snapshot)
+      : {
+          site: normalizedSite,
+          schemaRevision: deltaRecords.length
+            ? createHash("sha256").update(`${previous!.schemaRevision}:${result.snapshot.schemaRevision ?? "delta"}`).digest("hex")
+            : previous!.schemaRevision,
+          dataRevision: previous!.dataRevision,
+          observedAt: result.snapshot.observedAt,
+        };
+    if (!full) {
+      if (deltaRecords.length) {
+        store.upsertIndex(deltaRecords);
+        store.invalidateSiteCache(normalizedSite);
+      }
+      store.setRevision(revision);
+    }
+      const count = (value: readonly unknown[] | undefined): number => value?.length ?? 0;
+      const hydrated = (result.snapshot.doctypes ?? []).filter((value) => Array.isArray(recordObject(value)?.fields)).length;
+      return {
+        status: "ready",
+        mode: full ? "full" : "delta",
+        changedRecords: full ? undefined : deltaRecords.length,
+        site: revision.site,
+        observedAt: revision.observedAt,
+        schemaRevision: revision.schemaRevision,
+        dataRevision: revision.dataRevision,
+        requests: result.requests,
+        hydratedDoctypes: hydrated,
+        counts: {
+          apps: count(result.snapshot.apps),
+          modules: count(result.snapshot.modules),
+          doctypes: count(result.snapshot.doctypes),
+          customFields: count(result.snapshot.customFields),
+          propertySetters: count(result.snapshot.propertySetters),
+          permissionRules: count(result.snapshot.permissionRules),
+          reports: count(result.snapshot.reports),
+          funnels: count(result.snapshot.funnels),
+          flowConfigs: count(result.snapshot.flowConfigs),
+          dynamicAssignments: count(result.snapshot.dynamicAssignments),
+        },
+        warnings: result.warnings.slice(0, 100),
+      };
+  } catch (error) {
+    return { error: `Frappe enterprise metadata sync failed: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    store.close();
+  }
+}
+
 export async function frappe_customer_profile_validate(
   args: Record<string, unknown>,
   _context: FrappeToolContext,
@@ -1379,7 +2527,6 @@ export const tools = {
   frappe_identity_resolve,
   frappe_user_identity_resolve,
   frappe_semantic_data_resolve_lite,
-  frappe_records_create,
   frappe_docs_context,
   frappe_context_setup_plan,
   frappe_context_build,
@@ -1395,6 +2542,7 @@ export const tools = {
   frappe_safe_write,
   frappe_artifact_brief,
   frappe_enterprise_contract,
+  frappe_enterprise_sync,
   frappe_customer_profile_validate,
   frappe_hierarchy_scope,
 };
@@ -1420,53 +2568,6 @@ function inferOperation(prompt: string): FrappeInteractionPlan["operation"] {
   if (/\bapprove\b/.test(lower)) return "approve";
   if (/\breject\b/.test(lower)) return "reject";
   return "read";
-}
-
-function requiredFieldsForInteraction(
-  doctype: string,
-  operation: FrappeInteractionPlan["operation"],
-  args: Record<string, unknown>,
-): Array<{ fieldname: string; label: string; reason: string; options?: readonly string[] }> {
-  if (operation === "read") return [];
-  const fromMeta = metadataRequiredFields(args);
-  const fromPropertySetters = propertySetterRequiredFields(args);
-  const fields: Array<{ fieldname: string; label: string; reason: string; options?: readonly string[] }> = [...fromMeta, ...fromPropertySetters];
-  if (!fields.length) {
-    fields.push({ fieldname: "name_or_subject", label: "Document details", reason: "Frappe needs the required fields for this DocType before it can save the document." });
-  }
-  return uniqueRequiredFields(fields);
-}
-
-function metadataRequiredFields(args: Record<string, unknown>): Array<{ fieldname: string; label: string; reason: string; options?: readonly string[] }> {
-  const fields = Array.isArray(args.fields) ? args.fields : Array.isArray(args.metaFields) ? args.metaFields : [];
-  return fields.flatMap((field) => {
-    const row = recordObject(field);
-    if (!row || !booleanish(row.reqd)) return [];
-    const fieldname = recordString(row, "fieldname");
-    if (!fieldname) return [];
-    return [{
-      fieldname,
-      label: recordString(row, "label") ?? humanizeField(fieldname),
-      reason: `Frappe marks ${recordString(row, "label") ?? fieldname} as mandatory for this DocType.`,
-      ...(recordString(row, "options") ? { options: recordString(row, "options")!.split("\n").map((item) => item.trim()).filter(Boolean) } : {}),
-    }];
-  });
-}
-
-function propertySetterRequiredFields(args: Record<string, unknown>): Array<{ fieldname: string; label: string; reason: string }> {
-  const setters = Array.isArray(args.propertySetters) ? args.propertySetters : [];
-  return setters.flatMap((setter) => {
-    const row = recordObject(setter);
-    if (!row) return [];
-    if (recordString(row, "property") !== "reqd" || !booleanish(row.value)) return [];
-    const fieldname = recordString(row, "field_name") ?? recordString(row, "fieldname");
-    if (!fieldname) return [];
-    return [{ fieldname, label: humanizeField(fieldname), reason: "This field is mandatory because of a Frappe Property Setter customization." }];
-  });
-}
-
-function uniqueRequiredFields(fields: Array<{ fieldname: string; label: string; reason: string; options?: readonly string[] }>): Array<{ fieldname: string; label: string; reason: string; options?: readonly string[] }> {
-  return [...new Map(fields.map((field) => [field.fieldname, field])).values()];
 }
 
 function documentLinksForInteraction(siteUrl: string, args: Record<string, unknown>): Array<{ label: string; doctype: string; name: string; url: string }> {
@@ -1622,10 +2723,13 @@ async function resolveRolesForUser(
     const message = direct.data.message;
     const roles = Array.isArray(message) ? uniqueSorted(message.map(String)) : [];
     if (roles.length) return { roles };
-  } else if (direct.status !== 403 && direct.status !== 404) {
+  } else if (direct.status === 401) {
     return direct;
   }
 
+  // Custom Frappe deployments frequently override, restrict, or break the
+  // convenience get_roles method. Has Role remains the permission-bearing
+  // source and is safe to query through the current OAuth principal.
   const childQuery = new URLSearchParams({
     fields: JSON.stringify(["role"]),
     filters: JSON.stringify([["parent", "=", user]]),
@@ -1874,7 +2978,7 @@ function buildFrappeGraph(input: {
     }
     for (const link of doctype.links) {
       addNode(`doctype:${link.target}`, "doctype", link.target);
-      edges.push({ from: `doctype:${doctype.name}`, to: link.target, type: "doctype_link", label: link.fieldname });
+      edges.push({ from: `doctype:${doctype.name}`, to: `doctype:${link.target}`, type: "doctype_link", label: link.fieldname });
     }
     for (const table of doctype.childTables) {
       addNode(`doctype:${table.target}`, "doctype", table.target);
@@ -2126,18 +3230,84 @@ async function livePermissionPreflight(
   doctype: string,
   permission: FrappePermissionName,
   docname?: string,
+  suppliedMetadata?: FrappeEffectiveDocTypeMetadata,
 ): Promise<{ allowed: boolean; reason: string }> {
   if (typeof context.fetch !== "function") return { allowed: false, reason: "No network access for Frappe permission preflight." };
-  const query = new URLSearchParams({ doctype, ptype: permission, perm_type: permission });
-  if (docname) query.set("docname", docname);
-  const result = await frappeAuthedRequest(context.fetch, siteUrl, auth, "GET", `/api/method/frappe.client.has_permission?${query.toString()}`);
-  if (!result.ok) return { allowed: false, reason: `Frappe permission preflight failed: ${result.error}` };
-  const message = result.data.message;
-  const allowed = message === true || message === 1 || message === "true" || (typeof message === "object" && message !== null && booleanLike((message as Record<string, unknown>).has_permission));
+  if (docname) {
+    const result = await frappeAuthedRequest(
+      context.fetch,
+      siteUrl,
+      auth,
+      "GET",
+      `/api/method/frappe.client.has_permission?${new URLSearchParams({
+        doctype,
+        docname,
+        perm_type: permission,
+      }).toString()}`,
+    );
+    if (!result.ok) return { allowed: false, reason: `Frappe permission preflight failed: ${result.error}` };
+    const message = result.data.message;
+    const permissionResult = recordObject(message);
+    const allowed = message === true || permissionResult?.has_permission === true || permissionResult?.has_permission === 1;
+    return {
+      allowed,
+      reason: allowed
+        ? `Frappe permits ${permission} on this ${doctype} for the authenticated user.`
+        : `Frappe does not permit ${permission} on this ${doctype} for the authenticated user.`,
+    };
+  }
+  if (permission !== "create") return { allowed: false, reason: `Frappe cannot prove ${permission} permission for ${doctype} from effective metadata.` };
+  const metadata = suppliedMetadata ?? await loadFrappeEffectiveDocTypeMetadata(context, siteUrl, auth, doctype);
+  if ("error" in metadata) return { allowed: false, reason: `Frappe effective metadata preflight failed: ${metadata.error}` };
+  const userResult = await frappeAuthedRequest(context.fetch, siteUrl, auth, "GET", "/api/method/frappe.auth.get_logged_user");
+  if (!userResult.ok) return { allowed: false, reason: `Frappe identity preflight failed: ${userResult.error}` };
+  const principal = typeof userResult.data.message === "string" ? userResult.data.message : "";
+  if (!principal) return { allowed: false, reason: "Frappe identity preflight returned no authenticated principal." };
+  const rolesResult = await frappeAuthedRequest(
+    context.fetch,
+    siteUrl,
+    auth,
+    "GET",
+    `/api/method/frappe.core.doctype.user.user.get_roles?${new URLSearchParams({ user: principal }).toString()}`,
+  );
+  if (!rolesResult.ok) return { allowed: false, reason: `Frappe role preflight failed: ${rolesResult.error}` };
+  const roles = Array.isArray(rolesResult.data.message) ? rolesResult.data.message.filter((role): role is string => typeof role === "string") : [];
+  const allowed = metadata.permissions.some((row) => {
+    const permissionRow = recordObject(row);
+    if (!permissionRow) return false;
+    const role = recordString(permissionRow, "role");
+    const hasRole = role === "All" || (role ? roles.includes(role) : false);
+    const value = permissionRow[permission];
+    return hasRole && (value === 1 || value === true);
+  });
   return {
     allowed,
-    reason: allowed ? `Frappe allowed ${permission} on ${doctype}.` : `Frappe denied ${permission} on ${doctype}.`,
+    reason: allowed
+      ? `Frappe effective metadata permits ${permission} on ${doctype} for the authenticated user's live roles.`
+      : `Frappe effective metadata does not permit ${permission} on ${doctype} for the authenticated user's live roles.`,
   };
+}
+
+async function loadFrappeEffectiveDocTypeMetadata(
+  context: FrappeToolContext,
+  siteUrl: string,
+  auth: FrappeAuth,
+  doctype: string,
+): Promise<FrappeEffectiveDocTypeMetadata | FrappeError> {
+  if (typeof context.fetch !== "function") return { error: "No network access for Frappe effective metadata hydration." };
+  const result = await frappeAuthedRequest(
+    context.fetch,
+    siteUrl,
+    auth,
+    "GET",
+    `/api/method/frappe.desk.form.load.getdoctype?${new URLSearchParams({ doctype, with_parent: "1" }).toString()}`,
+  );
+  if (!result.ok) return result;
+  try {
+    return hydrateFrappeEffectiveDocTypeMetadata(result.data, doctype);
+  } catch (error) {
+    return { error: `Frappe effective metadata hydration failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
 }
 
 function permissionName(value: string): FrappePermissionName {

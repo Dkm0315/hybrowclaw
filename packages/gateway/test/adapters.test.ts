@@ -18,6 +18,8 @@ import {
   pollTelegram,
   requestPairing,
   resetAdapterAuthWarnings,
+  sanitizeChannelFinalText,
+  sanitizeChannelProgress,
   slackEventToSurfaceMessage,
   slackSignatureIsValid,
   SLACK_REPLAY_WINDOW_SECONDS,
@@ -120,6 +122,32 @@ test("telegram reply maps to sendMessage; unbound approvals fail closed to text"
   assert.match(approval.text, /Approval required/);
   assert.match(approval.text, /Authenticated approval controls are unavailable/);
   assert.equal(approval.reply_markup, undefined);
+});
+
+test("provider progress keeps useful text while redacting host paths, local endpoints, and secrets", () => {
+  const visible = sanitizeChannelProgress([
+    "Inspecting the leave workflow in /home/goblin/oxygenhr-muster/.muster/workspace.",
+    "Calling http://127.0.0.1:7461/internal with ACCESS_TOKEN=super-secret.",
+    "Comparing mandatory fields and permission rules.",
+  ].join("\n"));
+  assert.match(visible, /Inspecting the leave workflow/);
+  assert.match(visible, /Comparing mandatory fields and permission rules/);
+  assert.match(visible, /the workspace/);
+  assert.match(visible, /the local service/);
+  assert.match(visible, /ACCESS_TOKEN=\[redacted\]/);
+  assert.doesNotMatch(visible, /goblin|7461|super-secret/);
+});
+
+test("final channel answers remove host topology without truncating business content", () => {
+  const visible = sanitizeChannelFinalText([
+    "Your leave request needs a handover note.",
+    "Internal file: /home/goblin/oxygenhr-muster/.muster/workspace/context.json",
+    "ACCESS_TOKEN=super-secret",
+    "Please provide the colleague who will cover urgent work.",
+  ].join("\n"));
+  assert.match(visible, /Your leave request needs a handover note/);
+  assert.match(visible, /Please provide the colleague/);
+  assert.doesNotMatch(visible, /goblin|context\.json|super-secret/);
 });
 
 // --- Slack mapper ---
@@ -245,9 +273,10 @@ test("telegram webhook: pairing challenge then governed reply, outbound via inje
     // first contact: pairing challenge goes back to the chat
     assert.equal((await post()).status, 200);
     await running.waitForIdle();
-    assert.equal(outbound.length, 1);
-    assert.match(outbound[0].url, /^https:\/\/api\.telegram\.org\/bot123:ABC\/sendMessage$/);
-    const challengeBody = outbound[0].body as { chat_id: string; text: string };
+    const pairingMessages = outbound.filter((entry) => entry.url.endsWith("/sendMessage"));
+    assert.equal(pairingMessages.length, 1);
+    assert.match(pairingMessages[0].url, /^https:\/\/api\.telegram\.org\/bot123:ABC\/sendMessage$/);
+    const challengeBody = pairingMessages[0].body as { chat_id: string; text: string };
     assert.equal(challengeBody.chat_id, "-1001234567890");
     const code = challengeBody.text.match(/approve ([A-Z2-9]{8})/)?.[1];
     assert.ok(code, "pairing code is included in the challenge text");
@@ -262,8 +291,10 @@ test("telegram webhook: pairing challenge then governed reply, outbound via inje
     });
     assert.equal(governed.status, 200);
     await running.waitForIdle();
-    assert.equal(outbound.length, 2);
-    assert.equal((outbound[1].body as { text: string }).text, "deploy is green");
+    const replies = outbound.filter((entry) => entry.url.endsWith("/sendMessage"));
+    assert.equal(replies.length, 2);
+    assert.equal((replies[1].body as { text: string }).text, "deploy is green");
+    assert.ok(outbound.some((entry) => entry.url.endsWith("/sendChatAction")), "Telegram typing is on by default unless explicitly disabled");
   } finally {
     await running.close();
     llm.close();
@@ -301,10 +332,9 @@ test("telegram webhook shows typing and delivers MEDIA artifacts as documents", 
     assert.ok(outbound.some((entry) => entry.method === "sendChatAction"), "typing presence is sent while the run is active");
     assert.ok(outbound.some((entry) => entry.method === "sendDocument"), "local MEDIA artifact is attached as a Telegram document");
     const textMessages = outbound.filter((entry) => entry.method === "sendMessage").map((entry) => (entry.body as { text?: string }).text ?? "");
-    const progress = textMessages.find((text) => text.includes("Processing"));
+    const progress = textMessages.find((text) => text === "Working");
     assert.ok(progress, "progress can be toggled on");
-    assert.match(progress!, /Preparing artifact route/, "artifact requests show the artifact route");
-    assert.doesNotMatch(progress!, /memory/i, "memory is not claimed unless the request asks for recall");
+    assert.doesNotMatch(progress!, /memory|provider|artifact route/i, "progress does not invent internal steps");
     assert.ok(textMessages.some((text) => text === "Here is the PDF."), "visible reply strips MEDIA tag");
     const manifest = await channelArtifactManifest(cwd);
     assert.equal(manifest.artifacts[0].delivery.state, "uploaded");
@@ -324,8 +354,20 @@ test("Frappe context words do not turn a normal OSS Manager answer into a failed
     telegram: { botToken: "123:ABC", thinking: "progress" },
   }));
   const gateway = await loadGatewayConfig(cwd);
-  await requestPairing(TELEGRAM_SURFACE_ID, "5599220011", cwd).then((pending) => approvePairing(pending.code, cwd));
-  const llm = await startStubLlm("OSS Manager supports architecture, delivery, support, and deterministic validation.");
+  await requestPairing(TELEGRAM_SURFACE_ID, "5599220011", cwd).then((pending) => approvePairing(pending.code, cwd, {
+    provider: "frappe",
+    site: "https://erp.example.test",
+    user: "dhairya@example.test",
+    employee: "EMP-0001",
+    employeeName: "Dhairya",
+    roles: ["Employee"],
+    department: "People",
+    company: "Example",
+    permissionHash: "permhash",
+    rolesHash: "roleshash",
+    authMode: "oauth_bearer",
+  }));
+  const llm = await startStubLlm("OSS Manager supports architecture, delivery, support, and deterministic validation.", 150);
   const outbound: Array<{ method: string; body: unknown }> = [];
   const fetcher = (async (url: string | URL | Request, init?: RequestInit) => {
     const method = String(url).split("/").pop() ?? "";
@@ -351,6 +393,10 @@ test("Frappe context words do not turn a normal OSS Manager answer into a failed
     const serialized = JSON.stringify(outbound);
     assert.doesNotMatch(serialized, /Artifact delivery failed|Preparing artifact route/);
     assert.match(serialized, /OSS Manager supports architecture/);
+    const progressEditIndex = outbound.findIndex((entry) => entry.method === "editMessageText"
+      && /Preparing your answer/.test((entry.body as { text?: string }).text ?? ""));
+    assert.ok(progressEditIndex >= 0, "the Frappe run exposes its truthful progress milestone");
+    assert.equal(outbound[progressEditIndex + 1]?.method, "sendChatAction", "a progress edit immediately reasserts Telegram's native typing state");
   } finally {
     await running.close();
     llm.close();
@@ -419,10 +465,51 @@ test("telegram webhook edits one progress message into the final reply", async (
     });
     assert.equal(response.status, 200);
     await running.waitForIdle();
+    assert.deepEqual(
+      outbound.slice(0, 2).map((entry) => entry.method),
+      ["sendMessage", "sendChatAction"],
+      "Telegram sends the progress placeholder before asserting native typing so the message cannot clear the header indicator",
+    );
     const sentMessages = outbound.filter((entry) => entry.method === "sendMessage");
     assert.equal(sentMessages.length, 1, "Telegram uses one progress message instead of posting a second final message");
-    assert.match((sentMessages[0].body as { text: string }).text, /Processing/);
+    assert.match((sentMessages[0].body as { text: string }).text, /Working/);
     assert.ok(outbound.some((entry) => entry.method === "editMessageText" && (entry.body as { text?: string }).text === "slow run complete"), "final reply edits the progress message in place");
+  } finally {
+    await running.close();
+    llm.close();
+  }
+});
+
+test("telegram progress finalizer preserves mobile presentation and executable filters", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-gw-telegram-progress-presentation-"));
+  const { mkdir } = await import("node:fs/promises");
+  await mkdir(join(cwd, ".muster"), { recursive: true });
+  await writeFile(gatewayConfigPath(cwd), JSON.stringify({ token: "test-token", telegram: { botToken: "123:ABC", thinking: "progress" } }));
+  const gateway = await loadGatewayConfig(cwd);
+  await requestPairing(TELEGRAM_SURFACE_ID, "5599220011", cwd).then((pending) => approvePairing(pending.code, cwd));
+
+  const outbound: Array<{ method: string; body: Record<string, unknown> }> = [];
+  const fetcher = (async (url: string | URL | Request, init?: RequestInit) => {
+    const method = String(url).split("/").pop() ?? "";
+    outbound.push({ method, body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown> });
+    if (method === "sendMessage") return new Response(JSON.stringify({ ok: true, result: { message_id: 778 } }), { status: 200 });
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  }) as typeof fetch;
+  const llm = await startStubLlm("must not run");
+  const running = await startGatewayServer({ config: stubConfig(llm.url), gateway, cwd, fetcher }, 0);
+  try {
+    const response = await fetch(`http://127.0.0.1:${running.port}/v1/adapters/telegram`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer test-token" },
+      body: JSON.stringify({ ...telegramUpdate, update_id: 837366119, message: { ...telegramUpdate.message, text: "/usage" } }),
+    });
+    assert.equal(response.status, 200);
+    await running.waitForIdle();
+    const finalEdit = outbound.find((entry) => entry.method === "editMessageText" && entry.body.parse_mode === "HTML");
+    assert.ok(finalEdit, "the progress message is finalized through the Telegram presentation renderer");
+    assert.doesNotMatch(String(finalEdit.body.text), /[┌┐└┘├┤┬┴┼│─]/);
+    assert.doesNotMatch(JSON.stringify(finalEdit.body), /\{value\}/);
+    assert.ok(finalEdit.body.reply_markup, "interactive filter buttons remain attached to the edited message");
   } finally {
     await running.close();
     llm.close();
@@ -457,7 +544,7 @@ test("telegram progress final edit failure falls back to a final send", async ()
     await running.waitForIdle();
     const sentTexts = outbound.filter((entry) => entry.method === "sendMessage").map((entry) => (entry.body as { text?: string }).text ?? "");
     assert.equal(sentTexts.length, 2, "Telegram sends a fallback final message when progress edit fails");
-    assert.match(sentTexts[0], /Processing/);
+    assert.match(sentTexts[0], /Working/);
     assert.equal(sentTexts[1], "final after edit failure");
   } finally {
     await running.close();
@@ -487,8 +574,9 @@ test("telegram webhook replay of an unpaired update does not resend pairing inst
     assert.equal((await post()).status, 200);
     assert.equal((await post()).status, 200);
     await running.waitForIdle();
-    assert.equal(outbound.length, 1, "Telegram update_id replay is idempotent even for pairing challenges");
-    assert.match((outbound[0].body as { text: string }).text, /pairing approve/);
+    const pairingMessages = outbound.filter((entry) => entry.method === "sendMessage");
+    assert.equal(pairingMessages.length, 1, "Telegram update_id replay is idempotent even for pairing challenges");
+    assert.match((pairingMessages[0].body as { text: string }).text, /pairing approve/);
   } finally {
     await running.close();
     llm.close();
@@ -895,10 +983,9 @@ test("slack webhook rejects unverified remote MEDIA URLs instead of claiming an 
     assert.equal(response.status, 200);
     await running.waitForIdle();
     const posts = outbound.filter((entry) => entry.url === "https://slack.com/api/chat.postMessage").map((entry) => entry.body as { text: string });
-    const progress = posts.find((post) => post.text.includes("Processing"));
+    const progress = posts.find((post) => post.text === "Working");
     assert.ok(progress, "progress message is posted");
-    assert.match(progress!.text, /Preparing artifact route/, "artifact requests show the artifact route");
-    assert.doesNotMatch(progress!.text, /memory/i, "memory is not claimed unless the request asks for recall");
+    assert.doesNotMatch(progress!.text, /memory|provider|artifact route/i, "progress does not invent internal steps");
     assert.ok(posts.some((post) => post.text.includes("Created the workbook.") && post.text.includes("did not declare a verifiable file path")), "final text strips the unsafe MEDIA tag and reports the verification failure");
     assert.equal(posts.some((post) => post.text.includes("Some artifacts could not be attached directly")), false, "an unverified remote URL is not represented as an attachment");
   } finally {
@@ -936,7 +1023,7 @@ test("slack webhook edits one progress message into the final reply", async () =
     await running.waitForIdle();
     const posts = outbound.filter((entry) => entry.url === "https://slack.com/api/chat.postMessage");
     assert.equal(posts.length, 1, "Slack uses one progress message instead of posting a second final message");
-    assert.match((posts[0].body as { text: string }).text, /Processing/);
+    assert.match((posts[0].body as { text: string }).text, /Working/);
     assert.ok(outbound.some((entry) => entry.url === "https://slack.com/api/chat.update" && (entry.body as { text?: string }).text === "slow slack run complete"), "final reply edits the progress message in place");
   } finally {
     await running.close();
@@ -975,7 +1062,7 @@ test("slack progress final update failure falls back to a final post", async () 
     await running.waitForIdle();
     const postTexts = outbound.filter((entry) => entry.url === "https://slack.com/api/chat.postMessage").map((entry) => (entry.body as { text?: string }).text ?? "");
     assert.equal(postTexts.length, 2, "Slack sends a fallback final message when progress update fails");
-    assert.match(postTexts[0], /Processing/);
+    assert.match(postTexts[0], /Working/);
     assert.equal(postTexts[1], "final after update failure");
   } finally {
     await running.close();
@@ -1142,6 +1229,63 @@ test("slack webhook infers provider-created artifact paths when MEDIA tags are m
     assert.ok(outbound.some((entry) => entry.url === "https://slack.com/api/files.getUploadURLExternal"), "Slack upload URL is requested for inferred artifact");
     assert.ok(outbound.some((entry) => entry.url === "https://uploads.slack.test/inferred-report"), "inferred artifact bytes are uploaded to Slack");
     assert.ok(outbound.some((entry) => entry.url === "https://slack.com/api/files.completeUploadExternal"), "Slack upload is completed for inferred artifact");
+  } finally {
+    await running.close();
+    llm.close();
+  }
+});
+
+test("slack webhook infers absolute workspace artifact paths when MEDIA tags are missing", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-gw-slack-absolute-artifact-"));
+  const { mkdir } = await import("node:fs/promises");
+  const workspace = profileWorkspaceDir(cwd, "default");
+  await mkdir(join(cwd, ".muster"), { recursive: true });
+  await mkdir(workspace, { recursive: true });
+  const workbookBytes = Buffer.from("Area,Outcome\nTCO,Reduced hidden operational work\n");
+  const workbookPath = join(workspace, "battle_card_oss_vs_oss_manager.csv");
+  await writeFile(workbookPath, workbookBytes);
+  await writeFile(gatewayConfigPath(cwd), JSON.stringify({ token: "test-token", slack: { botToken: "xoxb-test", status: "message", thinking: "progress" } }));
+  const gateway = await loadGatewayConfig(cwd);
+  await requestPairing("slack:T024BE7LD", "U2147483697", cwd).then((pending) => approvePairing(pending.code, cwd));
+
+  const llm = await startStubLlm(`Prepared the battle card as a spreadsheet-ready CSV:\n\n[view file](${workbookPath})`);
+  const outbound: Array<{ url: string; body: unknown; method?: string }> = [];
+  const fetcher = (async (url: string | URL | Request, init?: RequestInit) => {
+    const target = String(url);
+    outbound.push({ url: target, method: init?.method, body: init?.body });
+    if (target === "https://slack.com/api/files.getUploadURLExternal") {
+      const form = new URLSearchParams(String(init?.body ?? ""));
+      assert.equal(form.get("filename"), "battle_card_oss_vs_oss_manager.csv");
+      assert.equal(form.get("length"), String(workbookBytes.byteLength));
+      return new Response(JSON.stringify({ ok: true, upload_url: "https://uploads.slack.test/absolute-csv", file_id: "FCSV" }), { status: 200 });
+    }
+    if (target === "https://uploads.slack.test/absolute-csv") {
+      assert.ok(init?.body, "upload request includes inferred CSV bytes");
+      return new Response("OK", { status: 200 });
+    }
+    if (target === "https://slack.com/api/files.completeUploadExternal") {
+      const form = new URLSearchParams(String(init?.body ?? ""));
+      assert.equal(form.get("files"), JSON.stringify([{ id: "FCSV", title: "battle_card_oss_vs_oss_manager.csv" }]));
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ ok: true, ts: "1765432000.000403" }), { status: 200 });
+  }) as typeof fetch;
+  const running = await startGatewayServer({ config: stubConfig(llm.url), gateway, cwd, fetcher }, 0);
+  try {
+    const response = await fetch(`http://127.0.0.1:${running.port}/v1/adapters/slack`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer test-token" },
+      body: JSON.stringify({
+        ...slackEventCallback,
+        event_id: "Ev-absolute-artifact-inferred-path",
+        event: { ...slackEventCallback.event, text: "muster: create a battle card spreadsheet" },
+      }),
+    });
+    assert.equal(response.status, 200);
+    await running.waitForIdle();
+    assert.ok(outbound.some((entry) => entry.url === "https://slack.com/api/files.getUploadURLExternal"), "Slack upload URL is requested for inferred absolute artifact");
+    assert.ok(outbound.some((entry) => entry.url === "https://uploads.slack.test/absolute-csv"), "inferred absolute artifact bytes are uploaded to Slack");
+    assert.ok(outbound.some((entry) => entry.url === "https://slack.com/api/files.completeUploadExternal"), "Slack upload is completed for inferred absolute artifact");
   } finally {
     await running.close();
     llm.close();
@@ -1475,4 +1619,35 @@ test("telegram webhook without a secret token requires gateway bearer and warns 
     await running.close();
     llm.close();
   }
+});
+
+test("trusted Telegram long-poll ingress does not emit a webhook authentication warning", async () => {
+  resetAdapterAuthWarnings();
+  const cwd = await mkdtemp(join(tmpdir(), "muster-gw-tg-poll-auth-"));
+  const { mkdir } = await import("node:fs/promises");
+  await mkdir(join(cwd, ".muster"), { recursive: true });
+  await writeFile(gatewayConfigPath(cwd), JSON.stringify({ token: "test-token", telegram: { botToken: "123:ABC" } }));
+  const gateway = await loadGatewayConfig(cwd);
+  const lines: string[] = [];
+  const update = JSON.stringify(telegramUpdate);
+  const fetcher = (async (url: string | URL | Request) => {
+    const target = String(url);
+    if (target.includes("/setMyCommands") || target.includes("/deleteWebhook") || target.includes("/sendMessage")) {
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), { status: 200 });
+    }
+    if (target.includes("/sendChatAction")) return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    if (target.includes("/getUpdates")) return new Response(JSON.stringify({ ok: true, result: [JSON.parse(update)] }), { status: 200 });
+    throw new Error(`unexpected fetch ${target}`);
+  }) as typeof fetch;
+
+  await pollTelegram({
+    config: stubConfig("http://127.0.0.1:1/v1/chat/completions"),
+    gateway,
+    cwd,
+    fetcher,
+    log: (line) => lines.push(line),
+    maxIterations: 1,
+  });
+
+  assert.equal(lines.some((line) => line.includes("UNAUTHENTICATED") && line.includes("telegram")), false);
 });

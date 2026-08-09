@@ -49,6 +49,8 @@ export interface CodexRunInput {
   readonly env?: Record<string, string>;
   readonly timeoutMs?: number;
   readonly command?: string;
+  /** Native Codex config overrides supplied by the governed host. */
+  readonly configOverrides?: readonly string[];
 }
 
 export interface CodexRunResult {
@@ -112,6 +114,7 @@ export function buildCodexArgs(input: CodexRunInput, outputLastMessageFile: stri
   args.push("-c", `approval_policy=${input.approval ?? "never"}`);
   if (input.networkAccess) args.push("-c", "sandbox_workspace_write.network_access=true");
   if (input.instructionsFile) args.push("-c", `experimental_instructions_file=${input.instructionsFile}`);
+  for (const override of input.configOverrides ?? []) args.push("-c", override);
   args.push("-o", outputLastMessageFile);
   if (isResume && input.sessionId) args.push(input.sessionId);
   args.push(input.prompt);

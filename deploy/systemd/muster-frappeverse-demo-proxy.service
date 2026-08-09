@@ -1,0 +1,17 @@
+[Unit]
+Description=Muster Frappeverse HTTP and realtime development proxy
+After=network-online.target muster-frappeverse-demo.service
+Wants=network-online.target muster-frappeverse-demo.service
+
+[Service]
+Type=simple
+Environment=HOME=/home/goblin
+Environment=PATH=/home/goblin/.nvm/versions/node/v24.17.0/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/goblin/.nvm/versions/node/v24.17.0/bin/node /home/goblin/frappe-dev-reverse-proxy.mjs --listen 8200 --web 8201 --socketio 9200
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

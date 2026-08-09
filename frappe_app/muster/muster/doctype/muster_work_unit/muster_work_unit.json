@@ -1,0 +1,190 @@
+{
+    "doctype": "DocType",
+    "name": "Muster Work Unit",
+    "module": "Muster",
+    "autoname": "hash",
+    "title_field": "title",
+    "track_changes": 1,
+    "field_order": [
+        "overview_tab",
+        "title",
+        "mission",
+        "external_node_id",
+        "node_kind",
+        "status",
+        "parent_work_unit",
+        "tree_path",
+        "depth",
+        "agent",
+        "target_workspace",
+        "dependency_section",
+        "dependencies_json",
+        "attempt_count",
+        "attempt_id",
+        "lease_section",
+        "lease_owner",
+        "fencing_token",
+        "lease_expires_at",
+        "started_at",
+        "completed_at"
+    ],
+    "fields": [
+        {
+            "fieldname": "overview_tab",
+            "fieldtype": "Tab Break",
+            "label": "Overview"
+        },
+        {
+            "fieldname": "title",
+            "fieldtype": "Data",
+            "label": "Work Unit",
+            "reqd": 1,
+            "in_list_view": 1
+        },
+        {
+            "fieldname": "mission",
+            "fieldtype": "Link",
+            "label": "Mission",
+            "options": "Muster Mission",
+            "reqd": 1,
+            "in_list_view": 1
+        },
+        {
+            "fieldname": "external_node_id",
+            "fieldtype": "Data",
+            "label": "Graph Node ID",
+            "read_only": 1,
+            "in_list_view": 1
+        },
+        {
+            "fieldname": "node_kind",
+            "fieldtype": "Data",
+            "label": "Node Kind",
+            "read_only": 1
+        },
+        {
+            "fieldname": "status",
+            "fieldtype": "Select",
+            "label": "Status",
+            "options": "Pending\nReady\nRunning\nWaiting\nSucceeded\nFailed\nCancelled\nNeeds Intervention",
+            "default": "Pending",
+            "reqd": 1,
+            "in_list_view": 1
+        },
+        {
+            "fieldname": "parent_work_unit",
+            "fieldtype": "Link",
+            "label": "Parent Work Unit",
+            "options": "Muster Work Unit"
+        },
+        {
+            "fieldname": "tree_path",
+            "fieldtype": "Data",
+            "label": "Tree Path",
+            "read_only": 1
+        },
+        {
+            "fieldname": "depth",
+            "fieldtype": "Int",
+            "label": "Depth",
+            "default": "0",
+            "read_only": 1
+        },
+        {
+            "fieldname": "agent",
+            "fieldtype": "Link",
+            "label": "Agent",
+            "options": "Muster Agent"
+        },
+        {
+            "fieldname": "target_workspace",
+            "fieldtype": "Data",
+            "label": "Visible Workspace"
+        },
+        {
+            "fieldname": "dependency_section",
+            "fieldtype": "Section Break",
+            "label": "Dependencies and Attempts"
+        },
+        {
+            "fieldname": "dependencies_json",
+            "fieldtype": "Code",
+            "label": "Dependencies",
+            "options": "JSON",
+            "read_only": 1
+        },
+        {
+            "fieldname": "attempt_count",
+            "fieldtype": "Int",
+            "label": "Attempts",
+            "default": "0",
+            "read_only": 1
+        },
+        {
+            "fieldname": "attempt_id",
+            "fieldtype": "Data",
+            "label": "Current Attempt ID",
+            "read_only": 1
+        },
+        {
+            "fieldname": "lease_section",
+            "fieldtype": "Section Break",
+            "label": "Lease"
+        },
+        {
+            "fieldname": "lease_owner",
+            "fieldtype": "Data",
+            "label": "Lease Owner",
+            "read_only": 1
+        },
+        {
+            "fieldname": "fencing_token",
+            "fieldtype": "Data",
+            "label": "Fencing Token",
+            "read_only": 1
+        },
+        {
+            "fieldname": "lease_expires_at",
+            "fieldtype": "Datetime",
+            "label": "Lease Expires",
+            "read_only": 1
+        },
+        {
+            "fieldname": "started_at",
+            "fieldtype": "Datetime",
+            "label": "Started At",
+            "read_only": 1
+        },
+        {
+            "fieldname": "completed_at",
+            "fieldtype": "Datetime",
+            "label": "Completed At",
+            "read_only": 1
+        }
+    ],
+    "permissions": [
+        {
+            "role": "Muster Administrator",
+            "read": 1,
+            "write": 1
+        },
+        {
+            "role": "Muster Automation Manager",
+            "read": 1,
+            "write": 1
+        },
+        {
+            "role": "Muster Operator",
+            "read": 1,
+            "write": 1
+        },
+        {
+            "role": "Muster Auditor",
+            "read": 1
+        },
+        {
+            "role": "Muster Viewer",
+            "read": 1
+        }
+    ]
+}

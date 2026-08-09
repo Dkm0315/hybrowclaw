@@ -69,7 +69,7 @@ test("onboarding applies real providers, plugins, MCPs, channels, memory policy,
   assert.ok(config.plugins?.allow?.includes("github"));
   assert.ok(config.plugins?.allow?.includes("browser"));
   assert.ok(config.plugins?.allow?.includes("artifact-studio"));
-  assert.ok(config.plugins?.load?.paths?.some((path) => path.includes("capability-packs/frappe")));
+  assert.ok(config.plugins?.load?.paths?.some((path) => /(?:capability|builtin)-packs[\\/]frappe/.test(path)));
 
   assert.equal(config.tools?.mcp?.servers?.git?.transport.kind, "stdio");
   assert.equal(config.tools?.mcp?.servers?.sqlite?.transport.kind, "stdio");
@@ -86,6 +86,7 @@ test("onboarding applies real providers, plugins, MCPs, channels, memory policy,
   assert.ok(workspaceProfile.configured.includes("provider:selfhosted:manual"));
   assert.ok(workspaceProfile.configured.includes("channel:slack:gateway-ready"));
   assert.ok(workspaceProfile.nextActions.some((action) => action.id === "slack" && action.env?.includes("SLACK_BOT_TOKEN")));
+  assert.ok(workspaceProfile.nextActions.some((action) => action.id === "gchat" && action.command === "muster channels ready gchat --audience https://your-domain.example/v1/adapters/gchat --no-start" && !action.env?.length));
   assert.ok(workspaceProfile.nextActions.some((action) => action.id === "openai" && action.url?.includes("platform.openai.com")));
   assert.ok(workspaceProfile.nextActions.some((action) => action.id === "notion" && action.command === "muster mcp oauth setup notion"));
 

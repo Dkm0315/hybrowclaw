@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { buildCodexArgs, parseCodexEvents, runCodex } from "../src/codex.js";
-import { clearCodexAppServerConversation, clearCodexAppServerSessions, runCodexAppServer } from "../src/codex-app-server.js";
+import { buildCodexAppServerArgs, clearCodexAppServerConversation, clearCodexAppServerSessions, runCodexAppServer } from "../src/codex-app-server.js";
+import { codexMcpDisableOverrides } from "../src/run.js";
 
 test("runCodex marks an unavailable CLI as safe for governed fallback", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-codex-missing-"));
@@ -75,6 +76,38 @@ test("buildCodexArgs: ephemeral fresh turns skip native session persistence for 
 
   assert.deepEqual(args.slice(0, 5), ["exec", "--json", "--ephemeral", "-C", "/ws"]);
   assert.ok(args.includes("--ephemeral"));
+});
+
+test("native Codex transports apply governed MCP exclusions without disabling native power", () => {
+  const override = "mcp_servers.frappe_control_plane.enabled=false";
+  const execArgs = buildCodexArgs({
+    prompt: "show my leave balance",
+    cwd: "/ws",
+    configOverrides: [override],
+  }, "/tmp/o.txt");
+  const appServerArgs = buildCodexAppServerArgs({ configOverrides: [override], networkAccess: true });
+
+  assert.deepEqual(execArgs.slice(execArgs.indexOf(override) - 1, execArgs.indexOf(override) + 1), ["-c", override]);
+  assert.deepEqual(appServerArgs, [
+    "app-server", "--stdio",
+    "-c", "sandbox_workspace_write.network_access=true",
+    "-c", override,
+  ]);
+});
+
+test("MCP exclusions never synthesize a transport-less Codex server", async () => {
+  const codexHome = await mkdtemp(join(tmpdir(), "muster-codex-home-"));
+  await writeFile(join(codexHome, "config.toml"), [
+    "[mcp_servers.frappe_control_plane]",
+    'command = "/opt/frappe-mcp"',
+    "",
+    '[mcp_servers."playwright"]',
+    'command = "npx"',
+  ].join("\n"));
+  assert.deepEqual(
+    await codexMcpDisableOverrides(["filesystem", "frappe_control_plane", "playwright"], codexHome),
+    ["mcp_servers.frappe_control_plane.enabled=false", "mcp_servers.playwright.enabled=false"],
+  );
 });
 
 test("parseCodexEvents: extracts thread_id (resume handle) from the JSONL stream", () => {
@@ -229,9 +262,11 @@ rl.on("line", async (line) => {
 test("runCodexAppServer: resumes a persisted thread after the warm process is gone", async () => {
   const dir = await mkdtemp(join(tmpdir(), "muster-codex-app-server-resume-"));
   const fake = join(dir, "codex-fake.mjs");
+  const startLog = join(dir, "start.json");
   const resumeLog = join(dir, "resume.json");
+  const turnLog = join(dir, "turn.jsonl");
   await writeFile(fake, `#!/usr/bin/env node
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import readline from "node:readline";
 const rl = readline.createInterface({ input: process.stdin });
 let threadId = "thread-" + process.pid;
@@ -239,12 +274,16 @@ function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
 rl.on("line", (line) => {
   const msg = JSON.parse(line);
   if (msg.method === "initialize") send({ id: msg.id, result: { userAgent: "fake" } });
-  else if (msg.method === "thread/start") send({ id: msg.id, result: { thread: { id: threadId } } });
+  else if (msg.method === "thread/start") {
+    writeFileSync(${JSON.stringify(startLog)}, JSON.stringify(msg.params));
+    send({ id: msg.id, result: { thread: { id: threadId } } });
+  }
   else if (msg.method === "thread/resume") {
     writeFileSync(${JSON.stringify(resumeLog)}, JSON.stringify(msg.params));
     threadId = msg.params.threadId;
     send({ id: msg.id, result: { thread: { id: threadId } } });
   } else if (msg.method === "turn/start") {
+    appendFileSync(${JSON.stringify(turnLog)}, JSON.stringify(msg.params) + "\\n");
     send({ id: msg.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
     send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m", text: threadId }, threadId, turnId: "turn-1" } });
     send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed" } } });
@@ -253,21 +292,74 @@ rl.on("line", (line) => {
 `, "utf8");
   await chmod(fake, 0o755);
   try {
-    const first = await runCodexAppServer({ prompt: "one", cwd: dir, command: fake, cacheKey: "resume-chat" });
+    const developerInstructions = "Use only the host-supplied permission-filtered business context.";
+    const first = await runCodexAppServer({ prompt: "one", cwd: dir, command: fake, cacheKey: "resume-chat", developerInstructions, applicationContext: "fresh snapshot one", sandbox: "read-only", networkAccess: false });
     clearCodexAppServerSessions();
-    const second = await runCodexAppServer({ prompt: "two", cwd: dir, command: fake, cacheKey: "resume-chat", threadId: first.threadId });
+    const second = await runCodexAppServer({ prompt: "two", cwd: dir, command: fake, cacheKey: "resume-chat", threadId: first.threadId, developerInstructions, applicationContext: "fresh snapshot two", sandbox: "read-only", networkAccess: false });
 
     assert.equal(first.status, "completed");
     assert.equal(second.status, "completed");
     assert.equal(second.threadId, first.threadId);
     assert.equal(second.timings?.threadOpenState, "resumed");
+    assert.deepEqual(JSON.parse(await readFile(startLog, "utf8")), {
+      cwd: dir,
+      approvalPolicy: "never",
+      sandbox: "read-only",
+      developerInstructions,
+    });
     assert.deepEqual(JSON.parse(await readFile(resumeLog, "utf8")), {
       threadId: first.threadId,
       cwd: dir,
       excludeTurns: true,
       approvalPolicy: "never",
-      sandbox: "workspace-write",
+      sandbox: "read-only",
+      developerInstructions,
     });
+    const turns = (await readFile(turnLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.deepEqual(turns.map((turn) => turn.additionalContext), [
+      { "muster.application": { value: "fresh snapshot one", kind: "application" } },
+      { "muster.application": { value: "fresh snapshot two", kind: "application" } },
+    ]);
+  } finally {
+    clearCodexAppServerSessions();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runCodexAppServer: replaces a stale persisted thread before dispatching the turn", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "muster-codex-app-server-stale-"));
+  const fake = join(dir, "codex-fake.mjs");
+  await writeFile(fake, `#!/usr/bin/env node
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+const threadId = "thread-fresh-" + process.pid;
+function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ id: msg.id, result: { userAgent: "fake" } });
+  else if (msg.method === "thread/resume") send({ id: msg.id, error: { code: -32600, message: "thread/resume failed: no rollout found for thread id thread-stale" } });
+  else if (msg.method === "thread/start") send({ id: msg.id, result: { thread: { id: threadId } } });
+  else if (msg.method === "turn/start") {
+    send({ id: msg.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
+    send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m", text: "fresh response" }, threadId, turnId: "turn-1" } });
+    send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  try {
+    const result = await runCodexAppServer({
+      prompt: "answer once",
+      cwd: dir,
+      command: fake,
+      cacheKey: "stale-chat",
+      threadId: "thread-stale",
+    });
+
+    assert.equal(result.status, "completed");
+    assert.equal(result.finalMessage, "fresh response");
+    assert.match(result.threadId ?? "", /^thread-fresh-/);
+    assert.equal(result.timings?.threadOpenState, "started");
   } finally {
     clearCodexAppServerSessions();
     await rm(dir, { recursive: true, force: true });

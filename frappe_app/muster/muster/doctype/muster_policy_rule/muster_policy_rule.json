@@ -1,0 +1,6 @@
+{
+ "doctype":"DocType","name":"Muster Policy Rule","module":"Muster","istable":1,
+ "field_order":["effect","capability","action","resource_type","resource_pattern","approval_class","constraints_json","max_uses"],
+ "fields":[{"fieldname":"effect","fieldtype":"Select","label":"Effect","options":"Deny\nAllow","default":"Deny","reqd":1,"in_list_view":1},{"fieldname":"capability","fieldtype":"Data","label":"Capability","reqd":1,"in_list_view":1},{"fieldname":"action","fieldtype":"Data","label":"Action","reqd":1},{"fieldname":"resource_type","fieldtype":"Select","label":"Resource Type","options":"Site\nCompany\nModule\nDocType\nDocument\nAgent\nWorkflow\nChannel","reqd":1},{"fieldname":"resource_pattern","fieldtype":"Data","label":"Resource Pattern","reqd":1},{"fieldname":"approval_class","fieldtype":"Select","label":"Approval","options":"None\nStandard\nSensitive\nPrivileged Code\nDestructive","default":"Standard"},{"fieldname":"constraints_json","fieldtype":"Code","label":"Constraints","options":"JSON"},{"fieldname":"max_uses","fieldtype":"Int","label":"Maximum Uses"}],
+ "permissions":[]
+}

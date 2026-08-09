@@ -38,6 +38,9 @@ export interface SurfaceArtifact {
   readonly name: string;
   readonly mime: string;
   readonly path: string;
+  /** Optional host-verified integrity binding for durable run artifacts. */
+  readonly sizeBytes?: number;
+  readonly sha256?: string;
 }
 
 export interface ApprovalRequest {

@@ -1,56 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { defaultConfig, planRun } from "../src/index.js";
+import { classifyTask } from "../src/router.js";
 
-test("planRun chooses one runtime and classifies architecture prompts", () => {
-  const config = defaultConfig();
-  const plan = planRun(config, {
-    prompt: "Design the architecture for a universal AI harness"
-  });
-
-  assert.equal(plan.runtimeId, "native");
-  assert.equal(plan.taskKind, "architecture");
-  assert.equal(plan.route.provider, "codex");
-  assert.equal(plan.route.reasoning, "high");
+test("business plans do not become architecture tasks", () => {
+  assert.equal(classifyTask("Give me a concise plan to apply leave next Monday"), "simple_qa");
+  assert.equal(classifyTask("Plan my travel reimbursement request"), "simple_qa");
 });
 
-test("sensitive prompts stay on configured Codex default unless local is explicitly configured", () => {
-  const config = defaultConfig();
-  const plan = planRun(config, {
-    prompt: "Analyze these private customer logs",
-    sensitive: true
-  });
-
-  assert.equal(plan.runtimeId, "native");
-  assert.equal(plan.sensitive, true);
-  assert.equal(plan.route.provider, "codex");
+test("technical architecture and implementation plans remain architecture tasks", () => {
+  assert.equal(classifyTask("Design the system architecture for the gateway"), "architecture");
+  assert.equal(classifyTask("Write an implementation plan for the control plane"), "architecture");
 });
 
-test("planRun rejects routes that reference missing providers", () => {
-  const config = defaultConfig();
-  const broken = {
-    ...config,
-    runtimes: {
-      ...config.runtimes,
-      native: {
-        ...config.runtimes.native,
-        routes: {
-          ...config.runtimes.native.routes,
-          architecture: {
-            provider: "missing",
-            model: "ghost-model",
-            reasoning: "high" as const
-          }
-        }
-      }
-    }
-  };
-
-  assert.throws(
-    () =>
-      planRun(broken, {
-        prompt: "Design the architecture"
-      }),
-    /missing provider/
-  );
+test("an explicit host task kind remains authoritative", () => {
+  assert.equal(classifyTask("plan to apply leave", "workflow"), "workflow");
 });

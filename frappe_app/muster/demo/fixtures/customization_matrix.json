@@ -1,0 +1,77 @@
+{
+  "schema_version": "1.0",
+  "fixture_id": "frappeverse-disposable-customization-matrix",
+  "disposable_prefix": "Muster Demo",
+  "requirements": {
+    "site": "fresh MariaDB-backed Frappe v16 demo site",
+    "actor": "enabled user with scoped Muster bindings and native Frappe permissions",
+    "approver": "different enabled user with Muster Approver authority",
+    "registered_app": "administrator-reviewed disposable custom app with an isolated source root",
+    "cleanup": "use the native Change Set rollback gate for artifacts and a reviewed reverse patch for app code"
+  },
+  "scenarios": [
+    {
+      "id": "CUS-01",
+      "prompt": "Add a required Customer field called Service Region after Customer Group, show it in list view, and let us filter by it.",
+      "artifacts": ["custom_field", "property_setter"],
+      "positive_evidence": ["reviewed typed diff", "independent approval", "effective Customer meta reread", "visible Customize Form and Customer form"],
+      "negative_probe": "request an eval: dependency and verify preview rejects executable metadata",
+      "reversal": "rollback the exact verified Change Set and reread effective Customer meta"
+    },
+    {
+      "id": "CUS-02",
+      "prompt": "Create a custom DocType Muster Demo Site Visit with clean sections for customer, visit date, owner, notes and status, then add a Desk Page and Workspace for service operations.",
+      "artifacts": ["doctype", "page", "workspace"],
+      "positive_evidence": ["DocType permissions reread", "Workspace content JSON reread", "Desk navigation and form screenshots"],
+      "negative_probe": "put active HTML in Workspace content and verify compilation fails before effect",
+      "reversal": "rollback Workspace, Page and DocType in dependency-safe reverse order"
+    },
+    {
+      "id": "CUS-03",
+      "prompt": "Build a parameterized Query Report for open site visits and a trusted Script Report for the service SLA summary.",
+      "artifacts": ["query_report", "script_report"],
+      "positive_evidence": ["generated parameterized SELECT", "trusted implementation registry key", "report permission check", "live report output"],
+      "negative_probe": "supply raw report_script or an unregistered implementation key and verify denial",
+      "reversal": "rollback both Report documents and confirm report routes no longer resolve"
+    },
+    {
+      "id": "CUS-04",
+      "prompt": "Create a safe Jinja print format for Muster Demo Site Visit using its name, customer, visit date and status.",
+      "artifacts": ["print_format"],
+      "positive_evidence": ["allowed doc.field placeholders", "Print permission check", "rendered PDF and Print Format reread"],
+      "negative_probe": "request a Jinja statement, method call or script tag and verify preview rejects it",
+      "reversal": "rollback the Print Format and verify it disappears from the print selector"
+    },
+    {
+      "id": "CUS-05",
+      "prompt": "Publish a login-required Web Form for a site visit request and a static Web Page explaining the request process.",
+      "artifacts": ["web_form", "web_page"],
+      "positive_evidence": ["route validation", "create permission check", "public route visual proof", "server-side document reread"],
+      "negative_probe": "request an external route, script event handler or dynamic template and verify fail-closed validation",
+      "reversal": "rollback both routes and verify they return not found"
+    },
+    {
+      "id": "CUS-06",
+      "prompt": "Notify the Support Team in Frappe when a new site visit is created and rotate open visits between two support users on weekdays.",
+      "artifacts": ["notification", "assignment_rule"],
+      "positive_evidence": ["recipient selector and event reread", "safe assignment expression", "created ToDo assignment", "system notification received by an authorized user"],
+      "negative_probe": "request a function call in the assignment condition or recipient code and verify rejection",
+      "reversal": "rollback both automation documents and prove a fresh visit produces neither notification nor assignment"
+    },
+    {
+      "id": "DEV-01",
+      "prompt": "In the registered demo app, add a controller validation, hook, patch and Vue service dashboard for Muster Demo Site Visit, with tests and an upgrade-safe migration.",
+      "surface": "Muster Development Proposal",
+      "positive_evidence": ["registered source revision", "allowed-path hash", "isolated generated patch", "independent review", "test manifest", "reviewed diff", "separate apply and deployment gates"],
+      "negative_probe": "attempt an out-of-scope path, symlink escape, dirty-source drift and failing test; every case must leave source and site unchanged",
+      "reversal": "apply a separately reviewed reverse patch and rerun migrate, build and upgrade tests through the fixed deployment registry"
+    }
+  ],
+  "global_verification": [
+    "every native artifact is reread independently after apply",
+    "schema or permission epoch drift forces a new preview",
+    "idempotent replay returns prior verified evidence without a second effect",
+    "rollback refuses to clobber an artifact edited after apply",
+    "all prompts remain in Ask Muster; native forms are opened only for visible attended proof"
+  ]
+}

@@ -83,6 +83,41 @@ test("expired async ownership becomes an unknown failure and is never replayed",
   }
 });
 
+test("artifact root references disappear only after terminal run expiry", async () => {
+  const store = new SqliteAsyncMessageRunStore(":memory:", { terminalTtlMs: 60_000 });
+  const root = "/private/artifacts/run-root";
+  try {
+    const claimed = await store.claim({ fingerprint: "sha256:artifact", artifactRoots: [root], leaseMs: 10_000, nowMs: 1_000 });
+    assert.equal(await store.markRunning(claimed.record.runId, claimed.ownerToken!, 1_000, 10_000), true);
+    assert.equal(await store.complete(claimed.record.runId, claimed.ownerToken!, { text: "done" }, 1_000), true);
+    assert.deepEqual(await store.listArtifactRoots(60_999), [root]);
+    assert.deepEqual(await store.listArtifactRoots(61_000), []);
+  } finally {
+    store.close();
+  }
+});
+
+test("delegated async idempotency cannot replay across authenticated authority lanes", async () => {
+  const store = new SqliteAsyncMessageRunStore(":memory:");
+  try {
+    const input = {
+      fingerprint: "sha256:same-message",
+      idempotencyScope: "same-idempotency-key",
+      authorityScope: "tenant-a:site-a:user-a",
+      artifactRoots: [process.cwd()],
+      leaseMs: 10_000,
+    } as const;
+    const claimed = await store.claim(input);
+    assert.equal(claimed.status, "claimed");
+    assert.equal(claimed.record.authorityScope, input.authorityScope);
+    assert.equal((await store.claim(input)).status, "replay");
+    assert.equal((await store.claim({...input, authorityScope: "tenant-a:site-a:user-b"})).status, "conflict");
+    assert.equal((await store.claim({...input, authorityScope: "tenant-b:site-b:user-a"})).status, "conflict");
+  } finally {
+    store.close();
+  }
+});
+
 test("separate async stores atomically admit one worker for an idempotency scope", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-async-store-processes-"));
   const filename = join(cwd, "runs.db");

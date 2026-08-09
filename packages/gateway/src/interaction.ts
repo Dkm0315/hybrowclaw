@@ -1,16 +1,19 @@
 import type { GatewayConfig, GatewayGovernanceAssignment, GatewayGovernanceRateLimit } from "./gateway-config.js";
-import type { PairedIdentity, PairedSender } from "./pairing.js";
-import type { SurfaceMessage, SurfaceReply } from "./envelope.js";
+import { pairingScopes, type PairedIdentity, type PairedSender } from "./pairing.js";
+import { conversationSessionId, type SurfaceMessage, type SurfaceReply } from "./envelope.js";
 import {
   aggregateEnterpriseUsage,
   enterpriseWindowBounds,
+  isVisibleInScopes,
+  listMemory,
   type EnterpriseActionReceipt,
   type EnterpriseSubject,
   type EnterpriseUsageEvent,
   type MusterConfig,
 } from "@musterhq/core";
 import { commandPage, paginateRows, renderPresentationText } from "./presentation.js";
-import { gatewayEnterpriseSubjects, usageEventsForSubjects, type GatewayEnterpriseRuntime } from "./enterprise-runtime.js";
+import { gatewayEnterpriseSubjects, gatewayGovernanceRateLimits, usageEventsForSubjects, type GatewayEnterpriseRuntime } from "./enterprise-runtime.js";
+import { gatewayPolicyManagementAllowed } from "./policy-store.js";
 import type {
   PresentationAudience,
   PresentationFilter,
@@ -25,6 +28,7 @@ import type {
 export type InteractionCommandName =
   | "help"
   | "start"
+  | "pair"
   | "status"
   | "whoami"
   | "tools"
@@ -61,6 +65,7 @@ interface InteractionContext {
   readonly message: SurfaceMessage;
   readonly gateway?: GatewayConfig;
   readonly enterprise?: GatewayEnterpriseRuntime;
+  readonly cwd?: string;
 }
 
 interface InteractionAction {
@@ -106,6 +111,7 @@ export interface InteractionCommandDescriptor {
 
 export const INTERACTION_COMMANDS: readonly InteractionCommandDescriptor[] = [
   { name: "start", summary: "Open the role-aware home view" },
+  { name: "pair", summary: "Pair this sender with its Frappe identity" },
   { name: "status", summary: "Connection, runtime, and session" },
   { name: "whoami", summary: "Resolved user and employee identity" },
   { name: "tools", summary: "Tools available to this identity" },
@@ -226,6 +232,12 @@ async function cardForCommand(ctx: InteractionContext): Promise<InteractionCard>
   switch (ctx.command) {
     case "start":
       return startCard(ctx, identity);
+    case "pair":
+      return {
+        kind: "form",
+        title: "Connect your work account",
+        lead: "Sign in once so I can use your existing access. I will never gain access to anything your account cannot already see or change.",
+      };
     case "status":
       return statusCard(ctx, identity);
     case "whoami":
@@ -272,39 +284,35 @@ async function cardForCommand(ctx: InteractionContext): Promise<InteractionCard>
     case "sessions":
       return sessionsCard(ctx);
     case "memory":
-      return memoryCard(ctx, identity);
+      return await memoryCard(ctx, identity);
     case "help":
       return helpCard(ctx, identity);
   }
 }
 
 function startCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
+  const experience = assistantExperience(ctx);
   if (!identity) {
     return {
-      title: "Ready",
-      lead: `You are connected on profile "${ctx.profile}". I can help with normal agent work from here.`,
-      body: [`Runtime: ${ctx.runtime}`, `Model: ${ctx.model}`, "Frappe is not connected for this sender yet, so ERPNext/Frappe tools are hidden."],
+      title: experience.name,
+      lead: "Tell me what you want to get done in your own words.",
+      body: ["Connect your work account when you want me to use live business information or complete an approved change."],
       next: [
-        { label: "/tools", detail: "Show tools available right now" },
-        { label: "/status", detail: "Check connection and runtime" },
-        { label: "Ask normally", detail: "Send the work you want done" },
+        { label: "Connect my account", detail: "Use my existing access", command: "/pair" },
+        { label: "See examples", detail: "A few ways to ask naturally", command: "/agents" },
       ],
     };
   }
   return {
-    title: "Ready",
-    lead: `You are connected as ${identity.employeeName ?? identity.user}. I will only show tools allowed for this Frappe identity.`,
+    title: experience.name,
+    lead: `Welcome ${firstName(identity.employeeName ?? identity.userName ?? identity.user)}. What would you like to get done in ${experience.organization ?? "your work system"}?`,
     body: compact([
-      `Site: ${identity.site}`,
-      `Employee: ${identity.employee ?? "not linked"}`,
-      identity.department ? `Department: ${identity.department}` : undefined,
-      `Runtime: ${ctx.runtime}`,
-      `Model: ${ctx.model}`,
+      "Ask naturally. I will use your existing access, ask only for missing information, preview changes, and confirm the result with a live link when available.",
     ]),
     next: [
-      { label: "/tools", detail: "Show role-aware tools" },
-      { label: "/reports", detail: "Show reports you can request" },
-      { label: "/tokens", detail: "Show token and usage controls" },
+      { label: "See examples", detail: "Common work I can help complete", command: "/agents" },
+      { label: "Explore reports", detail: "Start with one report area", command: "/reports" },
+      { label: "Check my access", detail: "See the identity used for permissions", command: "/whoami" },
     ],
   };
 }
@@ -353,10 +361,11 @@ function whoamiCard(_ctx: InteractionContext, identity: PairedIdentity | undefin
     table: {
       columns: ["Field", "Value"],
       rows: compactRows([
-        ["Frappe User", identity.user],
-        ["Employee", identity.employee ?? "not linked"],
+        ["Frappe User", identity.userName ? `${identity.userName} (${identity.user})` : identity.user],
+        ["Employee", identity.employeeName && identity.employee ? `${identity.employeeName} (${identity.employee})` : identity.employee ?? "not linked"],
         ["Employee Name", identity.employeeName],
-        ["Department", identity.department],
+        ["Department", identity.departmentName && identity.department ? `${identity.departmentName} (${identity.department})` : identity.department],
+        ["Reports To", identity.reportsToName && identity.reportsTo ? `${identity.reportsToName} (${identity.reportsTo})` : identity.reportsTo],
         ["Company", identity.company],
         ["Roles", identity.roles.length ? identity.roles.join(", ") : "none resolved"],
         ["Auth", identity.authMode ?? "not recorded"],
@@ -371,7 +380,8 @@ function whoamiCard(_ctx: InteractionContext, identity: PairedIdentity | undefin
 
 function toolsCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
   const assignment = governanceAssignment(ctx.gateway, ctx.message, ctx.paired);
-  const tools = visibleTools(identity, assignment?.roles);
+  const role = roleTier(identity, assignment?.roles);
+  const tools = visibleTools(identity, assignment?.roles).filter((tool) => tool.label !== "Team reports" || reportingScopeConfigured(assignment, role, identity));
   return {
     title: "Tools",
     lead: identity
@@ -399,7 +409,7 @@ async function reportsCard(ctx: InteractionContext, identity: PairedIdentity | u
     return usageCard({ ...ctx, args: setArgument(reportArgs, "scope", "self") }, identity);
   }
   if (selectedArea === "artifacts") return artifactsCard(ctx);
-  if (selectedArea === "team-usage" && (role.manager || role.hrbp || role.system)) {
+  if (selectedArea === "team-usage" && (role.manager || role.hrbp || role.system) && reportingScopeConfigured(assignment, role, identity)) {
     return usageCard({ ...ctx, args: setArgument(reportArgs, "scope", "team") }, identity);
   }
   if (selectedArea === "audit" && (role.manager || role.hrbp || role.system)) {
@@ -412,39 +422,74 @@ async function reportsCard(ctx: InteractionContext, identity: PairedIdentity | u
     return usageCard({ ...ctx, args: setArgument(reportArgs, "scope", "team") }, identity);
   }
 
-  const areas = [
-    { label: "Personal usage", value: "personal-usage", detail: "Requests, tokens, latency, and cache" },
-    { label: "Artifacts", value: "artifacts", detail: "Generated files and delivery capability" },
-    ...((role.manager || role.hrbp || role.system) ? [
-      { label: "Team usage", value: "team-usage", detail: "Explicit reporting hierarchy only" },
-      { label: "Audit", value: "audit", detail: "Governed actions and outcomes" },
-      { label: "Incidents", value: "incidents", detail: "Failures, denials, and recovery" },
-    ] : []),
-    ...(role.system ? [{ label: "System governance", value: "system-governance", detail: "Tenant-authorized usage and controls" }] : []),
-  ];
-  const rows = areas.map((area, index) => [String(index + 1), area.label, area.detail]);
+  const canSeeTeam = (role.manager || role.hrbp || role.system) && reportingScopeConfigured(assignment, role, identity);
+  if (selectedArea === "team") {
+    if (!canSeeTeam) {
+      return {
+        kind: "status",
+        title: "Team reports are not available",
+        lead: "Your current access does not include another person's activity. A job title alone never expands reporting access.",
+        body: ["You can still review your own activity and files."],
+        next: [
+          { label: "My activity", command: "/reports area=personal-usage" },
+          { label: "Check my access", command: "/whoami" },
+        ],
+      };
+    }
+    return {
+      kind: "menu",
+      title: "Team and controls",
+      lead: "Choose what you want to understand. Every view stays inside the people and departments already assigned to you.",
+      audience,
+      next: [
+        { label: "Team activity", detail: "Volume, tokens, and outcomes", command: "/reports area=team-usage" },
+        { label: "Usage controls", detail: "Allowances and safeguards", command: "/reports area=governance" },
+        { label: "Review and issues", detail: "Approvals, audit trail, and failures", command: "/reports area=assurance" },
+      ],
+      privacy: { rawPromptsIncluded: false, note: "Private message text stays hidden in management views." },
+    };
+  }
+  if (selectedArea === "governance" && canSeeTeam) {
+    return {
+      kind: "menu",
+      title: "Usage controls",
+      lead: "Review consumption, set an allowance where you are authorized, or check the safeguards applied before work runs.",
+      audience,
+      next: [
+        { label: "Allowances", detail: "View or configure request and token limits", command: "/limits" },
+        { label: "Safeguards", detail: "See access and approval controls", command: "/security" },
+        { label: "Quality checks", detail: "Review tests required before wider use", command: "/evals" },
+      ],
+      privacy: { rawPromptsIncluded: false, note: "Controls never grant access beyond the connected account's authorized scope." },
+    };
+  }
+  if (selectedArea === "assurance" && canSeeTeam) {
+    return {
+      kind: "menu",
+      title: "Review and issues",
+      lead: "Choose the evidence you need. Message text stays private unless a separate audited incident process permits it.",
+      audience,
+      next: [
+        { label: "Approvals", detail: "Pending and recent decisions", command: "/approvals" },
+        { label: "Audit trail", detail: "Governed actions and outcomes", command: "/audit" },
+        { label: "Failures and denials", detail: "Issues that need attention", command: "/incidents" },
+      ],
+      privacy: { rawPromptsIncluded: false },
+    };
+  }
+
+  const experience = assistantExperience(ctx);
   return {
-    kind: "report",
+    kind: "menu",
     title: "Reports",
-    lead: "Choose a report area or open a drill-down. Every option runs against the scope this identity is allowed to see.",
+    lead: `What would you like to understand in ${experience.organization ?? "your work system"}? Start with one area; I will ask for a period or person only when the report needs it.`,
     audience,
-    table: { columns: ["No", "Report area", "Includes"], rows },
-    filters: compact([
-      commandFilter(ctx, "/reports", "area", "Report area", areas.map(({ label, value }) => ({ label, value }))),
-      commandFilter(ctx, "/reports", "period", "Period", periodOptions()),
-    ]),
-    drilldowns: areas.slice(0, 5).map((area) => ({
-      label: area.label,
-      detail: area.detail,
-      command: `/reports area=${encodeURIComponent(area.value)}`,
-      kind: "drilldown" as const,
-    })),
     next: [
-      { label: "Refresh", detail: "Refresh authorized report data", command: "/reports", style: "primary" },
-      { label: "/tokens", detail: "View usage and token reports" },
-      { label: "/artifacts", detail: "Review export delivery" },
+      { label: "My activity", detail: "Requests, tokens, and outcomes", command: "/reports area=personal-usage" },
+      ...(canSeeTeam ? [{ label: "Team and controls", detail: "Only people and departments assigned to you", command: "/reports area=team" }] : []),
+      { label: "Files and exports", detail: "Documents and reports created for you", command: "/reports area=artifacts" },
     ],
-    privacy: { rawPromptsIncluded: false, note: "Manager reports omit raw prompts unless a separately audited incident workflow authorizes them." },
+    privacy: { rawPromptsIncluded: false, note: "Reports use only the scope already assigned to this account. Private message text is hidden by default." },
   };
 }
 
@@ -453,18 +498,29 @@ async function usageCard(ctx: InteractionContext, identity: PairedIdentity | und
   const role = roleTier(identity, assignment?.roles);
   const limitSnapshots = await readRateLimitSnapshots(ctx, assignment, identity, role, "current");
   const audience: PresentationAudience = role.system ? "admin" : role.manager || role.hrbp ? "manager" : "self";
-  const requestedScope = argumentValue(ctx.args, "scope") ?? "self";
+  const period = argumentValue(ctx.args, "period") ?? DEFAULT_USAGE_PERIOD;
+  const reportingAvailable = reportingScopeConfigured(assignment, role, identity);
+  const requestedScope = argumentValue(ctx.args, "scope") === "team"
+    && audience !== "self"
+    && reportingAvailable
+    ? "team"
+    : "self";
+  const reportCtx = {
+    ...ctx,
+    args: setArgument(setArgument(ctx.args, "scope", requestedScope), "period", period),
+  };
+  const personalScope = requestedScope === "self";
   const querySubjects = usageQuerySubjects(ctx, assignment, requestedScope);
-  const querySubjectAny = usageQueryAnySubjects(assignment, requestedScope);
-  const events = ctx.enterprise && (requestedScope === "self" || querySubjects.length > 0)
+  const querySubjectAny = usageQueryAnySubjects(ctx, assignment, requestedScope);
+  const events = ctx.enterprise && (requestedScope === "self" || querySubjects.length > 0 || querySubjectAny.length > 0)
     ? await ctx.enterprise.usageStore.queryUsage({
-      from: periodStart(argumentValue(ctx.args, "period")),
-      subjects: querySubjects,
+      from: periodStart(period),
+      subjects: requestedScope === "self" ? querySubjects : [],
       subjectAny: querySubjectAny,
     })
     : [];
   const scopedEvents = filterUsageEvents(events, ctx, assignment, requestedScope);
-  const visibleEvents = filterUsageDimensions(scopedEvents, ctx.args);
+  const visibleEvents = filterUsageDimensions(scopedEvents, reportCtx.args);
   const aggregation = aggregateEnterpriseUsage(visibleEvents, ["request_category", "provider", "outcome"]);
   const page = commandPage(ctx.args);
   const rows = aggregation.groups.map((group) => [
@@ -477,80 +533,157 @@ async function usageCard(ctx: InteractionContext, identity: PairedIdentity | und
   ]);
   const paged = paginateRows(rows, page, 8);
   const scopeDenied = requestedScope !== "self" && visibleEvents.length === 0 && !reportingScopeConfigured(assignment, role, identity);
+  const identifiedUserDrilldown = requestedScope !== "self"
+    && audience !== "self"
+    && assignment?.canViewIdentifiedUsage === true;
+  const managementDrilldowns = requestedScope !== "self" && audience !== "self" && reportingAvailable;
+  const teamUsageCommand = setArgument(
+    setArgument(argumentsWithout(ctx.args, ["scope", "page"]), "scope", "team"),
+    "period",
+    period,
+  );
+  const baseLead = scopeDenied
+    ? `For ${usagePeriodLabel(period)}, team activity is unavailable because no reporting hierarchy has been assigned to this account. A title alone never reveals another person's activity.`
+    : ctx.enterprise
+      ? `${usagePeriodLabel(period)} for ${requestedScope === "self" ? "your activity" : "the people and teams assigned to you"}.`
+      : "Usage history is not connected for this deployment, so I will not show estimated totals.";
+  const privacy = {
+    rawPromptsIncluded: false as const,
+    note: identifiedUserDrilldown
+      ? "Gateway usage ledger and counters only. Authorized person-level drill-downs are enabled; private message text remains hidden."
+      : "Gateway usage ledger and counters only. Live business records, private message text, and unapproved user identities are not included.",
+  };
+  const commonFilters = compact([
+    commandFilter(reportCtx, "/usage", "period", "Period", periodOptions()),
+    ...(audience === "self" || !reportingAvailable ? [] : [commandFilter(reportCtx, "/usage", "scope", "View", [
+      { label: "My activity", value: "self" },
+      { label: "My assigned team", value: "team" },
+    ])]),
+  ]);
+  const detailedFilters = compact([
+    ...commonFilters,
+    ...(identifiedUserDrilldown ? [commandFilter(reportCtx, "/usage", "user", "Person", authorizedUsageUserOptions(assignment, visibleEvents))] : []),
+    ...(managementDrilldowns ? [commandFilter(reportCtx, "/usage", "department", "Team", authorizedUsageDepartmentOptions(assignment, visibleEvents))] : []),
+    commandFilter(reportCtx, "/usage", "channel", "Channel", observedSubjectOptions(scopedEvents, "channel", (value) => {
+      const surface = value.split(":", 1)[0];
+      return { label: humanizeValue(surface), value: surface };
+    })),
+    commandFilter(reportCtx, "/usage", "provider", "Provider", configuredProviderOptions(ctx, scopedEvents)),
+    commandFilter(reportCtx, "/usage", "workload", "Type of work", observedWorkloadOptions(scopedEvents)),
+    commandFilter(reportCtx, "/usage", "outcome", "Result", observedValueOptions(scopedEvents.map((event) => event.outcome))),
+  ]);
+  const explicitDetail = ["user", "department", "channel", "provider", "workload", "outcome", "page"]
+    .some((key) => argumentValue(reportCtx.args, key) !== undefined);
+  const requestedView = argumentValue(reportCtx.args, "view") ?? (explicitDetail ? "work" : "overview");
+  const view = personalScope && requestedView === "performance" ? "overview" : requestedView;
+  const viewCommand = (nextView: "overview" | "work" | "performance") => commandWithArguments(
+    "/usage",
+    setArgument(argumentsWithout(reportCtx.args, ["page", "view"]), "view", nextView),
+  );
+  const note = "Billing is shown only after a verifiable provider billing source is connected; the token ledger never invents a cost.";
+
+  if (view === "performance") {
+    return {
+      kind: "report",
+      title: "Speed and reliability",
+      lead: `${baseLead} This view separates normal response time from slow-tail and failed work.`,
+      audience,
+      kpis: [
+        { label: "Typical response", value: formatDuration(aggregation.totals.p50LatencyMs), detail: "half of completed work is this fast or faster" },
+        { label: "Slow-tail response", value: formatDuration(aggregation.totals.p95LatencyMs), detail: "95% completes within this time" },
+        { label: "Success", value: formatRate(aggregation.totals.successfulRuns, aggregation.totals.runs) },
+        { label: "Errors", value: formatRate(aggregation.totals.failedRuns, aggregation.totals.runs) },
+        { label: "Blocked safely", value: formatRate(aggregation.totals.blockedRuns, aggregation.totals.runs) },
+        { label: "Prompt cache reused", value: `${aggregation.totals.cacheHitRate}%`, detail: "provider-reported cache events only" },
+      ],
+      trends: [{
+        id: "latency-percentiles",
+        label: "Response time",
+        unit: "ms",
+        points: [
+          { label: "Typical", value: aggregation.totals.p50LatencyMs },
+          { label: "95%", value: aggregation.totals.p95LatencyMs },
+          { label: "99%", value: aggregation.totals.p99LatencyMs },
+        ],
+      }],
+      filters: detailedFilters.filter((filter) => ["period", "scope", "channel", "provider", "outcome"].includes(filter.id)),
+      next: [
+        { label: "Back to summary", command: viewCommand("overview"), kind: "drilldown" },
+        { label: "See types of work", command: viewCommand("work"), kind: "drilldown" },
+        { label: "Review allowances", command: "/limits", kind: "drilldown" },
+      ],
+      privacy,
+      note,
+    };
+  }
+
+  if (view === "work") {
+    return {
+      kind: "report",
+      title: personalScope ? "Your activity" : "Where usage went",
+      lead: `${baseLead} Choose a person, team, channel, provider, or result to narrow the view.`,
+      audience,
+      kpis: [
+        { label: "Runs", value: String(aggregation.totals.runs) },
+        { label: "Tokens", value: String(aggregation.totals.totalTokens) },
+        { label: "Success", value: formatRate(aggregation.totals.successfulRuns, aggregation.totals.runs) },
+        ...(personalScope ? [] : [{ label: "Slow-tail response", value: formatDuration(aggregation.totals.p95LatencyMs) }]),
+      ],
+      tables: [{
+        id: "usage",
+        title: "Work breakdown",
+        columns: personalScope
+          ? ["Type of work", "Provider", "Result", "Runs", "Tokens"]
+          : ["Type of work", "Provider", "Result", "Runs", "Tokens", "95% within"],
+        rows: paged.rows.length
+          ? paged.rows.map((row) => personalScope ? row.slice(0, 5) : row)
+          : [personalScope
+              ? ["No activity in this view", "—", "—", "0", "0"]
+              : ["No activity in this view", "—", "—", "0", "0", "—"]],
+        pagination: paged.pagination,
+      }],
+      filters: detailedFilters,
+      next: [
+        { label: "Back to summary", command: viewCommand("overview"), kind: "drilldown" },
+        ...(personalScope ? [] : [
+          { label: "See speed and reliability", command: viewCommand("performance"), kind: "drilldown" as const },
+        ]),
+        { label: "Review allowances", command: "/limits", kind: "drilldown" },
+      ],
+      privacy,
+      note,
+    };
+  }
+
   return {
     kind: "report",
-    title: "Usage",
-    lead: scopeDenied
-      ? "Team usage is not available until an explicit reporting hierarchy or tenant reporting scope is assigned. Manager titles alone do not expose other users."
-      : ctx.enterprise
-        ? `Live gateway usage for the authorized ${requestedScope === "self" ? "personal" : "reporting"} scope.`
-        : "Usage reporting needs an enterprise ledger runtime; no synthetic totals are shown.",
+    title: requestedScope === "self" ? "Your assistant activity" : "Team assistant activity",
+    lead: `${baseLead} Start with the signal that matters; details stay one tap away.`,
     audience,
     kpis: [
+      { label: "Period", value: usagePeriodLabel(period) },
       { label: "Runs", value: String(aggregation.totals.runs) },
       { label: "Tokens", value: String(aggregation.totals.totalTokens) },
-      { label: "p50", value: formatDuration(aggregation.totals.p50LatencyMs) },
-      { label: "p95", value: formatDuration(aggregation.totals.p95LatencyMs) },
-      { label: "p99", value: formatDuration(aggregation.totals.p99LatencyMs) },
-      { label: "Cache hit", value: `${aggregation.totals.cacheHitRate}%` },
+      { label: "Success", value: formatRate(aggregation.totals.successfulRuns, aggregation.totals.runs) },
+      ...(personalScope ? [] : [
+        { label: "Errors", value: formatRate(aggregation.totals.failedRuns, aggregation.totals.runs) },
+        { label: "Blocked safely", value: formatRate(aggregation.totals.blockedRuns, aggregation.totals.runs) },
+      ]),
+      ...(personalScope ? [] : [
+        { label: "Typical response", value: formatDuration(aggregation.totals.p50LatencyMs) },
+        { label: "Slow-tail response", value: formatDuration(aggregation.totals.p95LatencyMs) },
+      ]),
     ],
-    tables: [
-      {
-        id: "usage",
-        title: "Observed usage",
-        columns: ["Category", "Provider", "Outcome", "Runs", "Tokens", "p95"],
-        rows: paged.rows.length ? paged.rows : [["No observed runs", "—", "—", "0", "0", "0ms"]],
-        pagination: paged.pagination,
-      },
-      {
-        id: "usage-limits",
-        title: "Configured limits",
-        columns: ["Scope", "Window", "Requests", "Tokens", "Resets"],
-        rows: limitSnapshots.length
-          ? limitSnapshots.map(rateLimitSnapshotRow)
-          : [["Current identity", "—", "No enforced cap", "No enforced cap", "—"]],
-      },
-    ],
-    trends: [{
-      id: "latency-percentiles",
-      label: "Latency",
-      unit: "ms",
-      points: [
-        { label: "p50", value: aggregation.totals.p50LatencyMs },
-        { label: "p95", value: aggregation.totals.p95LatencyMs },
-        { label: "p99", value: aggregation.totals.p99LatencyMs },
-      ],
-    }],
-    filters: compact([
-      commandFilter(ctx, "/usage", "period", "Period", periodOptions()),
-      ...(audience === "self" ? [] : [commandFilter(ctx, "/usage", "scope", "Scope", [
-        { label: "My usage", value: "self" },
-        { label: "Authorized team", value: "team" },
-      ])]),
-      commandFilter(ctx, "/usage", "provider", "Provider", configuredProviderOptions(ctx, scopedEvents)),
-      commandFilter(ctx, "/usage", "channel", "Channel", observedSubjectOptions(scopedEvents, "channel", (value) => {
-        const surface = value.split(":", 1)[0];
-        return { label: humanizeValue(surface), value: surface };
-      })),
-      commandFilter(ctx, "/usage", "outcome", "Outcome", observedValueOptions(scopedEvents.map((event) => event.outcome))),
-      ...(audience === "self" || requestedScope === "self" ? [] : [commandFilter(
-        ctx,
-        "/usage",
-        "user",
-        "User",
-        observedSubjectOptions(scopedEvents, "user", (value) => ({ label: value, value })),
-      )]),
-    ]),
-    drilldowns: [
-      { label: "Limits", command: "/limits", kind: "drilldown" },
-      { label: "Security", command: "/security", kind: "drilldown" },
-    ],
+    filters: commonFilters,
     next: [
-      { label: "Refresh personal usage", detail: "Requests, tokens, latency, cache, and artifacts", command: "/usage scope=self", style: "primary" },
-      ...(audience === "self" ? [] : [{ label: "Team usage", detail: "Explicitly assigned reporting hierarchy", command: "/usage scope=team", kind: "drilldown" as const }]),
-      { label: "/limits", detail: "Review rate and token limits" },
+      { label: personalScope ? "See my activity" : "Where usage went", detail: personalScope ? "Types of work, providers, and outcomes" : "People, teams, channels, providers, and work types", command: viewCommand("work"), kind: "drilldown" },
+      ...(personalScope ? [{ label: "My files", detail: "Documents and reports created for you", command: "/artifacts", kind: "drilldown" as const }] : [
+        { label: "Speed and reliability", detail: "Typical speed, slow-tail, failures, and cache reuse", command: viewCommand("performance"), kind: "drilldown" as const },
+      ]),
+      { label: "Review allowances", detail: "See or set a permitted request or token allowance", command: "/limits", kind: "drilldown" },
     ],
-    privacy: { rawPromptsIncluded: false, note: "Manager views expose categories, consumption, latency, and outcomes—not raw prompt text." },
+    privacy,
+    note,
   };
 }
 
@@ -565,8 +698,12 @@ async function limitsCard(ctx: InteractionContext, identity: PairedIdentity | un
   const tokenRemaining = snapshots
     .filter((snapshot) => snapshot.maxTokens !== undefined && snapshot.usedTokens !== undefined)
     .map((snapshot) => Math.max(0, snapshot.maxTokens! - snapshot.usedTokens!));
+  const requestConfigured = snapshots.some((snapshot) => snapshot.maxRuns !== undefined);
+  const tokenConfigured = snapshots.some((snapshot) => snapshot.maxTokens !== undefined);
   const subjectOptions = observedValueOptions(snapshots.map((snapshot) => snapshot.subjectKind));
   const windowOptions = observedValueOptions(snapshots.map((snapshot) => snapshot.window));
+  const roles = [...(identity?.roles ?? []), ...(assignment?.roles ?? [])];
+  const canManage = gatewayPolicyManagementAllowed(assignment, roles);
   return {
     kind: "report",
     title: "Limits",
@@ -576,8 +713,8 @@ async function limitsCard(ctx: InteractionContext, identity: PairedIdentity | un
     audience: role.system ? "admin" : role.manager || role.hrbp ? "manager" : "self",
     kpis: [
       { label: "Policies", value: String(snapshots.length) },
-      { label: "Request balance", value: requestRemaining.length ? String(Math.min(...requestRemaining)) : "Uncapped", detail: "lowest visible remaining allowance" },
-      { label: "Token balance", value: tokenRemaining.length ? String(Math.min(...tokenRemaining)) : "Uncapped", detail: "lowest visible remaining allowance" },
+      { label: "Request balance", value: requestRemaining.length ? String(Math.min(...requestRemaining)) : requestConfigured ? "Counter unavailable" : "Uncapped", detail: "lowest visible remaining allowance" },
+      { label: "Token balance", value: tokenRemaining.length ? String(Math.min(...tokenRemaining)) : tokenConfigured ? "Counter unavailable" : "Uncapped", detail: "lowest visible remaining allowance" },
       { label: "Counter store", value: ctx.enterprise?.backend ?? "Unavailable", tone: ctx.enterprise ? "positive" : "warning" },
     ],
     table: {
@@ -592,11 +729,12 @@ async function limitsCard(ctx: InteractionContext, identity: PairedIdentity | un
       commandFilter(ctx, "/limits", "window", "Window", windowOptions),
     ]),
     next: [
+      ...(canManage ? [{ label: "Configure a limit", detail: "Create a preview with /limits set, then apply its typed token", command: "/limits set", kind: "confirm" as const }] : []),
       { label: "Refresh", detail: "Read counters again", command: commandWithArguments("/limits", ctx.args), style: "primary" },
       { label: "/usage", detail: "Compare allowance with observed token usage" },
       { label: "/security", detail: "Review related safety policy" },
     ],
-    note: "Provider billing credits are separate from gateway token allowances and are shown only when a provider exposes a verifiable billing API.",
+    note: "Evidence: configured gateway policies plus observed gateway counters. No provider billing amount is shown because no verifiable billing API is connected; this is not live Frappe usage.",
   };
 }
 
@@ -629,6 +767,9 @@ function securityCard(ctx: InteractionContext, identity: PairedIdentity | undefi
       { label: "/limits", detail: "Review rate and token limits" },
       { label: "/evals", detail: "Review eval gates" },
     ],
+    note: identity
+      ? "Evidence boundary: the paired Frappe identity supplies authorization context; this card reports gateway-enforced controls, not live Frappe security records."
+      : "Evidence boundary: pairing and gateway configuration only. No live Frappe authorization is available for this sender.",
   };
 }
 
@@ -744,7 +885,7 @@ async function governanceQueueCard(
       { label: "Events", value: String(matching.length) },
       { label: "Visible scope", value: audience === "self" ? "Personal" : audience === "manager" ? "Explicit hierarchy" : "Authorized system scope" },
       { label: "Raw prompts", value: "Hidden", detail: "request fingerprints only" },
-      { label: "Data source", value: ctx.enterprise?.backend ?? "Not connected", detail: "no sample values" },
+      { label: "Data source", value: ctx.enterprise?.backend ?? "Not connected", detail: "gateway ledger only; no live Frappe records" },
     ],
     table: {
       id: title.toLowerCase(),
@@ -768,7 +909,7 @@ async function governanceQueueCard(
       { label: "/reports", detail: "Open report workflows" },
       { label: "/security", detail: "Review visibility rules" },
     ],
-    privacy: { rawPromptsIncluded: false, note: "Manager views show categories and outcomes, not raw prompts." },
+    privacy: { rawPromptsIncluded: false, note: "Evidence: gateway receipt ledger only. Live Frappe approval/audit records are unavailable unless supplied by a governed Frappe workflow." },
   };
 }
 
@@ -786,14 +927,14 @@ function filterUsageEvents(
     const scope = [user, boundary ?? fallback].filter((subject): subject is EnterpriseSubject => Boolean(subject));
     return user ? usageEventsForSubjects(events, scope) : [];
   }
-  if (role.system && assignment?.canViewTenantUsage) {
-    return boundary ? usageEventsForSubjects(events, [boundary]) : [];
+  if (role.system && reportingScopeConfigured(assignment, role, ctx.paired.identity?.provider === "frappe" ? ctx.paired.identity : undefined)) {
+    return events.filter((event) => eventInReportingBoundary(event.subjects, ctx, assignment));
   }
   if (!boundary) return [];
   const managedUsers = new Set(assignment?.managedUserIds ?? []);
   const managedDepartments = new Set(assignment?.managedDepartmentIds ?? []);
   if (!managedUsers.size && !managedDepartments.size) return [];
-  return events.filter((event) => enterpriseEventHasSubject(event.subjects, boundary)
+  return events.filter((event) => eventInReportingBoundary(event.subjects, ctx, assignment)
     && event.subjects.some((subject) =>
       (subject.kind === "user" && managedUsers.has(subject.id))
         || (subject.kind === "department" && managedDepartments.has(subject.id))));
@@ -804,10 +945,14 @@ function filterUsageDimensions(events: readonly EnterpriseUsageEvent[], args: st
   const channel = argumentValue(args, "channel");
   const outcome = argumentValue(args, "outcome");
   const user = argumentValue(args, "user");
+  const department = argumentValue(args, "department");
+  const workload = argumentValue(args, "workload");
   return events.filter((event) => {
     if (outcome && event.outcome !== outcome) return false;
     if (provider && !event.subjects.some((subject) => subject.kind === "provider" && subject.id === provider)) return false;
     if (user && !event.subjects.some((subject) => subject.kind === "user" && subject.id === user)) return false;
+    if (department && !event.subjects.some((subject) => subject.kind === "department" && subject.id === department)) return false;
+    if (workload && usageWorkload(event) !== workload) return false;
     if (channel && !event.subjects.some((subject) => subject.kind === "channel" && (
       subject.id === channel || subject.id.startsWith(`${channel}:`)
     ))) return false;
@@ -834,18 +979,25 @@ function usageQuerySubjects(
 ): readonly EnterpriseSubject[] {
   const subjects = gatewayEnterpriseSubjects(ctx.message, ctx.paired, assignment);
   const boundary = reportingBoundary(ctx, assignment);
-  if (requestedScope !== "self") return boundary ? [boundary] : [];
+  const identity = ctx.paired.identity?.provider === "frappe" ? ctx.paired.identity : undefined;
+  if (requestedScope !== "self") {
+    if (identity?.site) return [];
+    return boundary ? [boundary] : [];
+  }
   const user = subjects.find((subject) => subject.kind === "user");
   const fallback = subjects.find((subject) => subject.kind === "channel");
   return [user, boundary ?? fallback].filter((subject): subject is EnterpriseSubject => Boolean(subject));
 }
 
 function usageQueryAnySubjects(
+  ctx: InteractionContext,
   assignment: GatewayGovernanceAssignment | undefined,
   requestedScope: string,
 ): readonly EnterpriseSubject[] {
-  if (requestedScope === "self" || assignment?.canViewTenantUsage) return [];
+  if (requestedScope === "self") return [];
   return [
+    ...(ctx.paired.identity?.provider === "frappe" ? [{ kind: "site" as const, id: ctx.paired.identity.site }] : []),
+    ...(assignment?.tenantId ? [{ kind: "tenant" as const, id: assignment.tenantId }] : []),
     ...(assignment?.managedUserIds ?? []).map((id) => ({ kind: "user" as const, id })),
     ...(assignment?.managedDepartmentIds ?? []).map((id) => ({ kind: "department" as const, id })),
   ];
@@ -859,8 +1011,8 @@ function filterReceipts(
 ): readonly EnterpriseActionReceipt[] {
   const self = gatewayEnterpriseSubjects(ctx.message, ctx.paired, assignment).find((subject) => subject.kind === "user")?.id;
   const boundary = reportingBoundary(ctx, assignment);
-  if (role.system && assignment?.canViewTenantUsage) {
-    return boundary ? receipts.filter((receipt) => enterpriseEventHasSubject([...receipt.actor, ...receipt.target], boundary)) : [];
+  if (role.system && reportingScopeConfigured(assignment, role, ctx.paired.identity?.provider === "frappe" ? ctx.paired.identity : undefined)) {
+    return receipts.filter((receipt) => eventInReportingBoundary([...receipt.actor, ...receipt.target], ctx, assignment));
   }
   const users = new Set([...(self ? [self] : []), ...(assignment?.managedUserIds ?? [])]);
   const departments = new Set(assignment?.managedDepartmentIds ?? []);
@@ -884,7 +1036,9 @@ function receiptQueryScope(
   const fallback = gatewayEnterpriseSubjects(ctx.message, ctx.paired, assignment).find((subject) => subject.kind === "channel");
   const required = boundary ?? fallback;
   if (!required) return { subjects: [], subjectAny: [] };
-  if (role.system && assignment?.canViewTenantUsage) return { subjects: [required], subjectAny: [] };
+  if (role.system && reportingScopeConfigured(assignment, role, ctx.paired.identity?.provider === "frappe" ? ctx.paired.identity : undefined)) {
+    return { subjects: [], subjectAny: usageQueryAnySubjects(ctx, assignment, "team") };
+  }
   return {
     subjects: [required],
     subjectAny: [
@@ -899,8 +1053,8 @@ function reportingBoundary(
   ctx: InteractionContext,
   assignment: GatewayGovernanceAssignment | undefined,
 ): EnterpriseSubject | undefined {
-  if (assignment?.tenantId) return { kind: "tenant", id: assignment.tenantId };
   if (ctx.paired.identity?.provider === "frappe") return { kind: "site", id: ctx.paired.identity.site };
+  if (assignment?.tenantId) return { kind: "tenant", id: assignment.tenantId };
   if (assignment?.workspaceId) return { kind: "workspace", id: assignment.workspaceId };
   return undefined;
 }
@@ -917,10 +1071,26 @@ function reportingScopeConfigured(
   role: ReturnType<typeof roleTier>,
   identity: PairedIdentity | undefined,
 ): boolean {
-  const boundary = assignment?.tenantId || identity?.site || assignment?.workspaceId;
-  return Boolean(boundary && ((role.system && assignment?.canViewTenantUsage)
+  const boundary = identity?.site || assignment?.tenantId || assignment?.workspaceId;
+  const systemAllowed = role.system && (identity?.site ? true : assignment?.canViewTenantUsage === true);
+  return Boolean(boundary && (systemAllowed
     || assignment?.managedUserIds?.length
     || assignment?.managedDepartmentIds?.length));
+}
+
+function eventInReportingBoundary(
+  subjects: readonly EnterpriseSubject[],
+  ctx: InteractionContext,
+  assignment: GatewayGovernanceAssignment | undefined,
+): boolean {
+  const identity = ctx.paired.identity?.provider === "frappe" ? ctx.paired.identity : undefined;
+  if (identity?.site) {
+    const sites = subjects.filter((subject) => subject.kind === "site");
+    if (sites.length) return sites.some((subject) => subject.id === identity.site);
+    return assignment?.tenantId !== undefined && subjects.some((subject) => subject.kind === "tenant" && subject.id === assignment.tenantId);
+  }
+  const boundary = reportingBoundary(ctx, assignment);
+  return boundary ? enterpriseEventHasSubject(subjects, boundary) : false;
 }
 
 function periodOptions(): Array<{ label: string; value: string }> {
@@ -1003,6 +1173,36 @@ function observedSubjectOptions(
   return [...options].map(([value, label]) => ({ label, value }));
 }
 
+function authorizedUsageUserOptions(
+  assignment: GatewayGovernanceAssignment | undefined,
+  events: readonly EnterpriseUsageEvent[],
+): Array<{ label: string; value: string }> {
+  const allowed = new Set(assignment?.managedUserIds ?? []);
+  for (const event of events) {
+    for (const subject of event.subjects) if (subject.kind === "user") allowed.add(subject.id);
+  }
+  return [...allowed].sort().map((value) => ({ label: value, value }));
+}
+
+function authorizedUsageDepartmentOptions(
+  assignment: GatewayGovernanceAssignment | undefined,
+  events: readonly EnterpriseUsageEvent[],
+): Array<{ label: string; value: string }> {
+  const allowed = new Set(assignment?.managedDepartmentIds ?? []);
+  for (const event of events) {
+    for (const subject of event.subjects) if (subject.kind === "department") allowed.add(subject.id);
+  }
+  return [...allowed].sort().map((value) => ({ label: value, value }));
+}
+
+function observedWorkloadOptions(events: readonly EnterpriseUsageEvent[]): Array<{ label: string; value: string }> {
+  return observedValueOptions(events.map(usageWorkload));
+}
+
+function usageWorkload(event: EnterpriseUsageEvent): string {
+  return event.requestCategory?.trim() || "uncategorized";
+}
+
 function configuredProviderOptions(ctx: InteractionContext, events: readonly EnterpriseUsageEvent[]): Array<{ label: string; value: string }> {
   const values = new Set(Object.keys(ctx.config.providers));
   for (const event of events) {
@@ -1027,7 +1227,6 @@ function authorizedReportingScopeOptions(
   assignment: GatewayGovernanceAssignment | undefined,
 ): Array<{ label: string; value: string }> {
   return [
-    ...authorizedUserOptions(identity, assignment).map((option) => ({ label: option.label, value: `user:${option.value}` })),
     ...(assignment?.managedDepartmentIds ?? []).map((value) => ({ label: `Department: ${value}`, value: `department:${value}` })),
   ];
 }
@@ -1053,6 +1252,19 @@ function argumentValue(args: string, key: string): string | undefined {
 function periodStart(period: string | undefined): string | undefined {
   const duration = period === "today" ? 24 * 60 * 60_000 : period === "7d" ? 7 * 24 * 60 * 60_000 : period === "30d" ? 30 * 24 * 60 * 60_000 : undefined;
   return duration ? new Date(Date.now() - duration).toISOString() : undefined;
+}
+
+const DEFAULT_USAGE_PERIOD = "7d";
+
+function usagePeriodLabel(period: string): string {
+  if (period === "today") return "Today";
+  if (period === "30d") return "Last 30 days";
+  if (period === "7d") return "Last 7 days";
+  return `Period ${period}`;
+}
+
+function formatRate(part: number, total: number): string {
+  return total ? `${Math.round(part / total * 1000) / 10}%` : "0%";
 }
 
 function formatDuration(milliseconds: number): string {
@@ -1140,6 +1352,32 @@ function channelsCard(ctx: InteractionContext): InteractionCard {
 }
 
 function agentsCard(ctx: InteractionContext): InteractionCard {
+  const identity = ctx.paired.identity?.provider === "frappe" ? ctx.paired.identity : undefined;
+  if (identity) {
+    const assistant = ctx.gateway?.frappe?.assistant;
+    const experience = assistantExperience(ctx);
+    const name = experience.name;
+    const description = assistant?.description?.trim()
+      || "I help turn everyday requests into completed, verified work using the access already assigned to you.";
+    const domains = assistant?.domains?.map((domain) => domain.trim()).filter(Boolean).slice(0, 3) ?? [];
+    return {
+      kind: "menu",
+      title: name,
+      lead: `${description} Ask in your own words; you do not need to know commands or internal system names.`,
+      body: [
+        `Try: “What needs my attention today?”`,
+        `Try: “Help me complete this request and show me the change before saving.”`,
+        `Try: “Prepare a concise report I can share, with links to the source information.”`,
+        ...(domains.length ? [`I am configured to focus on ${domains.join(", ")}.`] : []),
+      ],
+      note: `I work as ${identity.employeeName ?? identity.userName ?? identity.user}; your existing access remains the boundary.`,
+      next: [
+        { label: "Explore reports", detail: "Choose one useful starting point", command: "/reports" },
+        { label: "Check my access", detail: "See who I am helping as", command: "/whoami" },
+        { label: "Review safeguards", detail: "See approvals and boundaries", command: "/security" },
+      ],
+    };
+  }
   const rows = (ctx.config.agents?.list ?? []).map((agent) => [agent.id, agent.skills?.join(", ") || "inherited defaults"]);
   return {
     kind: "menu",
@@ -1151,6 +1389,19 @@ function agentsCard(ctx: InteractionContext): InteractionCard {
       { label: "/tools", detail: "Inspect available tools" },
     ],
   };
+}
+
+function assistantExperience(ctx: InteractionContext): { readonly name: string; readonly organization?: string } {
+  const assistant = ctx.gateway?.frappe?.assistant;
+  const organization = assistant?.organization?.trim() || undefined;
+  return {
+    name: assistant?.name?.trim() || ctx.config.identity?.name?.trim() || "Work assistant",
+    ...(organization ? { organization } : {}),
+  };
+}
+
+function firstName(value: string): string {
+  return value.trim().split(/\s+/, 1)[0] || value;
 }
 
 function artifactsCard(ctx: InteractionContext): InteractionCard {
@@ -1203,26 +1454,45 @@ function sessionsCard(ctx: InteractionContext): InteractionCard {
   };
 }
 
-function memoryCard(ctx: InteractionContext, identity: PairedIdentity | undefined): InteractionCard {
-  return {
-    kind: "status",
-    title: "Memory",
-    lead: "Memory is scoped to this pairing and conversation. Channel runs recall it only when the request asks for prior context.",
-    table: {
-      id: "memory-scopes",
-      columns: ["Scope", "State"],
-      rows: [
-        ["Pairing", ctx.paired.pairingId],
-        ["Conversation", `${ctx.message.surfaceId}:${ctx.message.conversationId}`],
-        ["Frappe user", identity?.user ?? "not connected"],
-        ["Tenant", identity?.site ?? "not connected"],
+async function memoryCard(ctx: InteractionContext, identity: PairedIdentity | undefined): Promise<InteractionCard> {
+  const scopes = [
+    ...pairingScopes(ctx.paired),
+    { kind: "session" as const, id: conversationSessionId(ctx.message) },
+  ];
+  try {
+    const memories = await listMemory(ctx.cwd);
+    const visible = memories.filter((memory) => isVisibleInScopes(memory, scopes));
+    return {
+      kind: "status",
+      title: "Memory",
+      lead: `${visible.length} memory item${visible.length === 1 ? " is" : "s are"} currently visible to this identity and conversation.`,
+      table: {
+        id: "memory-evidence",
+        columns: ["Check", "Verified state"],
+        rows: [
+          ["Visible items", String(visible.length)],
+          ["Identity", identity ? "Connected work identity" : "Paired channel identity"],
+          ["Conversation", "Current conversation boundary applied"],
+          ["Evidence", `Checked ${memories.length} stored item${memories.length === 1 ? "" : "s"}; only eligible items counted`],
+        ],
+      },
+      note: "Memory contents and internal scope identifiers are not shown in this status view.",
+      next: [
+        { label: "/sessions", detail: "Review conversation continuity" },
+        { label: "/security", detail: "Review scope boundaries" },
       ],
-    },
-    next: [
-      { label: "/sessions", detail: "Review conversation continuity" },
-      { label: "/security", detail: "Review scope boundaries" },
-    ],
-  };
+    };
+  } catch {
+    return {
+      kind: "status",
+      title: "Memory unavailable",
+      lead: "Memory status could not be verified right now. No memory claim was made.",
+      next: [
+        { label: "/memory", detail: "Try the verification again" },
+        { label: "/security", detail: "Review scope boundaries" },
+      ],
+    };
+  }
 }
 
 function helpCard(ctx: InteractionContext, _identity: PairedIdentity | undefined): InteractionCard {
@@ -1246,17 +1516,19 @@ function helpCard(ctx: InteractionContext, _identity: PairedIdentity | undefined
 }
 
 function visibleTools(identity: PairedIdentity | undefined, assignedRoles: readonly string[] = []): Array<{ label: string; detail: string }> {
-  const base = [
+  const role = roleTier(identity, assignedRoles);
+  const tools = identity ? [
+    { label: "Ask about work", detail: "Answer from records and workflows your Frappe user can access" },
+    { label: "Find records", detail: "Resolve everyday language to live Frappe records without requiring DocType names" },
+    { label: "Create or update", detail: "Collect current mandatory fields, preview the change, request approval, then verify it" },
+    { label: "Workflow actions", detail: "Discover and apply only transitions currently available to your user" },
+    { label: "Reports and artifacts", detail: "Create permission-filtered tables, PDF, DOCX, PPTX, and Excel outputs" },
+    { label: "Open documents", detail: "Return Frappe links for records used or changed" },
+    { label: "Research and analysis", detail: "Use provider reasoning for the business task without exposing deployment internals" },
+  ] : [
     { label: "Ask the agent", detail: "Normal task, code, research, or document prompt" },
     { label: "Create artifacts", detail: "PDF, DOCX, PPTX, Excel where office tools are enabled" },
   ];
-  const role = roleTier(identity, assignedRoles);
-  const tools = identity ? [
-    { label: "Frappe lookup", detail: "Find records you can read" },
-    { label: "Frappe create/update", detail: "Guided forms with mandatory fields, preview, and approval" },
-    { label: "Open documents", detail: "Return Frappe links for records used or changed" },
-    ...base,
-  ] : [...base];
   if (role.manager || role.hrbp || role.system) tools.push({ label: "Team reports", detail: "Tables, filters, exports, and drilldowns for allowed people" });
   if (role.hrbp || role.system) tools.push({ label: "HRBP tools", detail: "Employee lifecycle, leave, attendance, hierarchy-aware reports" });
   if (role.system) tools.push({ label: "System controls", detail: "Limits, security policy, evals, index controls" });
@@ -1299,7 +1571,7 @@ async function readRateLimitSnapshots(
 ): Promise<RateLimitSnapshot[]> {
   const subjectFilter = argumentValue(ctx.args, "subject");
   const windowFilter = argumentValue(ctx.args, "window");
-  const limits = (ctx.gateway?.governance?.rateLimits ?? []).filter((limit) => {
+  const limits = (await gatewayGovernanceRateLimits(ctx.gateway, ctx.enterprise)).filter((limit) => {
     if (subjectFilter && limit.subject.kind !== subjectFilter) return false;
     if (windowFilter && limit.window !== windowFilter) return false;
     if (limitMatchesCurrentContext(limit, ctx, assignment, identity)) return true;

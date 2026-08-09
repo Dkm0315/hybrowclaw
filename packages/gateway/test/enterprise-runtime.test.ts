@@ -72,11 +72,11 @@ test("gateway records real usage and preserves atomic limits across restart", as
     assert.match("text" in blocked ? blocked.text : "", /Rate limit exceeded/);
     assert.equal(provider.calls(), 1, "blocked requests must not invoke the provider");
 
-    const usage = await handleSurfaceMessage(message("/usage"), { config: providerConfig(provider.url), gateway, enterprise, cwd });
-    assert.equal("presentation" in usage ? usage.presentation?.title : undefined, "Usage");
+    const usage = await handleSurfaceMessage(message("/usage view=work"), { config: providerConfig(provider.url), gateway, enterprise, cwd });
+    assert.equal("presentation" in usage ? usage.presentation?.title : undefined, "Your activity");
     assert.match("text" in usage ? usage.text : "", /Runs: 2/);
-    assert.match("text" in usage ? usage.text : "", /success/);
-    assert.match("text" in usage ? usage.text : "", /blocked/);
+    assert.match("text" in usage ? usage.text : "", /success/i);
+    assert.match("text" in usage ? usage.text : "", /blocked/i);
 
     await enterprise.close?.();
     enterprise = openSqliteGatewayEnterpriseRuntime(cwd);

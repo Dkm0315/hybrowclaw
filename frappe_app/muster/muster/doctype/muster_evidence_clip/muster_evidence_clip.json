@@ -1,0 +1,53 @@
+{
+  "doctype": "DocType",
+  "name": "Muster Evidence Clip",
+  "module": "Muster",
+  "autoname": "MST-EVC-.YYYY.-.#####",
+  "title_field": "scenario",
+  "track_changes": 1,
+  "search_fields": "scenario,claim,actor,module,mission,status",
+  "sort_field": "modified",
+  "sort_order": "DESC",
+  "field_order": [
+    "overview_tab", "scenario", "status", "claim", "actor_section", "actor", "actor_role", "module",
+    "scope_section", "mission", "change_set",
+    "video_tab", "video", "video_mime_type", "video_sha256", "duration_seconds",
+    "viewport_section", "viewport_width", "viewport_height", "build_revision",
+    "proof_tab", "test_receipt_json", "verification_section", "verified_by", "verified_at"
+  ],
+  "fields": [
+    {"fieldname":"overview_tab","fieldtype":"Tab Break","label":"Overview"},
+    {"fieldname":"scenario","fieldtype":"Data","label":"Scenario","reqd":1,"in_list_view":1},
+    {"fieldname":"status","fieldtype":"Select","label":"Status","options":"Draft\nReady\nVerified\nRejected","default":"Draft","reqd":1,"in_list_view":1},
+    {"fieldname":"claim","fieldtype":"Small Text","label":"Claim Proven","reqd":1},
+    {"fieldname":"actor_section","fieldtype":"Section Break","label":"Actor and Product Scope"},
+    {"fieldname":"actor","fieldtype":"Link","label":"Actor","options":"User","reqd":1,"in_list_view":1},
+    {"fieldname":"actor_role","fieldtype":"Link","label":"Actor Role","options":"Role","reqd":1},
+    {"fieldname":"module","fieldtype":"Link","label":"Module","options":"Module Def","reqd":1,"in_list_view":1},
+    {"fieldname":"scope_section","fieldtype":"Section Break","label":"Governed Execution"},
+    {"fieldname":"mission","fieldtype":"Link","label":"Mission","options":"Muster Mission","reqd":1,"in_list_view":1},
+    {"fieldname":"change_set","fieldtype":"Link","label":"Change Set","options":"Muster Change Set"},
+    {"fieldname":"video_tab","fieldtype":"Tab Break","label":"Video Proof"},
+    {"fieldname":"video","fieldtype":"Attach","label":"Private Video","reqd":1},
+    {"fieldname":"video_mime_type","fieldtype":"Data","label":"MIME Type","read_only":1},
+    {"fieldname":"video_sha256","fieldtype":"Data","label":"Video SHA-256","read_only":1},
+    {"fieldname":"duration_seconds","fieldtype":"Float","label":"Duration (seconds)","reqd":1},
+    {"fieldname":"viewport_section","fieldtype":"Section Break","label":"Capture Environment"},
+    {"fieldname":"viewport_width","fieldtype":"Int","label":"Viewport Width","reqd":1},
+    {"fieldname":"viewport_height","fieldtype":"Int","label":"Viewport Height","reqd":1},
+    {"fieldname":"build_revision","fieldtype":"Data","label":"Build Revision","reqd":1},
+    {"fieldname":"proof_tab","fieldtype":"Tab Break","label":"Test Evidence"},
+    {"fieldname":"test_receipt_json","fieldtype":"Code","label":"Test Receipt","options":"JSON","reqd":1},
+    {"fieldname":"verification_section","fieldtype":"Section Break","label":"Verification"},
+    {"fieldname":"verified_by","fieldtype":"Link","label":"Verified By","options":"User","read_only":1},
+    {"fieldname":"verified_at","fieldtype":"Datetime","label":"Verified At","read_only":1}
+  ],
+  "permissions": [
+    {"role":"Muster Administrator","read":1,"write":1,"create":1,"delete":1,"report":1,"export":1,"print":1},
+    {"role":"Muster Automation Manager","read":1,"write":1,"create":1,"delete":1,"report":1,"export":1,"print":1},
+    {"role":"Muster Auditor","read":1,"select":1,"report":1,"export":1,"print":1},
+    {"role":"Muster Operator","read":1,"select":1},
+    {"role":"Muster Approver","read":1,"select":1},
+    {"role":"Muster Viewer","read":1,"select":1}
+  ]
+}

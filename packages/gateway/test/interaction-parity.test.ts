@@ -49,7 +49,11 @@ const MANAGER_PAIRED: PairedSender = {
     provider: "frappe",
     site: "https://erp.example.test",
     user: "manager@example.test",
+    userName: "Mira Manager",
     employee: "EMP-0001",
+    employeeName: "Mira Manager",
+    department: "DEP-OPS",
+    departmentName: "Operations",
     roles: ["Employee", "Reports Manager"],
     resolvedAt: "2026-07-10T00:00:00.000Z",
   },
@@ -100,7 +104,7 @@ test("role and capability visibility fail closed without sending commands to the
   };
   const tokens = await dispatchCommand(message("/tokens"), commandContext(BASE_PAIRED, capabilityGateway));
   const mcp = await dispatchCommand(message("/mcp"), commandContext(BASE_PAIRED, capabilityGateway));
-  assert.equal(tokens?.presentation?.title, "Usage");
+  assert.equal(tokens?.presentation?.title, "Your assistant activity");
   assert.equal(mcp?.presentation?.title, "Command unavailable");
 
   const emptyAllowlist: GatewayConfig = { token: "test", governance: { assignments: { default: { capabilities: [] } } } };
@@ -112,11 +116,74 @@ test("role and capability visibility fail closed without sending commands to the
   assert.equal(managerWithoutFrappe?.presentation?.title, "Audit", "manager visibility must not be hardcoded to Frappe identities");
 });
 
+test("ordinary users never see operational speed or cache telemetry", async () => {
+  const overview = await dispatchCommand(message("/usage"), commandContext());
+  assert.equal(overview?.presentation?.audience, "self");
+  assert.equal(overview?.presentation?.kpis?.some((item) => /response|latency|cache|p\d+/i.test(item.label)), false);
+  assert.equal(overview?.presentation?.actions?.some((action) => /speed|reliability|performance/i.test(`${action.label} ${action.command}`)), false);
+
+  const work = await dispatchCommand(message("/usage view=work"), commandContext());
+  assert.equal(work?.presentation?.title, "Your activity");
+  assert.equal(work?.presentation?.actions?.some((action) => /speed|reliability|performance/i.test(`${action.label} ${action.command}`)), false);
+  assert.equal(work?.presentation?.tables?.some((table) => table.columns.some((column) => /p50|p95|p99|latency|speed/i.test(column))), false);
+
+  const crafted = await dispatchCommand(message("/usage view=performance"), commandContext());
+  assert.equal(crafted?.presentation?.title, "Your assistant activity");
+  assert.equal(crafted?.presentation?.kpis?.some((item) => /response|latency|cache|p\d+/i.test(item.label)), false);
+
+  for (const command of [
+    "/usage scope=team",
+    "/usage scope=team view=work",
+    "/usage scope=team view=performance",
+    "/usage scope=anything view=performance",
+    "/tokens scope=team view=performance",
+  ]) {
+    const attemptedBypass = await dispatchCommand(message(command), commandContext());
+    assert.equal(attemptedBypass?.presentation?.audience, "self", command);
+    assert.match(attemptedBypass?.presentation?.title ?? "", /Your (?:assistant )?activity/, command);
+    const serialized = JSON.stringify(attemptedBypass?.presentation);
+    assert.doesNotMatch(serialized, /latency|p50|p95|p99|cache|slow-tail|speed and reliability|typical response/i, command);
+    assert.doesNotMatch(
+      JSON.stringify(surfaceReplyToTelegramSend(attemptedBypass!, "100")),
+      /latency|p50|p95|p99|cache|slow-tail|speed and reliability|typical response/i,
+      command,
+    );
+  }
+});
+
+test("manager personal usage stays task-focused while authorized team performance remains explicit", async () => {
+  const gateway: GatewayConfig = {
+    token: "test",
+    governance: {
+      assignments: {
+        default: {
+          tenantId: "tenant-a",
+          roles: ["Manager"],
+          managedUserIds: ["employee-a"],
+        },
+      },
+    },
+  };
+
+  const personal = await dispatchCommand(message("/usage"), commandContext(MANAGER_PAIRED, gateway));
+  assert.equal(personal?.presentation?.title, "Your assistant activity");
+  assert.equal(personal?.presentation?.kpis?.some((item) => /response|latency|cache|p\d+/i.test(item.label)), false);
+  assert.equal(personal?.presentation?.actions?.some((action) => /speed|reliability|performance/i.test(`${action.label} ${action.command}`)), false);
+
+  const craftedPersonal = await dispatchCommand(message("/usage view=performance"), commandContext(MANAGER_PAIRED, gateway));
+  assert.equal(craftedPersonal?.presentation?.title, "Your assistant activity");
+  assert.equal(craftedPersonal?.presentation?.kpis?.some((item) => /response|latency|cache|p\d+/i.test(item.label)), false);
+
+  const teamPerformance = await dispatchCommand(message("/usage scope=team view=performance"), commandContext(MANAGER_PAIRED, gateway));
+  assert.equal(teamPerformance?.presentation?.title, "Speed and reliability");
+  assert.ok(teamPerformance?.presentation?.kpis?.some((item) => item.label === "Typical response"));
+});
+
 test("tenant-wide usage fails closed when an authorized system role has no tenant binding", async () => {
   const enterprise = createInMemoryGatewayEnterpriseRuntime();
   await enterprise.usageStore.appendUsage({
     eventId: "tenant-a-run",
-    occurredAt: "2026-07-10T01:00:00.000Z",
+    occurredAt: new Date(Date.now() - 120_000).toISOString(),
     subjects: [{ kind: "tenant", id: "tenant-a" }, { kind: "user", id: "user-a" }],
     outcome: "success",
     latencyMs: 10,
@@ -128,7 +195,7 @@ test("tenant-wide usage fails closed when an authorized system role has no tenan
   });
   await enterprise.usageStore.appendUsage({
     eventId: "tenant-b-run",
-    occurredAt: "2026-07-10T01:01:00.000Z",
+    occurredAt: new Date(Date.now() - 60_000).toISOString(),
     subjects: [{ kind: "tenant", id: "tenant-b" }, { kind: "user", id: "user-b" }],
     outcome: "success",
     latencyMs: 20,
@@ -158,7 +225,7 @@ test("self and department reports require the caller tenant boundary", async () 
   for (const tenant of ["tenant-a", "tenant-b"] as const) {
     await enterprise.usageStore.appendUsage({
       eventId: `${tenant}-shared-user`,
-      occurredAt: tenant === "tenant-a" ? "2026-07-10T02:00:00.000Z" : "2026-07-10T02:01:00.000Z",
+      occurredAt: new Date(Date.now() - (tenant === "tenant-a" ? 120_000 : 60_000)).toISOString(),
       subjects: [
         { kind: "tenant", id: tenant },
         { kind: "department", id: "HR" },
@@ -195,9 +262,10 @@ test("self and department reports require the caller tenant boundary", async () 
   assert.equal(denied?.presentation?.kpis?.find((kpi) => kpi.label === "Runs")?.value, "0");
 });
 
-test("report filters are executable and route to real scoped reports", async () => {
+test("reports open as a progressive human menu and route to real scoped reports", async () => {
   const gateway: GatewayConfig = {
     token: "test",
+    frappe: { assistant: { name: "Acme Assistant", organization: "Acme" } },
     governance: {
       assignments: {
         default: {
@@ -209,13 +277,79 @@ test("report filters are executable and route to real scoped reports", async () 
     },
   };
   const menu = await dispatchCommand(message("/reports"), commandContext(MANAGER_PAIRED, gateway));
-  const area = menu?.presentation?.filters?.find((filter) => filter.id === "area");
-  assert.ok(area?.options?.some((option) => option.value === "personal-usage"));
-  assert.equal(area?.action?.command, "/reports area={value}");
+  assert.equal(menu?.presentation?.title, "Reports");
+  assert.match(menu?.presentation?.summary ?? "", /Acme/);
+  assert.equal(menu?.presentation?.tables?.length ?? 0, 0, "entry screen must not be a report catalog table");
+  assert.equal(menu?.presentation?.filters?.length ?? 0, 0, "entry screen must not dump every filter");
+  assert.ok((menu?.presentation?.actions?.length ?? 0) <= 3);
+  assert.ok(menu?.presentation?.actions?.some((action) => action.command === "/reports area=team"));
+
+  const team = await dispatchCommand(message("/reports area=team"), commandContext(MANAGER_PAIRED, gateway));
+  assert.equal(team?.presentation?.title, "Team and controls");
+  assert.equal(team?.presentation?.tables?.length ?? 0, 0);
+  assert.ok((team?.presentation?.actions?.length ?? 0) <= 3);
+  assert.ok(team?.presentation?.actions?.some((action) => action.command === "/reports area=governance"));
+
+  const controls = await dispatchCommand(message("/reports area=governance"), commandContext(MANAGER_PAIRED, gateway));
+  assert.equal(controls?.presentation?.title, "Usage controls");
+  assert.deepEqual(controls?.presentation?.actions?.map((action) => action.command), ["/limits", "/security", "/evals"]);
 
   const selected = await dispatchCommand(message("/reports area=personal-usage period=7d"), commandContext(MANAGER_PAIRED, gateway));
-  assert.equal(selected?.presentation?.title, "Usage");
+  assert.equal(selected?.presentation?.title, "Your assistant activity");
   assert.equal(selected?.presentation?.filters?.find((filter) => filter.id === "period")?.selected, "7d");
+});
+
+test("connected agent help uses the configured identity and natural examples without a catalog wall", async () => {
+  const gateway: GatewayConfig = {
+    token: "test",
+    frappe: {
+      assistant: {
+        name: "Acme Assistant",
+        organization: "Acme",
+        domains: ["people operations", "service delivery"],
+      },
+    },
+  };
+  const reply = await dispatchCommand(message("/agents"), commandContext(MANAGER_PAIRED, gateway));
+  assert.equal(reply?.presentation?.title, "Acme Assistant");
+  assert.match(reply?.text ?? "", /Ask in your own words/);
+  assert.match(reply?.text ?? "", /What needs my attention today/);
+  assert.match(reply?.text ?? "", /Mira Manager/);
+  assert.equal(reply?.presentation?.tables?.length ?? 0, 0);
+  assert.ok((reply?.presentation?.actions?.length ?? 0) <= 3);
+  assert.doesNotMatch(reply?.text ?? "", /DocType|fieldname|property setter|No named agent profiles|deployment defaults/i);
+});
+
+test("progressive reports never infer team access from a manager title", async () => {
+  const menu = await dispatchCommand(message("/reports"), commandContext(MANAGER_PAIRED));
+  assert.ok(!menu?.presentation?.actions?.some((action) => action.command === "/reports area=team"));
+
+  const direct = await dispatchCommand(message("/reports area=team"), commandContext(MANAGER_PAIRED));
+  assert.equal(direct?.presentation?.title, "Team reports are not available");
+  assert.match(direct?.text ?? "", /job title alone never expands reporting access/i);
+  assert.ok((direct?.presentation?.actions?.length ?? 0) <= 2);
+});
+
+test("governance cards label gateway evidence and do not expose user identifiers or fake selects", async () => {
+  const gateway: GatewayConfig = {
+    token: "test",
+    governance: {
+      enabled: true,
+      assignments: { default: { tenantId: "tenant-a", roles: ["System Manager"], canViewTenantUsage: true, managedUserIds: ["private@example.test"] } },
+      rateLimits: [{ subject: { kind: "user", id: "private@example.test" }, window: "day", maxRuns: 10 }],
+    },
+  };
+  const usage = await dispatchCommand(message("/usage scope=team"), commandContext(MANAGER_PAIRED, gateway));
+  assert.match(usage?.text ?? "", /gateway usage ledger/i);
+  assert.doesNotMatch(JSON.stringify(usage?.presentation), /private@example\.test/);
+
+  const audit = await dispatchCommand(message("/audit"), commandContext(MANAGER_PAIRED, gateway));
+  assert.match(audit?.text ?? "", /gateway receipt ledger/i);
+  assert.doesNotMatch(JSON.stringify(audit?.presentation), /private@example\.test/);
+
+  const rendered = surfaceReplyToGchatResponse(usage!);
+  assert.doesNotMatch(JSON.stringify(rendered), /selectionInput/);
+  assert.match(JSON.stringify(rendered), /muster:cmd:\/limits/);
 });
 
 test("limits show enforced counters, remaining allowance, and reset time", async () => {
@@ -461,7 +595,7 @@ test("mobile pagination truncates rows and unsupported callbacks retain a text f
   const telegram = surfaceReplyToTelegramSend(reply, "5");
   assert.equal(telegram.reply_markup?.inline_keyboard.flat().length, 1, "only the safe callback should be emitted");
   assert.match(telegram.text, /Run long command/);
-  assert.match(telegram.text, /Page 2\/4/);
+  assert.match(telegram.text, /Page 2 of 4/);
 });
 
 test("async acknowledgement is visible and actionable across channel renderers", () => {

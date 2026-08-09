@@ -33,6 +33,12 @@ function stubConfig(baseUrl: string): MusterConfig {
   };
 }
 
+async function waitForOutput(predicate: () => boolean, message: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) await delay(20);
+  assert.ok(predicate(), message);
+}
+
 test("contract handshake, session lifecycle, prompt round-trip with ledger.tick", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-rpc-"));
   const llm = await startStubLlm();
@@ -49,6 +55,7 @@ test("contract handshake, session lifecycle, prompt round-trip with ledger.tick"
 
     const reply = await core.handle({ jsonrpc: "2.0", id: 3, method: "prompt.submit", params: { sessionId, prompt: "hello" } });
     assert.equal((reply.result as { text: string }).text, "rpc reply");
+    assert.equal("timings" in (reply.result as object), false, "normal clients do not receive operational diagnostics");
     assert.deepEqual(events, ["session.created", "message.stop", "ledger.tick"]);
 
     const ledger = await core.handle({ jsonrpc: "2.0", id: 4, method: "ledger.recent" });
@@ -101,7 +108,7 @@ rl.on("line", (line) => {
       return (response.result as { sessionId: string }).sessionId;
     };
     const submit = async (id: number, sessionId: string, prompt: string) => {
-      const response = await core.handle({ jsonrpc: "2.0", id, method: "prompt.submit", params: { sessionId, prompt } });
+      const response = await core.handle({ jsonrpc: "2.0", id, method: "prompt.submit", params: { sessionId, prompt, includeDiagnostics: true } });
       assert.equal(response.error, undefined);
       return response.result as { text: string; timings?: { providerTransport?: string; providerCacheState?: string } };
     };
@@ -165,13 +172,16 @@ test("stdio transport: NDJSON requests, responses, and pushed events on one pipe
     output.on("data", (chunk) => { received += chunk.toString(); });
 
     input.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "session.create" })}\n`);
-    await delay(50);
+    await waitForOutput(() => received.includes("sessionId") && received.includes('"id":1'), "session creation response arrives on the pipe");
     const sessionId = (JSON.parse(received.split("\n").find((line) => line.includes("sessionId") && line.includes("result"))!) as { result: { sessionId: string } }).result.sessionId;
 
     input.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "prompt.submit", params: { sessionId, prompt: "hi" } })}\n`);
-    await delay(300);
+    await waitForOutput(
+      () => received.includes('"type":"ledger.tick"') && received.includes("rpc reply"),
+      "provider reply and ledger event arrive on the same pipe",
+    );
     input.write("not-json\n");
-    await delay(50);
+    await waitForOutput(() => received.includes('"code":-32700'), "parse error response arrives without closing the pipe");
 
     const lines = received.trim().split("\n").map((line) => JSON.parse(line));
     assert.ok(lines.some((line) => line.method === "event" && line.params?.type === "ledger.tick"), "events pushed on the same pipe");

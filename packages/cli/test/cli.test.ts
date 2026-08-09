@@ -1071,7 +1071,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
 
   const enabledPlugin = await runCli(["plugins", "enable", "frappe", "--allow-high-risk"], cwd);
   assert.match(enabledPlugin.stdout, /enabled plugin=frappe-federated-bridge/);
-  assert.match(enabledPlugin.stdout, /missing_env=FRAPPE_SITE_URL,FRAPPE_API_TOKEN/);
+  assert.doesNotMatch(enabledPlugin.stdout, /missing_env=FRAPPE_SITE_URL,FRAPPE_API_TOKEN/);
 
   const noFrappeEnv = { FRAPPE_SITE_URL: "", FRAPPE_API_TOKEN: "" };
   const frappeContextSetup = await runCli(["plugins", "context", "frappe", "setup", "--site-url", "https://erp.example.test"], cwd, noFrappeEnv);
@@ -1658,7 +1658,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
     oneCommandTelegramCwd,
   );
   assert.match(oneCommandTelegram.stdout, /channel_ready=telegram status=ready/);
-  assert.match(oneCommandTelegram.stdout, /single_command=true/);
+  assert.match(oneCommandTelegram.stdout, /single_command=false reason=no-start/);
   assert.match(oneCommandTelegram.stdout, /daemon=skipped start="muster gateway daemon start --with-telegram-poll --port 7460"/);
   assert.match(oneCommandTelegram.stdout, /channel_simulation=telegram normalized=true/);
   assert.match(oneCommandTelegram.stdout, /done=channel_ready channel=telegram daemon=skipped sample=local_simulation/);
@@ -1840,6 +1840,13 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   const gchatWorkflow = await runCli(["integrations", "workflow", "gchat"], cwd);
   assert.match(gchatWorkflow.stdout, /integration_workflow=gchat kind=channel ready=true/);
   assert.match(gchatWorkflow.stdout, /auth=google-signed-oidc-or-jwt missing=-/);
+  assert.match(gchatWorkflow.stdout, /verify=muster channels doctor gchat --live/);
+
+  const coldGchatIntegrationCwd = await mkdtemp(join(tmpdir(), "muster-cli-gchat-integration-"));
+  const coldGchatIntegrationSetup = await runCli(["integrations", "setup", "gchat"], coldGchatIntegrationCwd);
+  assert.match(coldGchatIntegrationSetup.stdout, /setup_required=muster channels ready gchat --audience https:\/\/your-domain\.example\/v1\/adapters\/gchat/);
+  assert.match(coldGchatIntegrationSetup.stdout, /integration_next=muster channels ready gchat --audience https:\/\/your-domain\.example\/v1\/adapters\/gchat/);
+  assert.doesNotMatch(coldGchatIntegrationSetup.stdout, /integration_next=muster integrations verify gchat/);
 
   const githubPluginWorkflow = await runCli(["integrations", "workflow", "github"], cwd);
   assert.match(githubPluginWorkflow.stdout, /integration_workflow=github kind=plugin enabled=false/);
@@ -1856,9 +1863,12 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(parallelMcpWorkflow.stdout, /sample=muster mcp check parallel-search/);
   assert.match(parallelMcpWorkflow.stdout, /steps=pick -> explain impact -> authenticate\/setup -> verify -> enable -> run sample/);
 
+  const gchatProjectAudience = await runCli(["channels", "setup", "gchat", "--audience", "123456789012"], cwd);
+  assert.match(gchatProjectAudience.stdout, /channel=gchat .*ready=true/);
   const gchatIntegrationVerify = await runCli(["integrations", "verify", "gchat"], cwd);
   assert.match(gchatIntegrationVerify.stdout, /integration_action=verify target=gchat kind=channel/);
-  assert.match(gchatIntegrationVerify.stdout, /channel_doctor=gchat status=ready/);
+  assert.match(gchatIntegrationVerify.stdout, /channel_doctor=gchat status=warning/);
+  assert.match(gchatIntegrationVerify.stdout, /check=gchat_endpoint status=warning detail="Cloud project audience is valid, but endpoint reachability cannot be inferred/);
 
   const gchatIntegrationSample = await runCli(["integrations", "sample", "gchat"], cwd);
   assert.match(gchatIntegrationSample.stdout, /integration_action=sample target=gchat kind=channel/);

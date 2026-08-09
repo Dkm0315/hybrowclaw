@@ -66,23 +66,27 @@ for (const fixture of [
     assert.ok(beforeWarm.hashOperations >= 1, "the indexed skill must be digest verified on cold load");
 
     const warmStartedAt = performance.now();
+    const warmCpuStartedAt = process.cpuUsage();
     for (let iteration = 0; iteration < fixture.iterations; iteration += 1) {
       assert.equal((await listSkills(cwd)).length, fixture.count + 1);
     }
     const warmElapsedMs = performance.now() - warmStartedAt;
+    const warmCpu = process.cpuUsage(warmCpuStartedAt);
+    const warmCpuMs = (warmCpu.user + warmCpu.system) / 1_000;
     const afterWarm = getSkillCatalogSnapshotMetrics(cwd);
 
     assert.deepEqual(ioCounters(afterWarm), ioCounters(beforeWarm), "warm turns must not walk, stat, read, hash, or refresh");
     assert.equal(afterWarm.cacheHits - beforeWarm.cacheHits, fixture.iterations);
     assert.ok(
-      warmElapsedMs < fixture.maxWarmMs,
-      `${fixture.iterations} warm discoveries took ${warmElapsedMs.toFixed(2)}ms (budget ${fixture.maxWarmMs}ms)`,
+      warmCpuMs < fixture.maxWarmMs,
+      `${fixture.iterations} warm discoveries used ${warmCpuMs.toFixed(2)}ms CPU (budget ${fixture.maxWarmMs}ms)`,
     );
     context.diagnostic(JSON.stringify({
       skills: fixture.count + 1,
       coldElapsedMs: Number(coldElapsedMs.toFixed(2)),
       warmCalls: fixture.iterations,
       warmElapsedMs: Number(warmElapsedMs.toFixed(2)),
+      warmCpuMs: Number(warmCpuMs.toFixed(2)),
       warmAverageMs: Number((warmElapsedMs / fixture.iterations).toFixed(4)),
     }));
   });

@@ -1,0 +1,8 @@
+{
+ "doctype":"DocType","name":"Muster Role Binding","module":"Muster","autoname":"hash","title_field":"subject","track_changes":1,
+ "field_order":["binding_tab","subject_type","subject","status","scope_section","scope_type","scope_value","capabilities","validity_section","valid_from","valid_until"],
+ "fields":[
+  {"fieldname":"binding_tab","fieldtype":"Tab Break","label":"Binding"},{"fieldname":"subject_type","fieldtype":"Select","label":"Subject Type","options":"User\nRole","reqd":1},{"fieldname":"subject","fieldtype":"Dynamic Link","label":"Subject","options":"subject_type","reqd":1,"in_list_view":1},{"fieldname":"status","fieldtype":"Select","label":"Status","options":"Active\nSuspended\nExpired","default":"Active","reqd":1,"in_list_view":1},{"fieldname":"scope_section","fieldtype":"Section Break","label":"Scope"},{"fieldname":"scope_type","fieldtype":"Select","label":"Scope Type","options":"Site\nCompany\nModule\nDocType\nDocument\nAgent\nWorkflow","reqd":1},{"fieldname":"scope_value","fieldtype":"Data","label":"Scope Value","description":"Stable identifier interpreted according to Scope Type."},{"fieldname":"capabilities","fieldtype":"Small Text","label":"Capabilities","description":"One capability per line. This narrows, never expands, Frappe permissions."},{"fieldname":"validity_section","fieldtype":"Section Break","label":"Validity"},{"fieldname":"valid_from","fieldtype":"Datetime","label":"Valid From"},{"fieldname":"valid_until","fieldtype":"Datetime","label":"Valid Until"}
+ ],
+ "permissions":[{"role":"Muster Administrator","read":1,"write":1,"create":1,"delete":1},{"role":"Muster Auditor","read":1},{"role":"System Manager","read":1,"write":1,"create":1,"delete":1}]
+}

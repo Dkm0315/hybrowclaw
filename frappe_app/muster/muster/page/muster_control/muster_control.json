@@ -1,0 +1,4 @@
+{
+ "doctype":"Page","name":"muster-control","page_name":"muster-control","title":"Muster Mission Control","module":"Muster","standard":"Yes","system_page":0,"icon":"bot",
+ "roles":[{"role":"Muster Administrator"},{"role":"Muster Automation Manager"},{"role":"Muster Operator"},{"role":"Muster Approver"},{"role":"Muster Auditor"},{"role":"Muster Viewer"}]
+}

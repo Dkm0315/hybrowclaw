@@ -4,7 +4,7 @@
   "name": "Frappe/ERPNext Federated Bridge",
   "version": "0.1.0",
   "kind": "tool",
-  "entrypoint": "src/index.ts",
+  "entrypoint": "dist/index.js",
   "permissions": [
     "network",
     "secrets"
@@ -14,19 +14,19 @@
     "FRAPPE_SITE_URL",
     "FRAPPE_API_TOKEN",
     "FRAPPE_APPROVAL_SIGNING_KEY",
+    "FRAPPE_BUSINESS_API_CATALOG",
     "FRAPPE_READ_MODEL_PATH"
   ],
   "evals": [
     "evals/identity-resolution.json",
     "evals/permission-scoping.json"
   ],
-  "digest": "sha256:42111428ce10d0816ba547d633e8bed53b7d420fdb5d0447bdb957ad22cac250",
+  "digest": "sha256:145bc3a0c0cd00231774b3e1062cd8243cda279e9efcf96ebb164cd6331d18f9",
   "description": "Permission-scoped Frappe/ERPNext tools with federated OAuth identity and an executable enterprise read model. Frappe remains the authorization authority. SQLite provides local/test persistence while the Postgres deployment contract preserves the same site, principal, permission-epoch, and revision boundaries. Customer deployments are data-only profiles; no customer-specific answers live in the pack code.",
   "implementedTools": [
     "frappe_identity_resolve",
     "frappe_user_identity_resolve",
     "frappe_semantic_data_resolve_lite",
-    "frappe_records_create",
     "frappe_docs_context",
     "frappe_context_setup_plan",
     "frappe_context_build",
@@ -42,6 +42,7 @@
     "frappe_safe_write",
     "frappe_artifact_brief",
     "frappe_enterprise_contract",
+    "frappe_enterprise_sync",
     "frappe_customer_profile_validate",
     "frappe_hierarchy_scope"
   ],
@@ -51,7 +52,7 @@
     "frappe_records_update",
     "frappe_dataset_fetch_for_artifact"
   ],
-  "status": "v0.6 beta: executable SQLite read-model storage, Postgres deployment contract, zero-app REST/OAuth polling, optional idempotent event ingestion, full metadata/customization indexing, revision-scoped caches, complete permission epochs, live-field hierarchy scope, signed one-use write approvals, and data-only customer profiles. Frappe remains the authorization authority; cached answers are keyed by site, principal, permission epoch, schema revision, and data revision.",
+  "status": "beta: permission-scoped REST/OAuth polling and governed CRUD/workflow writes through frappe_safe_write. Writes require live Frappe permission checks, short-lived one-use mutation-bound approval receipts, expected_modified for existing records, idempotency keys, and postcondition verification. Unsupported behavior is returned explicitly; Frappe remains the authorization authority.",
   "readiness": {
     "level": "verified",
     "status": "beta",

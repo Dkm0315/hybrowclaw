@@ -1,0 +1,41 @@
+[build-system]
+requires = ["flit_core>=3.9,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "muster"
+authors = [{name = "Muster", email = "engineering@themuster.dev"}]
+description = "Governed AI automation operating system for Frappe"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dynamic = ["version"]
+dependencies = ["pypdf>=5,<7", "requests>=2.32,<3"]
+license = {text = "AGPL-3.0-or-later"}
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Framework :: Frappe",
+  "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+  "Programming Language :: Python :: 3.14",
+]
+
+[project.urls]
+Homepage = "https://themuster.dev"
+Repository = "https://github.com/musterhq/muster-frappe"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S"]
+ignore = ["S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["muster/tests"]
+python_files = ["test_*.py"]
+
+[tool.frappe.testing.function_type_validation]
+max_module_depth = 0
+
+[tool.bench.frappe-dependencies]
+frappe = ">=16.0.0,<17.0.0"

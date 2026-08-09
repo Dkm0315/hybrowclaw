@@ -24,6 +24,16 @@ import type {
 } from "./gateway-config.js";
 import type { SurfaceMessage } from "./envelope.js";
 import type { PairedSender } from "./pairing.js";
+import {
+  createInMemoryGatewayPolicyStore,
+  openGatewayPolicyStore,
+  type GatewayPolicyStore,
+} from "./policy-store.js";
+import {
+  InMemoryFrappeInteractionStore,
+  SqliteFrappeInteractionStore,
+  type FrappeInteractionStore,
+} from "./frappe-interaction-store.js";
 
 export interface GatewayEnterpriseRuntime {
   readonly backend: "memory" | "sqlite" | "external";
@@ -31,6 +41,8 @@ export interface GatewayEnterpriseRuntime {
   readonly idempotencyStore: EnterpriseIdempotencyStore;
   readonly receiptStore: EnterpriseReceiptStore;
   readonly usageStore: EnterpriseUsageStore;
+  readonly policyStore: GatewayPolicyStore;
+  readonly frappeInteractionStore: FrappeInteractionStore;
   close?(): void | Promise<void>;
 }
 
@@ -62,19 +74,42 @@ export function createInMemoryGatewayEnterpriseRuntime(): GatewayEnterpriseRunti
     idempotencyStore: governance,
     receiptStore: governance,
     usageStore: new InMemoryEnterpriseUsageStore(),
+    policyStore: createInMemoryGatewayPolicyStore(),
+    frappeInteractionStore: new InMemoryFrappeInteractionStore(),
   };
 }
 
 export function openSqliteGatewayEnterpriseRuntime(cwd = process.cwd()): GatewayEnterpriseRuntime {
-  const store = new EnterpriseSqliteStore(join(dataDir(cwd), "enterprise-control-plane.db"));
+  const filename = join(dataDir(cwd), "enterprise-control-plane.db");
+  const store = new EnterpriseSqliteStore(filename);
+  const frappeInteractionStore = new SqliteFrappeInteractionStore(filename);
   return {
     backend: "sqlite",
     rateLimitStore: store,
     idempotencyStore: store,
     receiptStore: store,
     usageStore: store,
-    close: () => store.close(),
+    policyStore: openGatewayPolicyStore(cwd),
+    frappeInteractionStore,
+    close: () => {
+      frappeInteractionStore.close();
+      store.close();
+    },
   };
+}
+
+export type GatewayEffectiveGovernanceRateLimit = GatewayGovernanceRateLimit & { readonly policyId: string };
+
+export async function gatewayGovernanceRateLimits(
+  gateway: Pick<GatewayConfig, "governance"> | undefined,
+  runtime?: Pick<GatewayEnterpriseRuntime, "policyStore">,
+): Promise<readonly GatewayEffectiveGovernanceRateLimit[]> {
+  const staticLimits = (gateway?.governance?.rateLimits ?? []).map((limit, index) => ({
+    ...limit,
+    policyId: `static_${index}_${limit.subject.kind}_${limit.subject.id}_${limit.window}`,
+  }));
+  const persisted = runtime ? await runtime.policyStore.listPolicies() : [];
+  return [...staticLimits, ...persisted.map((policy) => ({ ...policy, policyId: policy.id }))];
 }
 
 export function resolveGatewayGovernanceAssignment(
@@ -100,12 +135,13 @@ export function gatewayEnterpriseSubjects(
   const identity = paired.identity?.provider === "frappe" ? paired.identity : undefined;
   const userId = assignment.userId ?? identity?.user ?? identity?.employee ?? message.senderId;
   const roles = [...new Set([...(assignment.roles ?? []), ...(identity?.roles ?? [])])];
+  const departments = [...new Set([...(assignment.departmentIds ?? []), ...(identity?.department ? [identity.department] : [])])];
   return normalizeEnterpriseSubjects([
     ...(assignment.tenantId ? [{ kind: "tenant" as const, id: assignment.tenantId }] : []),
     ...(identity?.site ? [{ kind: "site" as const, id: identity.site }] : []),
     ...(assignment.workspaceId ? [{ kind: "workspace" as const, id: assignment.workspaceId }] : []),
     { kind: "channel", id: `${message.surfaceId}:${message.conversationId}` },
-    ...(assignment.departmentIds ?? []).map((id) => ({ kind: "department" as const, id })),
+    ...departments.map((id) => ({ kind: "department" as const, id })),
     ...roles.map((id) => ({ kind: "role" as const, id })),
     { kind: "user", id: userId },
     ...(agentId ? [{ kind: "agent" as const, id: agentId }] : []),
@@ -126,7 +162,7 @@ export async function enforceGatewayRateLimits(input: {
   readonly estimatedTokens: number;
   readonly nowMs?: number;
 }): Promise<GatewayGovernancePreflightResult> {
-  const limits = (input.gateway.governance?.rateLimits ?? []).filter((limit) =>
+  const limits = (await gatewayGovernanceRateLimits(input.gateway, input.runtime)).filter((limit) =>
     gatewayLimitMatches(limit, input.message, input.paired, input.assignment, input.agentId));
   if (!limits.length) return { policyIds: [] };
 
@@ -143,11 +179,11 @@ export async function enforceGatewayRateLimits(input: {
       const base = `${limit.subject.kind}:${limit.subject.id}:${bounds.key}`;
       return [
         ...(limit.maxRuns === undefined ? [] : [{
-          id: `${base}:runs`, key: `gateway:${base}:runs`, amount: 1, limit: limit.maxRuns,
+          id: `${limit.policyId}:runs`, key: `gateway:${base}:runs`, amount: 1, limit: limit.maxRuns,
           subject: `${limit.subject.kind}:${limit.subject.id}`, window: limit.window, bounds,
         }]),
         ...(limit.maxTokens === undefined ? [] : [{
-          id: `${base}:tokens`, key: `gateway:${base}:tokens`, amount: input.estimatedTokens, limit: limit.maxTokens,
+          id: `${limit.policyId}:tokens`, key: `gateway:${base}:tokens`, amount: input.estimatedTokens, limit: limit.maxTokens,
           subject: `${limit.subject.kind}:${limit.subject.id}`, window: limit.window, bounds,
         }]),
       ];
@@ -244,7 +280,7 @@ function gatewayLimitMatches(
     return [assignment.userId, identity?.user, identity?.employee, message.senderId, paired.pairingId].includes(limit.subject.id);
   }
   if (limit.subject.kind === "role") return [...(assignment.roles ?? []), ...(identity?.roles ?? [])].includes(limit.subject.id);
-  if (limit.subject.kind === "department") return assignment.departmentIds?.includes(limit.subject.id) ?? false;
+  if (limit.subject.kind === "department") return [...(assignment.departmentIds ?? []), ...(identity?.department ? [identity.department] : [])].includes(limit.subject.id);
   if (limit.subject.kind === "channel") return limit.subject.id === `${message.surfaceId}:${message.conversationId}` || limit.subject.id === message.conversationId;
   if (limit.subject.kind === "surface") return limit.subject.id === message.surfaceId;
   if (limit.subject.kind === "tenant") return limit.subject.id === assignment.tenantId || limit.subject.id === identity?.site;

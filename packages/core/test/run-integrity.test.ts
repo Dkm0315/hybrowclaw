@@ -76,7 +76,9 @@ test("executeRun records the episode, token usage, and a session-scoped memory c
     payload: { choices: [{ message: { content: "stubbed answer about Muster" } }] },
   }));
   try {
-    const outcome = await executeRun(stubConfig(server.url), { prompt: "what is muster?", cwd });
+    const runUser = process.env.USER || process.env.USERNAME || "local";
+    const scopes = [{ kind: "user" as const, id: runUser }, { kind: "session" as const, id: "conversation-1" }];
+    const outcome = await executeRun(stubConfig(server.url), { prompt: "what is muster?", cwd, scopes });
     assert.equal(outcome.episode.outcome?.kind, "completed");
     assert.equal(outcome.episode.responseText, "stubbed answer about Muster");
 
@@ -88,9 +90,8 @@ test("executeRun records the episode, token usage, and a session-scoped memory c
     assert.equal(tokens[0].runId, outcome.plan.runId);
     assert.equal(tokens[0].estimated, true);
 
-    const runUser = process.env.USER || process.env.USERNAME || "local";
     const sessionMemory = await searchMemory({
-      scopes: [{ kind: "session", id: outcome.plan.runId }, { kind: "user", id: runUser }],
+      scopes,
     }, cwd);
     assert.equal(sessionMemory.length, 1, "completed runs write a session-scoped memory candidate");
 
@@ -247,6 +248,120 @@ test("executeRun keeps simple provider prompts compact when no context is needed
     assert.ok(observedMessages[0].content.length < 120);
   } finally {
     server.close();
+  }
+});
+
+test("executeRun keeps trusted host context out of the user turn and persisted prompt", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-run-host-context-"));
+  let observedMessages: Array<{ role: string; content: string }> = [];
+  const server = await startStubServer((body) => {
+    observedMessages = JSON.parse(body).messages as Array<{ role: string; content: string }>;
+    return { status: 200, payload: { choices: [{ message: { content: "You have two pending requests." } }] } };
+  });
+  try {
+    const outcome = await executeRun(stubConfig(server.url), {
+      prompt: "What is pending for me?",
+      systemContext: "Trusted Frappe contract: user=employee@example.test; roles=Employee.",
+      turnContext: "Fresh permission-filtered context: route=/app/leave-application; pending=2.",
+      cwd,
+      skipAgentRules: true,
+      skipMemoryWrite: true,
+    });
+
+    assert.equal(observedMessages.at(-1)?.role, "user");
+    assert.equal(observedMessages.at(-1)?.content, "What is pending for me?");
+    assert.ok(observedMessages.some((message) => message.role === "system" && message.content.includes("Trusted Frappe contract")));
+    assert.ok(observedMessages.some((message) => message.role === "system" && message.content.includes("Fresh permission-filtered context")));
+    assert.equal(observedMessages.at(-1)?.content.includes("Fresh permission-filtered context"), false);
+    assert.equal(outcome.episode.prompt, "What is pending for me?");
+    assert.equal((await listTokenRecords(cwd)).length, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test("executeRun defers unrelated native Codex features only for answer-only turns", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-run-codex-activation-"));
+  const fake = join(cwd, "codex-fake.mjs");
+  const argsLog = join(cwd, "args.jsonl");
+  const instructionsLog = join(cwd, "instructions.txt");
+  await writeCandidateSkill({
+    name: "exact-reply",
+    description: "Reply exactly to answer-only prompts",
+    body: "Use the requested exact response.",
+  }, cwd);
+  await promoteSkill("exact-reply", report(true), cwd);
+  await writeFile(fake, `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args[0] === "--help") {
+  process.stdout.write("Options:\\n  --disable <FEATURE>\\nCommands:\\n  exec\\n");
+  process.exit(0);
+}
+if (args[0] === "features" && args[1] === "list") {
+  process.stdout.write("plugins stable true\\nbrowser_use stable true\\n");
+  process.exit(0);
+}
+appendFileSync(${JSON.stringify(argsLog)}, JSON.stringify(args) + "\\n");
+const rl = readline.createInterface({ input: process.stdin });
+const threadId = "thread-activation-" + process.pid;
+function send(message) { process.stdout.write(JSON.stringify(message) + "\\n"); }
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") send({ id: message.id, result: { userAgent: "fake" } });
+  else if (message.method === "thread/start") {
+    appendFileSync(${JSON.stringify(instructionsLog)}, (message.params.developerInstructions ?? "") + "\\n");
+    send({ id: message.id, result: { thread: { id: threadId } } });
+  }
+  else if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
+    send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m", text: "ok" }, threadId, turnId: "turn-1" } });
+    send({ method: "thread/tokenUsage/updated", params: { threadId, turnId: "turn-1", tokenUsage: { last: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 1 } } } });
+    send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  const previousCommand = process.env.MUSTER_CODEX_COMMAND;
+  process.env.MUSTER_CODEX_COMMAND = fake;
+  try {
+    const base = {
+      cwd,
+      workspaceDir: cwd,
+      runtime: "codex" as const,
+      nativeTransport: "warm" as const,
+      nativeSessionKeepAlive: false,
+      skipAgentRules: true,
+      skipMemoryWrite: true,
+    };
+    const lean = await executeRun(defaultConfig(), {
+      ...base,
+      prompt: "Reply with exactly: lean-ok",
+      systemContext: "Trusted permission context: user=employee@example.test; roles=Employee.",
+      conversationKey: "gateway:activation:lean",
+    });
+    const full = await executeRun(defaultConfig(), {
+      ...base,
+      prompt: "Search the workspace for package metadata.",
+      conversationKey: "gateway:activation:full",
+    });
+
+    const invocations = (await readFile(argsLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
+    const leanArgs = invocations.find((args) => args.includes("--disable"));
+    const fullArgs = invocations.find((args) => !args.includes("--disable"));
+    assert.ok(leanArgs?.includes("plugins"), "answer-only turn defers ambient provider plugins and their skill catalog");
+    assert.ok(leanArgs?.includes("browser_use"), "answer-only turn defers unrelated browser tools");
+    assert.equal(fullArgs?.[0], "app-server", "tool-bearing turn uses the configured provider command unchanged");
+    assert.ok(invocations.every((args) => args.every((arg) => !arg.includes("experimental_instructions_file"))), "trusted context is never passed through provider process arguments");
+    assert.match(await readFile(instructionsLog, "utf8"), /Trusted permission context: user=employee@example\.test; roles=Employee\./);
+    assert.equal(lean.tokens.skills, undefined, "matching ambient Muster skills are not injected into answer-only turns");
+    assert.match(lean.episode.evidence.find((item) => item.label === "context_activation")?.detail ?? "", /mode=lean .*skills=deferred .*provider_context=lean/);
+    assert.match(full.episode.evidence.find((item) => item.label === "context_activation")?.detail ?? "", /mode=full .*provider_context=full/);
+  } finally {
+    clearCodexAppServerSessions();
+    if (previousCommand === undefined) delete process.env.MUSTER_CODEX_COMMAND;
+    else process.env.MUSTER_CODEX_COMMAND = previousCommand;
   }
 });
 
@@ -423,6 +538,65 @@ rl.on("line", (line) => {
     assert.equal(resume.threadId, "thread-persisted");
     assert.equal(resume.cwd, cwd);
     assert.equal(resume.excludeTurns, true);
+  } finally {
+    clearCodexAppServerSessions();
+    if (previousCommand === undefined) delete process.env.MUSTER_CODEX_COMMAND;
+    else process.env.MUSTER_CODEX_COMMAND = previousCommand;
+  }
+});
+
+test("executeRun rotates a native provider thread when its host governance policy changes", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-run-policy-rotation-"));
+  const fake = join(cwd, "codex-fake.mjs");
+  await writeFile(fake, `#!/usr/bin/env node
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+let threadCounter = 0;
+let threadId = "";
+let turnCounter = 0;
+function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ id: msg.id, result: { userAgent: "fake" } });
+  else if (msg.method === "thread/start") {
+    threadId = "thread-policy-" + (++threadCounter);
+    send({ id: msg.id, result: { thread: { id: threadId } } });
+  } else if (msg.method === "thread/resume") {
+    threadId = msg.params.threadId;
+    send({ id: msg.id, result: { thread: { id: threadId } } });
+  } else if (msg.method === "turn/start") {
+    const turnId = "turn-" + (++turnCounter);
+    send({ id: msg.id, result: { turn: { id: turnId, status: "inProgress" } } });
+    send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m-" + turnCounter, text: threadId }, threadId, turnId } });
+    send({ method: "turn/completed", params: { threadId, turn: { id: turnId, status: "completed" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  const previousCommand = process.env.MUSTER_CODEX_COMMAND;
+  process.env.MUSTER_CODEX_COMMAND = fake;
+  try {
+    const base = {
+      cwd,
+      workspaceDir: cwd,
+      runtime: "codex" as const,
+      conversationKey: "gateway:policy-rotation",
+      nativeSession: true,
+      nativeTransport: "warm" as const,
+      skipRecall: true,
+      skipSkillSelection: true,
+      skipAgentRules: true,
+      skipMemoryWrite: true,
+    };
+    const first = await executeRun(defaultConfig(), { ...base, prompt: "remember this request", nativeSessionPolicyKey: "policy-a" });
+    const second = await executeRun(defaultConfig(), { ...base, prompt: "what about it?", nativeSessionPolicyKey: "policy-a" });
+    const third = await executeRun(defaultConfig(), { ...base, prompt: "continue after access changed", nativeSessionPolicyKey: "policy-b" });
+
+    assert.equal(first.episode.responseText, "thread-policy-1");
+    assert.equal(second.episode.responseText, "thread-policy-1", "an unchanged host policy preserves continuity");
+    assert.equal(third.episode.responseText, "thread-policy-2", "a changed host policy starts a clean provider thread");
+    const handle = await loadSessionHandle("gateway:policy-rotation", "codex", cwd);
+    assert.equal(handle?.handle, "thread-policy-2");
   } finally {
     clearCodexAppServerSessions();
     if (previousCommand === undefined) delete process.env.MUSTER_CODEX_COMMAND;
@@ -649,7 +823,7 @@ test("fallback chain stops after a dispatched provider request times out", async
     calls += 1;
     if (calls === 1) return { status: 500, payload: { error: "primary rejected" } };
     if (calls === 2) {
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
       return { status: 200, payload: { choices: [{ message: { content: "late answer" } }] } };
     }
     return { status: 200, payload: { choices: [{ message: { content: "must not replay" } }] } };
@@ -669,7 +843,7 @@ test("fallback chain stops after a dispatched provider request times out", async
     const outcome = await executeRun(withFallbacks, {
       prompt: "perform a bounded provider request",
       cwd,
-      timeoutMs: 25,
+      timeoutMs: 250,
       skipMemoryWrite: true,
       skipAgentRules: true,
     });

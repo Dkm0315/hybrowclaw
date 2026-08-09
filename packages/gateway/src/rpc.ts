@@ -1,7 +1,17 @@
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
-import { closeWarmProviderTransports, executeRun, listTokenRecords } from "@musterhq/core";
+import { closeWarmProviderTransports, dataDir, executeRun, listTokenRecords } from "@musterhq/core";
 import type { MusterConfig } from "@musterhq/core";
+import {
+  SqliteFrappeRunEventStore,
+  type AcceptedFrappeRunCommand,
+  type FrappeRunCommandRequest,
+  type FrappeRunEvent,
+  type FrappeRunEventPermissionFilter,
+  type FrappeRunEventScope,
+  type FrappeRunEventStore,
+} from "./frappe-run-events.js";
 
 /**
  * Muster gateway RPC — ONE newline-delimited JSON-RPC 2.0 protocol consumed
@@ -43,12 +53,32 @@ export interface RpcCore {
 
 const TICKET_TTL_MS = 30_000;
 
-export function createRpcCore(options: { config: MusterConfig; cwd?: string; nativeTransportOwner?: string }): RpcCore {
+export interface RpcCoreOptions {
+  readonly config: MusterConfig;
+  readonly cwd?: string;
+  readonly nativeTransportOwner?: string;
+  /** Host-verified authority for Frappe RPC methods; never accepted from params. */
+  readonly frappeRunEventScope?: FrappeRunEventScope;
+  readonly frappeRunEventStore?: FrappeRunEventStore;
+  readonly frappeRunEventCanRead?: FrappeRunEventPermissionFilter;
+  readonly frappeRunCommandCsrfToken?: string;
+  readonly onFrappeRunCommand?: (command: AcceptedFrappeRunCommand) => void | Promise<void>;
+}
+
+export function createRpcCore(options: RpcCoreOptions): RpcCore {
   const cwd = options.cwd ?? process.cwd();
   const nativeTransportOwner = options.nativeTransportOwner ?? `rpc:${randomUUID()}`;
   const listeners = new Set<(event: RpcEvent) => void>();
   const tickets = new Map<string, number>();
   const sessions = new Set<string>();
+  const ownsFrappeRunEventStore = options.frappeRunEventStore === undefined && options.frappeRunEventScope !== undefined;
+  const frappeRunEventStore = options.frappeRunEventStore
+    ?? (options.frappeRunEventScope ? new SqliteFrappeRunEventStore(join(dataDir(cwd), "frappe-run-events.db")) : undefined);
+
+  const frappeAuthority = (): { scope: FrappeRunEventScope; store: FrappeRunEventStore } => {
+    if (!options.frappeRunEventScope || !frappeRunEventStore) throw new Error("Frappe run event RPC authority is unavailable.");
+    return { scope: options.frappeRunEventScope, store: frappeRunEventStore };
+  };
 
   const emit = (event: RpcEvent) => {
     for (const listener of listeners) listener(event);
@@ -91,13 +121,53 @@ export function createRpcCore(options: { config: MusterConfig; cwd?: string; nat
       if (outcome.episode.outcome?.kind !== "completed") {
         throw new Error(outcome.episode.outcome?.detail ?? "Run failed");
       }
-      return { runId: outcome.plan.runId, text: outcome.episode.responseText, timings: outcome.timings };
+      return {
+        runId: outcome.plan.runId,
+        text: outcome.episode.responseText,
+        ...(params.includeDiagnostics === true ? { timings: outcome.timings } : {}),
+      };
     },
 
     "ledger.recent": async (params) => {
       const limit = Number(params.limit ?? 20);
       const records = await listTokenRecords(cwd);
       return { records: records.slice(-limit) };
+    },
+
+    "frappe.runEvents.append": async (params) => {
+      const { scope, store } = frappeAuthority();
+      const event = params.event as FrappeRunEvent | undefined;
+      if (!event || typeof event !== "object") throw new Error("Frappe run event is required.");
+      if (params.idempotencyKey !== event.id) throw new Error("RPC idempotencyKey must match the run event id.");
+      return store.append({ scope, event });
+    },
+
+    "frappe.runEvents.replay": async (params) => {
+      const { scope, store } = frappeAuthority();
+      return store.replay({
+        scope,
+        ...(typeof params.missionId === "string" ? { missionId: params.missionId } : {}),
+        ...(typeof params.cursor === "string" ? { cursor: params.cursor } : {}),
+        ...(params.limit !== undefined ? { limit: Number(params.limit) } : {}),
+        ...(options.frappeRunEventCanRead ? { canRead: options.frappeRunEventCanRead } : {}),
+      });
+    },
+
+    "frappe.runCommands.submit": async (params) => {
+      const { scope, store } = frappeAuthority();
+      if (!options.frappeRunCommandCsrfToken) throw new Error("Frappe run command RPC CSRF authority is unavailable.");
+      if (!options.onFrappeRunCommand) throw new Error("Frappe run command RPC dispatch is unavailable.");
+      const request = params.command as FrappeRunCommandRequest | undefined;
+      if (!request || typeof request !== "object") throw new Error("Frappe run command is required.");
+      if (params.idempotencyKey !== request.idempotencyKey) throw new Error("RPC idempotencyKey must match the run command envelope.");
+      const claimed = await store.claimCommand(request, {
+        method: "POST",
+        authenticatedScope: scope,
+        expectedCsrfToken: options.frappeRunCommandCsrfToken,
+      });
+      if (claimed.status === "conflict") throw new Error("Run command idempotency conflict.");
+      await options.onFrappeRunCommand(claimed.command);
+      return { ...claimed, dispatched: true };
     },
   };
 
@@ -138,6 +208,7 @@ export function createRpcCore(options: { config: MusterConfig; cwd?: string; nat
     },
     close() {
       closeWarmProviderTransports(nativeTransportOwner);
+      if (ownsFrappeRunEventStore) void frappeRunEventStore?.close?.();
       sessions.clear();
       tickets.clear();
       listeners.clear();

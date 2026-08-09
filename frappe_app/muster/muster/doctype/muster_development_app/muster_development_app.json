@@ -1,0 +1,25 @@
+{
+  "doctype": "DocType",
+  "name": "Muster Development App",
+  "module": "Muster",
+  "autoname": "field:app_name",
+  "title_field": "app_name",
+  "track_changes": 1,
+  "field_order": ["app_name", "enabled", "source_root_secret", "allowed_paths_json", "registration_section", "registered_revision", "registered_status_hash", "registered_by", "registered_at"],
+  "fields": [
+    {"fieldname": "app_name", "fieldtype": "Data", "label": "Frappe App", "reqd": 1, "unique": 1, "in_list_view": 1},
+    {"fieldname": "enabled", "fieldtype": "Check", "label": "Enabled", "default": "1", "in_list_view": 1},
+    {"fieldname": "source_root_secret", "fieldtype": "Password", "label": "Registered Source Root", "reqd": 1, "hidden": 1, "description": "Absolute operator-registered path. Never sent to the browser or model."},
+    {"fieldname": "allowed_paths_json", "fieldtype": "Code", "label": "Allowed App-relative Paths", "options": "JSON", "reqd": 1, "description": "Closed list of app-relative path patterns, for example [\"muster/**\",\"pyproject.toml\"]."},
+    {"fieldname": "registration_section", "fieldtype": "Section Break", "label": "Verified Registration"},
+    {"fieldname": "registered_revision", "fieldtype": "Data", "label": "Git Revision", "read_only": 1},
+    {"fieldname": "registered_status_hash", "fieldtype": "Data", "label": "Clean Status SHA-256", "read_only": 1},
+    {"fieldname": "registered_by", "fieldtype": "Link", "label": "Registered By", "options": "User", "read_only": 1},
+    {"fieldname": "registered_at", "fieldtype": "Datetime", "label": "Registered At", "read_only": 1}
+  ],
+  "permissions": [
+    {"role": "Muster Administrator", "read": 1, "write": 1, "create": 1},
+    {"role": "System Manager", "read": 1, "write": 1, "create": 1},
+    {"role": "Muster Automation Manager", "read": 1}
+  ]
+}

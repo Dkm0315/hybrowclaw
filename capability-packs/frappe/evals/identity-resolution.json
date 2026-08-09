@@ -5,12 +5,12 @@
   "sourceEpisodeId": "capability-pack-frappe-federated-bridge",
   "prompt": "Verify the Frappe/ERPNext Federated Bridge capability pack baseline contract.",
   "taskKind": "architecture",
-  "recordedResponseText": "frappe-federated-bridge capability pack baseline.\nImplemented tools: frappe_identity_resolve, frappe_semantic_data_resolve_lite, frappe_records_create, frappe_docs_context, frappe_context_setup_plan, frappe_context_build, frappe_installed_context, frappe_module_context.\nStatus: v0: loads through the capability-pack loader (HC-012). frappe_identity_resolve, frappe_semantic_data_resolve_lite, and frappe_records_create are implemented as pure {fetch, config}-context tools with exact Frappe error passthrough; remaining gateway tools are still planned..\nSafety: secret redaction is required and no raw credentials should be printed.",
+  "recordedResponseText": "frappe-federated-bridge capability pack baseline.\nImplemented tools include frappe_identity_resolve, frappe_semantic_data_resolve_lite, frappe_safe_write, frappe_docs_context, frappe_context_setup_plan, frappe_context_build, frappe_installed_context, and frappe_module_context.\nStatus: the pack loads through the capability-pack loader. Direct create is not exported; writes use frappe_safe_write with permission checks, mutation-bound approval, replay protection, and verification.\nSafety: secret redaction is required and no raw credentials should be printed.",
   "expectedContains": [
     "frappe-federated-bridge",
     "frappe_identity_resolve",
     "frappe_semantic_data_resolve_lite",
-    "frappe_records_create",
+    "frappe_safe_write",
     "secret redaction"
   ],
   "forbiddenContains": [

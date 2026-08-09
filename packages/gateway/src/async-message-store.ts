@@ -18,12 +18,15 @@ export interface StoredAsyncMessageRun {
   readonly error?: string;
   readonly fingerprint: string;
   readonly idempotencyScope?: string;
+  /** Opaque authenticated caller lane. Required for tenant-safe delegated polling. */
+  readonly authorityScope?: string;
   readonly artifactRoots: readonly string[];
 }
 
 export interface AsyncMessageRunClaimInput {
   readonly fingerprint: string;
   readonly idempotencyScope?: string;
+  readonly authorityScope?: string;
   readonly artifactRoots: readonly string[];
   readonly nowMs?: number;
   readonly leaseMs: number;
@@ -51,12 +54,15 @@ export interface AsyncMessageRunStore {
   ): Promise<boolean>;
   complete(runId: string, ownerToken: string, reply: SurfaceReply | PairingChallenge, nowMs?: number): Promise<boolean>;
   fail(runId: string, ownerToken: string, error: string, nowMs?: number): Promise<boolean>;
+  /** Roots still referenced by active or retained terminal runs, after expiry reaping. */
+  listArtifactRoots(nowMs?: number): Promise<readonly string[]>;
   close?(): void | Promise<void>;
 }
 
 interface SqliteStatement {
   run(...params: unknown[]): { changes?: number | bigint };
   get(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
 }
 
 interface SqliteDatabase {
@@ -78,6 +84,7 @@ interface RunRow {
   reasoning_text: unknown;
   error: unknown;
   artifact_roots_json: unknown;
+  authority_scope: unknown;
 }
 
 const DEFAULT_TERMINAL_TTL_MS = 60 * 60_000;
@@ -131,6 +138,7 @@ export class SqliteAsyncMessageRunStore implements AsyncMessageRunStore {
         reasoning_text TEXT,
         error TEXT,
         artifact_roots_json TEXT NOT NULL,
+        authority_scope TEXT,
         owner_token TEXT,
         lease_expires_at_ms INTEGER
       ) STRICT;
@@ -139,6 +147,11 @@ export class SqliteAsyncMessageRunStore implements AsyncMessageRunStore {
       CREATE INDEX IF NOT EXISTS idx_gateway_message_runs_lease
         ON gateway_message_runs(status, lease_expires_at_ms);
     `);
+    // Upgrade durable stores created before delegated Frappe polling existed.
+    const authorityColumn = this.#db.prepare(
+      "SELECT name FROM pragma_table_info('gateway_message_runs') WHERE name = 'authority_scope'",
+    ).get();
+    if (!authorityColumn) this.#db.exec("ALTER TABLE gateway_message_runs ADD COLUMN authority_scope TEXT");
   }
 
   async claim(input: AsyncMessageRunClaimInput): Promise<AsyncMessageRunClaimResult> {
@@ -150,7 +163,10 @@ export class SqliteAsyncMessageRunStore implements AsyncMessageRunStore {
         const existing = this.#selectByScope(input.idempotencyScope);
         if (existing) {
           return Object.freeze({
-            status: existing.fingerprint === input.fingerprint ? "replay" as const : "conflict" as const,
+            status: existing.fingerprint === input.fingerprint
+              && existing.authorityScope === input.authorityScope
+              ? "replay" as const
+              : "conflict" as const,
             record: existing,
           });
         }
@@ -161,8 +177,8 @@ export class SqliteAsyncMessageRunStore implements AsyncMessageRunStore {
       this.#db.prepare(`
         INSERT INTO gateway_message_runs
           (run_id, idempotency_scope, fingerprint, status, created_at_ms, updated_at_ms, version,
-           artifact_roots_json, owner_token, lease_expires_at_ms)
-        VALUES (?, ?, ?, 'queued', ?, ?, 1, ?, ?, ?)
+           artifact_roots_json, authority_scope, owner_token, lease_expires_at_ms)
+        VALUES (?, ?, ?, 'queued', ?, ?, 1, ?, ?, ?, ?)
       `).run(
         runId,
         input.idempotencyScope ?? null,
@@ -170,6 +186,7 @@ export class SqliteAsyncMessageRunStore implements AsyncMessageRunStore {
         nowMs,
         nowMs,
         JSON.stringify(input.artifactRoots),
+        input.authorityScope ?? null,
         ownerToken,
         nowMs + input.leaseMs,
       );
@@ -258,6 +275,14 @@ export class SqliteAsyncMessageRunStore implements AsyncMessageRunStore {
     `).run(error.slice(0, 4_000), nowMs, runId, ownerToken)));
   }
 
+  async listArtifactRoots(nowMs = Date.now()): Promise<readonly string[]> {
+    return this.#transaction(() => {
+      this.#reap(nowMs);
+      const rows = this.#db.prepare("SELECT artifact_roots_json FROM gateway_message_runs").all() as Array<{ artifact_roots_json?: unknown }>;
+      return Object.freeze([...rows.flatMap((row) => parseStringArray(row.artifact_roots_json, "artifact roots"))]);
+    });
+  }
+
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
@@ -267,7 +292,7 @@ export class SqliteAsyncMessageRunStore implements AsyncMessageRunStore {
   #select(runId: string): StoredAsyncMessageRun | undefined {
     const row = this.#db.prepare(`
       SELECT run_id, idempotency_scope, fingerprint, status, created_at_ms, updated_at_ms, version,
-             reply_json, partial_text, reasoning_text, error, artifact_roots_json
+             reply_json, partial_text, reasoning_text, error, artifact_roots_json, authority_scope
       FROM gateway_message_runs WHERE run_id = ?
     `).get(runId) as RunRow | undefined;
     return row ? rowToRecord(row) : undefined;
@@ -276,7 +301,7 @@ export class SqliteAsyncMessageRunStore implements AsyncMessageRunStore {
   #selectByScope(scope: string): StoredAsyncMessageRun | undefined {
     const row = this.#db.prepare(`
       SELECT run_id, idempotency_scope, fingerprint, status, created_at_ms, updated_at_ms, version,
-             reply_json, partial_text, reasoning_text, error, artifact_roots_json
+             reply_json, partial_text, reasoning_text, error, artifact_roots_json, authority_scope
       FROM gateway_message_runs WHERE idempotency_scope = ?
     `).get(scope) as RunRow | undefined;
     return row ? rowToRecord(row) : undefined;
@@ -342,6 +367,7 @@ function rowToRecord(row: RunRow): StoredAsyncMessageRun {
     ...(row.error ? { error: String(row.error) } : {}),
     fingerprint: String(row.fingerprint),
     ...(row.idempotency_scope ? { idempotencyScope: String(row.idempotency_scope) } : {}),
+    ...(row.authority_scope ? { authorityScope: String(row.authority_scope) } : {}),
     artifactRoots,
   });
 }
@@ -356,6 +382,9 @@ function validateClaim(input: AsyncMessageRunClaimInput): void {
   if (!input.fingerprint || input.fingerprint.length > 256) throw new Error("Async message fingerprint is invalid.");
   if (input.idempotencyScope !== undefined && (!input.idempotencyScope || input.idempotencyScope.length > 256)) {
     throw new Error("Async message idempotency scope is invalid.");
+  }
+  if (input.authorityScope !== undefined && (!input.authorityScope || input.authorityScope.length > 256)) {
+    throw new Error("Async message authority scope is invalid.");
   }
   if (!Array.isArray(input.artifactRoots) || input.artifactRoots.some((root) => typeof root !== "string" || !root)) {
     throw new Error("Async message artifact roots are invalid.");

@@ -10,8 +10,24 @@ import type { DraftSink, FlowToolRegistry, MusterConfig } from "@musterhq/core";
 import { dispatchCommand, gatewayAgentCatalog, gatewayCommandCatalog, parseCommand, resolveCustomCommand } from "./commands.js";
 import { conversationSessionId, isPairingChallenge, parseSurfaceMessage } from "./envelope.js";
 import type { PairingChallenge, SurfaceArtifact, SurfaceMessage, SurfaceReply } from "./envelope.js";
-import { pairingScopes, requestPairing, resolvePairing } from "./pairing.js";
-import type { PairedSender } from "./pairing.js";
+import { clearTrustedFrappePairingIdentity, clearTrustedFrappeTelegramBindings, pairingScopes, requestPairing, resolvePairing, upsertTrustedFrappePairing } from "./pairing.js";
+import type { PairedIdentity, PairedSender } from "./pairing.js";
+import { frappeChannelSystemContext, frappeChannelTurnContext, frappeNativeSessionPolicyKey, parseTrustedFrappeIngress, trustedFrappeProviderBoundary, trustedFrappeSystemContext, trustedFrappeTurnContext, TRUSTED_FRAPPE_ASYNC_PATH, TRUSTED_FRAPPE_ASYNC_RUNS_PATH, TRUSTED_FRAPPE_CATALOG_PATH } from "./frappe-ingress.js";
+import type { TrustedFrappeContext } from "./frappe-ingress.js";
+import { FrappeOAuthCoordinator } from "./frappe-oauth.js";
+import type { FrappeOAuthAuthorization } from "./frappe-oauth.js";
+import {
+  FRAPPE_SITE_API_CREDENTIALS_PATH,
+  FRAPPE_SITE_AUTHORIZE_PATH,
+  FRAPPE_SITE_EXCHANGE_PATH,
+  FRAPPE_SITE_VERIFY_PATH,
+  FrappeSiteBindingCoordinator,
+  FrappeSiteBindingError,
+  type FrappeSiteBindingRecord,
+} from "./frappe-connect.js";
+import { FRAPPE_TELEGRAM_LINK_PATH, FrappeTelegramLinkCoordinator, openSqliteFrappeTelegramLinkCoordinator } from "./frappe-telegram-link.js";
+import type { FrappeTelegramAuthority, TelegramChatType } from "./frappe-telegram-link.js";
+import { frappeChannelQuickReply, frappeEvidenceQuickReply, frappePermissionContextForTurn, frappeTaskKindForIntent, isFrappeBusinessIntent } from "./frappe-channel.js";
 import { googleChatAudienceIsValid, type GatewayConfig, type GatewayGovernanceAssignment } from "./gateway-config.js";
 import {
   classifyGatewayRequest,
@@ -22,12 +38,14 @@ import {
   type GatewayEnterpriseRuntime,
 } from "./enterprise-runtime.js";
 import { surfaceReplyToTelegramSend, telegramCallbackQueryId, telegramUpdateToSurfaceMessage } from "./adapters/telegram.js";
+import type { TelegramSendMessagePayload } from "./adapters/telegram.js";
 import { slackDeliveryId, slackEventToSurfaceMessage, slackSignatureIsValid, surfaceReplyToSlackPost } from "./adapters/slack.js";
 import { DISCORD_PONG, discordInteractionToInbound, discordSignatureIsValid, surfaceReplyToDiscordInteractionResponse } from "./adapters/discord.js";
 import { surfaceReplyToWhatsAppSend, whatsAppMessageIds, whatsAppVerifyChallenge, whatsAppWebhookToSurfaceMessages } from "./adapters/whatsapp.js";
-import { gchatDeliveryId, gchatEventToken, gchatEventToSurfaceMessage, surfaceReplyToGchatResponse } from "./adapters/gchat.js";
+import { gchatActor, gchatDeliveryId, gchatEventToken, gchatEventToSurfaceMessage, surfaceReplyToGchatResponse } from "./adapters/gchat.js";
 import type { GchatRequestVerifier } from "./adapters/gchat.js";
 import { createGoogleChatRequestVerifier } from "./google-chat-verifier.js";
+import { resolveGchatFrappeIdentity } from "./gchat-frappe-identity.js";
 import { surfaceReplyToTeamsActivity, teamsActivityToSurfaceMessage, teamsHmacIsValid } from "./adapters/teams.js";
 import { createOutboundQueue, createSlackDraftSink, createTelegramDraftSink } from "./streaming.js";
 import type { OutboundQueue } from "./streaming.js";
@@ -38,7 +56,7 @@ import {
   type GatewayIngressIdentity,
   type GatewayIngressOwnership,
 } from "./durable-ingress.js";
-import { createApprovalActionCodec, pendingApprovalFromRaw, verifiedApprovalFromRaw, type ApprovalActionBinding, type ApprovalActionCodec, type ApprovalActionRenderContext, type ApprovalDecision } from "./presentation.js";
+import { createApprovalActionCodec, pendingApprovalFromRaw, renderPresentationText, verifiedApprovalFromRaw, type ApprovalActionBinding, type ApprovalActionCodec, type ApprovalActionRenderContext, type ApprovalDecision, type SurfacePresentation } from "./presentation.js";
 import { SqliteApprovalActionStore } from "./approval-store.js";
 import {
   DurableGatewayIngressSpool,
@@ -53,6 +71,69 @@ import {
   type StoredAsyncMessageRun,
 } from "./async-message-store.js";
 import { DurableConversationLease } from "./conversation-lease.js";
+import type { PendingFrappeInteraction } from "./frappe-interaction-store.js";
+import {
+  FRAPPE_RUN_EVENTS_PATH,
+  FrappeRunEventError,
+  SqliteFrappeRunEventStore,
+  frappeRunCsrfProofMatches,
+  validateFrappeRunEventScope,
+  type AcceptedFrappeRunCommand,
+  type FrappeRunCommandRequest,
+  type FrappeRunEvent,
+  type FrappeRunEventPermissionFilter,
+  type FrappeRunEventScope,
+  type FrappeRunEventStore,
+} from "./frappe-run-events.js";
+import {
+  createGovernedFrappeMissionExecutor,
+  DurableFrappeMissionBridge,
+  TRUSTED_FRAPPE_MISSIONS_PATH,
+  type FrappeMissionBridge,
+  type FrappeMissionNodeExecutor,
+  type TrustedFrappeMissionRequest,
+} from "./frappe-mission-bridge.js";
+import {
+  createEffectfulFrappeMissionExecutor,
+  createVerifiedBindingFrappeEffectTransport,
+  SqliteGovernedFrappeEffectStore,
+  type FrappeEffectPolicy,
+  type GovernedFrappeEffectStore,
+  type GovernedFrappeEffectTransport,
+} from "./frappe-effect-executor.js";
+import {
+  createVerifiedBindingFrappeBrowserMissionExecutor,
+  type FrappeBrowserAutomationPort,
+} from "./frappe-browser-work-session.js";
+import {
+  createPlaywrightFrappeBrowserAutomationPort,
+  DirectoryFrappeBrowserScreenshotEvidenceStore,
+} from "./frappe-playwright-browser.js";
+import {
+  createFrappeWorkflowProposalResult,
+  createGovernedFrappeWorkflowPlanner,
+  FrappeWorkflowPlanningError,
+  MAX_FRAPPE_PLANNING_REQUEST_BYTES,
+  TRUSTED_FRAPPE_WORKFLOW_PROPOSALS_PATH,
+  type FrappeWorkflowPlanner,
+} from "./frappe-workflow-planner.js";
+import { garbageCollectFrappeAskArtifacts, runIsolatedFrappeAskArtifact, type FrappeAskArtifactExecutor } from "./frappe-ask-artifact.js";
+import {
+  createFrappeReadPlan,
+  createGovernedFrappeReadPlanner,
+  FrappeReadPlanningError,
+  MAX_FRAPPE_READ_PLAN_REQUEST_BYTES,
+  TRUSTED_FRAPPE_READ_PLANS_PATH,
+  type FrappeReadPlanner,
+} from "./frappe-read-planner.js";
+import {
+  createFrappeAskIntent,
+  createGovernedFrappeAskIntentRouter,
+  FrappeAskIntentError,
+  MAX_FRAPPE_ASK_INTENT_REQUEST_BYTES,
+  TRUSTED_FRAPPE_ASK_INTENTS_PATH,
+  type FrappeAskIntentRouter,
+} from "./frappe-ask-intent.js";
 
 /** HTTP gateway plus channel-specific polling/socket workers. */
 
@@ -79,6 +160,38 @@ export interface GatewayServerOptions {
   readonly messageRunStore?: AsyncMessageRunStore;
   /** Internal owner token for warm native provider processes. */
   readonly nativeTransportOwner?: string;
+  /** Per-channel Frappe OAuth state and encrypted grants. Derived from gateway config by default. */
+  readonly frappeOAuth?: FrappeOAuthCoordinator;
+  /** Reciprocal installation-time site trust coordinator. */
+  readonly frappeSiteBindings?: FrappeSiteBindingCoordinator;
+  /** Frappe-issued, one-time Telegram identity links. Shared with poll workers when enabled. */
+  readonly frappeTelegramLinks?: FrappeTelegramLinkCoordinator;
+  /** Durable Frappe mission event projection. Defaults to a gateway-owned SQLite store. */
+  readonly frappeRunEventStore?: FrappeRunEventStore;
+  /** Optional live Frappe permission recheck applied to every replayed event. */
+  readonly frappeRunEventCanRead?: FrappeRunEventPermissionFilter;
+  /** Dispatches accepted pause/cancel/steer commands into the authoritative graph runtime. */
+  readonly onFrappeRunCommand?: (command: AcceptedFrappeRunCommand) => void | Promise<void>;
+  /** Server-held HMAC secret for binding Frappe CSRF tokens. Defaults to the gateway bearer secret. */
+  readonly frappeRunCsrfSecret?: string;
+  /** Portable graph execution bridge for first-class trusted Frappe missions. */
+  readonly frappeMissionBridge?: FrappeMissionBridge;
+  /** Capability-governed node executor used when the server owns the mission bridge. */
+  readonly frappeMissionExecutor?: FrappeMissionNodeExecutor;
+  /** Fixed-operation Frappe transport. Its presence enables typed effect nodes; absence remains read-only. */
+  readonly frappeEffectTransport?: GovernedFrappeEffectTransport;
+  readonly frappeEffectStore?: GovernedFrappeEffectStore;
+  readonly frappeEffectPolicy?: FrappeEffectPolicy;
+  /** Trusted browser transport override. Browser work remains disabled unless injected or enabled in gateway config. */
+  readonly frappeBrowserAutomation?: FrappeBrowserAutomationPort;
+  /** Produces inert workflow JSON; output is always strictly validated before returning. */
+  readonly frappeWorkflowPlanner?: FrappeWorkflowPlanner;
+  /** Produces a bounded data-only read IR; Frappe remains the independent RBAC executor. */
+  readonly frappeReadPlanner?: FrappeReadPlanner;
+  /** Classifies requested outcomes only. Its output carries no authority or executable data. */
+  readonly frappeAskIntentRouter?: FrappeAskIntentRouter;
+  /** Isolated Ask artifact executor; injectable only by the gateway host for verification. */
+  readonly frappeAskArtifactExecutor?: FrappeAskArtifactExecutor;
 }
 
 export interface RunningGateway {
@@ -99,6 +212,116 @@ export class GatewayHttpError extends Error {
 
 function defaultRegistry(): FlowToolRegistry {
   return { echo: async (args) => args };
+}
+
+const FRAPPE_SAFE_WRITE_TOOL = "frappe-federated-bridge__frappe_safe_write";
+
+interface FrappeWriteProposal {
+  readonly proposalId: string;
+  readonly mutationHash: string;
+  readonly site: string;
+  readonly principal: string;
+  readonly operation: string;
+  readonly doctype: string;
+  readonly fields: readonly string[];
+  readonly permissionEpoch: string;
+  readonly schemaRevision: string;
+  readonly dataRevision: string;
+  readonly issuedAt: string;
+  readonly expiresAt: string;
+  readonly nonce: string;
+  readonly humanSummary: string;
+  readonly bindingRequirements: readonly string[];
+}
+
+function canonicalJson(value: unknown): string {
+  const canonical = (input: unknown): unknown => Array.isArray(input)
+    ? input.map(canonical)
+    : input && typeof input === "object"
+      ? Object.fromEntries(Object.entries(input as Record<string, unknown>)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, item]) => [key, canonical(item)]))
+      : input;
+  return JSON.stringify(canonical(value));
+}
+
+function signFrappeWriteProposal(proposal: FrappeWriteProposal, approvedBy: string, signingKey: string): Record<string, unknown> {
+  const approvedAt = new Date().toISOString();
+  const unsigned = { proposal, approvedBy: approvedBy.trim().toLowerCase(), approvedAt };
+  return {
+    ...unsigned,
+    signature: createHmac("sha256", signingKey).update(canonicalJson(unsigned)).digest("hex"),
+  };
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function frappeDeskLink(site: string, doctype: string, name: string): string {
+  const route = doctype.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  return `${site.replace(/\/$/, "")}/app/${route}/${encodeURIComponent(name)}`;
+}
+
+async function acceptPendingFrappeCreation(input: {
+  readonly pending?: PendingFrappeInteraction;
+  readonly authorization?: FrappeOAuthAuthorization;
+  readonly registry?: FlowToolRegistry;
+  readonly signingKey?: string;
+  readonly clear: () => void;
+}): Promise<SurfaceReply> {
+  if (!input.pending) return { text: "There is no request waiting for approval." };
+  if (input.pending.operation !== "create") return { text: "This approval action currently supports new records only. Nothing was changed." };
+  if (input.pending.phase !== "review" || input.pending.requiredFields.length) {
+    return { text: "This request still needs information before it can be created." };
+  }
+  if (!input.authorization) return { text: "Your Frappe authorization is unavailable. Reconnect with /pair, then review the request again." };
+  if (!input.signingKey?.trim()) return { text: "Creation approval is not configured for this deployment. Nothing was changed." };
+  const safeWrite = input.registry?.[FRAPPE_SAFE_WRITE_TOOL];
+  if (!safeWrite) return { text: "The governed Frappe write tool is unavailable. Nothing was changed." };
+  const apiToken = input.authorization.header.replace(/^Bearer\s+/i, "").trim();
+  const args = {
+    operation: "create",
+    doctype: input.pending.doctype,
+    doc: input.pending.values,
+    siteUrl: input.authorization.site,
+    apiToken,
+  };
+  const dryRun = objectRecord(await safeWrite(args));
+  const proposal = objectRecord(dryRun?.approvalProposal) as FrappeWriteProposal | undefined;
+  if (dryRun?.status === "denied") return { text: "Frappe did not allow this request under your current permissions. Nothing was changed." };
+  if (dryRun?.error || dryRun?.status !== "approval_required" || !proposal) {
+    return { text: typeof dryRun?.error === "string" ? dryRun.error : "The request could not be verified for creation. Nothing was changed." };
+  }
+  const approvalReceipt = signFrappeWriteProposal(proposal, input.pending.principal, input.signingKey.trim());
+  const executed = objectRecord(await safeWrite({
+    ...args,
+    permissionEpoch: proposal.permissionEpoch,
+    schemaRevision: proposal.schemaRevision,
+    dataRevision: proposal.dataRevision,
+    approvalReceipt,
+    approvalNote: "Approved from the governed channel review.",
+  }));
+  const verification = objectRecord(executed?.verification);
+  if (executed?.status !== "executed" || verification?.verified !== true) {
+    return { text: typeof executed?.error === "string" ? executed.error : "Frappe did not verify the saved record, so I cannot report this request as created." };
+  }
+  const fetched = objectRecord(verification.fetched);
+  const result = objectRecord(executed.result);
+  const created = objectRecord(result?.created);
+  const name = typeof fetched?.name === "string" ? fetched.name : typeof created?.name === "string" ? created.name : undefined;
+  if (!name) return { text: "Frappe saved the request but did not return a verifiable record reference." };
+  input.clear();
+  const link = frappeDeskLink(input.pending.site, input.pending.doctype, name);
+  const presentation: SurfacePresentation = {
+    kind: "status",
+    title: "Created",
+    summary: `Your ${input.pending.doctype.toLowerCase()} was created successfully.`,
+    tables: [{ id: "created-record", columns: ["Reference", "Open"], rows: [[name, link]] }],
+  };
+  return { text: renderPresentationText(presentation), presentation };
 }
 
 /** Per-profile workspace dirs already ensured this process — skip the mkdir syscall on the hot path. */
@@ -217,6 +440,7 @@ class AsyncMessageRunRegistry {
     idempotencyKey: string | undefined,
     artifactRoots: readonly string[],
     execute: (stream: AsyncMessageRunStream) => Promise<SurfaceReply | PairingChallenge>,
+    authorityScope?: string,
   ): Promise<{ readonly snapshot: AsyncMessageRunSnapshot; readonly replayed: boolean; readonly conflict: boolean; readonly work?: Promise<void> }> {
     const fingerprint = `sha256:${createHash("sha256").update(JSON.stringify(message)).digest("hex")}`;
     const idempotencyScope = idempotencyKey
@@ -228,12 +452,13 @@ class AsyncMessageRunRegistry {
     const claim = await this.#store.claim({
       fingerprint,
       idempotencyScope,
+      authorityScope,
       artifactRoots: artifactRoots.map((root) => resolve(root)),
       leaseMs: ASYNC_MESSAGE_LEASE_MS,
     });
     if (claim.status !== "claimed") {
       return {
-        snapshot: this.#snapshot(claim.record),
+        snapshot: this.#snapshot(claim.record, authorityScope ? TRUSTED_FRAPPE_ASYNC_RUNS_PATH : undefined),
         replayed: true,
         conflict: claim.status === "conflict",
       };
@@ -241,7 +466,9 @@ class AsyncMessageRunRegistry {
     const ownerToken = claim.ownerToken as string;
     const runId = claim.record.runId;
 
-    const work = (async () => {
+    // The durable claim above is already committed. Yield once before the
+    // running-state write so the HTTP 202 can flush even when SQLite is busy.
+    const work = new Promise<void>((resolveWork) => setImmediate(resolveWork)).then(async () => {
       if (!await this.#store.markRunning(runId, ownerToken, Date.now(), ASYNC_MESSAGE_LEASE_MS)) return;
       let persistence = Promise.resolve();
       let leaseError: unknown;
@@ -314,13 +541,14 @@ class AsyncMessageRunRegistry {
         if (previewTimer) clearTimeout(previewTimer);
         clearInterval(heartbeat);
       }
-    })();
-    return { snapshot: this.#snapshot(claim.record), replayed: false, conflict: false, work };
+    });
+    return { snapshot: this.#snapshot(claim.record, authorityScope ? TRUSTED_FRAPPE_ASYNC_RUNS_PATH : undefined), replayed: false, conflict: false, work };
   }
 
-  async read(runId: string, waitMs = 0): Promise<AsyncMessageRunSnapshot | undefined> {
+  async read(runId: string, waitMs = 0, authorityScope?: string): Promise<AsyncMessageRunSnapshot | undefined> {
     const record = await this.#store.read(runId);
     if (!record) return undefined;
+    if (authorityScope !== undefined && record.authorityScope !== authorityScope) return undefined;
     const boundedWait = Math.max(0, Math.min(ASYNC_MESSAGE_LONG_POLL_MAX_MS, Math.trunc(waitMs)));
     if (boundedWait && (record.status === "queued" || record.status === "running")) {
       const deadline = Date.now() + boundedWait;
@@ -333,19 +561,23 @@ class AsyncMessageRunRegistry {
         ));
         const current = await this.#store.read(runId);
         if (!current) return undefined;
-        if (current.status === "completed" || current.status === "failed"
-          || (current.partialText ?? "") !== initialPartial
-          || (current.reasoningText ?? "") !== initialReasoning) {
-          return this.#snapshot(current);
+        if (authorityScope !== undefined && current.authorityScope !== authorityScope) return undefined;
+        const previewChanged = authorityScope === undefined && (
+          (current.partialText ?? "") !== initialPartial
+          || (current.reasoningText ?? "") !== initialReasoning
+        );
+        if (current.status === "completed" || current.status === "failed" || previewChanged) {
+          return this.#snapshot(current, authorityScope ? TRUSTED_FRAPPE_ASYNC_RUNS_PATH : undefined);
         }
       }
     }
-    return this.#snapshot(await this.#store.read(runId) ?? record);
+    return this.#snapshot(await this.#store.read(runId) ?? record, authorityScope ? TRUSTED_FRAPPE_ASYNC_RUNS_PATH : undefined);
   }
 
-  async readArtifact(runId: string, index: number): Promise<AsyncMessageArtifactDownload | undefined> {
+  async readArtifact(runId: string, index: number, authorityScope?: string): Promise<AsyncMessageArtifactDownload | undefined> {
     const record = await this.#store.read(runId);
     if (!record || record.status !== "completed" || !record.reply || isPairingChallenge(record.reply)) return undefined;
+    if (authorityScope !== undefined && record.authorityScope !== authorityScope) return undefined;
     const artifact = record.reply.artifacts?.[index];
     if (!artifact || isHttpArtifact(artifact.path)) return undefined;
     const canonical = await realpath(artifact.path).catch(() => undefined);
@@ -361,26 +593,39 @@ class AsyncMessageRunRegistry {
         const openedPath = await realpath(`/proc/self/fd/${handle.fd}`).catch(() => undefined);
         if (!openedPath || !roots.some((root) => insideDirectory(root, openedPath))) return undefined;
       }
+      const bytes = await handle.readFile();
+      if (artifact.sizeBytes !== undefined && artifact.sizeBytes !== bytes.length) return undefined;
+      if (artifact.sha256 !== undefined
+        && (!/^[a-f0-9]{64}$/.test(artifact.sha256) || createHash("sha256").update(bytes).digest("hex") !== artifact.sha256)) return undefined;
       return {
         name: basename(artifact.name || canonical),
         mime: artifact.mime || artifactMime(canonical),
-        bytes: await handle.readFile(),
+        bytes,
       };
     } finally {
       await handle.close();
     }
   }
 
-  #snapshot(record: StoredAsyncMessageRun): AsyncMessageRunSnapshot {
+  #snapshot(record: StoredAsyncMessageRun, artifactBase = "/v1/messages/runs"): AsyncMessageRunSnapshot {
+    const exposeProviderPreview = artifactBase !== TRUSTED_FRAPPE_ASYNC_RUNS_PATH;
     return {
       runId: record.runId,
       status: record.status,
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
-      reply: sanitizeAsyncReply(record.runId, record.reply),
-      partialText: record.partialText ? extractMediaTags(record.partialText).text : undefined,
-      reasoningText: record.reasoningText,
-      error: record.error,
+      reply: sanitizeAsyncReply(record.runId, record.reply, artifactBase),
+      ...(exposeProviderPreview && record.partialText
+        ? { partialText: extractMediaTags(record.partialText).text }
+        : {}),
+      ...(exposeProviderPreview && record.reasoningText
+        ? { reasoningText: record.reasoningText }
+        : {}),
+      ...(record.error
+        ? { error: exposeProviderPreview
+            ? record.error
+            : "Muster could not complete this request. You can retry safely." }
+        : {}),
     };
   }
 
@@ -389,13 +634,14 @@ class AsyncMessageRunRegistry {
 function sanitizeAsyncReply(
   runId: string,
   reply: SurfaceReply | PairingChallenge | undefined,
+  artifactBase = "/v1/messages/runs",
 ): SurfaceReply | PairingChallenge | undefined {
   if (!reply || isPairingChallenge(reply) || !reply.artifacts?.length) return reply;
   return {
     ...reply,
     artifacts: reply.artifacts.map((artifact, index) => ({
       ...artifact,
-      path: isHttpArtifact(artifact.path) ? artifact.path : `/v1/messages/runs/${runId}/artifacts/${index}`,
+      path: isHttpArtifact(artifact.path) ? artifact.path : `${artifactBase}/${runId}/artifacts/${index}`,
     })),
   };
 }
@@ -442,6 +688,7 @@ const ARTIFACT_NOUN_RE = /\b(?:artifact|attachment|document|presentation|slides?
 const ARTIFACT_CREATION_RE = /\b(?:attach|build|convert|create|draft|export|generate|give|make|need|prepare|produce|send|want|write)\b/i;
 const MEMORY_REQUEST_RE = /\b(remember when|recall|look up memory|search memory|from memory|chat history|previous conversation|earlier conversation|last time|we discussed|named chat|previous session|context from before|what did (we|i) (discuss|say|decide)|my preference)\b/i;
 const ARTIFACT_REF_RE = /(?:^|[\s`"'(])((?:\.\/)?artifacts\/[^\s`"')]+?\.(?:pdf|docx|xlsx|pptx|md|txt|csv|json|zip))/gi;
+const LOCAL_ARTIFACT_PATH_RE = /(?:^|[\s`"'(])((?:\/home|\/Users|\/private\/tmp|\/tmp|\/var\/folders)\/[^\s`"')]+?\.(?:pdf|docx|xlsx|pptx|md|txt|csv|json|zip))/gi;
 
 function userRequestText(text: string): string {
   const marker = "\nUser request:\n";
@@ -473,20 +720,46 @@ function shouldRecallForChannel(text: string): boolean {
   return MEMORY_REQUEST_RE.test(text);
 }
 
-function channelProgressText(text: string, surface: "slack" | "telegram", elapsedMs = 0): string {
-  const steps = [
-    "Checking the request",
-    shouldRecallForChannel(text) ? "Looking up scoped memory" : undefined,
-    isArtifactRequest(text) ? "Preparing artifact route" : undefined,
-    "Running the provider",
-    isArtifactRequest(text) ? "Will verify and attach generated files" : undefined,
-  ].filter(Boolean);
-  const chevron = surface === "slack" ? "▾" : "▾";
-  const elapsed = elapsedMs > 0 ? ` · ${Math.max(1, Math.round(elapsedMs / 1000))}s` : "";
-  return [
-    `${chevron} Processing${elapsed}`,
-    ...steps.map((step, index) => `${index + 1}. ${step}`),
-  ].join("\n");
+const ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+const LOCAL_PATH_RE = /(^|[\s("'`])(?:file:\/\/\/)?\/(?:home|Users|private|tmp|var\/folders|opt|srv)\/[^\s)"'`]+/gim;
+const WINDOWS_PATH_RE = /\b[A-Za-z]:\\(?:[^\s\\]+\\)*[^\s]*/g;
+const LOCAL_ENDPOINT_RE = /\b(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?(?:\/[^\s]*)?/gi;
+const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi;
+const TOKEN_QUERY_RE = /([?&](?:access_?token|token|key|secret|password)=)[^&\s]+/gi;
+const ASSIGNMENT_SECRET_RE = /\b([A-Za-z0-9_]*(?:TOKEN|SECRET|KEY|PASSWORD)[A-Za-z0-9_]*)\s*=\s*[^\s]+/gi;
+const SLACK_TOKEN_RE = /\bxox[a-z]-[A-Za-z0-9-]+/gi;
+const MAX_CHANNEL_PROGRESS_CHARS = 1_200;
+
+/**
+ * Provider progress is user-visible. Keep the provider's exposed summary, but
+ * strip host topology and secret-shaped values before it reaches a channel.
+ * Hidden chain-of-thought is never available to this function.
+ */
+export function sanitizeChannelProgress(value: string): string {
+  const sanitized = sanitizeChannelFinalText(value);
+  if (sanitized.length <= MAX_CHANNEL_PROGRESS_CHARS) return sanitized;
+  return `…${sanitized.slice(-(MAX_CHANNEL_PROGRESS_CHARS - 1))}`;
+}
+
+/** Last-mile channel safety: preserve the answer while removing host topology and secret-shaped values. */
+export function sanitizeChannelFinalText(value: string): string {
+  return value
+    .replace(ANSI_ESCAPE_RE, "")
+    .replace(LOCAL_PATH_RE, (_match, prefix: string) => `${prefix}the workspace`)
+    .replace(WINDOWS_PATH_RE, "the workspace")
+    .replace(LOCAL_ENDPOINT_RE, "the local service")
+    .replace(BEARER_RE, "Bearer [redacted]")
+    .replace(TOKEN_QUERY_RE, "$1[redacted]")
+    .replace(ASSIGNMENT_SECRET_RE, "$1=[redacted]")
+    .replace(SLACK_TOKEN_RE, "[redacted]")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function channelProgressText(providerSummary: string): string {
+  const summary = sanitizeChannelProgress(providerSummary);
+  return summary ? `▾ ${summary}` : "Working";
 }
 
 function artifactMime(path: string): string {
@@ -501,6 +774,8 @@ function artifactMime(path: string): string {
       return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
     case ".md":
       return "text/markdown";
+    case ".csv":
+      return "text/csv";
     case ".txt":
       return "text/plain";
     default:
@@ -523,7 +798,6 @@ async function resolveSurfaceArtifactRef(ref: string, workspaceDir: string): Pro
   if (isHttpArtifact(ref)) return undefined;
   const workspaceRoot = await realpath(workspaceDir).catch(() => resolve(workspaceDir));
   const candidate = isAbsolute(ref) ? resolve(ref) : resolve(workspaceRoot, ref);
-  if (!insideDirectory(workspaceRoot, candidate)) return undefined;
   const canonical = await realpath(candidate).catch(() => undefined);
   if (!canonical || !insideDirectory(workspaceRoot, canonical) || !await readableFile(canonical)) return undefined;
   return { name: basename(canonical), mime: artifactMime(canonical), path: canonical };
@@ -537,6 +811,10 @@ function insideDirectory(parent: string, child: string): boolean {
 function extractArtifactPathRefs(text: string): string[] {
   const refs: string[] = [];
   for (const match of text.matchAll(ARTIFACT_REF_RE)) {
+    const ref = match[1]?.replace(/[.,;:]+$/, "");
+    if (ref) refs.push(ref);
+  }
+  for (const match of text.matchAll(LOCAL_ARTIFACT_PATH_RE)) {
     const ref = match[1]?.replace(/[.,;:]+$/, "");
     if (ref) refs.push(ref);
   }
@@ -809,9 +1087,27 @@ async function recoverPendingApprovals(options: GatewayServerOptions, store: Sql
   }
 }
 
+function pairedIdentityNeedsRefresh(
+  paired: PairedIdentity,
+  authorized: Omit<PairedIdentity, "provider" | "resolvedAt">,
+): boolean {
+  return paired.permissionHash !== authorized.permissionHash
+    || paired.rolesHash !== authorized.rolesHash
+    || paired.userName !== authorized.userName
+    || paired.employee !== authorized.employee
+    || paired.employeeName !== authorized.employeeName
+    || paired.employeeStatus !== authorized.employeeStatus
+    || paired.department !== authorized.department
+    || paired.departmentName !== authorized.departmentName
+    || paired.reportsTo !== authorized.reportsTo
+    || paired.reportsToName !== authorized.reportsToName
+    || paired.company !== authorized.company
+    || paired.displayNamesResolvedAt !== authorized.displayNamesResolvedAt;
+}
+
 export async function handleSurfaceMessage(
   message: SurfaceMessage,
-  options: Pick<GatewayServerOptions, "config" | "cwd" | "nativeTransportOwner"> & {
+  options: Pick<GatewayServerOptions, "config" | "cwd" | "nativeTransportOwner" | "frappeOAuth"> & {
     readonly gateway?: GatewayConfig;
     readonly enterprise?: GatewayEnterpriseRuntime;
     readonly approvalStore?: SqliteApprovalActionStore;
@@ -829,20 +1125,44 @@ export async function handleSurfaceMessage(
     readonly onDelta?: (text: string) => void;
     /** Provider-visible reasoning summary, forwarded unchanged. */
     readonly onReasoningDelta?: (text: string) => void;
+    /** Truthful host milestone for channel progress; never hidden reasoning. */
+    readonly onStatus?: (text: string) => void;
+    /** Present only for the bearer-authenticated Frappe integration route. */
+    readonly trustedFrappe?: TrustedFrappeContext;
+    /** Host-classified artifact permission. False also suppresses artifact discovery/persistence. */
+    readonly allowArtifacts?: boolean;
   },
 ): Promise<SurfaceReply | PairingChallenge> {
   const cwd = options.cwd ?? process.cwd();
-  const paired = await resolvePairing(message.surfaceId, message.senderId, cwd);
-  if (!paired) {
+  const resolvedPairing = await resolvePairing(message.surfaceId, message.senderId, cwd);
+  if (!resolvedPairing) {
     const pending = await requestPairing(message.surfaceId, message.senderId, cwd);
     return { status: "pairing_required", code: pending.code };
   }
+  let paired = resolvedPairing;
+  if (options.trustedFrappe && paired.identity?.provider !== "frappe") {
+    return { text: "This Frappe request could not be verified against a bound Frappe identity." };
+  }
+  const parsedCommand = parseCommand(message.text);
+  if (options.trustedFrappe && parsedCommand && ["pair", "connect"].includes(parsedCommand.name)) {
+    return {
+      text: "Your Frappe identity is already connected through this signed session. No separate pairing is needed.",
+    };
+  }
+  let frappeAuthorization: FrappeOAuthAuthorization | undefined;
   const profile = activeProfile(cwd);
   // muster builtin slash-commands and tool-dispatch skills are answered here
   // with NO model call; prompt-dispatch skills rewrite the prompt, and unknown
   // commands fall through to the native provider CLI.
   const sessionKey = conversationSessionId(message);
   const assignment = resolveGatewayGovernanceAssignment(options.gateway, message, paired.pairingId);
+  const frappeInteractionKey = paired.identity?.provider === "frappe"
+    ? pendingFrappeInteractionKey(message, paired.identity.site, paired.identity.user)
+    : undefined;
+  if (frappeInteractionKey && parsedCommand?.name === "cancel") {
+    options.enterprise?.frappeInteractionStore.clear(frappeInteractionKey);
+    return { text: "Request cancelled. Nothing was created or changed." };
+  }
   const pendingApproval = pendingApprovalFromRaw(message.raw);
   if (pendingApproval) {
     if (!options.approvalActions) return { text: "Approval could not be verified: approval controls are unavailable." };
@@ -866,13 +1186,13 @@ export async function handleSurfaceMessage(
       enterprise: options.enterprise,
     });
   }
-  const parsedCommand = parseCommand(message.text);
   const dispatchBuiltin = () => dispatchCommand(message, {
     config: options.config,
     profile,
     paired,
     gateway: options.gateway,
     enterprise: options.enterprise,
+    frappeOAuth: options.frappeOAuth,
     cwd,
     conversationKey: sessionKey,
     legacyConversationKey: `${message.surfaceId}:${message.conversationId}`,
@@ -900,8 +1220,168 @@ export async function handleSurfaceMessage(
     }
     return preflight.reply;
   }
+  if (options.trustedFrappe?.fastReply) {
+    if (options.enterprise) {
+      await recordGatewayUsage(options.enterprise, {
+        message,
+        paired,
+        assignment,
+        outcome: "success",
+        latencyMs: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        requestCategory: "frappe",
+        action: "gateway.frappe_fast_reply",
+        agentId: profile,
+        policyIds: preflight.policyIds,
+      });
+    }
+    return options.trustedFrappe.fastReply;
+  }
+  if (paired.identity?.provider === "frappe" && parsedCommand?.name !== "pair") {
+    const quickReply = frappeChannelQuickReply(
+      message.text,
+      paired.identity,
+      options.gateway?.frappe?.assistant,
+      true,
+    );
+    if (quickReply) {
+      if (options.enterprise) {
+        await recordGatewayUsage(options.enterprise, {
+          message,
+          paired,
+          assignment,
+          outcome: "success",
+          latencyMs: 0,
+          inputTokens: estimateTokens(message.text),
+          outputTokens: estimateTokens(quickReply.text),
+          requestCategory: "frappe",
+          action: "gateway.frappe_deterministic",
+          agentId: profile,
+          policyIds: preflight.policyIds,
+        });
+      }
+      return quickReply;
+    }
+  }
+  if (paired.identity?.provider === "frappe" && !options.trustedFrappe && options.frappeOAuth && !frappeAuthorization) {
+    try {
+      frappeAuthorization = await options.frappeOAuth.authorizationForActor({
+        surfaceId: message.surfaceId,
+        senderId: message.senderId,
+        pairingId: paired.pairingId,
+      }, paired.identity.site);
+    } catch {
+      return { text: "Your Frappe authorization could not be selected safely. Use /pair to reconnect this chat before accessing live records." };
+    }
+    if (frappeAuthorization
+      && (frappeAuthorization.identity.user !== paired.identity.user || frappeAuthorization.site !== paired.identity.site)) {
+      return { text: "Your paired Frappe identity no longer matches its authorization. Use /pair to reconnect before accessing live records." };
+    }
+    if (frappeAuthorization && pairedIdentityNeedsRefresh(paired.identity, frappeAuthorization.identity)) {
+      paired = await upsertTrustedFrappePairing(message.surfaceId, message.senderId, frappeAuthorization.identity, cwd);
+    }
+  }
+  if (frappeInteractionKey && parsedCommand && ["accept", "create"].includes(parsedCommand.name)) {
+    const pendingInteraction = options.enterprise?.frappeInteractionStore.read(frappeInteractionKey);
+    return acceptPendingFrappeCreation({
+      pending: pendingInteraction,
+      authorization: frappeAuthorization,
+      registry: options.registry,
+      signingKey: options.gateway?.frappe?.approvalSigningKey,
+      clear: () => options.enterprise?.frappeInteractionStore.clear(frappeInteractionKey),
+    });
+  }
+  const storedFrappeInteraction = frappeInteractionKey && !parsedCommand
+    ? options.enterprise?.frappeInteractionStore.read(frappeInteractionKey)
+    : undefined;
+  const interruptsFrappeInteraction = storedFrappeInteraction
+    ? isIndependentFrappeRequest(message.text, storedFrappeInteraction)
+    : false;
+  if (interruptsFrappeInteraction && frappeInteractionKey) {
+    options.enterprise?.frappeInteractionStore.clear(frappeInteractionKey);
+  }
+  const frappeContinuation = storedFrappeInteraction && !interruptsFrappeInteraction
+    ? continuePendingFrappeInteraction(storedFrappeInteraction, message.text)
+    : undefined;
+  if (paired.identity?.provider === "frappe" && frappeAuthorization) {
+    options.onStatus?.(frappeContinuation ? "Checking the next required detail" : "Checking your current access");
+  }
+  const frappeTurnContext = paired.identity?.provider === "frappe" && frappeAuthorization
+    ? await frappePermissionContextForTurn({
+        prompt: frappeContinuation?.prompt ?? message.text,
+        surfaceId: message.surfaceId,
+        identity: paired.identity,
+        authorization: frappeAuthorization,
+        registry: options.registry,
+        ...(frappeContinuation ? { continuation: frappeContinuation.continuation } : {}),
+      })
+    : undefined;
+  if (frappeInteractionKey && frappeTurnContext?.pendingInteraction && options.enterprise) {
+    const nowMs = Date.now();
+    options.enterprise.frappeInteractionStore.put({
+      key: frappeInteractionKey,
+      site: paired.identity!.site,
+      principal: paired.identity!.user,
+      surfaceId: message.surfaceId,
+      conversationId: message.conversationId,
+      senderId: message.senderId,
+      doctype: frappeTurnContext.pendingInteraction.doctype,
+      operation: frappeTurnContext.pendingInteraction.operation,
+      values: frappeTurnContext.pendingInteraction.values,
+      requiredFields: frappeTurnContext.pendingInteraction.requiredFields,
+      phase: frappeTurnContext.pendingInteraction.requiredFields.length ? "collecting" : "review",
+      createdAtMs: storedFrappeInteraction?.createdAtMs ?? nowMs,
+      updatedAtMs: nowMs,
+      expiresAtMs: nowMs + 15 * 60_000,
+    });
+  }
+  const evidenceReply = frappeTurnContext ? frappeEvidenceQuickReply(frappeTurnContext) : undefined;
+  if (evidenceReply) {
+    if (options.enterprise) {
+      await recordGatewayUsage(options.enterprise, {
+        message,
+        paired,
+        assignment,
+        outcome: "success",
+        latencyMs: frappeTurnContext?.elapsedMs ?? 0,
+        inputTokens: estimateTokens(message.text),
+        outputTokens: estimateTokens(evidenceReply.text),
+        requestCategory: "frappe",
+        action: "gateway.frappe_evidence_reply",
+        agentId: profile,
+        policyIds: preflight.policyIds,
+      });
+    }
+    return evidenceReply;
+  }
+  if (frappeTurnContext) {
+    options.onStatus?.(frappeTurnContext.source === "live_frappe"
+      ? "Reading the information you can access"
+      : "Checking the current workflow");
+  }
+  const frappeTaskKind = frappeTaskKindForIntent(frappeTurnContext?.intent, message.text);
+  const governedFrappeTurn = paired.identity?.provider === "frappe"
+    && Boolean(options.trustedFrappe || isFrappeBusinessIntent(frappeTurnContext?.intent));
+  const trustedProviderBoundary = options.trustedFrappe
+    ? trustedFrappeProviderBoundary(
+        Object.keys(options.config.tools?.mcp?.servers ?? {}),
+        options.gateway?.frappe?.providerTools?.denyInherited ?? [],
+      )
+    : undefined;
+  const inheritedToolDeny = governedFrappeTurn
+    ? trustedProviderBoundary?.inheritedToolDeny ?? options.gateway?.frappe?.providerTools?.denyInherited ?? []
+    : [];
+  const nativeSessionPolicyKey = paired.identity?.provider === "frappe"
+    ? frappeNativeSessionPolicyKey(
+        paired.identity,
+        options.gateway?.frappe?.assistant,
+        Boolean(frappeAuthorization || options.trustedFrappe),
+        inheritedToolDeny,
+      )
+    : undefined;
   const customCommand = resolveCustomCommand(message, options.gateway);
-  let runText = customCommand?.prompt ?? maybeAddChannelArtifactInstructions(message.text);
+  let runText = customCommand?.prompt ?? (options.allowArtifacts === false ? message.text : maybeAddChannelArtifactInstructions(message.text));
   if (parsedCommand && !customCommand) {
     const skillCommand = await resolveSkillCommand(parsedCommand.name, parsedCommand.args, cwd, {
       skillAllowlist: resolveAgentSkillAllowlist(options.config, profile),
@@ -929,8 +1409,10 @@ export async function handleSurfaceMessage(
     ? runDraftLoop(channel.events, options.sink)
     : undefined;
   try {
+    if (paired.identity?.provider === "frappe") options.onStatus?.("Preparing your answer");
     const outcome = await runConversationExclusive(sessionKey, () => executeRun(options.config, {
       prompt: runText,
+      ...(frappeTaskKind ? { taskKind: frappeTaskKind } : {}),
       cwd,
       workspaceDir,
       skipRecall: !shouldRecallForChannel(message.text),
@@ -942,6 +1424,10 @@ export async function handleSurfaceMessage(
       nativeTransportOwner: options.nativeTransportOwner,
       agentId: profile,
       ...(process.env.MUSTER_CODEX_HOME ? { codexHome: process.env.MUSTER_CODEX_HOME } : {}),
+      ...(inheritedToolDeny.length
+        ? { inheritedToolDeny }
+        : {}),
+      ...(nativeSessionPolicyKey ? { nativeSessionPolicyKey } : {}),
       surfaceId: message.surfaceId,
       scopes: [
         ...pairingScopes(paired),
@@ -952,13 +1438,37 @@ export async function handleSurfaceMessage(
         options.onDelta?.(text);
       } : undefined,
       onReasoningDelta: options.onReasoningDelta,
+      ...(options.trustedFrappe
+        ? {
+            systemContext: trustedFrappeSystemContext(
+              paired.identity!,
+              options.trustedFrappe,
+              options.gateway?.frappe?.assistant,
+            ),
+            turnContext: trustedFrappeTurnContext(options.trustedFrappe),
+            nativeSandbox: trustedProviderBoundary!.nativeSandbox,
+            nativeNetworkAccess: trustedProviderBoundary!.nativeNetworkAccess,
+            skipSkillSelection: trustedProviderBoundary!.skipSkillSelection,
+          }
+        : paired.identity?.provider === "frappe"
+          ? {
+              systemContext: frappeChannelSystemContext(
+                paired.identity,
+                options.gateway?.frappe?.assistant,
+                Boolean(frappeAuthorization),
+              ),
+              ...(frappeTurnContext?.context
+                ? { turnContext: frappeChannelTurnContext(frappeTurnContext.context) }
+                : {}),
+            }
+          : {}),
     }), options.enterprise);
     if (outcome.episode.outcome?.kind !== "completed") {
       throw new Error(outcome.episode.outcome?.detail ?? "Run failed");
     }
     const extracted = extractMediaTags(outcome.episode.responseText);
-    const artifactRequested = isArtifactRequest(message.text);
-    const artifacts = await resolveChannelArtifacts(
+    const artifactRequested = options.allowArtifacts !== false && isArtifactRequest(message.text);
+    const artifacts = options.allowArtifacts === false ? [] : await resolveChannelArtifacts(
       outcome.episode.responseText,
       extracted.media.map((item) => item.ref),
       workspaceDir,
@@ -973,9 +1483,10 @@ export async function handleSurfaceMessage(
         tokenLedgerId: outcome.tokens.runId,
       },
     );
+    const safeProviderText = sanitizeChannelFinalText(extracted.text);
     const finalText = artifactRequested && !artifacts.length
-      ? `${extracted.text}\n\nArtifact delivery failed: the provider did not declare a verifiable file path for this run.`
-      : extracted.text;
+      ? `${safeProviderText}\n\nArtifact delivery failed: the provider did not declare a verifiable file path for this run.`
+      : safeProviderText;
     // finalize() is the only emitter of the final event (OpenClaw #33492).
     streamRun?.finalize(finalText);
     if (options.enterprise) {
@@ -1020,11 +1531,60 @@ export async function handleSurfaceMessage(
   }
 }
 
+function pendingFrappeInteractionKey(
+  message: Pick<SurfaceMessage, "surfaceId" | "conversationId" | "senderId">,
+  site: string,
+  principal: string,
+): string {
+  return createHash("sha256")
+    .update(site).update("\0")
+    .update(principal).update("\0")
+    .update(message.surfaceId).update("\0")
+    .update(message.conversationId).update("\0")
+    .update(message.senderId)
+    .digest("hex");
+}
+
+function continuePendingFrappeInteraction(
+  pending: PendingFrappeInteraction,
+  response: string,
+): {
+  readonly prompt: string;
+  readonly continuation: {
+    readonly doctype: string;
+    readonly operation: PendingFrappeInteraction["operation"];
+    readonly values: Readonly<Record<string, unknown>>;
+  };
+} | undefined {
+  if (pending.phase !== "collecting") return undefined;
+  const field = pending.requiredFields[0];
+  const value = response.trim();
+  if (!field || !value || value.length > 4_000) return undefined;
+  return {
+    prompt: `${pending.operation} ${pending.doctype}`,
+    continuation: {
+      doctype: pending.doctype,
+      operation: pending.operation,
+      values: { ...pending.values, [field.fieldname]: value },
+    },
+  };
+}
+
+function isIndependentFrappeRequest(response: string, pending: PendingFrappeInteraction): boolean {
+  if (pending.phase !== "collecting") return false;
+  const value = response.trim();
+  if (!value) return false;
+  const expected = pending.requiredFields[0];
+  if (expected?.options?.some((option) => option.localeCompare(value, undefined, { sensitivity: "accent" }) === 0)) return false;
+  if (/[?]$/.test(value)) return true;
+  return /^(?:how|what|when|where|who|which|show|list|check|tell|is|are|was|were|do|does|did|can|could|would|create|open|raise|apply|submit|approve|reject|cancel)\b/i.test(value);
+}
+
 async function readBody(request: IncomingMessage, limitBytes = 1_000_000): Promise<string> {
   let body = "";
   for await (const chunk of request) {
     body += chunk;
-    if (body.length > limitBytes) throw new Error("Request body too large.");
+    if (body.length > limitBytes) throw new GatewayHttpError(413, "Request body too large.");
   }
   return body;
 }
@@ -1034,10 +1594,103 @@ function sendJson(response: ServerResponse, status: number, payload: unknown): v
   response.end(JSON.stringify(payload));
 }
 
+function sendOAuthPage(response: ServerResponse, status: number, title: string, message: string): void {
+  const escape = (value: string): string => value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+  const body = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><style>body{margin:0;background:#081311;color:#e8fffb;font:16px/1.55 system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}.panel{max-width:560px;padding:32px;border:1px solid #3fc7b5;background:#0d1d1a}h1{margin:0 0 12px;color:#6ee7d5;font-size:26px}p{margin:0;color:#c8d8d5}</style></head><body><main class="panel"><h1>${escape(title)}</h1><p>${escape(message)}</p></main></body></html>`;
+  response.writeHead(status, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-length": Buffer.byteLength(body) });
+  response.end(body);
+}
+
 function bearerTokenMatches(request: IncomingMessage, expected: string): boolean {
   const header = request.headers.authorization ?? "";
   const presented = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
   return headerEquals(presented, expected);
+}
+
+function singleRequestHeader(request: IncomingMessage, name: string): string | undefined {
+  const value = request.headers[name];
+  return (Array.isArray(value) ? value[0] : value)?.trim() || undefined;
+}
+
+function parseJsonRecord(body: string, label: string): Record<string, unknown> {
+  let value: unknown;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    throw new GatewayHttpError(400, `${label} must be valid JSON.`);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new GatewayHttpError(400, `${label} must be a JSON object.`);
+  return value as Record<string, unknown>;
+}
+
+function frappeRunEventHttpStatus(error: FrappeRunEventError): number {
+  switch (error.code) {
+    case "forbidden": return 403;
+    case "conflict": return 409;
+    case "cursor_expired": return 410;
+    case "permission_filter_failed": return 503;
+    default: return 400;
+  }
+}
+
+function frappeRunScopeFromUnknown(value: unknown): FrappeRunEventScope {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new GatewayHttpError(400, "Frappe run event scope must be an object.");
+  return validateFrappeRunEventScope(value as FrappeRunEventScope);
+}
+
+function authenticatedFrappeRunScope(
+  request: IncomingMessage,
+  secret: string,
+): { readonly scope: FrappeRunEventScope; readonly csrfToken: string } {
+  const tenantId = singleRequestHeader(request, "x-frappe-tenant-id");
+  const userId = singleRequestHeader(request, "x-frappe-user-id");
+  if (!tenantId || !userId) throw new FrappeRunEventError("forbidden", "Frappe run authority headers are required.");
+  const siteId = singleRequestHeader(request, "x-frappe-site-id");
+  const scope = validateFrappeRunEventScope({
+    tenantId,
+    ...(siteId ? { siteId } : {}),
+    userId,
+  });
+  const csrfToken = singleRequestHeader(request, "x-frappe-csrf-token");
+  const csrfProof = singleRequestHeader(request, "x-muster-csrf-proof");
+  if (!csrfToken || !frappeRunCsrfProofMatches(csrfProof, secret, csrfToken, scope)) {
+    throw new FrappeRunEventError("forbidden", "Frappe run authority proof is invalid.");
+  }
+  return Object.freeze({ scope, csrfToken });
+}
+
+function trustedFrappeBindingRoute(pathname: string): boolean {
+  return pathname === TRUSTED_FRAPPE_CATALOG_PATH
+    || pathname === FRAPPE_TELEGRAM_LINK_PATH
+    || pathname === TRUSTED_FRAPPE_ASYNC_PATH
+    || pathname.startsWith(`${TRUSTED_FRAPPE_ASYNC_RUNS_PATH}/`)
+    || pathname === TRUSTED_FRAPPE_WORKFLOW_PROPOSALS_PATH
+    || pathname === TRUSTED_FRAPPE_READ_PLANS_PATH
+    || pathname === TRUSTED_FRAPPE_ASK_INTENTS_PATH
+    || pathname === TRUSTED_FRAPPE_MISSIONS_PATH
+    || pathname.startsWith(`${TRUSTED_FRAPPE_MISSIONS_PATH}/`)
+    || pathname === FRAPPE_RUN_EVENTS_PATH
+    || pathname.startsWith(`${FRAPPE_RUN_EVENTS_PATH}/`);
+}
+
+function frappeAsyncAuthorityScope(scope: FrappeRunEventScope): string {
+  return createHash("sha256").update(JSON.stringify([
+    scope.tenantId,
+    scope.siteId ?? "",
+    scope.userId.trim().toLowerCase(),
+  ])).digest("hex");
+}
+
+function assertSiteBindingScope(binding: FrappeSiteBindingRecord | undefined, scope: FrappeRunEventScope): void {
+  if (!binding) return;
+  if (scope.tenantId !== binding.tenantId || scope.siteId !== binding.siteUuid) {
+    throw new FrappeRunEventError("forbidden", "Frappe run authority does not match the authenticated site binding.");
+  }
 }
 
 /** Constant-time string compare for header secrets (returns false on undefined/length mismatch). */
@@ -1062,6 +1715,8 @@ interface AdapterContext {
   readonly enterprise?: GatewayEnterpriseRuntime;
   readonly approvalActions?: ApprovalActionCodec;
   readonly approvalStore?: SqliteApprovalActionStore;
+  readonly frappeOAuth?: FrappeOAuthCoordinator;
+  readonly frappeTelegramLinks?: FrappeTelegramLinkCoordinator;
   /** The HTTP route already verified the platform signature against the raw body. */
   readonly platformVerified?: boolean;
   /** Durable execution/delivery checkpoints for adapters acknowledged before work completes. */
@@ -1127,31 +1782,54 @@ async function withConversationLane<T>(
   }
 }
 
-function startTelegramTyping(options: {
+export interface TelegramTypingHandle {
+  pulse(): void;
+  stop(): void;
+}
+
+function noopTelegramTyping(): TelegramTypingHandle {
+  return { pulse: () => undefined, stop: () => undefined };
+}
+
+export function startTelegramTyping(options: {
   readonly botToken: string;
   readonly chatId: string;
   readonly fetcher: typeof fetch;
   readonly log: (line: string) => void;
   readonly apiBase?: string;
-}): () => void {
+}): TelegramTypingHandle {
   let stopped = false;
-  let timer: NodeJS.Timeout | undefined;
+  let inFlight = false;
+  let pending = false;
   const apiBase = options.apiBase ?? "https://api.telegram.org";
   const tick = (): void => {
     if (stopped) return;
+    if (inFlight) {
+      pending = true;
+      return;
+    }
+    inFlight = true;
+    pending = false;
     void options.fetcher(`${apiBase}/bot${options.botToken}/sendChatAction`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ chat_id: options.chatId, action: "typing" }),
     }).then((response) => {
       if (!response.ok) options.log(`telegram sendChatAction failed: HTTP ${response.status}`);
-    }).catch((error) => options.log(`telegram sendChatAction failed: ${error instanceof Error ? error.message : String(error)}`));
-    timer = setTimeout(tick, 2500);
+    }).catch((error) => options.log(`telegram sendChatAction failed: ${error instanceof Error ? error.message : String(error)}`)).finally(() => {
+      inFlight = false;
+      if (pending && !stopped) tick();
+    });
   };
   tick();
-  return () => {
-    stopped = true;
-    if (timer) clearTimeout(timer);
+  const timer = setInterval(tick, 2000);
+  return {
+    pulse: tick,
+    stop: () => {
+      stopped = true;
+      pending = false;
+      clearInterval(timer);
+    },
   };
 }
 
@@ -1243,48 +1921,79 @@ async function deliverTelegramArtifactsOnly(botToken: string, reply: SurfaceRepl
 }
 
 interface ChannelProgressHandle {
-  stop(finalText?: string): Promise<"updated" | "none">;
+  /** Provider-exposed reasoning summary delta. Hidden reasoning is never forwarded. */
+  update(delta: string): void;
+  /** Replace the placeholder with a truthful host lifecycle milestone. */
+  set(status: string): void;
+  stop(
+    finalText?: string,
+    finalOptions?: Pick<TelegramSendMessagePayload, "parse_mode" | "reply_markup">,
+  ): Promise<"updated" | "none">;
 }
 
 function noopProgress(): ChannelProgressHandle {
-  return { stop: async () => "none" };
+  return { update: () => undefined, set: () => undefined, stop: async () => "none" };
 }
 
 function channelApiSucceeded(result: unknown): boolean {
   return typeof result === "object" && result !== null && (result as { ok?: unknown }).ok === true;
 }
 
-async function startTelegramProgress(botToken: string, message: SurfaceMessage, context: AdapterContext): Promise<ChannelProgressHandle> {
+async function startTelegramProgress(
+  botToken: string,
+  message: SurfaceMessage,
+  context: AdapterContext,
+  onRendered: () => void = () => undefined,
+): Promise<ChannelProgressHandle> {
   if (context.gateway.telegram?.thinking !== "progress") return noopProgress();
-  const startedAt = Date.now();
+  let providerSummary = "";
+  let statusSummary = "";
+  let writeChain = Promise.resolve();
+  let lastRendered = channelProgressText(providerSummary);
   const response = await sendTelegramPayload(botToken, {
     chat_id: message.conversationId,
-    text: channelProgressText(message.text, "telegram"),
+    text: channelProgressText(providerSummary),
   }, context);
   const messageId = typeof response === "object" && response
     ? (response as { result?: { message_id?: unknown } }).result?.message_id
     : undefined;
   if (typeof messageId !== "number") return noopProgress();
   let stopped = false;
-  const tick = (): void => {
+  const queueUpdate = (): void => {
     if (stopped) return;
-    void sendTelegramPayload(botToken, {
-      chat_id: message.conversationId,
-      message_id: messageId,
-      text: channelProgressText(message.text, "telegram", Date.now() - startedAt),
-    }, context, "editMessageText");
-    timer = setTimeout(tick, 3000);
+    const text = channelProgressText(providerSummary || statusSummary);
+    if (text === lastRendered) return;
+    lastRendered = text;
+    writeChain = writeChain.then(async () => {
+      if (stopped) return;
+      await sendTelegramPayload(botToken, {
+        chat_id: message.conversationId,
+        message_id: messageId,
+        text,
+      }, context, "editMessageText");
+      onRendered();
+    });
   };
-  let timer = setTimeout(tick, 3000);
   return {
-    stop: async (finalText?: string) => {
+    update: (delta) => {
+      if (stopped || !delta) return;
+      providerSummary = `${providerSummary}${delta}`.slice(-4_800);
+      queueUpdate();
+    },
+    set: (status) => {
+      if (stopped || providerSummary || !status.trim()) return;
+      statusSummary = status.trim();
+      queueUpdate();
+    },
+    stop: async (finalText?: string, finalOptions = {}) => {
       stopped = true;
-      clearTimeout(timer);
+      await writeChain;
       if (finalText) {
         const result = await sendTelegramPayload(botToken, {
           chat_id: message.conversationId,
           message_id: messageId,
           text: finalText,
+          ...finalOptions,
         }, context, "editMessageText");
         return channelApiSucceeded(result) ? "updated" : "none";
       }
@@ -1408,10 +2117,11 @@ async function deliverSlackReply(botToken: string, reply: SurfaceReply | Pairing
 
 async function startSlackProgress(botToken: string, message: SurfaceMessage, context: AdapterContext): Promise<ChannelProgressHandle> {
   if (context.gateway.slack?.status !== "message" && context.gateway.slack?.thinking !== "progress") return noopProgress();
-  const startedAt = Date.now();
-  const text = context.gateway.slack?.thinking === "progress"
-    ? channelProgressText(message.text, "slack")
-    : "Processing this.";
+  let providerSummary = "";
+  let statusSummary = "";
+  let writeChain = Promise.resolve();
+  const text = "Working";
+  let lastRendered = text;
   const response = await sendSlackPayload(botToken, {
     channel: message.conversationId,
     thread_ts: message.replyTo,
@@ -1420,23 +2130,34 @@ async function startSlackProgress(botToken: string, message: SurfaceMessage, con
   const ts = typeof response === "object" && response ? (response as { ts?: unknown }).ts : undefined;
   if (typeof ts !== "string") return noopProgress();
   let stopped = false;
-  const tick = (): void => {
+  const queueUpdate = (): void => {
     if (stopped) return;
-    const nextText = context.gateway.slack?.thinking === "progress"
-      ? channelProgressText(message.text, "slack", Date.now() - startedAt)
-      : `Processing this · ${Math.max(1, Math.round((Date.now() - startedAt) / 1000))}s`;
-    void sendSlackPayload(botToken, {
-      channel: message.conversationId,
-      ts,
-      text: nextText,
-    }, context, "chat.update");
-    timer = setTimeout(tick, 3000);
+    const text = channelProgressText(providerSummary || statusSummary);
+    if (text === lastRendered) return;
+    lastRendered = text;
+    writeChain = writeChain.then(async () => {
+      if (stopped) return;
+      await sendSlackPayload(botToken, {
+        channel: message.conversationId,
+        ts,
+        text,
+      }, context, "chat.update");
+    });
   };
-  let timer = setTimeout(tick, 3000);
   return {
+    update: (delta) => {
+      if (stopped || !delta || context.gateway.slack?.thinking !== "progress") return;
+      providerSummary = `${providerSummary}${delta}`.slice(-4_800);
+      queueUpdate();
+    },
+    set: (status) => {
+      if (stopped || providerSummary || !status.trim()) return;
+      statusSummary = status.trim();
+      queueUpdate();
+    },
     stop: async (finalText?: string) => {
       stopped = true;
-      clearTimeout(timer);
+      await writeChain;
       if (finalText) {
         const result = await sendSlackPayload(botToken, {
           channel: message.conversationId,
@@ -1459,6 +2180,93 @@ async function startSlackProgress(botToken: string, message: SurfaceMessage, con
  * (constant-time) or the webhook is rejected with 401; otherwise we warn once
  * that the Telegram webhook is unauthenticated.
  */
+async function frappeTelegramOnboardingReply(
+  message: SurfaceMessage,
+  update: unknown,
+  context: AdapterContext,
+): Promise<SurfaceReply | undefined> {
+  const config = context.gateway.frappe?.telegramLinking;
+  if (!config?.enabled) return undefined;
+  const coordinator = context.frappeTelegramLinks;
+  const botId = telegramBotId(context.gateway.telegram?.botToken);
+  if (!coordinator || !botId) {
+    return { text: "Frappe Telegram linking is unavailable. Ask an administrator to verify the Muster gateway configuration." };
+  }
+  const updateId = telegramUpdateId(update);
+  if (updateId === undefined || !coordinator.claimTelegramUpdate(botId, updateId)) {
+    return { text: "This Telegram update cannot be used for identity linking. Start a new link from Frappe." };
+  }
+
+  const paired = await resolvePairing(message.surfaceId, message.senderId, context.cwd);
+  const identity = paired?.identity?.provider === "frappe" ? paired.identity : undefined;
+  const channelLink = identity?.telegramLink;
+  if (identity && channelLink && identity.permissionHash) {
+    const registeredTenant = config.tenants.find((tenant) => tenant.id === channelLink.tenantId
+      && normalizedHttpsOrigin(tenant.site) === normalizedHttpsOrigin(identity.site));
+    const currentBindingValid = channelLink.botId === botId
+      && Boolean(registeredTenant)
+      && channelLink.scopes.every((scope) => registeredTenant!.allowedScopes.includes(scope));
+    if (!currentBindingValid) {
+      await clearTrustedFrappePairingIdentity(message.surfaceId, message.senderId, context.cwd);
+      return { text: "Your Frappe Telegram link is no longer active. Open Muster in Frappe and create a new Telegram link." };
+    }
+    const active = coordinator.resolveActive(channelLink.linkId, {
+      site: identity.site,
+      user: identity.user,
+      tenantId: channelLink.tenantId,
+      botId: channelLink.botId,
+      scopes: channelLink.scopes,
+      permissionEpoch: identity.permissionHash,
+    });
+    if (active.ok && active.value.telegramUserId === message.senderId && active.value.telegramChatId === message.conversationId) return undefined;
+    await clearTrustedFrappePairingIdentity(message.surfaceId, message.senderId, context.cwd);
+    return { text: "Your Frappe Telegram link is no longer active. Open Muster in Frappe and create a new Telegram link." };
+  }
+
+  const token = telegramStartToken(message.text);
+  if (!token) {
+    return { text: "Connect this chat from Muster inside Frappe. Operator pairing is disabled for this trusted Frappe Telegram bot." };
+  }
+  const chatType = telegramChatType(update);
+  if (!chatType) return { text: "This Telegram identity link is unavailable. Start a new link from Frappe." };
+  const redeemed = coordinator.redeemFromTelegram({
+    token,
+    botId,
+    telegramUserId: message.senderId,
+    telegramChatId: message.conversationId,
+    chatType,
+  });
+  return redeemed.ok
+    ? { text: "Telegram identity observed. Return to Muster in Frappe, verify this Telegram account, and confirm the link." }
+    : { text: redeemed.message };
+}
+
+function telegramBotId(botToken: string | undefined): string | undefined {
+  const id = botToken?.split(":", 1)[0];
+  return id && /^[1-9][0-9]{0,18}$/.test(id) ? id : undefined;
+}
+
+function telegramStartToken(text: string): string | undefined {
+  const match = text.trim().match(/^\/start(?:@[A-Za-z0-9_]{5,32})?\s+([A-Za-z0-9_-]{43})$/);
+  return match?.[1];
+}
+
+function telegramUpdateId(update: unknown): string | undefined {
+  if (!update || typeof update !== "object") return undefined;
+  const value = (update as { update_id?: unknown }).update_id;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? String(value) : undefined;
+}
+
+function telegramChatType(update: unknown): TelegramChatType | undefined {
+  if (!update || typeof update !== "object") return undefined;
+  const typed = update as {
+    message?: { chat?: { type?: unknown } };
+    callback_query?: { message?: { chat?: { type?: unknown } } };
+  };
+  const value = typed.message?.chat?.type ?? typed.callback_query?.message?.chat?.type;
+  return value === "private" || value === "group" || value === "supergroup" || value === "channel" ? value : undefined;
+}
+
 async function handleTelegramWebhook(body: string, context: AdapterContext): Promise<unknown> {
   const botToken = context.gateway.telegram?.botToken;
   if (!botToken) throw new Error("Telegram adapter not configured. Add telegram.botToken to .muster/gateway.json.");
@@ -1468,7 +2276,7 @@ async function handleTelegramWebhook(body: string, context: AdapterContext): Pro
     if (!headerEquals(typeof presented === "string" ? presented : undefined, secretToken)) {
       throw new GatewayHttpError(401, "Telegram secret token mismatch.");
     }
-  } else if (!secretToken) {
+  } else if (!secretToken && !context.platformVerified) {
     warnUnauthenticatedOnce("telegram", context.log);
   }
   const payload = JSON.parse(body);
@@ -1479,6 +2287,18 @@ async function handleTelegramWebhook(body: string, context: AdapterContext): Pro
   if (cached !== undefined) return cached;
   const mapped = telegramUpdateToSurfaceMessage(payload, { approvalActions: context.approvalActions });
   if (!mapped) return { ok: true, ignored: "not a text message update" };
+  const onboardingReply = await frappeTelegramOnboardingReply(mapped, payload, context);
+  if (onboardingReply) {
+    if (context.durableDelivery) {
+      await context.durableDelivery.checkpoint([{ message: mapped, reply: onboardingReply }]);
+      await context.durableDelivery.begin();
+    }
+    await deliverTelegramReply(botToken, onboardingReply, mapped.conversationId, context, mapped);
+    if (context.durableDelivery) await context.durableDelivery.delivered();
+    const result = { ok: true, onboarding: true };
+    deliveryStore(deliveryKey, result);
+    return result;
+  }
   if (context.gateway.telegram?.stream === "draft") {
     const message: SurfaceMessage = { ...mapped, stream: "draft" };
     const channelSink = createTelegramDraftSink({
@@ -1498,72 +2318,106 @@ async function handleTelegramWebhook(body: string, context: AdapterContext): Pro
         durableDraftDelivered = true;
       },
     } : channelSink;
-    const stopTyping = context.gateway.telegram?.status === "typing"
-      ? startTelegramTyping({ botToken, chatId: message.conversationId, fetcher: context.fetcher, log: context.log })
-      : () => undefined;
+    let typing = noopTelegramTyping();
     let reply: SurfaceReply | PairingChallenge;
     let progress = noopProgress();
     try {
-      progress = await startTelegramProgress(botToken, message, context);
-      reply = await withConversationLane(message, context, context.gateway.telegram?.busy ?? "queue", () => handleSurfaceMessage(message, { ...context, sink }));
+      progress = await startTelegramProgress(botToken, message, context, () => typing.pulse());
+      // Telegram clears chat actions when the bot sends a message. Start the
+      // keepalive after the progress placeholder so the native header remains
+      // visibly active throughout the provider run.
+      typing = context.gateway.telegram?.status !== "off"
+        ? startTelegramTyping({ botToken, chatId: message.conversationId, fetcher: context.fetcher, log: context.log })
+        : noopTelegramTyping();
+      reply = await withConversationLane(message, context, context.gateway.telegram?.busy ?? "queue", () => handleSurfaceMessage(message, {
+        ...context,
+        sink,
+        onReasoningDelta: (delta) => progress.update(delta),
+        onStatus: (status) => progress.set(status),
+      }));
       await progress.stop(isPairingChallenge(reply) ? undefined : "✓ Done");
     } catch (error) {
-      await progress.stop("! Failed");
+      try {
+        await progress.stop("! Failed");
+      } finally {
+        typing.stop();
+      }
       throw error;
-    } finally {
-      stopTyping();
     }
-    // A streamed reply was already delivered draft-by-draft by the sink;
-    // pairing challenges fall through to the normal buffered send below.
-    if (!isPairingChallenge(reply) && durableDraftDelivered) {
-      for (const artifact of reply.artifacts ?? []) await sendTelegramArtifact(botToken, artifact, message.conversationId, context);
-      const result = { ok: true, streamed: true };
+    try {
+      // A streamed reply was already delivered draft-by-draft by the sink;
+      // pairing challenges fall through to the normal buffered send below.
+      if (!isPairingChallenge(reply) && durableDraftDelivered) {
+        for (const artifact of reply.artifacts ?? []) await sendTelegramArtifact(botToken, artifact, message.conversationId, context);
+        const result = { ok: true, streamed: true };
+        deliveryStore(deliveryKey, result);
+        return result;
+      }
+      if (context.durableDelivery && !durableDraftDelivered) {
+        await context.durableDelivery.checkpoint([{ message, reply }]);
+        await context.durableDelivery.begin();
+      }
+      await deliverTelegramReply(botToken, reply, message.conversationId, context, message);
+      if (context.durableDelivery && !durableDraftDelivered) await context.durableDelivery.delivered();
+      const result = { ok: true };
       deliveryStore(deliveryKey, result);
       return result;
+    } finally {
+      typing.stop();
     }
-    if (context.durableDelivery && !durableDraftDelivered) {
-      await context.durableDelivery.checkpoint([{ message, reply }]);
-      await context.durableDelivery.begin();
-    }
-    await deliverTelegramReply(botToken, reply, message.conversationId, context, message);
-    if (context.durableDelivery && !durableDraftDelivered) await context.durableDelivery.delivered();
-    const result = { ok: true };
-    deliveryStore(deliveryKey, result);
-    return result;
   }
   const message = mapped;
-  const stopTyping = context.gateway.telegram?.status === "typing"
-    ? startTelegramTyping({ botToken, chatId: message.conversationId, fetcher: context.fetcher, log: context.log })
-    : () => undefined;
+  let typing = noopTelegramTyping();
   let reply: SurfaceReply | PairingChallenge;
   let progress = noopProgress();
   let progressFinal: "updated" | "none" = "none";
   let durableDeliveryBegan = false;
   try {
-    progress = await startTelegramProgress(botToken, message, context);
-    reply = await withConversationLane(message, context, context.gateway.telegram?.busy ?? "queue", () => handleSurfaceMessage(message, context));
+    progress = await startTelegramProgress(botToken, message, context, () => typing.pulse());
+    typing = context.gateway.telegram?.status !== "off"
+      ? startTelegramTyping({ botToken, chatId: message.conversationId, fetcher: context.fetcher, log: context.log })
+      : noopTelegramTyping();
+    reply = await withConversationLane(message, context, context.gateway.telegram?.busy ?? "queue", () => handleSurfaceMessage(message, {
+      ...context,
+      onReasoningDelta: (delta) => progress.update(delta),
+      onStatus: (status) => progress.set(status),
+    }));
     if (context.durableDelivery) await context.durableDelivery.checkpoint([{ message, reply }]);
     if (context.durableDelivery && !isPairingChallenge(reply) && !reply.approvalRequest) {
       await context.durableDelivery.begin();
       durableDeliveryBegan = true;
     }
-    progressFinal = await progress.stop(!isPairingChallenge(reply) && !reply.approvalRequest ? reply.text : undefined);
+    if (!isPairingChallenge(reply) && !reply.approvalRequest) {
+      const finalPayload = surfaceReplyToTelegramSend(reply, message.conversationId, {
+        approvalAction: approvalRenderContext(reply, message, context),
+      });
+      progressFinal = await progress.stop(finalPayload.text, {
+        ...(finalPayload.parse_mode ? { parse_mode: finalPayload.parse_mode } : {}),
+        ...(finalPayload.reply_markup ? { reply_markup: finalPayload.reply_markup } : {}),
+      });
+    }
   } catch (error) {
-    await progress.stop("! Failed");
+    try {
+      await progress.stop("! Failed");
+    } finally {
+      typing.stop();
+    }
     throw error;
+  }
+  try {
+    if (context.durableDelivery && !durableDeliveryBegan) await context.durableDelivery.begin();
+    if (isPairingChallenge(reply) || reply.approvalRequest || progressFinal !== "updated") {
+      await deliverTelegramReply(botToken, reply, message.conversationId, context, message);
+    } else {
+      await deliverTelegramArtifactsOnly(botToken, reply, message.conversationId, context);
+    }
+    if (context.durableDelivery) await context.durableDelivery.delivered();
+    const result = { ok: true };
+    deliveryStore(deliveryKey, result);
+    return result;
   } finally {
-    stopTyping();
+    typing.stop();
   }
-  if (context.durableDelivery && !durableDeliveryBegan) await context.durableDelivery.begin();
-  if (isPairingChallenge(reply) || reply.approvalRequest || progressFinal !== "updated") {
-    await deliverTelegramReply(botToken, reply, message.conversationId, context, message);
-  } else {
-    await deliverTelegramArtifactsOnly(botToken, reply, message.conversationId, context);
-  }
-  if (context.durableDelivery) await context.durableDelivery.delivered();
-  const result = { ok: true };
-  deliveryStore(deliveryKey, result);
-  return result;
 }
 
 export interface TelegramPollOptions {
@@ -1571,6 +2425,9 @@ export interface TelegramPollOptions {
   readonly gateway: GatewayConfig;
   readonly cwd?: string;
   readonly fetcher?: typeof fetch;
+  /** Shared Frappe OAuth coordinator used by the HTTP callback and channel worker. */
+  readonly frappeOAuth?: FrappeOAuthCoordinator;
+  readonly frappeTelegramLinks?: FrappeTelegramLinkCoordinator;
   readonly registry?: FlowToolRegistry;
   readonly enterprise?: GatewayEnterpriseRuntime;
   readonly ingress?: DurableGatewayIngress;
@@ -1614,6 +2471,9 @@ export async function pollTelegram(options: TelegramPollOptions): Promise<void> 
   });
   const ownsEnterpriseRuntime = options.enterprise === undefined;
   const enterprise = options.enterprise ?? openSqliteGatewayEnterpriseRuntime(cwd);
+  const ownsFrappeTelegramLinks = options.frappeTelegramLinks === undefined && options.gateway.frappe?.telegramLinking?.enabled === true;
+  const frappeTelegramLinks = options.frappeTelegramLinks
+    ?? (ownsFrappeTelegramLinks ? openSqliteFrappeTelegramLinkCoordinator(join(dataDir(cwd), "frappe-telegram-links.db")) : undefined);
   const ingress = options.ingress ?? new DurableGatewayIngress(enterprise.idempotencyStore, { defaultLeaseMs: 15 * 60_000 });
   const ingressSpool = options.ingressSpool ?? new DurableGatewayIngressSpool(
     join(dataDir(cwd), "gateway-ingress-spool"),
@@ -1628,8 +2488,28 @@ export async function pollTelegram(options: TelegramPollOptions): Promise<void> 
     ingressSpool,
     approvalActions,
     approvalStore,
+    frappeTelegramLinks,
   }, queue, ingressSpool);
   const base = `https://api.telegram.org/bot${botToken}`;
+  const telegramCommands = gatewayCommandCatalog(options.gateway)
+    .map((entry) => ({
+      command: entry.name.replaceAll("-", "_").slice(0, 32),
+      description: entry.description.trim().slice(0, 256),
+    }))
+    .filter((entry, index, entries) => /^[a-z][a-z0-9_]{0,31}$/.test(entry.command)
+      && entry.description.length > 0
+      && entries.findIndex((candidate) => candidate.command === entry.command) === index)
+    .slice(0, 100);
+  try {
+    const published = await fetcher(`${base}/setMyCommands`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ commands: telegramCommands }),
+    });
+    if (!published.ok) log(`telegram setMyCommands HTTP ${published.status}`);
+  } catch (error) {
+    log(`telegram setMyCommands error: ${error instanceof Error ? error.message : String(error)}`);
+  }
   // getUpdates is rejected while a webhook is set; clear it first (best-effort).
   try { await fetcher(`${base}/deleteWebhook`, { method: "POST" }); } catch { /* best-effort */ }
   log("telegram long-poll started");
@@ -1673,7 +2553,7 @@ export async function pollTelegram(options: TelegramPollOptions): Promise<void> 
         if (claim.status === "conflict") {
           log(`telegram update ${updateId} conflicts with a prior durable fingerprint; quarantining by offset`);
         } else if (claim.status === "replay" || claim.status === "in-flight") {
-          await acknowledgeTelegramReplay(body, effectiveAdapterContext({ ...options, enterprise, approvalActions, approvalStore }, {}, queue, cwd, true));
+          await acknowledgeTelegramReplay(body, effectiveAdapterContext({ ...options, enterprise, approvalActions, approvalStore, frappeTelegramLinks }, {}, queue, cwd, true));
         } else {
           if (!claim.claimToken) throw new Error("Telegram ingress claim did not return its generation token.");
           const ownership: GatewayIngressOwnership = { ...identity, claimToken: claim.claimToken };
@@ -1689,7 +2569,7 @@ export async function pollTelegram(options: TelegramPollOptions): Promise<void> 
             await saveTelegramPollOffset(cwd, persistedOffset);
             offset = persistedOffset;
           }
-          const context = effectiveAdapterContext({ ...options, enterprise, approvalActions, approvalStore }, {}, queue, cwd, true);
+          const context = effectiveAdapterContext({ ...options, enterprise, approvalActions, approvalStore, frappeTelegramLinks }, {}, queue, cwd, true);
           await runAcceptedDurableAdapter({
             adapterId: "telegram",
             body,
@@ -1713,6 +2593,7 @@ export async function pollTelegram(options: TelegramPollOptions): Promise<void> 
     }
   }
   if (ownsApprovalStore) approvalStore.close();
+  if (ownsFrappeTelegramLinks) frappeTelegramLinks?.close();
   if (ownsEnterpriseRuntime) await enterprise.close?.();
   log("telegram long-poll stopped");
 }
@@ -1788,7 +2669,12 @@ async function handleSlackPayload(payload: unknown, context: AdapterContext, bot
     const progress = await startSlackProgress(botToken, message, context);
     let reply: SurfaceReply | PairingChallenge;
     try {
-      reply = await withConversationLane(message, context, context.gateway.slack?.busy ?? "queue", () => handleSurfaceMessage(message, { ...context, sink }));
+      reply = await withConversationLane(message, context, context.gateway.slack?.busy ?? "queue", () => handleSurfaceMessage(message, {
+        ...context,
+        sink,
+        onReasoningDelta: (delta) => progress.update(delta),
+        onStatus: (status) => progress.set(status),
+      }));
       await progress.stop(isPairingChallenge(reply) ? undefined : "✓ Done");
     } catch (error) {
       await progress.stop("! Failed");
@@ -1813,7 +2699,11 @@ async function handleSlackPayload(payload: unknown, context: AdapterContext, bot
   let progressFinal: "updated" | "none" = "none";
   let durableDeliveryBegan = false;
   try {
-    reply = await withConversationLane(inbound.message, context, context.gateway.slack?.busy ?? "queue", () => handleSurfaceMessage(inbound.message, context));
+    reply = await withConversationLane(inbound.message, context, context.gateway.slack?.busy ?? "queue", () => handleSurfaceMessage(inbound.message, {
+      ...context,
+      onReasoningDelta: (delta) => progress.update(delta),
+      onStatus: (status) => progress.set(status),
+    }));
     if (context.durableDelivery) await context.durableDelivery.checkpoint([{ message: inbound.message, reply }]);
     if (context.durableDelivery && !isPairingChallenge(reply) && !reply.approvalRequest) {
       await context.durableDelivery.begin();
@@ -1842,6 +2732,8 @@ interface SlackSocketOptions {
   readonly cwd?: string;
   readonly fetcher?: typeof fetch;
   readonly registry?: FlowToolRegistry;
+  /** Shared Frappe OAuth coordinator used by /pair and permission-bound runs. */
+  readonly frappeOAuth?: FrappeOAuthCoordinator;
   readonly enterprise?: GatewayEnterpriseRuntime;
   readonly ingress?: DurableGatewayIngress;
   readonly ingressSpool?: DurableGatewayIngressSpool;
@@ -2158,7 +3050,34 @@ async function handleGchatWebhook(body: string, context: AdapterContext): Promis
   if (cached !== undefined) return cached;
   const inbound = gchatEventToSurfaceMessage(payload, { commands: context.gateway.gchat.commands, approvalActions: context.approvalActions });
   if (inbound.kind === "ignored") return { ok: true, ignored: inbound.reason };
-  const reply = await handleSurfaceMessage(inbound.message, context);
+  let trustedFrappe: TrustedFrappeContext | undefined;
+  const identityConfig = context.gateway.gchat.frappeIdentity;
+  if (identityConfig) {
+    const actor = gchatActor(payload);
+    const existing = await resolvePairing(inbound.message.surfaceId, inbound.message.senderId, context.cwd);
+    const cacheTtlMs = Math.max(0, Math.min(5 * 60_000, Math.trunc(identityConfig.cacheTtlMs ?? 60_000)));
+    const identityIsFresh = existing?.identity?.provider === "frappe"
+      && Number.isFinite(Date.parse(existing.identity.resolvedAt))
+      && Date.now() - Date.parse(existing.identity.resolvedAt) <= cacheTtlMs;
+    if (!identityIsFresh) {
+      const resolved = await resolveGchatFrappeIdentity(actor, identityConfig, context.fetcher);
+      if (!resolved.ok) {
+        if (resolved.detail) context.log(`[gchat] Frappe identity resolution failed: ${resolved.detail}`);
+        return surfaceReplyToGchatResponse({ text: resolved.reason }, inbound.message.replyTo);
+      }
+      await upsertTrustedFrappePairing(
+        inbound.message.surfaceId,
+        inbound.message.senderId,
+        resolved.identity,
+        context.cwd,
+      );
+    }
+    trustedFrappe = {
+      pageType: "Google Chat",
+      summary: "The sender identity was resolved by Frappe. No business record rows were attached to this turn.",
+    };
+  }
+  const reply = await handleSurfaceMessage(inbound.message, { ...context, ...(trustedFrappe ? { trustedFrappe } : {}) });
   const result = surfaceReplyToGchatResponse(reply, inbound.message.replyTo, { approvalAction: approvalRenderContext(reply, inbound.message, context) });
   if (!isPairingChallenge(reply)) deliveryStore(deliveryKey, result);
   return result;
@@ -2272,6 +3191,8 @@ function effectiveAdapterContext(
     enterprise: options.enterprise,
     approvalActions: options.approvalActions,
     approvalStore: options.approvalStore,
+    frappeOAuth: options.frappeOAuth,
+    frappeTelegramLinks: options.frappeTelegramLinks,
     platformVerified,
     durableDelivery,
   };
@@ -2844,6 +3765,149 @@ async function recoverIngressSpool(
   }
 }
 
+function frappeTelegramAuthorityFromRequest(
+  payload: Record<string, unknown>,
+  gateway: GatewayConfig,
+): FrappeTelegramAuthority {
+  const linking = gateway.frappe?.telegramLinking;
+  const botId = telegramBotId(gateway.telegram?.botToken);
+  if (!linking?.enabled || !botId) throw new GatewayHttpError(503, "Frappe Telegram linking is not configured.");
+  const tenantId = typeof payload.tenantId === "string" ? payload.tenantId.trim() : "";
+  const site = typeof payload.site === "string" ? payload.site.trim() : "";
+  const user = typeof payload.user === "string" ? payload.user.trim().toLowerCase() : "";
+  const permissionEpoch = typeof payload.permissionEpoch === "string" ? payload.permissionEpoch.trim() : "";
+  const scopes = Array.isArray(payload.scopes) ? payload.scopes.filter((scope): scope is string => typeof scope === "string") : [];
+  const tenant = linking.tenants.find((entry) => entry.id === tenantId);
+  if (!tenant || normalizedHttpsOrigin(tenant.site) !== normalizedHttpsOrigin(site)) {
+    throw new GatewayHttpError(403, "Frappe Telegram tenant binding is not authorized.");
+  }
+  const allowed = new Set(tenant.allowedScopes);
+  if (!scopes.length || scopes.some((scope) => !allowed.has(scope))) {
+    throw new GatewayHttpError(403, "Frappe Telegram scopes are not authorized for this tenant.");
+  }
+  if (!user || !permissionEpoch) throw new GatewayHttpError(400, "Frappe Telegram user and permission epoch are required.");
+  return { site: normalizedHttpsOrigin(site), user, tenantId, botId, scopes, permissionEpoch };
+}
+
+function normalizedHttpsOrigin(value: string): string {
+  let url: URL;
+  try { url = new URL(value); } catch { throw new GatewayHttpError(400, "Frappe site must be a valid HTTPS origin."); }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || (url.pathname !== "/" && url.pathname !== "")) {
+    throw new GatewayHttpError(400, "Frappe site must be a valid HTTPS origin.");
+  }
+  return url.origin;
+}
+
+function frappeTelegramIdentityFromRequest(
+  raw: unknown,
+  authority: FrappeTelegramAuthority,
+  linkId: string,
+): Omit<PairedIdentity, "provider" | "resolvedAt"> & { readonly resolvedAt?: string } {
+  const identity = objectRecord(raw);
+  if (!identity) throw new GatewayHttpError(400, "A permission-checked Frappe identity is required.");
+  const site = typeof identity.site === "string" ? normalizedHttpsOrigin(identity.site) : "";
+  const user = typeof identity.user === "string" ? identity.user.trim().toLowerCase() : "";
+  const permissionHash = typeof identity.permissionHash === "string" ? identity.permissionHash.trim() : "";
+  const roles = Array.isArray(identity.roles)
+    ? identity.roles.filter((role): role is string => typeof role === "string" && Boolean(role.trim())).map((role) => role.trim())
+    : [];
+  if (site !== authority.site || user !== authority.user || permissionHash !== authority.permissionEpoch || !roles.length) {
+    throw new GatewayHttpError(403, "Frappe identity does not match the issued Telegram authority.");
+  }
+  const optional = (key: "userName" | "employee" | "employeeName" | "employeeStatus" | "reportsTo" | "reportsToName" | "department" | "departmentName" | "company" | "displayNamesResolvedAt" | "rolesHash") => {
+    const value = identity[key];
+    return typeof value === "string" && value.trim() ? { [key]: value.trim() } : {};
+  };
+  return {
+    site,
+    user,
+    roles,
+    permissionHash,
+    authMode: "frappe_session",
+    telegramLink: { linkId, tenantId: authority.tenantId, botId: authority.botId, scopes: [...authority.scopes] },
+    ...optional("userName"),
+    ...optional("employee"),
+    ...optional("employeeName"),
+    ...optional("employeeStatus"),
+    ...optional("reportsTo"),
+    ...optional("reportsToName"),
+    ...optional("department"),
+    ...optional("departmentName"),
+    ...optional("company"),
+    ...optional("displayNamesResolvedAt"),
+    ...optional("rolesHash"),
+  };
+}
+
+async function handleFrappeTelegramLinkRpc(
+  payload: Record<string, unknown>,
+  options: GatewayServerOptions,
+  cwd: string,
+): Promise<{ readonly status: number; readonly body: unknown }> {
+  const coordinator = options.frappeTelegramLinks;
+  const linking = options.gateway.frappe?.telegramLinking;
+  if (!coordinator || !linking?.enabled) throw new GatewayHttpError(503, "Frappe Telegram linking is not configured.");
+  const action = typeof payload.action === "string" ? payload.action : "issue";
+  if (action === "rebind") {
+    const tenantId = typeof payload.tenantId === "string" ? payload.tenantId.trim() : "";
+    const site = typeof payload.site === "string" ? normalizedHttpsOrigin(payload.site) : "";
+    const tenant = linking.tenants.find((entry) => entry.id === tenantId && normalizedHttpsOrigin(entry.site) === site);
+    if (!tenant) throw new GatewayHttpError(403, "Frappe Telegram tenant binding is not authorized.");
+    const botId = telegramBotId(options.gateway.telegram?.botToken);
+    const invalidated = coordinator.invalidateForRebind({ site, tenantId, botId });
+    const identitiesCleared = await clearTrustedFrappeTelegramBindings(site, tenantId, botId, cwd);
+    return { status: 200, body: { ok: true, invalidated, identitiesCleared } };
+  }
+  const authority = frappeTelegramAuthorityFromRequest(payload, options.gateway);
+  if (action === "issue") {
+    const allowedChatTypes = Array.isArray(payload.allowedChatTypes)
+      ? payload.allowedChatTypes.filter((value): value is TelegramChatType => value === "private" || value === "group" || value === "supergroup" || value === "channel")
+      : ["private" as const];
+    const started = coordinator.issue({
+      ...authority,
+      allowedChatTypes,
+      ...(typeof payload.ttlMs === "number" ? { ttlMs: payload.ttlMs } : {}),
+    });
+    if (!/^[A-Za-z0-9_]{5,32}$/.test(linking.botUsername)) throw new GatewayHttpError(503, "Telegram bot username is invalid.");
+    return {
+      status: 201,
+      body: {
+        ok: true,
+        linkId: started.linkId,
+        expiresAt: started.expiresAt,
+        startUrl: `https://t.me/${linking.botUsername}?start=${started.token}`,
+      },
+    };
+  }
+  const linkId = typeof payload.linkId === "string" ? payload.linkId.trim() : "";
+  if (!linkId) throw new GatewayHttpError(400, "Telegram linkId is required.");
+  if (action === "confirm") {
+    const identity = frappeTelegramIdentityFromRequest(payload.identity, authority, linkId);
+    const confirmed = coordinator.confirm({ ...authority, linkId });
+    if (!confirmed.ok) throw new GatewayHttpError(403, confirmed.message);
+    const paired = await upsertTrustedFrappePairing("telegram:bot", confirmed.value.telegramUserId, identity, cwd);
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        linkId,
+        pairingId: paired.pairingId,
+        telegramUserId: confirmed.value.telegramUserId,
+        telegramChatId: confirmed.value.telegramChatId,
+        chatType: confirmed.value.chatType,
+      },
+    };
+  }
+  if (action === "revoke") {
+    const active = coordinator.resolveActive(linkId, authority);
+    const revoked = coordinator.revoke({ linkId, site: authority.site, user: authority.user, tenantId: authority.tenantId });
+    if (!revoked.ok) throw new GatewayHttpError(403, revoked.message);
+    if (active.ok) await clearTrustedFrappePairingIdentity("telegram:bot", active.value.telegramUserId, cwd);
+    return { status: 200, body: { ok: true, linkId, revokedAt: revoked.value.revokedAt } };
+  }
+  throw new GatewayHttpError(400, "Unsupported Frappe Telegram link action.");
+}
+
 async function route(
   request: IncomingMessage,
   response: ServerResponse,
@@ -2857,6 +3921,65 @@ async function route(
 
   if (request.method === "GET" && url.pathname === "/v1/health") {
     sendJson(response, 200, { ok: true, service: "muster-gateway" });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === FRAPPE_SITE_AUTHORIZE_PATH) {
+    if (!options.frappeSiteBindings) throw new GatewayHttpError(503, "Frappe site binding is unavailable.");
+    const location = options.frappeSiteBindings.authorize(url);
+    response.writeHead(302, { location, "cache-control": "no-store", "referrer-policy": "no-referrer" });
+    response.end();
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === FRAPPE_SITE_EXCHANGE_PATH) {
+    if (!options.frappeSiteBindings) throw new GatewayHttpError(503, "Frappe site binding is unavailable.");
+    const payload = parseJsonRecord(await readBody(request, 64_000), "Frappe site OAuth exchange");
+    response.setHeader("cache-control", "private, no-store");
+    sendJson(response, 200, await options.frappeSiteBindings.exchange(payload));
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === FRAPPE_SITE_API_CREDENTIALS_PATH) {
+    if (!options.frappeSiteBindings) throw new GatewayHttpError(503, "Frappe site binding is unavailable.");
+    const payload = parseJsonRecord(await readBody(request, 64_000), "Frappe site API credential exchange");
+    response.setHeader("cache-control", "private, no-store");
+    sendJson(response, 200, await options.frappeSiteBindings.exchangeApiCredentials(payload));
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === FRAPPE_SITE_VERIFY_PATH) {
+    if (!options.frappeSiteBindings) throw new GatewayHttpError(503, "Frappe site binding is unavailable.");
+    const token = bearerFromRequest(request);
+    const payload = parseJsonRecord(await readBody(request, 64_000), "Frappe site reciprocal verification");
+    response.setHeader("cache-control", "private, no-store");
+    sendJson(response, 200, options.frappeSiteBindings.verify(token, payload));
+    return;
+  }
+
+  if (request.method === "GET" && ["/frappe2/oauth/callback", "/v1/frappe/oauth/callback"].includes(url.pathname)) {
+    if (!options.frappeOAuth) {
+      sendOAuthPage(response, 404, "Pairing unavailable", "This Muster gateway has no Frappe OAuth connection configured.");
+      return;
+    }
+    let completed: Awaited<ReturnType<FrappeOAuthCoordinator["completeCallback"]>> | undefined;
+    try {
+      completed = await options.frappeOAuth.completeCallback(request.url ?? url.pathname);
+      const current = await resolvePairing(completed.surfaceId, completed.senderId, cwd);
+      if (!current || current.pairingId !== completed.pairingId) throw new Error("The channel pairing changed before Frappe authorization completed.");
+      await upsertTrustedFrappePairing(completed.surfaceId, completed.senderId, completed.identity, cwd);
+      sendOAuthPage(response, 200, "Frappe paired", `Signed in as ${completed.identity.employeeName ?? completed.identity.user}. Return to the chat and use /whoami to verify your scope.`);
+    } catch (error) {
+      if (completed) {
+        await options.frappeOAuth.disconnect(completed.connectionId, {
+          surfaceId: completed.surfaceId,
+          senderId: completed.senderId,
+          pairingId: completed.pairingId,
+        }).catch(() => undefined);
+      }
+      options.log?.(`Frappe OAuth callback failed: ${error instanceof Error ? error.message : String(error)}`);
+      sendOAuthPage(response, 400, "Pairing did not complete", "The authorization was denied, expired, or already used. Return to the chat and run /pair again.");
+    }
     return;
   }
 
@@ -2989,7 +4112,10 @@ async function route(
     };
     if (runAfterAcknowledgement) {
       sendJson(response, 200, { ok: true, accepted: true });
-      const task = processAdapter().then(() => undefined).catch(async (error) => {
+      // Claim and spool are durable at this point. Defer execution by one
+      // event-loop turn so platform acknowledgements are not held behind the
+      // first synchronous SQLite transition in the background workflow.
+      const task = new Promise<void>((resolveTask) => setImmediate(resolveTask)).then(processAdapter).then(() => undefined).catch(async (error) => {
         context.log(`background ${adapterId} delivery failed: ${error instanceof Error ? error.message : String(error)}`);
         if (error instanceof PostDeliveryPersistenceError) return;
         await notifyBackgroundFailure(adapterId, body, context).catch((deliveryError) => {
@@ -3004,9 +4130,229 @@ async function route(
     return;
   }
 
-  // Everything below requires the gateway bearer token.
-  if (!bearerTokenMatches(request, options.gateway.token)) {
+  // Everything below requires either the deployment bearer or a verified,
+  // exact-site binding bearer on the narrow trusted Frappe routes.
+  const deploymentBearer = bearerTokenMatches(request, options.gateway.token);
+  let siteBinding: FrappeSiteBindingRecord | undefined;
+  if (!deploymentBearer && options.frappeSiteBindings && trustedFrappeBindingRoute(url.pathname)) {
+    try { siteBinding = options.frappeSiteBindings.authorization(bearerFromRequest(request)); } catch { /* uniform 401 below */ }
+  }
+  const productionSiteRoute = options.gateway.security?.deployment === "production"
+    && trustedFrappeBindingRoute(url.pathname);
+  // A deployment-wide operator bearer is not site authority. Production
+  // planning, mission, run-event, and Frappe-link routes must authenticate the
+  // exact reciprocal site binding and its separate HMAC secret.
+  if ((!deploymentBearer && !siteBinding) || (productionSiteRoute && !siteBinding)) {
     sendJson(response, 401, { error: "Unauthorized. Send Authorization: Bearer <gateway token>." });
+    return;
+  }
+  const frappeAuthoritySecret = siteBinding?.secrets.hmacSecret ?? options.frappeRunCsrfSecret ?? options.gateway.token;
+
+  if (request.method === "POST" && url.pathname === TRUSTED_FRAPPE_WORKFLOW_PROPOSALS_PATH) {
+    const { scope } = authenticatedFrappeRunScope(request, frappeAuthoritySecret);
+    assertSiteBindingScope(siteBinding, scope);
+    const idempotencyKey = singleRequestHeader(request, "idempotency-key");
+    if (!idempotencyKey || idempotencyKey.length > 140) {
+      throw new GatewayHttpError(400, "Idempotency-Key is required for trusted Frappe workflow planning.");
+    }
+    const payload = parseJsonRecord(
+      await readBody(request, MAX_FRAPPE_PLANNING_REQUEST_BYTES),
+      "Trusted Frappe workflow planning request",
+    );
+    try {
+      const planned = await createFrappeWorkflowProposalResult(payload, scope, options.frappeWorkflowPlanner);
+      response.setHeader("cache-control", "private, no-store");
+      sendJson(response, 200, {
+        schemaVersion: 1,
+        requestId: payload.requestId,
+        status: "proposed",
+        proposal: planned.proposal,
+        graph: planned.graph,
+        ...(planned.runMetadata ? { run: planned.runMetadata } : {}),
+      });
+    } catch (error) {
+      if (error instanceof FrappeWorkflowPlanningError) {
+        throw new GatewayHttpError(error.code === "capability_escalation" ? 403 : 400, error.message);
+      }
+      throw error;
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === TRUSTED_FRAPPE_READ_PLANS_PATH) {
+    const { scope } = authenticatedFrappeRunScope(request, frappeAuthoritySecret);
+    assertSiteBindingScope(siteBinding, scope);
+    const idempotencyKey = singleRequestHeader(request, "idempotency-key");
+    if (!idempotencyKey || idempotencyKey.length > 140) {
+      throw new GatewayHttpError(400, "Idempotency-Key is required for trusted Frappe read planning.");
+    }
+    const payload = parseJsonRecord(
+      await readBody(request, MAX_FRAPPE_READ_PLAN_REQUEST_BYTES),
+      "Trusted Frappe read planning request",
+    );
+    try {
+      const plan = await createFrappeReadPlan(payload, scope, options.frappeReadPlanner!);
+      response.setHeader("cache-control", "private, no-store");
+      sendJson(response, 200, { schemaVersion: 1, requestId: payload.requestId, status: "planned", plan });
+    } catch (error) {
+      if (error instanceof FrappeReadPlanningError) throw new GatewayHttpError(400, error.message);
+      throw error;
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === TRUSTED_FRAPPE_ASK_INTENTS_PATH) {
+    const { scope } = authenticatedFrappeRunScope(request, frappeAuthoritySecret);
+    assertSiteBindingScope(siteBinding, scope);
+    const idempotencyKey = singleRequestHeader(request, "idempotency-key");
+    if (!idempotencyKey || idempotencyKey.length > 140) {
+      throw new GatewayHttpError(400, "Idempotency-Key is required for trusted Frappe Ask routing.");
+    }
+    const payload = parseJsonRecord(
+      await readBody(request, MAX_FRAPPE_ASK_INTENT_REQUEST_BYTES),
+      "Trusted Frappe Ask intent request",
+    );
+    try {
+      const intent = await createFrappeAskIntent(payload, scope, options.frappeAskIntentRouter!);
+      response.setHeader("cache-control", "private, no-store");
+      sendJson(response, 200, { schemaVersion: 1, requestId: payload.requestId, status: "classified", intent });
+    } catch (error) {
+      if (error instanceof FrappeAskIntentError) throw new GatewayHttpError(400, error.message);
+      throw error;
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === FRAPPE_TELEGRAM_LINK_PATH) {
+    let payload: Record<string, unknown>;
+    try {
+      payload = objectRecord(JSON.parse(await readBody(request))) ?? {};
+    } catch {
+      sendJson(response, 400, { error: "Frappe Telegram link request must be valid JSON." });
+      return;
+    }
+    const result = await handleFrappeTelegramLinkRpc(payload, options, cwd);
+    response.setHeader("cache-control", "private, no-store");
+    sendJson(response, result.status, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === TRUSTED_FRAPPE_MISSIONS_PATH) {
+    if (!options.frappeMissionBridge) throw new GatewayHttpError(503, "Trusted Frappe mission execution is unavailable.");
+    const { scope } = authenticatedFrappeRunScope(request, frappeAuthoritySecret);
+    assertSiteBindingScope(siteBinding, scope);
+    const root = parseJsonRecord(await readBody(request), "Trusted Frappe mission request");
+    const mission = root as unknown as TrustedFrappeMissionRequest;
+    const idempotencyKey = singleRequestHeader(request, "idempotency-key");
+    if (!idempotencyKey) throw new GatewayHttpError(400, "Idempotency-Key is required for trusted Frappe mission submission.");
+    if (typeof mission.idempotencyKey !== "string" || !headerEquals(idempotencyKey, mission.idempotencyKey)) {
+      throw new GatewayHttpError(409, "Idempotency-Key must match the trusted Frappe mission envelope.");
+    }
+    const submitted = await options.frappeMissionBridge.submit(mission, scope);
+    response.setHeader("location", submitted.pollPath);
+    response.setHeader("retry-after", "1");
+    response.setHeader("cache-control", "private, no-store");
+    sendJson(response, submitted.replayed ? 200 : 202, submitted);
+    return;
+  }
+
+  const frappeMissionStatusMatch = url.pathname.match(new RegExp(`^${TRUSTED_FRAPPE_MISSIONS_PATH}/([^/]+)$`));
+  if (request.method === "GET" && frappeMissionStatusMatch) {
+    if (!options.frappeMissionBridge) throw new GatewayHttpError(503, "Trusted Frappe mission status is unavailable.");
+    const { scope } = authenticatedFrappeRunScope(request, frappeAuthoritySecret);
+    assertSiteBindingScope(siteBinding, scope);
+    let missionId: string;
+    try {
+      missionId = decodeURIComponent(frappeMissionStatusMatch[1]);
+    } catch {
+      throw new GatewayHttpError(400, "Trusted Frappe mission path is invalid.");
+    }
+    const snapshot = await options.frappeMissionBridge.status(scope, missionId);
+    if (!snapshot) {
+      sendJson(response, 404, { error: "Mission was not found in the authenticated Frappe authority lane." });
+      return;
+    }
+    response.setHeader("cache-control", "private, no-store");
+    sendJson(response, 200, snapshot);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === FRAPPE_RUN_EVENTS_PATH) {
+    if (!options.frappeRunEventStore) throw new GatewayHttpError(503, "Frappe run event storage is unavailable.");
+    const authority = authenticatedFrappeRunScope(request, frappeAuthoritySecret);
+    assertSiteBindingScope(siteBinding, authority.scope);
+    const root = parseJsonRecord(await readBody(request), "Frappe run event append request");
+    const scope = frappeRunScopeFromUnknown(root.scope);
+    if (scope.tenantId !== authority.scope.tenantId || scope.siteId !== authority.scope.siteId || scope.userId !== authority.scope.userId) {
+      throw new FrappeRunEventError("forbidden", "Frappe run append scope does not match the authenticated authority.");
+    }
+    if (!root.event || typeof root.event !== "object" || Array.isArray(root.event)) {
+      throw new GatewayHttpError(400, "Frappe run event append request requires an event object.");
+    }
+    const event = root.event as FrappeRunEvent;
+    const idempotencyKey = singleRequestHeader(request, "idempotency-key");
+    if (!idempotencyKey) throw new GatewayHttpError(400, "Idempotency-Key is required for Frappe run event append.");
+    if (typeof event.id !== "string" || !headerEquals(idempotencyKey, event.id)) {
+      throw new GatewayHttpError(409, "Idempotency-Key must match the run event id.");
+    }
+    const result = await options.frappeRunEventStore.append({ scope, event });
+    response.setHeader("cache-control", "private, no-store");
+    sendJson(response, result.status === "appended" ? 201 : 200, result);
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === FRAPPE_RUN_EVENTS_PATH) {
+    if (!options.frappeRunEventStore) throw new GatewayHttpError(503, "Frappe run event storage is unavailable.");
+    const { scope } = authenticatedFrappeRunScope(request, frappeAuthoritySecret);
+    assertSiteBindingScope(siteBinding, scope);
+    const limitValue = url.searchParams.get("limit");
+    const limit = limitValue === null ? undefined : Number(limitValue);
+    const page = await options.frappeRunEventStore.replay({
+      scope,
+      ...(url.searchParams.get("missionId") ? { missionId: url.searchParams.get("missionId")! } : {}),
+      ...(url.searchParams.get("cursor") ? { cursor: url.searchParams.get("cursor")! } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+      ...(options.frappeRunEventCanRead ? { canRead: options.frappeRunEventCanRead } : {}),
+    });
+    response.setHeader("cache-control", "private, no-store");
+    sendJson(response, 200, page);
+    return;
+  }
+
+  const frappeRunCommandMatch = url.pathname.match(new RegExp(`^${FRAPPE_RUN_EVENTS_PATH}/missions/([^/]+)/commands$`));
+  if (request.method === "POST" && frappeRunCommandMatch) {
+    if (!options.frappeRunEventStore) throw new GatewayHttpError(503, "Frappe run event storage is unavailable.");
+    if (!options.onFrappeRunCommand) throw new GatewayHttpError(503, "Frappe run control dispatch is unavailable.");
+    const root = parseJsonRecord(await readBody(request), "Frappe run command request");
+    const command = root as unknown as FrappeRunCommandRequest;
+    let pathMissionId: string;
+    try {
+      pathMissionId = decodeURIComponent(frappeRunCommandMatch[1]);
+    } catch {
+      throw new GatewayHttpError(400, "Frappe run command mission path is invalid.");
+    }
+    if (command.missionId !== pathMissionId) throw new GatewayHttpError(409, "Run command mission does not match the request path.");
+    const idempotencyKey = singleRequestHeader(request, "idempotency-key");
+    if (!idempotencyKey) throw new GatewayHttpError(400, "Idempotency-Key is required for Frappe run control.");
+    if (typeof command.idempotencyKey !== "string" || !headerEquals(idempotencyKey, command.idempotencyKey)) {
+      throw new GatewayHttpError(409, "Idempotency-Key must match the run command envelope.");
+    }
+    const { scope, csrfToken } = authenticatedFrappeRunScope(request, frappeAuthoritySecret);
+    assertSiteBindingScope(siteBinding, scope);
+    const claimed = await options.frappeRunEventStore.claimCommand(command, {
+      method: request.method,
+      authenticatedScope: scope,
+      expectedCsrfToken: csrfToken,
+    });
+    if (claimed.status === "conflict") {
+      sendJson(response, 409, { error: "Idempotency-Key or command id was already used for different run control.", commandId: claimed.command.commandId });
+      return;
+    }
+    // Dispatch both first delivery and replay. The graph runtime deduplicates by
+    // the persisted command id/key, so a prior transient dispatch failure heals.
+    await options.onFrappeRunCommand(claimed.command);
+    response.setHeader("cache-control", "private, no-store");
+    sendJson(response, claimed.status === "claimed" ? 202 : 200, { ...claimed, dispatched: true });
     return;
   }
 
@@ -3019,8 +4365,143 @@ async function route(
       sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
       return;
     }
-    const reply = await handleSurfaceMessage(message, { config: options.config, gateway: options.gateway, enterprise: options.enterprise, approvalStore: options.approvalStore, cwd, registry: options.registry });
+    const reply = await handleSurfaceMessage(message, { config: options.config, gateway: options.gateway, enterprise: options.enterprise, approvalStore: options.approvalStore, cwd, registry: options.registry, frappeOAuth: options.frappeOAuth });
     sendJson(response, 200, reply);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === TRUSTED_FRAPPE_ASYNC_PATH) {
+    const { scope } = authenticatedFrappeRunScope(request, frappeAuthoritySecret);
+    assertSiteBindingScope(siteBinding, scope);
+    const body = await readBody(request);
+    let ingress: ReturnType<typeof parseTrustedFrappeIngress>;
+    try {
+      ingress = parseTrustedFrappeIngress(JSON.parse(body));
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
+      return;
+    }
+    if (siteBinding && normalizedHttpsOrigin(ingress.identity.site) !== siteBinding.siteOrigin) {
+      sendJson(response, 403, { error: "Trusted Frappe identity site does not match the authenticated site binding." });
+      return;
+    }
+    if (ingress.identity.user.trim().toLowerCase() !== scope.userId.trim().toLowerCase()) {
+      sendJson(response, 403, { error: "Trusted Frappe identity user does not match the authenticated authority lane." });
+      return;
+    }
+    const paired = await upsertTrustedFrappePairing(
+      ingress.message.surfaceId,
+      ingress.message.senderId,
+      ingress.identity,
+      cwd,
+    );
+    if (paired.identity?.provider !== "frappe") {
+      sendJson(response, 500, { error: "Trusted Frappe identity could not be bound." });
+      return;
+    }
+    const contextFingerprint = createHash("sha256")
+      .update(JSON.stringify({ identity: ingress.identity, context: ingress.context }))
+      .digest("hex");
+    const message: SurfaceMessage = {
+      ...ingress.message,
+      pairingId: paired.pairingId,
+      raw: { integration: "frappe", contextFingerprint },
+    };
+    const rawIdempotencyKey = request.headers["idempotency-key"];
+    const idempotencyKey = (Array.isArray(rawIdempotencyKey) ? rawIdempotencyKey[0] : rawIdempotencyKey)?.trim();
+    if (idempotencyKey && idempotencyKey.length > 200) {
+      sendJson(response, 400, { error: "Idempotency-Key must contain at most 200 characters." });
+      return;
+    }
+    const authorityScope = frappeAsyncAuthorityScope(scope);
+    const isolatedArtifact = ingress.context.ask?.requestedOutcomes.includes("artifact") === true;
+    // The opaque directory is allocated in the durable artifact store, but is
+    // not created unless this idempotency claim owns execution. It is the sole
+    // artifact root for the run and remains bound to authorityScope in SQLite.
+    const isolatedArtifactRoot = join(dataDir(cwd), "artifacts", "frappe-ask", randomUUID());
+    const artifactRoots = isolatedArtifact ? [isolatedArtifactRoot] : [];
+    const started = await messageRuns.start(message, idempotencyKey, artifactRoots, (stream) => isolatedArtifact
+      ? (options.frappeAskArtifactExecutor ?? runIsolatedFrappeAskArtifact)({
+          config: options.config,
+          prompt: message.text,
+          evidence: ingress.context.summary,
+          authority: scope,
+          durableRoot: isolatedArtifactRoot,
+          configuredMcpServers: Object.keys(options.config.tools?.mcp?.servers ?? {}),
+          policyDeniedServers: options.gateway?.frappe?.providerTools?.denyInherited ?? [],
+          nativeTransportOwner: options.nativeTransportOwner,
+          // Stream only provider-visible progress, never the raw JSON manifest.
+          onReasoningDelta: stream.onReasoningDelta,
+        })
+      : handleSurfaceMessage(message, {
+          config: options.config,
+          gateway: options.gateway,
+          enterprise: options.enterprise,
+          approvalStore: options.approvalStore,
+          cwd,
+          registry: options.registry,
+          trustedFrappe: ingress.context,
+          allowArtifacts: false,
+          onDelta: stream.onDelta,
+          onReasoningDelta: stream.onReasoningDelta,
+        }), authorityScope);
+    if (started.conflict) {
+      sendJson(response, 409, { error: "Idempotency-Key was already used for a different Frappe request.", runId: started.snapshot.runId });
+      return;
+    }
+    if (started.work) trackBackgroundTask(backgroundTasks, started.work);
+    response.setHeader("location", `${TRUSTED_FRAPPE_ASYNC_RUNS_PATH}/${started.snapshot.runId}`);
+    response.setHeader("retry-after", "1");
+    sendJson(response, started.replayed ? 200 : 202, {
+      ...started.snapshot,
+      replayed: started.replayed,
+      pollUrl: `${TRUSTED_FRAPPE_ASYNC_RUNS_PATH}/${started.snapshot.runId}`,
+      pairingId: paired.pairingId,
+    });
+    return;
+  }
+
+  const trustedFrappeAsyncRunMatch = url.pathname.match(new RegExp(`^${TRUSTED_FRAPPE_ASYNC_RUNS_PATH}/(msg_[A-Za-z0-9-]+)$`));
+  if (request.method === "GET" && trustedFrappeAsyncRunMatch) {
+    const { scope } = authenticatedFrappeRunScope(request, frappeAuthoritySecret);
+    assertSiteBindingScope(siteBinding, scope);
+    const waitMs = Number(url.searchParams.get("waitMs") ?? 0);
+    const snapshot = await messageRuns.read(
+      trustedFrappeAsyncRunMatch[1],
+      Number.isFinite(waitMs) ? waitMs : 0,
+      frappeAsyncAuthorityScope(scope),
+    );
+    if (!snapshot) {
+      sendJson(response, 404, { error: "Message run was not found in the authenticated Frappe authority lane." });
+      return;
+    }
+    response.setHeader("cache-control", "private, no-store");
+    if (snapshot.status === "queued" || snapshot.status === "running") response.setHeader("retry-after", "1");
+    sendJson(response, 200, snapshot);
+    return;
+  }
+
+  const trustedFrappeAsyncArtifactMatch = url.pathname.match(new RegExp(`^${TRUSTED_FRAPPE_ASYNC_RUNS_PATH}/(msg_[A-Za-z0-9-]+)/artifacts/(\\d+)$`));
+  if (request.method === "GET" && trustedFrappeAsyncArtifactMatch) {
+    const { scope } = authenticatedFrappeRunScope(request, frappeAuthoritySecret);
+    assertSiteBindingScope(siteBinding, scope);
+    const artifact = await messageRuns.readArtifact(
+      trustedFrappeAsyncArtifactMatch[1],
+      Number(trustedFrappeAsyncArtifactMatch[2]),
+      frappeAsyncAuthorityScope(scope),
+    );
+    if (!artifact) {
+      sendJson(response, 404, { error: "Run artifact was not found in the authenticated Frappe authority lane." });
+      return;
+    }
+    const fallbackName = artifact.name.replace(/[^\x20-\x7E]+/g, "_").replace(/["\\]/g, "_") || "artifact";
+    response.writeHead(200, {
+      "cache-control": "private, no-store",
+      "content-disposition": `attachment; filename="${fallbackName}"; filename*=UTF-8''${encodeURIComponent(artifact.name)}`,
+      "content-length": String(artifact.bytes.length),
+      "content-type": artifact.mime || "application/octet-stream",
+    });
+    response.end(artifact.bytes);
     return;
   }
 
@@ -3050,6 +4531,7 @@ async function route(
       approvalStore: options.approvalStore,
       cwd,
       registry: options.registry,
+      frappeOAuth: options.frappeOAuth,
       onDelta: stream.onDelta,
       onReasoningDelta: stream.onReasoningDelta,
     }));
@@ -3099,10 +4581,21 @@ async function route(
     return;
   }
 
-  if (request.method === "GET" && url.pathname === "/v1/catalog") {
+  if (request.method === "GET" && (url.pathname === "/v1/catalog" || url.pathname === TRUSTED_FRAPPE_CATALOG_PATH)) {
+    const skills = Object.entries(options.config.skills?.entries ?? {})
+      .filter(([, entry]) => entry.enabled !== false)
+      .map(([name]) => ({ name, label: name, description: "Available governed Muster skill" }));
+    const mcpServers = Object.keys(options.config.tools?.mcp?.servers ?? {})
+      .map((name) => ({ name, label: name, description: "Configured governed MCP server" }));
     sendJson(response, 200, {
-      commands: gatewayCommandCatalog(options.gateway),
+      // This HTTP catalog is consumed by the trusted Frappe surface. Channel
+      // adapters publish their own catalog and retain /pair for OAuth identity.
+      commands: gatewayCommandCatalog(options.gateway).filter((entry) => !["pair", "connect"].includes(entry.name)),
       personas: gatewayAgentCatalog(options.config),
+      // Only display metadata is published. Transport commands, URLs, headers,
+      // environment, OAuth material, tool schemas, and secrets stay private.
+      skills,
+      mcp_servers: mcpServers,
       source: "muster_native_http",
     });
     return;
@@ -3182,7 +4675,72 @@ export function startGatewayServer(options: GatewayServerOptions, port = 0): Pro
   const messageRunStore = options.messageRunStore ?? new SqliteAsyncMessageRunStore(
     join(dataDir(cwd), "gateway-message-runs.db"),
   );
+  const ownsFrappeRunEventStore = options.frappeRunEventStore === undefined;
+  const frappeRunEventStore = options.frappeRunEventStore ?? new SqliteFrappeRunEventStore(
+    join(dataDir(cwd), "frappe-run-events.db"),
+  );
   const nativeTransportOwner = options.nativeTransportOwner ?? `gateway:${randomUUID()}`;
+  const missionWorkspaceDir = profileWorkspaceDir(cwd, activeProfile(cwd));
+  const frappeSiteBindings = options.frappeSiteBindings ?? new FrappeSiteBindingCoordinator({
+    fetcher: options.fetcher,
+    storePath: join(dataDir(cwd), "frappe-site-bindings.v1.enc.json"),
+    encryptionSecret: options.gateway.token,
+  });
+  const readOnlyFrappeMissionExecutor = createGovernedFrappeMissionExecutor({
+    config: options.config,
+    cwd,
+    workspaceDir: missionWorkspaceDir,
+    nativeTransportOwner,
+    inheritedToolDeny: [
+      ...Object.keys(options.config.tools?.mcp?.servers ?? {}),
+      ...(options.gateway.frappe?.providerTools?.denyInherited ?? []),
+    ],
+  });
+  const frappeEffectTransport = options.frappeEffectTransport ?? createVerifiedBindingFrappeEffectTransport({
+    bindings: frappeSiteBindings,
+    fetcher: options.fetcher,
+  });
+  const ownsFrappeEffectStore = options.frappeEffectStore === undefined;
+  const frappeEffectStore = options.frappeEffectStore
+    ?? new SqliteGovernedFrappeEffectStore(join(dataDir(cwd), "governed-frappe-effects.db"));
+  const effectfulFrappeMissionExecutor = options.frappeMissionExecutor
+    ?? createEffectfulFrappeMissionExecutor({
+      transport: frappeEffectTransport,
+      store: frappeEffectStore,
+      fallback: readOnlyFrappeMissionExecutor,
+      policy: options.frappeEffectPolicy,
+    });
+  const browserConfig = options.gateway.frappe?.browserAutomation;
+  const ownsFrappeBrowserAutomation = options.frappeBrowserAutomation === undefined && browserConfig?.enabled === true;
+  const frappeBrowserAutomation = options.frappeBrowserAutomation
+    ?? (browserConfig?.enabled === true
+      ? createPlaywrightFrappeBrowserAutomationPort({
+        evidence: new DirectoryFrappeBrowserScreenshotEvidenceStore(join(dataDir(cwd), "frappe-browser-evidence")),
+        headless: browserConfig.headless,
+        executablePath: browserConfig.executablePath,
+        launchTimeoutMs: browserConfig.launchTimeoutMs,
+        actionTimeoutMs: browserConfig.actionTimeoutMs,
+      })
+      : undefined);
+  const frappeMissionExecutor = frappeBrowserAutomation
+    ? createVerifiedBindingFrappeBrowserMissionExecutor({
+      bindings: frappeSiteBindings,
+      browser: frappeBrowserAutomation,
+      fallback: effectfulFrappeMissionExecutor,
+      maxActionsPerNode: browserConfig?.maxActionsPerNode,
+      fetcher: options.fetcher,
+    })
+    : effectfulFrappeMissionExecutor;
+  const ownsFrappeMissionBridge = options.frappeMissionBridge === undefined;
+  const frappeMissionBridge = options.frappeMissionBridge
+    ?? new DurableFrappeMissionBridge({ store: frappeRunEventStore, executeNode: frappeMissionExecutor });
+  const frappeOAuthConnections = options.gateway.frappe?.oauth?.connections ?? [];
+  const frappeOAuth = options.frappeOAuth ?? (frappeOAuthConnections.length
+    ? new FrappeOAuthCoordinator({ connections: frappeOAuthConnections, cwd, fetcher: options.fetcher })
+    : undefined);
+  const ownsFrappeTelegramLinks = options.frappeTelegramLinks === undefined && options.gateway.frappe?.telegramLinking?.enabled === true;
+  const frappeTelegramLinks = options.frappeTelegramLinks
+    ?? (ownsFrappeTelegramLinks ? openSqliteFrappeTelegramLinkCoordinator(join(dataDir(cwd), "frappe-telegram-links.db")) : undefined);
   const effectiveOptions: GatewayServerOptions = {
     ...options,
     enterprise,
@@ -3192,16 +4750,73 @@ export function startGatewayServer(options: GatewayServerOptions, port = 0): Pro
     approvalStore,
     approvalActions,
     messageRunStore,
+    frappeRunEventStore,
+    frappeMissionBridge,
+    frappeWorkflowPlanner: options.frappeWorkflowPlanner ?? createGovernedFrappeWorkflowPlanner({
+      config: options.config,
+      cwd,
+      workspaceDir: missionWorkspaceDir,
+      nativeTransportOwner,
+      inheritedToolDeny: [
+        ...Object.keys(options.config.tools?.mcp?.servers ?? {}),
+        ...(options.gateway.frappe?.providerTools?.denyInherited ?? []),
+      ],
+    }),
+    frappeReadPlanner: options.frappeReadPlanner ?? createGovernedFrappeReadPlanner({
+      config: options.config,
+      cwd,
+      workspaceDir: missionWorkspaceDir,
+      nativeTransportOwner,
+      inheritedToolDeny: [
+        ...Object.keys(options.config.tools?.mcp?.servers ?? {}),
+        ...(options.gateway.frappe?.providerTools?.denyInherited ?? []),
+      ],
+    }),
+    frappeAskIntentRouter: options.frappeAskIntentRouter ?? createGovernedFrappeAskIntentRouter({
+      config: options.config,
+      cwd,
+      workspaceDir: missionWorkspaceDir,
+      nativeTransportOwner,
+      inheritedToolDeny: [
+        ...Object.keys(options.config.tools?.mcp?.servers ?? {}),
+        ...(options.gateway.frappe?.providerTools?.denyInherited ?? []),
+      ],
+    }),
+    onFrappeRunCommand: options.onFrappeRunCommand
+      ?? (frappeMissionBridge ? (command) => frappeMissionBridge.control(command) : undefined),
     nativeTransportOwner,
+    frappeOAuth,
+    frappeSiteBindings,
+    frappeTelegramLinks,
   };
   // One outbound queue per gateway: chat keys share retry_after backoff state.
   const queue = createOutboundQueue();
   const backgroundTasks = new Set<Promise<void>>();
   const messageRuns = new AsyncMessageRunRegistry(messageRunStore);
+  const frappeAskArtifactRoot = join(dataDir(cwd), "artifacts", "frappe-ask");
+  const collectExpiredAskArtifacts = async (): Promise<void> => {
+    const referencedRoots = await messageRunStore.listArtifactRoots(Date.now());
+    await garbageCollectFrappeAskArtifacts({
+      rootDir: frappeAskArtifactRoot,
+      referencedRoots,
+      minimumAgeMs: 60 * 60_000,
+      maxEntries: 1_000,
+    });
+  };
+  const artifactGcTimer = setInterval(() => {
+    void collectExpiredAskArtifacts().catch((error) => log(`artifact GC failed closed: ${error instanceof Error ? error.message : String(error)}`));
+  }, 15 * 60_000);
+  artifactGcTimer.unref?.();
   const server = createServer((request, response) => {
     route(request, response, effectiveOptions, queue, backgroundTasks, messageRuns).catch((error) => {
       const detail = error instanceof Error ? error.message : String(error);
-      const status = error instanceof GatewayHttpError ? error.status : 500;
+      const status = error instanceof GatewayHttpError
+        ? error.status
+        : error instanceof FrappeSiteBindingError
+          ? error.status
+        : error instanceof FrappeRunEventError
+          ? frappeRunEventHttpStatus(error)
+          : 500;
       log(`error ${request.method} ${request.url}: ${detail}`);
       if (!response.headersSent) sendJson(response, status, { error: detail });
       else response.end();
@@ -3216,8 +4831,14 @@ export function startGatewayServer(options: GatewayServerOptions, port = 0): Pro
       if (server.listening) {
         await new Promise<void>((done) => server.close(() => done()));
       }
+      clearInterval(artifactGcTimer);
       closeWarmProviderTransports(nativeTransportOwner);
       if (ownsMessageRunStore) await messageRunStore.close?.();
+      if (ownsFrappeMissionBridge) await frappeMissionBridge?.close();
+      if (ownsFrappeBrowserAutomation) await frappeBrowserAutomation?.close?.();
+      if (ownsFrappeEffectStore) frappeEffectStore?.close();
+      if (ownsFrappeRunEventStore) await frappeRunEventStore.close?.();
+      if (ownsFrappeTelegramLinks) frappeTelegramLinks?.close();
       if (ownsApprovalStore) approvalStore.close();
       if (ownsEnterpriseRuntime) await enterprise.close?.();
     };
@@ -3229,7 +4850,8 @@ export function startGatewayServer(options: GatewayServerOptions, port = 0): Pro
       );
     };
     server.once("error", failStartup);
-    recoverPendingApprovals(effectiveOptions, approvalStore)
+    collectExpiredAskArtifacts()
+      .then(() => recoverPendingApprovals(effectiveOptions, approvalStore))
       .then(() => recoverIngressSpool(effectiveOptions, queue, ingressSpool))
       .then(() => server.listen(port, "127.0.0.1", () => {
       const address = server.address();
@@ -3254,11 +4876,31 @@ export function startGatewayServer(options: GatewayServerOptions, port = 0): Pro
   });
 }
 
+function bearerFromRequest(request: IncomingMessage): string {
+  const header = request.headers.authorization ?? "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  if (!token) throw new FrappeSiteBindingError(401, "Frappe site binding bearer is required.");
+  return token;
+}
+
 export function gatewayStartupErrors(gateway: GatewayConfig): readonly string[] {
   if (gateway.security?.deployment !== "production") return [];
   const errors: string[] = [];
   if (gateway.token.length < 32) errors.push("gateway bearer token must contain at least 32 characters");
   if (gateway.telegram?.botToken && !gateway.telegram.secretToken) errors.push("Telegram secretToken is required");
+  if (gateway.frappe?.telegramLinking?.enabled) {
+    const linking = gateway.frappe.telegramLinking;
+    if (!gateway.telegram?.botToken || !telegramBotId(gateway.telegram.botToken)) errors.push("Frappe Telegram linking requires a Telegram bot token with a numeric bot id");
+    if (!/^[A-Za-z0-9_]{5,32}$/.test(linking.botUsername)) errors.push("Frappe Telegram linking requires a valid botUsername");
+    if (!linking.tenants.length) errors.push("Frappe Telegram linking requires at least one trusted tenant");
+    const tenantIds = new Set<string>();
+    for (const tenant of linking.tenants) {
+      if (!tenant.id.trim() || tenantIds.has(tenant.id)) errors.push("Frappe Telegram tenant ids must be non-empty and unique");
+      tenantIds.add(tenant.id);
+      try { normalizedHttpsOrigin(tenant.site); } catch { errors.push(`Frappe Telegram tenant ${tenant.id || "<empty>"} requires a valid HTTPS site origin`); }
+      if (!tenant.allowedScopes.length) errors.push(`Frappe Telegram tenant ${tenant.id || "<empty>"} requires at least one allowed scope`);
+    }
+  }
   if (gateway.slack?.botToken) {
     const mode = gateway.slack.mode ?? (gateway.slack.appToken ? "socket" : "http");
     if (mode === "socket" && !gateway.slack.appToken) errors.push("Slack Socket Mode appToken is required");

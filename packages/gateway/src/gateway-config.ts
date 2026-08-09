@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import type { FrappeOAuthConnectionConfig } from "./frappe-oauth.js";
 
 /** Gateway-local config (.muster/gateway.json): bearer token + adapter bot tokens. */
 export interface GatewayCustomCommand {
@@ -12,6 +13,35 @@ export interface GatewayCustomCommand {
   readonly surfaces?: readonly string[];
   readonly source?: "openclaw" | "user" | "migration";
   readonly sourceChannel?: string;
+}
+
+/**
+ * Human-facing identity for a Frappe-connected deployment. This is policy and
+ * copy only; it never carries credentials or expands a user's Frappe access.
+ */
+export interface GatewayFrappeAssistantConfig {
+  readonly name?: string;
+  readonly description?: string;
+  readonly organization?: string;
+  readonly domains?: readonly string[];
+  /** Deployment-owned scope rules used to resolve ambiguous business requests. */
+  readonly operatingInstructions?: readonly string[];
+}
+
+export interface GatewayFrappeTelegramTenant {
+  readonly id: string;
+  /** Exact trusted Frappe origin for this tenant. */
+  readonly site: string;
+  /** Maximum scopes this tenant may place in a Telegram identity link. */
+  readonly allowedScopes: readonly string[];
+}
+
+export interface GatewayFrappeTelegramLinkingConfig {
+  readonly enabled: true;
+  /** Telegram bot username without @, used only to construct the Frappe deep link. */
+  readonly botUsername: string;
+  /** Explicit site registry; no browser-supplied hostname can create a tenant. */
+  readonly tenants: readonly GatewayFrappeTelegramTenant[];
 }
 
 export interface GatewayConfig {
@@ -28,6 +58,37 @@ export interface GatewayConfig {
   };
   readonly commands?: {
     readonly entries?: Record<string, GatewayCustomCommand>;
+  };
+  readonly frappe?: {
+    /** Canonical externally reachable Muster origin used for reciprocal site bindings. */
+    readonly publicOrigin?: string;
+    /** Stable non-secret identifier for this Muster installation. */
+    readonly installationId?: string;
+    readonly assistant?: GatewayFrappeAssistantConfig;
+    /** Reviewed, read-only business API contracts available to the Frappe capability pack. */
+    readonly businessApis?: readonly Record<string, unknown>[];
+    /** Optional permission-scoped read-model location; defaults inside .muster/data. */
+    readonly readModelPath?: string;
+    /** Gateway-held HMAC key for actor-bound, single-use Frappe write approvals. */
+    readonly approvalSigningKey?: string;
+    /** Duplicate provider-native business connectors to suppress for OAuth-bound Frappe turns. */
+    readonly providerTools?: { readonly denyInherited?: readonly string[] };
+    /** Real isolated Desk automation. Disabled unless explicitly enabled. */
+    readonly browserAutomation?: {
+      readonly enabled: true;
+      /** Headless is the production default; set false for an attended evidence run. */
+      readonly headless?: boolean;
+      /** Operator-owned Chromium executable path; never accepted from a workflow. */
+      readonly executablePath?: string;
+      readonly launchTimeoutMs?: number;
+      readonly actionTimeoutMs?: number;
+      readonly maxActionsPerNode?: number;
+    };
+    readonly telegramLinking?: GatewayFrappeTelegramLinkingConfig;
+    readonly oauth?: {
+      readonly defaultConnection?: string;
+      readonly connections: readonly FrappeOAuthConnectionConfig[];
+    };
   };
   readonly telegram?: {
     /** Friendly bot label shown in setup/status output; not used as a secret. */
@@ -90,6 +151,18 @@ export interface GatewayConfig {
     readonly verification?: { readonly mode: "bearer"; readonly audience: string };
     /** Google command id -> Muster slash command. */
     readonly commands?: Readonly<Record<string, string>>;
+    /** Resolve a verified Google email to a permission-bearing Frappe identity. */
+    readonly frappeIdentity?: {
+      /** Full HTTPS Frappe method URL for the identity resolver. */
+      readonly resolverUrl: string;
+      /** Environment variable containing an OAuth access token for Frappe. */
+      readonly oauthTokenEnv: string;
+      /** Defense-in-depth domain allowlist; an empty list denies every automatic binding. */
+      readonly allowedDomains: readonly string[];
+      readonly timeoutMs?: number;
+      /** Revalidate Frappe role/employee binding after this interval. Defaults to 60 seconds. */
+      readonly cacheTtlMs?: number;
+    };
   };
   readonly teams?: { readonly hmacSecret?: string };
   readonly devices?: {

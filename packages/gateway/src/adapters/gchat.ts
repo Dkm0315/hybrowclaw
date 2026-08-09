@@ -41,6 +41,16 @@ export type GchatInbound =
 interface GchatUser {
   readonly name?: string;
   readonly type?: string;
+  readonly displayName?: string;
+  readonly email?: string;
+  readonly domainId?: string;
+}
+
+export interface GchatActor {
+  readonly resourceName: string;
+  readonly email?: string;
+  readonly displayName?: string;
+  readonly domainId?: string;
 }
 
 interface GchatEvent {
@@ -86,6 +96,21 @@ export function gchatDeliveryId(payload: unknown): string | undefined {
   const sender = event.message?.sender?.name ?? event.user?.name ?? event.common?.user?.name;
   const parts = [event.eventTime, event.space?.name, sender, action].filter((value): value is string => typeof value === "string" && value.length > 0);
   return parts.length >= 3 ? parts.join(":") : undefined;
+}
+
+/** Identity asserted by a platform-verified Google Chat event. */
+export function gchatActor(payload: unknown): GchatActor | undefined {
+  if (typeof payload !== "object" || payload === null) return undefined;
+  const event = payload as GchatEvent;
+  const sender = event.message?.sender ?? event.user ?? event.common?.user;
+  if (!sender?.name || sender.type === "BOT") return undefined;
+  const email = sender.email?.trim().toLowerCase();
+  return {
+    resourceName: sender.name,
+    ...(email ? { email } : {}),
+    ...(sender.displayName?.trim() ? { displayName: sender.displayName.trim() } : {}),
+    ...(sender.domainId?.trim() ? { domainId: sender.domainId.trim() } : {}),
+  };
 }
 
 /** Map MESSAGE, APP_COMMAND, CARD_CLICKED, APP_HOME, and SUBMIT_FORM events. */

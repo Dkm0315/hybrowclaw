@@ -1,4 +1,6 @@
 export * from "./agent-rules.js";
+export * from "./agent-graph.js";
+export * from "./workflow-module.js";
 export * from "./artifacts.js";
 export * from "./benchmark.js";
 export * from "./builtin-catalog.js";
@@ -41,6 +43,7 @@ export * from "./pi.js";
 export * from "./router.js";
 export * from "./roster.js";
 export * from "./run.js";
+export * from "./run-events.js";
 export * from "./runtime-doctor.js";
 export * from "./scheduler.js";
 export * from "./sessions.js";

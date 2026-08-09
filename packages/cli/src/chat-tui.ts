@@ -99,6 +99,13 @@ export interface MusterChatHarness {
   openPicker(command: string): void;
 }
 
+const WORKING_FRAMES = ["|", "/", "-", "\\"] as const;
+
+export function formatWorkingIndicator(agentId: string | undefined, frame: number): string {
+  const label = agentId ? `@${agentId} working` : "working";
+  return `${WORKING_FRAMES[Math.abs(frame) % WORKING_FRAMES.length]} ${label}`;
+}
+
 const RESET = "\x1b[0m";
 const ACCENT_RGB = "41;211;255";
 const HIGHLIGHT_RGB = "104;245;168";

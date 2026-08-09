@@ -9,11 +9,18 @@ export interface CodexAppServerRunInput {
   readonly cwd: string;
   readonly model?: string;
   readonly reasoning?: "none" | "low" | "medium" | "high";
+  /** Native app-server developer contract; sent in protocol, never process arguments. */
+  readonly developerInstructions?: string;
+  /** Fresh host-verified context for this turn; never made sticky on the provider thread. */
+  readonly applicationContext?: string;
   readonly instructionsFile?: string;
+  readonly sandbox?: "read-only" | "workspace-write" | "danger-full-access";
   readonly networkAccess?: boolean;
   readonly env?: Record<string, string>;
   readonly timeoutMs?: number;
   readonly command?: string;
+  /** Native Codex config overrides supplied by the governed host. */
+  readonly configOverrides?: readonly string[];
   /** Persisted Codex thread to re-open when no warm process is cached. */
   readonly threadId?: string;
   /** Stable conversation identity. Omit it to disable cross-call process reuse. */
@@ -144,7 +151,7 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
   if (!input.prompt.trim()) throw new Error("Codex prompt is required.");
   const started = Date.now();
   const keepAlive = (input.keepAlive ?? true) && input.cacheKey !== undefined;
-  const instructionsHash = await hashInstructionsFile(input.instructionsFile);
+  const instructionsHash = await hashInstructions(input.developerInstructions, input.instructionsFile);
   const command = resolveCodexCommand(input.command);
   const conversationIdentity = input.cacheKey ?? `anonymous:${randomUUID()}`;
   const scopeKey = appServerScopeKey(input, command, conversationIdentity);
@@ -153,14 +160,15 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
   try {
     lease = await acquireSession({ input, command, key, scopeKey, keepAlive });
   } catch (error) {
-    return {
-      status: "failed",
-      finalMessage: "",
-      durationMs: Date.now() - started,
-      errorMessage: error instanceof Error ? error.message : String(error),
-      fallbackEligible: true,
-      hadActivity: false,
-    };
+    if (input.threadId && missingProviderThread(error)) {
+      try {
+        lease = await acquireSession({ input: { ...input, threadId: undefined }, command, key, scopeKey, keepAlive });
+      } catch (recoveryError) {
+        return coldFailure(recoveryError, started);
+      }
+    } else {
+      return coldFailure(error, started);
+    }
   }
 
   let queueMs = 0;
@@ -179,6 +187,7 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
     const turn = await lease.session.client.runTurn({
       threadId: lease.session.threadId,
       prompt: input.prompt,
+      applicationContext: input.applicationContext,
       timeoutMs: input.timeoutMs ?? 180_000,
       onDelta: (text) => {
         providerActivity = true;
@@ -236,6 +245,22 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
         hadActivity: providerActivity,
       };
     });
+}
+
+function coldFailure(error: unknown, started: number): CodexAppServerRunResult {
+  return {
+    status: "failed",
+    finalMessage: "",
+    durationMs: Date.now() - started,
+    errorMessage: error instanceof Error ? error.message : String(error),
+    fallbackEligible: true,
+    hadActivity: false,
+  };
+}
+
+function missingProviderThread(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:no rollout found|unknown thread|thread (?:not found|does not exist)|session (?:not found|does not exist))/i.test(message);
 }
 
 function appServerTimings(
@@ -316,8 +341,10 @@ async function createSession(
     cwd: input.input.cwd,
     model: input.input.model,
     reasoning: input.input.reasoning,
-    instructionsFile: input.input.instructionsFile,
+    developerInstructions: input.input.developerInstructions,
     networkAccess: input.input.networkAccess,
+    configOverrides: input.input.configOverrides,
+    sandbox: input.input.sandbox,
     env: input.input.env,
     onClose: () => ACTIVE_CLIENTS.delete(client),
   });
@@ -389,8 +416,24 @@ function appServerScopeKey(input: CodexAppServerRunInput, command: string, conve
     reasoning: input.reasoning ?? "",
     command,
     networkAccess: input.networkAccess === true,
+    configOverrides: input.configOverrides ?? [],
+    sandbox: input.sandbox ?? "workspace-write",
     env,
   })).digest("hex");
+}
+
+export function buildCodexAppServerArgs(input: {
+  readonly model?: string;
+  readonly reasoning?: "none" | "low" | "medium" | "high";
+  readonly networkAccess?: boolean;
+  readonly configOverrides?: readonly string[];
+}): string[] {
+  const args = ["app-server", "--stdio"];
+  if (input.model) args.push("-c", `model=${JSON.stringify(input.model)}`);
+  if (input.reasoning) args.push("-c", `model_reasoning_effort=${JSON.stringify(input.reasoning === "none" ? "low" : input.reasoning)}`);
+  if (input.networkAccess) args.push("-c", "sandbox_workspace_write.network_access=true");
+  for (const override of input.configOverrides ?? []) args.push("-c", override);
+  return args;
 }
 
 function closeCachedSession(key: string, session: CachedSession): void {
@@ -430,15 +473,17 @@ function pruneSessionCache(now: number, protectedKey: string): void {
   makeSessionCacheRoom(protectedKey);
 }
 
-async function hashInstructionsFile(path: string | undefined): Promise<string> {
-  if (!path) return "";
-  const content = await readFile(path, "utf8").catch(() => "");
+async function hashInstructions(direct: string | undefined, path: string | undefined): Promise<string> {
+  const content = direct ?? (path ? await readFile(path, "utf8").catch(() => "") : "");
+  if (!content) return "";
   return createHash("sha256").update(content).digest("hex");
 }
 
 class CodexAppServerClient {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly onClose?: () => void;
+  private readonly developerInstructions?: string;
+  private readonly sandbox: "read-only" | "workspace-write" | "danger-full-access";
   private nextId = 1;
   private stdoutBuffer = "";
   private readonly pending = new Map<number, PendingRequest>();
@@ -452,17 +497,17 @@ class CodexAppServerClient {
     readonly cwd: string;
     readonly model?: string;
     readonly reasoning?: "none" | "low" | "medium" | "high";
-    readonly instructionsFile?: string;
+    readonly developerInstructions?: string;
+    readonly sandbox?: "read-only" | "workspace-write" | "danger-full-access";
     readonly networkAccess?: boolean;
+    readonly configOverrides?: readonly string[];
     readonly env?: Record<string, string>;
     readonly onClose?: () => void;
   }) {
     this.onClose = input.onClose;
-    const args = ["app-server", "--stdio"];
-    if (input.model) args.push("-c", `model=${JSON.stringify(input.model)}`);
-    if (input.reasoning) args.push("-c", `model_reasoning_effort=${JSON.stringify(input.reasoning === "none" ? "low" : input.reasoning)}`);
-    if (input.networkAccess) args.push("-c", "sandbox_workspace_write.network_access=true");
-    if (input.instructionsFile) args.push("-c", `experimental_instructions_file=${JSON.stringify(input.instructionsFile)}`);
+    this.developerInstructions = input.developerInstructions;
+    this.sandbox = input.sandbox ?? "workspace-write";
+    const args = buildCodexAppServerArgs(input);
     this.child = spawn(input.command, args, {
       cwd: input.cwd,
       env: { ...process.env, ...(input.env ?? {}), RUST_LOG: process.env.RUST_LOG ?? "warn" },
@@ -501,7 +546,8 @@ class CodexAppServerClient {
     const result = await this.request("thread/start", {
       cwd,
       approvalPolicy: "never",
-      sandbox: "workspace-write",
+      sandbox: this.sandbox,
+      ...(this.developerInstructions ? { developerInstructions: this.developerInstructions } : {}),
     }, 15_000);
     const thread = asRecord(result.thread);
     const threadId = stringValue(thread.id) ?? stringValue(thread.sessionId) ?? stringValue(result.sessionId) ?? stringValue(result.threadId);
@@ -515,7 +561,8 @@ class CodexAppServerClient {
       cwd,
       excludeTurns: true,
       approvalPolicy: "never",
-      sandbox: "workspace-write",
+      sandbox: this.sandbox,
+      ...(this.developerInstructions ? { developerInstructions: this.developerInstructions } : {}),
     }, 30_000);
     const thread = asRecord(result.thread);
     const resumedId = stringValue(thread.id) ?? stringValue(thread.sessionId) ?? stringValue(result.sessionId) ?? stringValue(result.threadId);
@@ -527,6 +574,7 @@ class CodexAppServerClient {
   async runTurn(input: {
     readonly threadId: string;
     readonly prompt: string;
+    readonly applicationContext?: string;
     readonly timeoutMs: number;
     readonly onDelta?: (text: string) => void;
     readonly onReasoningDelta?: (text: string) => void;
@@ -544,6 +592,16 @@ class CodexAppServerClient {
     const turnStart = await this.request("turn/start", {
       threadId: input.threadId,
       input: [{ type: "text", text: input.prompt }],
+      ...(input.applicationContext
+        ? {
+            additionalContext: {
+              "muster.application": {
+                value: input.applicationContext,
+                kind: "application",
+              },
+            },
+          }
+        : {}),
     }, 15_000);
     const turnId = stringValue(asRecord(turnStart.turn).id);
     let finalMessage = "";

@@ -1,0 +1,45 @@
+{
+  "key": "frappeverse",
+  "title": "Frappeverse Wholesale Automation",
+  "description": "Cross-module governed automation proof with visible agent delegation and adversarial access cases.",
+  "agent_archetypes": [
+    ["Business Supervisor", "Supervisor", "Coordinate business outcomes across permitted modules"],
+    ["Selling Operator", "Module", "Operate permitted selling records and reports"],
+    ["Buying Operator", "Module", "Operate permitted buying records and reports"],
+    ["Finance Analyst", "Specialist", "Prepare finance analysis and evidence"],
+    ["Metadata Builder", "Specialist", "Propose governed metadata and UI changes"],
+    ["Report Designer", "Specialist", "Create verified reports and dashboards"],
+    ["Print Designer", "Specialist", "Create reviewed print formats and office artifacts"],
+    ["Helpdesk Coordinator", "Business", "Coordinate service outcomes when Helpdesk is installed"],
+    ["Security Reviewer", "Specialist", "Challenge authorization, approvals and isolation"],
+    ["Evidence Auditor", "Specialist", "Verify receipts, artifacts and postconditions"]
+  ],
+  "workflow_archetypes": [
+    "Order-to-Cash Exception Recovery",
+    "Purchase Compliance Review",
+    "Finance Close Evidence Pack",
+    "Metadata Change with Approval",
+    "Executive Dashboard Factory",
+    "Customer Service Resolution",
+    "Print and Office Artifact Studio",
+    "Data Quality Remediation",
+    "Role and Permission Audit",
+    "Multi-Agent Business Planning",
+    "Website and Web Form Launch",
+    "Adversarial Change Verification"
+  ],
+  "mission_outcomes": [
+    "Resolve overdue customer commitments and prepare an evidence-backed action plan",
+    "Review purchase exceptions and route only policy-compliant changes for approval",
+    "Produce a finance close evidence pack without changing submitted accounting records",
+    "Design a custom field and property setter change with rollback evidence",
+    "Create an executive dashboard proposal from permission-filtered business records",
+    "Coordinate a customer service resolution and produce a verified response artifact",
+    "Generate a reviewed print format and office presentation for the operating team",
+    "Find data-quality failures and propose idempotent repair operations",
+    "Audit effective roles and demonstrate that unauthorized records stay invisible",
+    "Delegate a business plan across bounded module and specialist subagents",
+    "Prepare a web page and web form launch plan with injection checks",
+    "Attempt a stale approval replay and prove that execution remains denied"
+  ]
+}
