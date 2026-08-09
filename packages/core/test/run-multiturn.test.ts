@@ -70,6 +70,35 @@ test("provider-direct runs accumulate a budgeted multi-turn transcript across tu
   }
 });
 
+test("grounded standalone turns shed stale history while explicit follow-ups retain continuity", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-multiturn-activation-"));
+  const stub = await startStub();
+  const config = nativeConfig(stub.url);
+  const base = { cwd, conversationKey: "web:demo:activation", skipMemoryWrite: true, skipAgentRules: true } as const;
+  const systemContext = "Trusted host context: the permission-filtered pending request count is 2.";
+  try {
+    await executeRun(config, { ...base, prompt: "Store this unrelated opening question for later." });
+    const standalone = await executeRun(config, {
+      ...base,
+      prompt: "How many requests are pending for me?",
+      systemContext,
+    });
+    const followUp = await executeRun(config, {
+      ...base,
+      prompt: "What about approved ones?",
+      systemContext,
+    });
+
+    assert.deepEqual(stub.turns[1].map((message) => message.content), [systemContext, "How many requests are pending for me?"], "self-contained grounded QA omits unrelated transcript");
+    assert.ok(stub.turns[2].some((message) => message.content === "How many requests are pending for me?"), "referential follow-up receives the prior user turn");
+    assert.ok(stub.turns[2].some((message) => message.content === "ASSISTANT_REPLY"), "referential follow-up receives prior assistant context");
+    assert.match(standalone.episode.evidence.find((item) => item.label === "context_activation")?.detail ?? "", /mode=lean .*history=fresh/);
+    assert.match(followUp.episode.evidence.find((item) => item.label === "context_activation")?.detail ?? "", /mode=lean .*history=continuity/);
+  } finally {
+    await stub.close();
+  }
+});
+
 test("a DIFFERENT conversation does not see another conversation's turns (isolation)", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-multiturn-iso-"));
   const stub = await startStub();

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["flit_core>=3.9,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "field_ops_demo"
+authors = [{name = "Field Ops Demo", email = "field-ops@example.invalid"}]
+description = "Independent Frappe v16 Vue field-operations reference application"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dynamic = ["version"]
+dependencies = []
+license = {text = "MIT"}
+
+[tool.bench.frappe-dependencies]
+frappe = ">=16.0.0,<17.0.0"

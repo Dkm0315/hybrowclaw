@@ -1,0 +1,18 @@
+[mariadbd]
+bind-address = 127.0.0.1
+port = 13306
+socket = /home/goblin/frappeverse/mariadb-user/run/mariadb.sock
+pid-file = /home/goblin/frappeverse/mariadb-user/run/mariadb.pid
+datadir = /home/goblin/frappeverse/mariadb-user/data
+log-error = /home/goblin/frappeverse/mariadb-user/log/mariadb.log
+skip-name-resolve
+character-set-server = utf8mb4
+collation-server = utf8mb4_unicode_ci
+innodb-file-per-table = 1
+max-connections = 200
+
+[client]
+host = 127.0.0.1
+port = 13306
+socket = /home/goblin/frappeverse/mariadb-user/run/mariadb.sock
+default-character-set = utf8mb4

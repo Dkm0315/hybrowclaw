@@ -1,0 +1,141 @@
+{
+  "doctype": "DocType",
+  "name": "Muster Activity",
+  "module": "Muster",
+  "autoname": "hash",
+  "track_changes": 0,
+  "field_order": [
+    "event_tab",
+    "mission",
+    "sequence",
+    "event_type",
+    "state",
+    "summary",
+    "visibility",
+    "actor",
+    "agent",
+    "reference_section",
+    "reference_doctype",
+    "reference_name",
+    "idempotency_key",
+    "payload_json"
+  ],
+  "fields": [
+    {
+      "fieldname": "event_tab",
+      "fieldtype": "Tab Break",
+      "label": "Event"
+    },
+    {
+      "fieldname": "mission",
+      "fieldtype": "Link",
+      "label": "Mission",
+      "options": "Muster Mission",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "sequence",
+      "fieldtype": "Int",
+      "label": "Sequence",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "event_type",
+      "fieldtype": "Data",
+      "label": "Event Type",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "state",
+      "fieldtype": "Data",
+      "label": "State",
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "summary",
+      "fieldtype": "Small Text",
+      "label": "Summary",
+      "reqd": 1
+    },
+    {
+      "fieldname": "visibility",
+      "fieldtype": "Select",
+      "label": "Visibility",
+      "options": "Participants\nApprovers\nAuditors\nAdministrators",
+      "default": "Participants",
+      "reqd": 1
+    },
+    {
+      "fieldname": "actor",
+      "fieldtype": "Link",
+      "label": "Actor",
+      "options": "User"
+    },
+    {
+      "fieldname": "agent",
+      "fieldtype": "Link",
+      "label": "Agent",
+      "options": "Muster Agent"
+    },
+    {
+      "fieldname": "reference_section",
+      "fieldtype": "Section Break",
+      "label": "Reference and Evidence"
+    },
+    {
+      "fieldname": "reference_doctype",
+      "fieldtype": "Link",
+      "label": "Reference DocType",
+      "options": "DocType"
+    },
+    {
+      "fieldname": "reference_name",
+      "fieldtype": "Dynamic Link",
+      "label": "Reference",
+      "options": "reference_doctype"
+    },
+    {
+    "fieldname": "idempotency_key",
+    "fieldtype": "Data",
+    "label": "Idempotency Key",
+    "unique": 1
+    },
+    {
+      "fieldname": "payload_json",
+      "fieldtype": "Code",
+      "label": "Sanitized Payload",
+      "options": "JSON",
+      "read_only": 1
+    }
+  ],
+  "permissions": [
+    {
+      "role": "Muster Administrator",
+      "read": 1
+    },
+    {
+      "role": "Muster Automation Manager",
+      "read": 1
+    },
+    {
+      "role": "Muster Operator",
+      "read": 1
+    },
+    {
+      "role": "Muster Approver",
+      "read": 1
+    },
+    {
+      "role": "Muster Auditor",
+      "read": 1,
+      "export": 1
+    },
+    {
+      "role": "Muster Viewer",
+      "read": 1
+    }
+  ]
+}

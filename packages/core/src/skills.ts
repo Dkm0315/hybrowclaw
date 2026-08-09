@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { musterRoot } from "./profiles.js";
 import { readJsonFile } from "./store.js";
 import { estimateTokens } from "./tokens.js";
@@ -84,6 +85,8 @@ export interface AppliedSkillEnv {
 export interface SkillDiscoveryOptions {
   readonly extraDirs?: readonly string[];
   readonly includeHomeDirs?: boolean;
+  /** How long a coherent catalog snapshot may be reused without filesystem I/O. */
+  readonly snapshotTtlMs?: number;
 }
 
 interface SkillSearchRoot {
@@ -98,12 +101,37 @@ interface SkillFileCandidate {
 }
 
 interface SkillCatalogSnapshot {
-  readonly signature: string;
+  readonly generation: number;
+  readonly expiresAtMs: number;
   readonly skills: readonly SkillRecord[];
 }
 
+interface SkillCatalogRefresh {
+  readonly generation: number;
+  readonly promise: Promise<SkillCatalogSnapshot>;
+}
+
+interface MutableSkillCatalogMetrics {
+  cacheHits: number;
+  refreshes: number;
+  recursiveWalks: number;
+  directoryReads: number;
+  fileReads: number;
+  hashOperations: number;
+}
+
+export interface SkillCatalogSnapshotMetrics extends Readonly<MutableSkillCatalogMetrics> {
+  readonly generation: number;
+  readonly cachedSkills: number;
+}
+
 const NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{1,63}$/;
+const DEFAULT_SKILL_CATALOG_SNAPSHOT_TTL_MS = 30_000;
+const MAX_SKILL_CATALOG_SNAPSHOT_TTL_MS = 300_000;
 const skillCatalogCache = new Map<string, SkillCatalogSnapshot>();
+const skillCatalogRefreshes = new Map<string, SkillCatalogRefresh>();
+const skillCatalogMetrics = new Map<string, MutableSkillCatalogMetrics>();
+let skillCatalogGeneration = 0;
 
 export function skillsDir(cwd = process.cwd()): string {
   return join(musterRoot(cwd), "skills");
@@ -289,7 +317,13 @@ async function upsertSkillIndex(skill: SkillRecord, raw: string, cwd: string): P
   await rename(temp, path);
 }
 
-function verifySkillIndexEntry(index: SkillIndex | undefined, skill: SkillRecord, raw: string, path: string): void {
+function verifySkillIndexEntry(
+  index: SkillIndex | undefined,
+  skill: SkillRecord,
+  raw: string,
+  path: string,
+  metrics?: MutableSkillCatalogMetrics,
+): void {
   const entry = index?.skills?.[skill.name];
   if (!entry) {
     if (index && skill.status === "active") {
@@ -300,6 +334,7 @@ function verifySkillIndexEntry(index: SkillIndex | undefined, skill: SkillRecord
   if (entry.status !== skill.status) {
     throw skillTrustError(`Skill index status mismatch for "${skill.name}" at ${path}: index=${entry.status}, file=${skill.status}.`);
   }
+  if (metrics) metrics.hashOperations += 1;
   const actual = skillDigest(raw);
   if (entry.digest !== actual) {
     throw skillTrustError(`Skill digest mismatch for "${skill.name}" at ${path}: expected ${entry.digest}, got ${actual}.`);
@@ -429,11 +464,13 @@ function expandHome(path: string, cwd: string): string {
   return isAbsolute(path) ? path : join(cwd, path);
 }
 
-async function findSkillFiles(root: string): Promise<string[]> {
+async function findSkillFiles(root: string, metrics: MutableSkillCatalogMetrics): Promise<string[]> {
   const found: string[] = [];
+  metrics.recursiveWalks += 1;
   const visit = async (dir: string): Promise<void> => {
     let entries: { name: string; isDirectory(): boolean; isFile(): boolean }[] = [];
     try {
+      metrics.directoryReads += 1;
       entries = await readdir(dir, { withFileTypes: true });
     } catch {
       return;
@@ -452,62 +489,128 @@ async function findSkillFiles(root: string): Promise<string[]> {
   return found.sort();
 }
 
-async function buildSkillCatalogSignature(cwd: string, candidates: readonly SkillFileCandidate[]): Promise<string> {
-  const parts: string[] = [];
-  try {
-    const indexStat = await stat(skillsIndexPath(cwd));
-    parts.push(`index:${indexStat.mtimeMs}:${indexStat.size}`);
-  } catch {
-    parts.push("index:missing");
-  }
-  for (const candidate of candidates) {
-    try {
-      const fileStat = await stat(candidate.path);
-      const digest = skillDigest(await readFile(candidate.path, "utf8"));
-      parts.push(`${candidate.root.path}:${candidate.root.indexed ? "i" : "u"}:${candidate.root.candidates ? "c" : "a"}:${candidate.path}:${fileStat.mtimeMs}:${fileStat.size}:${digest}`);
-    } catch {
-      parts.push(`${candidate.root.path}:${candidate.path}:missing`);
-    }
-  }
-  return skillDigest(parts.join("\n"));
+function normalizeSkillCatalogSnapshotTtl(ttlMs: number | undefined): number {
+  if (ttlMs === undefined || !Number.isFinite(ttlMs)) return DEFAULT_SKILL_CATALOG_SNAPSHOT_TTL_MS;
+  return Math.min(MAX_SKILL_CATALOG_SNAPSHOT_TTL_MS, Math.max(0, Math.floor(ttlMs)));
 }
 
-function skillCatalogCacheKey(cwd: string, roots: readonly SkillSearchRoot[]): string {
+function skillCatalogCacheKey(cwd: string, roots: readonly SkillSearchRoot[], ttlMs: number): string {
   return JSON.stringify({
     cwd: resolve(cwd),
     roots: roots.map((root) => ({ path: root.path, indexed: root.indexed, candidates: root.candidates })),
+    ttlMs,
   });
 }
 
 export function clearSkillCatalogSnapshots(): void {
+  skillCatalogGeneration += 1;
   skillCatalogCache.clear();
+  skillCatalogRefreshes.clear();
+  skillCatalogMetrics.clear();
+}
+
+/** Read-only diagnostics used by performance tests and runtime observability. */
+export function getSkillCatalogSnapshotMetrics(
+  cwd = process.cwd(),
+  discovery: SkillDiscoveryOptions = {},
+): SkillCatalogSnapshotMetrics {
+  const roots = buildSkillSearchRoots(cwd, discovery);
+  const ttlMs = normalizeSkillCatalogSnapshotTtl(discovery.snapshotTtlMs);
+  const cacheKey = skillCatalogCacheKey(cwd, roots, ttlMs);
+  const metrics = skillCatalogMetrics.get(cacheKey) ?? createSkillCatalogMetrics();
+  return {
+    generation: skillCatalogGeneration,
+    cachedSkills: skillCatalogCache.get(cacheKey)?.skills.length ?? 0,
+    ...metrics,
+  };
 }
 
 export async function listSkills(cwd = process.cwd(), statuses?: SkillStatus[], discovery: SkillDiscoveryOptions = {}): Promise<SkillRecord[]> {
   const roots = buildSkillSearchRoots(cwd, discovery);
-  const candidates: SkillFileCandidate[] = [];
-  for (const root of roots) {
-    for (const path of await findSkillFiles(root.path)) candidates.push({ root, path });
+  const ttlMs = normalizeSkillCatalogSnapshotTtl(discovery.snapshotTtlMs);
+  const cacheKey = skillCatalogCacheKey(cwd, roots, ttlMs);
+  const metrics = getOrCreateSkillCatalogMetrics(cacheKey);
+  let catalog: readonly SkillRecord[];
+
+  while (true) {
+    const generation = skillCatalogGeneration;
+    const cached = skillCatalogCache.get(cacheKey);
+    if (cached?.generation === generation && performance.now() < cached.expiresAtMs) {
+      metrics.cacheHits += 1;
+      catalog = cached.skills;
+      break;
+    }
+
+    let refresh = skillCatalogRefreshes.get(cacheKey);
+    if (!refresh || refresh.generation !== generation) {
+      const promise = refreshSkillCatalog(cwd, roots, ttlMs, generation, metrics);
+      refresh = { generation, promise };
+      skillCatalogRefreshes.set(cacheKey, refresh);
+      void promise.finally(() => {
+        if (skillCatalogRefreshes.get(cacheKey)?.promise === promise) skillCatalogRefreshes.delete(cacheKey);
+      }).catch(() => undefined);
+    }
+
+    const snapshot = await refresh.promise;
+    if (snapshot.generation !== skillCatalogGeneration) continue;
+    skillCatalogCache.set(cacheKey, snapshot);
+    catalog = snapshot.skills;
+    break;
   }
-  const cacheKey = skillCatalogCacheKey(cwd, roots);
-  const signature = await buildSkillCatalogSignature(cwd, candidates);
-  const cached = skillCatalogCache.get(cacheKey);
-  const catalog = cached?.signature === signature ? cached.skills : await loadSkillCatalog(cwd, candidates);
-  if (!cached || cached.signature !== signature) skillCatalogCache.set(cacheKey, { signature, skills: catalog });
+
   return statuses ? catalog.filter((skill) => statuses.includes(skill.status)) : [...catalog];
 }
 
-async function loadSkillCatalog(cwd: string, candidates: readonly SkillFileCandidate[]): Promise<readonly SkillRecord[]> {
+function createSkillCatalogMetrics(): MutableSkillCatalogMetrics {
+  return { cacheHits: 0, refreshes: 0, recursiveWalks: 0, directoryReads: 0, fileReads: 0, hashOperations: 0 };
+}
+
+function getOrCreateSkillCatalogMetrics(cacheKey: string): MutableSkillCatalogMetrics {
+  const existing = skillCatalogMetrics.get(cacheKey);
+  if (existing) return existing;
+  const metrics = createSkillCatalogMetrics();
+  skillCatalogMetrics.set(cacheKey, metrics);
+  return metrics;
+}
+
+async function refreshSkillCatalog(
+  cwd: string,
+  roots: readonly SkillSearchRoot[],
+  ttlMs: number,
+  generation: number,
+  metrics: MutableSkillCatalogMetrics,
+): Promise<SkillCatalogSnapshot> {
+  metrics.refreshes += 1;
+  const candidates: SkillFileCandidate[] = [];
+  for (const root of roots) {
+    for (const path of await findSkillFiles(root.path, metrics)) candidates.push({ root, path });
+  }
+  const skills = await loadSkillCatalog(cwd, candidates, metrics);
+  return {
+    generation,
+    expiresAtMs: performance.now() + ttlMs,
+    skills,
+  };
+}
+
+async function loadSkillCatalog(
+  cwd: string,
+  candidates: readonly SkillFileCandidate[],
+  metrics: MutableSkillCatalogMetrics,
+): Promise<readonly SkillRecord[]> {
   const skills: SkillRecord[] = [];
   const seen = new Set<string>();
   const index = await readJsonFile<SkillIndex | undefined>(skillsIndexPath(cwd), undefined);
   for (const candidate of candidates) {
       try {
+        metrics.fileReads += 1;
         const raw = await readFile(candidate.path, "utf8");
         const skill = parse(raw);
         if (candidate.root.candidates && skill.status !== "candidate") continue;
         if (!candidate.root.candidates && skill.status === "candidate") continue;
-        if (candidate.root.indexed) verifySkillIndexEntry(index, skill, raw, candidate.path);
+        if (candidate.root.indexed) {
+          verifySkillIndexEntry(index, skill, raw, candidate.path, metrics);
+        }
         if (seen.has(skill.name)) continue;
         seen.add(skill.name);
         skills.push(skill);

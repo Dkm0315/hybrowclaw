@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "id": "oss-manager-native-qa",
+  "name": "OSS Manager Deterministic QA Contract",
+  "version": "0.2.0",
+  "kind": "workflow",
+  "entrypoint": "src/index.ts",
+  "permissions": [],
+  "sandbox": "read_only",
+  "evals": [
+    "evals/negative-control.json",
+    "evals/killed-run-recovery.json",
+    "evals/missing-evidence.json",
+    "evals/wrong-sha.json",
+    "evals/data-mismatch.json",
+    "evals/restoration-failure.json"
+  ],
+  "implementedTools": [
+    "oss_qa_source_lock",
+    "oss_qa_diff_classify",
+    "oss_qa_documentation_impact",
+    "oss_qa_scenario_compile",
+    "oss_qa_use_case_select",
+    "oss_qa_suite_catalog",
+    "oss_qa_suite_manifest_validate",
+    "oss_qa_run_create",
+    "oss_qa_executor_next",
+    "oss_qa_compensation_register",
+    "oss_qa_mutation_record",
+    "oss_qa_validator_evaluate",
+    "oss_qa_suite_validation_record",
+    "oss_qa_validation_coverage",
+    "oss_qa_state_record",
+    "oss_qa_run_recover",
+    "oss_qa_progress_render",
+    "oss_qa_report_build",
+    "oss_qa_operation_validate",
+    "oss_qa_catalog",
+    "oss_qa_profile_describe",
+    "oss_qa_evidence_digest"
+  ],
+  "digest": "sha256:af9fa9cc869af20077601c1ed340bca09acef0fd4b7280ddf65360b7f56b2c31",
+  "description": "Local deterministic OSS Manager QA planner and receipt evaluator with source locks, feature-owned suite validators, documentation-impact gates, typed operation contracts, fail-closed suite coverage, compensation-before-mutation, killed-run recovery, and restore-finally verdicts. Live infrastructure adapters are deployment-supplied and are not bundled.",
+  "readiness": {
+    "level": "executable",
+    "status": "beta",
+    "actionability": "local_tool",
+    "owner": "muster-core",
+    "surfaces": [
+      "cli"
+    ],
+    "setup": {
+      "urls": [
+        "https://github.com/hybrowlabs/OSS-Manager"
+      ],
+      "requiredEnv": [],
+      "requiredAnyEnv": [],
+      "credentialStorage": "none"
+    },
+    "diagnostics": {
+      "doctorCommand": "muster capability inspect capability-packs/oss-manager",
+      "smokeCommand": "pnpm exec tsx --test capability-packs/oss-manager/test/*.test.ts",
+      "latencyBudgetMs": 1000,
+      "requiresLiveCredentials": false
+    },
+    "safety": {
+      "risk": "high",
+      "permissionMode": "deny_by_default",
+      "mutationApproval": "required",
+      "resultCapBytes": 65536,
+      "secretRedaction": true
+    },
+    "evidence": {
+      "unitTests": [
+        "capability-packs/oss-manager/test/oss-manager.test.ts"
+      ],
+      "qaSuites": [
+        "negative-control",
+        "killed-run-recovery",
+        "missing-evidence",
+        "wrong-sha",
+        "data-mismatch",
+        "restoration-failure"
+      ],
+      "liveArtifacts": [],
+      "docs": [
+        "capability-packs/oss-manager/README.md"
+      ]
+    }
+  }
+}

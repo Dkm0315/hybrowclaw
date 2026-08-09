@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "id": "jenkins-governed",
+  "name": "Governed Jenkins",
+  "version": "0.1.0",
+  "kind": "tool",
+  "slot": "ci",
+  "entrypoint": "src/index.ts",
+  "digest": "sha256:6baa96e61d70e62172db63a99f17dc5c63642c5916491e34f5e98cbcc4162e02",
+  "description": "Allowlisted Jenkins job discovery, chronological build evidence, bounded console inspection, and hash-bound pipeline planning and application.",
+  "permissions": [
+    "network",
+    "secrets"
+  ],
+  "sandbox": "network_limited",
+  "secrets": [
+    "JENKINS_URL",
+    "JENKINS_USER",
+    "JENKINS_PASSWORD"
+  ],
+  "evals": [
+    "evals/jenkins-boundaries.json"
+  ],
+  "implementedTools": [
+    "jenkins_connection_check",
+    "jenkins_jobs_list",
+    "jenkins_builds_list",
+    "jenkins_build_inspect",
+    "jenkins_console_tail",
+    "jenkins_pipeline_read",
+    "jenkins_pipeline_plan",
+    "jenkins_pipeline_apply",
+    "jenkins_build_trigger"
+  ],
+  "status": "beta: live Jenkins REST tools constrained to configured job roots. Reads are bounded and redacted. Pipeline mutation requires an exact source hash, plan digest, explicit confirmation, and post-write verification.",
+  "readiness": {
+    "level": "verified",
+    "status": "beta",
+    "actionability": "local_tool",
+    "owner": "muster-core",
+    "surfaces": [
+      "cli",
+      "frappe",
+      "channel"
+    ],
+    "setup": {
+      "urls": [
+        "https://www.jenkins.io/doc/book/using/remote-access-api/"
+      ],
+      "requiredEnv": [
+        "JENKINS_URL",
+        "JENKINS_USER",
+        "JENKINS_PASSWORD"
+      ],
+      "requiredAnyEnv": [],
+      "credentialStorage": "env",
+      "notes": [
+        "JENKINS_PASSWORD may be a Jenkins API token.",
+        "Configure allowedRoots in plugin policy. Mutation remains denied unless allowMutation is true."
+      ]
+    },
+    "diagnostics": {
+      "doctorCommand": "muster plugins check jenkins-governed",
+      "smokeCommand": "pnpm exec tsx --test capability-packs/jenkins/test/*.test.ts",
+      "latencyBudgetMs": 3000,
+      "requiresLiveCredentials": true
+    },
+    "safety": {
+      "risk": "high",
+      "permissionMode": "ask",
+      "mutationApproval": "required",
+      "resultCapBytes": 65536,
+      "secretRedaction": true
+    },
+    "evidence": {
+      "unitTests": [
+        "capability-packs/jenkins/test/jenkins.test.ts"
+      ],
+      "qaSuites": [
+        "allowlist",
+        "chronology",
+        "hash-bound-mutation",
+        "secret-redaction"
+      ],
+      "liveArtifacts": [],
+      "docs": [
+        "capability-packs/jenkins/README.md"
+      ]
+    }
+  }
+}

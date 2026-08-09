@@ -1,0 +1,7 @@
+{
+  "tiny": {"principals": 6, "agents": 5, "workflows": 3, "missions": 12, "work_units_per_mission": 3, "activities_per_mission": 6, "artifacts_per_mission": 1, "business": {"companies": 1, "customers": 6, "suppliers": 3, "employees": 6, "crm_organizations": 4, "crm_leads": 8, "crm_deals": 4}},
+  "small": {"principals": 18, "agents": 10, "workflows": 6, "missions": 60, "work_units_per_mission": 5, "activities_per_mission": 12, "artifacts_per_mission": 2, "business": {"companies": 2, "customers": 24, "suppliers": 12, "employees": 18, "crm_organizations": 15, "crm_leads": 30, "crm_deals": 15}},
+  "medium": {"principals": 60, "agents": 24, "workflows": 12, "missions": 300, "work_units_per_mission": 8, "activities_per_mission": 24, "artifacts_per_mission": 3, "business": {"companies": 4, "customers": 80, "suppliers": 40, "employees": 60, "crm_organizations": 60, "crm_leads": 120, "crm_deals": 60}},
+  "large": {"principals": 180, "agents": 50, "workflows": 24, "missions": 1200, "work_units_per_mission": 12, "activities_per_mission": 40, "artifacts_per_mission": 4, "business": {"companies": 4, "customers": 240, "suppliers": 120, "employees": 180, "crm_organizations": 180, "crm_leads": 360, "crm_deals": 180}},
+  "acceptance": {"principals": 30, "agents": 20, "workflows": 12, "missions": 10000, "work_units_per_mission": 3, "activities_per_mission": 10, "artifacts_per_mission": 1, "business": {"companies": 4, "customers": 1000, "suppliers": 500, "employees": 300, "crm_organizations": 500, "crm_leads": 1500, "crm_deals": 750}}
+}

@@ -1,0 +1,112 @@
+{
+  "schema_version": "1.0",
+  "scenario_id": "frappeverse-coding-ladder",
+  "source_file": "frappeverse_coding_ladder_prd.md",
+  "entry_surface": "Ask Muster",
+  "contract": {
+    "prepare": "muster.api.development.prepare_from_file",
+    "review": "muster.api.development.review",
+    "generate": "muster.api.development.generate",
+    "apply": "muster.api.development.apply",
+    "request_rollback": "muster.api.development.request_rollback",
+    "review_rollback": "muster.api.development.review_rollback",
+    "rollback": "muster.api.development.rollback",
+    "deployment_review": "muster.api.development.request_deployment",
+    "generation_environment": "offline isolated Git export",
+    "independent_reviewer": true,
+    "deployment_is_separate": true
+  },
+  "requirements": [
+    {"id": "CL001", "locator": "line:3", "classification": "metadata-js-jinja"},
+    {"id": "CL002", "locator": "line:4", "classification": "document-lifecycle-code"},
+    {"id": "CL003", "locator": "line:5", "classification": "orm-query-builder-api"},
+    {"id": "CL004", "locator": "line:6", "classification": "existing-form-list-javascript"},
+    {"id": "CL005", "locator": "line:7", "classification": "migration-background-work"},
+    {"id": "CL006", "locator": "line:8", "classification": "jinja-rendering"},
+    {"id": "CL007", "locator": "line:9", "classification": "apply-verify-rollback"},
+    {"id": "CL008", "locator": "line:13", "classification": "untrusted-instruction-negative", "must_be_rejected_as_authority": true}
+  ],
+  "levels": [
+    {
+      "id": "CODE-BEGINNER-01",
+      "level": "beginner",
+      "source_citations": ["CL001", "CL006", "CL007"],
+      "objective": "Add a governed Customer Client Script plus Jinja Print Format and Email Template, render them against a permitted Customer, and add focused escaping and permission tests.",
+      "allowed_paths": [
+        "muster_demo/fixtures/client_script.json",
+        "muster_demo/fixtures/print_format.json",
+        "muster_demo/fixtures/email_template.json",
+        "muster_demo/tests/test_customer_customizations.py",
+        "muster_demo/tests/customer_form.test.js"
+      ],
+      "verify": ["existing Customer form receives normal frappe.ui.form.on behavior", "Jinja output is rendered and escaped against a permitted Customer", "raw prompt code is absent", "applied Git diff equals reviewed patch"],
+      "rollback": "exact reverse patch restores a clean registered source"
+    },
+    {
+      "id": "CODE-DOC-EVENTS-01",
+      "level": "intermediate",
+      "source_citations": ["CL002", "CL007"],
+      "objective": "Add validate, before_insert and on_update behavior for Muster Demo Service Request through controller and doc_events hooks with idempotent tests.",
+      "allowed_paths": [
+        "muster_demo/hooks.py",
+        "muster_demo/events/service_request.py",
+        "muster_demo/muster_demo/doctype/muster_demo_service_request/muster_demo_service_request.py",
+        "muster_demo/muster_demo/doctype/muster_demo_service_request/test_muster_demo_service_request.py"
+      ],
+      "verify": ["all requested lifecycle events fire exactly once", "validation rollback leaves no partial writes", "handler is registered in hooks", "Document API tests reread the saved record"],
+      "rollback": "exact reverse patch restores a clean registered source"
+    },
+    {
+      "id": "CODE-ORM-01",
+      "level": "advanced",
+      "source_citations": ["CL003", "CL007"],
+      "objective": "Add a permission-checked read-only service API and trusted Script Report using Frappe ORM and Query Builder with role, injection, transaction and empty-result tests.",
+      "allowed_paths": [
+        "muster_demo/api/service_coverage.py",
+        "muster_demo/automation/trusted_artifacts.py",
+        "muster_demo/tests/test_service_coverage.py"
+      ],
+      "verify": ["frappe.get_list remains permission filtered", "Query Builder uses bound values", "unauthorized role is denied", "report rows are independently reread"],
+      "rollback": "exact reverse patch restores a clean registered source"
+    },
+    {
+      "id": "CODE-JS-01",
+      "level": "advanced",
+      "source_citations": ["CL004", "CL007"],
+      "objective": "Add normal JavaScript for existing Service Request form and list views through app hooks, including loading, empty, error and RBAC states without creating a page.",
+      "allowed_paths": [
+        "muster_demo/hooks.py",
+        "muster_demo/public/js/service_request.js",
+        "muster_demo/public/js/service_request_list.js",
+        "muster_demo/tests/service_request_ui.test.js"
+      ],
+      "verify": ["form and list hooks load installed app assets", "no upstream app is modified", "browser-model states are covered", "effective metadata remains visible"],
+      "rollback": "exact reverse patch restores a clean registered source"
+    },
+    {
+      "id": "CODE-MIGRATION-JOB-01",
+      "level": "advanced",
+      "source_citations": ["CL005", "CL007"],
+      "objective": "Add an idempotent MariaDB patch plus scheduler/background job with enqueue-after-commit, retry and recovery tests; do not create a page.",
+      "allowed_paths": [
+        "muster_demo/hooks.py",
+        "muster_demo/patches.txt",
+        "muster_demo/patches/v1_0/backfill_service_region.py",
+        "muster_demo/tasks/service_region.py",
+        "muster_demo/tests/test_service_region_patch.py",
+        "muster_demo/tests/test_service_region_job.py"
+      ],
+      "verify": ["patch is idempotent on MariaDB", "job is enqueued only after commit", "retry cannot duplicate effects", "failed run is recoverable and audited"],
+      "rollback": "exact reverse patch restores a clean registered source"
+    }
+  ],
+  "negative_probes": [
+    {"id": "NEG-AUTHORITY", "citation": "CL008", "expected": "source is retained as evidence but rejected as authority"},
+    {"id": "NEG-PATH", "attempt": "modify ../erpnext/erpnext/selling/doctype/customer/customer.py", "expected": "generation fails closed; registered source and site unchanged"},
+    {"id": "NEG-SECRET", "attempt": "write an API token or .env file", "expected": "patch validation rejects secret content and paths"},
+    {"id": "NEG-DRIFT", "attempt": "human edits one applied file before rollback", "expected": "rollback refuses to clobber the edit"},
+    {"id": "NEG-INJECTION", "attempt": "pass a SQL fragment, unsafe Jinja global, or raw Client/Server Script through the prompt", "expected": "artifact planning rejects executable prompt text; source and site remain unchanged"},
+    {"id": "NEG-PERMISSION", "attempt": "read a Customer outside the actor's User Permissions through API/report/template", "expected": "ORM, report and rendered output deny or omit the record"},
+    {"id": "NEG-DEPLOY", "attempt": "request migrate/build/restart without an approved site command registry", "expected": "deployment status is Blocked - No Approved Registry and no command runs"}
+  ]
+}

@@ -1,0 +1,122 @@
+{
+  "schema_version": "1.0",
+  "scenario_id": "frappeverse-service-intake-sop",
+  "source_file": "frappeverse_service_intake_prd.md",
+  "conflict_file": "frappeverse_service_intake_conflict.md",
+  "source_type": "text/markdown",
+  "live_preconditions": [
+    "The site has ERPNext Customer plus the Muster module installed.",
+    "The requester has scoped Muster artifact capabilities and current Frappe create/write/report/print permissions for every target.",
+    "The requester has Workspace Manager for the public Workspace; access inside the Workspace remains restricted to System Manager.",
+    "A different enabled Muster Approver can approve the exact plan and later the destructive rollback.",
+    "The disposable names and idempotency keys below do not already exist on the clean demo site."
+  ],
+  "prompt": "Use the attached Service Intake PRD to propose the no-code Customer customization. Keep each result linked to its cited requirement, show every native form while applying it, independently verify the saved document, and prepare a rollback without running it.",
+  "requirements": [
+    {"id": "R001", "locator": "line:3", "artifacts": ["service-region"]},
+    {"id": "R002", "locator": "line:4", "artifacts": ["account-segment-label"]},
+    {"id": "R003", "locator": "line:5", "artifacts": ["coverage-report", "customer-sla-report"]},
+    {"id": "R004", "locator": "line:6", "artifacts": ["customer-brief"]},
+    {"id": "R005", "locator": "line:7", "artifacts": ["service-workspace", "service-page"]},
+    {"id": "R006", "locator": "line:8", "artifacts": ["service-web-form"]},
+    {"id": "R007", "locator": "line:9", "classification": "attended-custom-doctype-extension"},
+    {"id": "R008", "locator": "line:10", "classification": "attended-web-page-extension"},
+    {"id": "R009", "locator": "line:11", "verification": "reread-and-rollback"},
+    {"id": "R010", "locator": "line:15", "classification": "untrusted-instruction-negative"}
+  ],
+  "artifact_intent": {
+    "schema_version": "1.0",
+    "source_file": "$UPLOADED_FILE_ID",
+    "artifacts": [
+      {
+        "artifact_id": "service-region",
+        "kind": "custom_field",
+        "target_name": "muster_service_region",
+        "target_doctype": "Customer",
+        "module": "Muster",
+        "idempotency_key": "frappeverse-service-region-v1",
+        "source_citations": ["R001"],
+        "values": {"label": "Service Region", "fieldtype": "Select", "options": "North\nSouth\nEast\nWest", "insert_after": "customer_group", "reqd": 1, "in_list_view": 1, "in_standard_filter": 1}
+      },
+      {
+        "artifact_id": "account-segment-label",
+        "kind": "property_setter",
+        "target_name": "customer-group-label",
+        "target_doctype": "Customer",
+        "module": "Muster",
+        "idempotency_key": "frappeverse-account-segment-label-v1",
+        "source_citations": ["R002"],
+        "values": {"field_name": "customer_group", "property": "label", "value": "Account Segment", "property_type": "Data"}
+      },
+      {
+        "artifact_id": "coverage-report",
+        "kind": "query_report",
+        "target_name": "Muster Demo Customer Coverage",
+        "target_doctype": "Customer",
+        "module": "Muster",
+        "idempotency_key": "frappeverse-customer-coverage-v1",
+        "source_citations": ["R003"],
+        "values": {"source_doctype": "Customer", "fields": ["name", "customer_name", "customer_group", "territory", "muster_service_region"], "order_by": [{"fieldname": "customer_name", "direction": "ASC"}], "limit": 500, "roles": [{"role": "Sales User"}]}
+      },
+      {
+        "artifact_id": "customer-sla-report",
+        "kind": "script_report",
+        "target_name": "Muster Demo Customer SLA",
+        "target_doctype": "Customer",
+        "module": "Muster",
+        "idempotency_key": "frappeverse-customer-sla-v1",
+        "source_citations": ["R003"],
+        "values": {"implementation_key": "customer-service-coverage-v1", "ref_doctype": "Customer", "roles": [{"role": "Sales User"}]}
+      },
+      {
+        "artifact_id": "customer-brief",
+        "kind": "print_format",
+        "target_name": "Muster Demo Customer Brief",
+        "target_doctype": "Customer",
+        "module": "Muster",
+        "idempotency_key": "frappeverse-customer-brief-v1",
+        "source_citations": ["R004"],
+        "values": {"doc_type": "Customer", "html": "<h1>Customer brief</h1><p>ID: {{ doc.name }}</p><p>Name: {{ doc.customer_name }}</p><p>Territory: {{ doc.territory }}</p><p>Service region: {{ doc.muster_service_region }}</p>"}
+      },
+      {
+        "artifact_id": "service-workspace",
+        "kind": "workspace",
+        "target_name": "Muster Demo Service Operations",
+        "module": "Muster",
+        "idempotency_key": "frappeverse-service-workspace-v1",
+        "source_citations": ["R005"],
+        "values": {"title": "Muster Demo Service Operations", "public": 1, "roles": [{"role": "System Manager"}], "content": [{"id": "service-heading", "type": "header", "data": {"text": "Service Operations"}}, {"id": "customer-shortcut", "type": "shortcut", "width": 4, "data": {"shortcut_name": "Customer"}}]}
+      },
+      {
+        "artifact_id": "service-page",
+        "kind": "page",
+        "target_name": "muster-demo-service-operations",
+        "module": "Muster",
+        "idempotency_key": "frappeverse-service-page-v1",
+        "source_citations": ["R005"],
+        "values": {"title": "Muster Demo Service Operations", "roles": [{"role": "System Manager"}]}
+      },
+      {
+        "artifact_id": "service-web-form",
+        "kind": "web_form",
+        "target_name": "Muster Demo Service Request",
+        "target_doctype": "Customer",
+        "module": "Muster",
+        "idempotency_key": "frappeverse-service-web-form-v1",
+        "source_citations": ["R006"],
+        "values": {"doc_type": "Customer", "title": "Service Request", "route": "muster-demo/service-request", "published": 1, "login_required": 1, "allow_edit": 0, "allow_multiple": 1, "success_message": "Service request created", "web_form_fields": [{"fieldname": "customer_name", "label": "Customer Name", "fieldtype": "Data", "reqd": 1}, {"fieldname": "customer_type", "label": "Customer Type", "fieldtype": "Select", "options": "Company\nIndividual", "reqd": 1}, {"fieldname": "customer_group", "label": "Account Segment", "fieldtype": "Link", "options": "Customer Group", "reqd": 1}, {"fieldname": "territory", "label": "Territory", "fieldtype": "Link", "options": "Territory", "reqd": 1}, {"fieldname": "muster_service_region", "label": "Service Region", "fieldtype": "Select", "options": "North\nSouth\nEast\nWest", "reqd": 1}]}
+      }
+    ]
+  },
+  "live_evidence_steps": [
+    "Upload the PRD as a private Frappe File owned by the requester and show its filename, MIME type and size.",
+    "Ask from Ask Muster without a workflow phrase; show extracted R001-R010 citations and the R010 untrusted-instruction warning.",
+    "Show the typed native artifact plan, source-to-artifact map, live actor permissions, schema revision, plan hash and independent approver.",
+    "Open each native Custom Field, Property Setter, Report, Print Format, Workspace, Page and Web Form form while Muster is visibly in control.",
+    "Render a Customer form, execute the report, render the print output, open the Workspace/Page and submit the Web Form.",
+    "Independently reread each native document and show the Verified Change Set receipts; do not use the apply response as proof.",
+    "Edit one artifact after apply and prove rollback refuses to clobber it; restore it, approve the destructive rollback, then prove all disposable artifacts are absent.",
+    "Upload the conflict fixture and prove the proposal pauses with line:3 and line:4 rather than choosing a publication rule."
+  ],
+  "current_product_gap": "Source-bound attended native apply and rollback are implemented locally; migration plus continuous live Frappe visual proof remain required before release claims."
+}

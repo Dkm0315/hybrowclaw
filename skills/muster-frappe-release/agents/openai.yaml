@@ -1,0 +1,7 @@
+interface:
+  display_name: "Muster Frappe Release"
+  short_description: "Deploy break test and prove the Frappe release"
+  brand_color: "#7C3AED"
+  default_prompt: "Use $muster-frappe-release to deploy, negatively test, and produce evidence for this release."
+policy:
+  allow_implicit_invocation: true

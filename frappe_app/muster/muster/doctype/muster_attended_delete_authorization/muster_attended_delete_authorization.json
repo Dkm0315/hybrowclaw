@@ -1,0 +1,34 @@
+{
+  "doctype": "DocType",
+  "name": "Muster Attended Delete Authorization",
+  "module": "Muster",
+  "autoname": "MST-ADA-.YYYY.-.#####",
+  "track_changes": 0,
+  "field_order": ["authorization_tab", "status", "proposal", "actor", "site", "target_doctype", "record_name", "record_revision", "plan_hash", "approval_proof", "issue_key", "token_hash", "expires_at", "consumed_at", "verification_token_hash", "verification_expires_at", "verified_at", "receipt_hash", "evidence_json"],
+  "fields": [
+    {"fieldname": "authorization_tab", "fieldtype": "Tab Break", "label": "Authorization"},
+    {"fieldname": "status", "fieldtype": "Select", "label": "Status", "options": "Issued\nConsumed\nVerified\nFailed\nExpired", "reqd": 1, "read_only": 1, "in_list_view": 1},
+    {"fieldname": "proposal", "fieldtype": "Link", "label": "Proposal", "options": "Muster Workflow Proposal", "reqd": 1, "read_only": 1, "in_list_view": 1},
+    {"fieldname": "actor", "fieldtype": "Link", "label": "Actor", "options": "User", "reqd": 1, "read_only": 1},
+    {"fieldname": "site", "fieldtype": "Data", "label": "Site", "reqd": 1, "read_only": 1},
+    {"fieldname": "target_doctype", "fieldtype": "Link", "label": "Target DocType", "options": "DocType", "reqd": 1, "read_only": 1},
+    {"fieldname": "record_name", "fieldtype": "Data", "label": "Record", "reqd": 1, "read_only": 1},
+    {"fieldname": "record_revision", "fieldtype": "Data", "label": "Record Revision", "reqd": 1, "read_only": 1},
+    {"fieldname": "plan_hash", "fieldtype": "Data", "label": "Plan SHA-256", "reqd": 1, "read_only": 1},
+    {"fieldname": "approval_proof", "fieldtype": "Data", "label": "Approval SHA-256", "reqd": 1, "read_only": 1},
+    {"fieldname": "issue_key", "fieldtype": "Data", "label": "Issue Idempotency Key", "reqd": 1, "unique": 1, "read_only": 1},
+    {"fieldname": "token_hash", "fieldtype": "Data", "label": "Authorization Token SHA-256", "reqd": 1, "unique": 1, "read_only": 1},
+    {"fieldname": "expires_at", "fieldtype": "Datetime", "label": "Expires At", "reqd": 1, "read_only": 1},
+    {"fieldname": "consumed_at", "fieldtype": "Datetime", "label": "Consumed At", "read_only": 1},
+    {"fieldname": "verification_token_hash", "fieldtype": "Data", "label": "Verification Token SHA-256", "unique": 1, "read_only": 1},
+    {"fieldname": "verification_expires_at", "fieldtype": "Datetime", "label": "Verification Expires At", "read_only": 1},
+    {"fieldname": "verified_at", "fieldtype": "Datetime", "label": "Verified At", "read_only": 1},
+    {"fieldname": "receipt_hash", "fieldtype": "Data", "label": "Receipt SHA-256", "read_only": 1},
+    {"fieldname": "evidence_json", "fieldtype": "Code", "label": "Sanitized Evidence", "options": "JSON", "read_only": 1}
+  ],
+  "permissions": [
+    {"role": "Muster Administrator", "read": 1, "report": 1, "export": 1},
+    {"role": "Muster Auditor", "read": 1, "report": 1, "export": 1},
+    {"role": "System Manager", "read": 1, "report": 1}
+  ]
+}

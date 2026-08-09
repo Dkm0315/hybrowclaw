@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "oss-manager-data-mismatch",
+  "createdAt": "2026-07-10T00:00:00.000Z",
+  "sourceEpisodeId": "oss-manager-native-qa-pack",
+  "prompt": "The service is healthy but one seeded row or field has a different digest. Determine the verdict.",
+  "taskKind": "workflow",
+  "recordedResponseText": "FAIL. Service health cannot override full selected-record verification; the mismatched row or field remains a verified regression.",
+  "expectedContains": ["FAIL", "Service health cannot override", "mismatched row or field"],
+  "forbiddenContains": ["PASS", "minor mismatch"],
+  "evidenceLabels": ["data-digest", "semantic-mismatch"]
+}

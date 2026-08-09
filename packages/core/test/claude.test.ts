@@ -166,3 +166,21 @@ test("inspectClaudeCode reports unavailable commands safely", async () => {
 
   assert.equal(report.available, false);
 });
+
+test("runClaudeCode classifies only pre-dispatch spawn failures as fallback-safe", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-claude-fallback-"));
+  const missing = await runClaudeCode({
+    command: join(cwd, "missing-claude"),
+    prompt: "hello",
+    cwd,
+  });
+  assert.equal(missing.status, "failed");
+  assert.equal(missing.fallbackEligible, true);
+
+  const exitsAfterStart = join(cwd, "claude-exit.sh");
+  await writeFile(exitsAfterStart, "#!/usr/bin/env bash\nexit 7\n", "utf8");
+  await chmod(exitsAfterStart, 0o755);
+  const dispatched = await runClaudeCode({ command: exitsAfterStart, prompt: "hello", cwd });
+  assert.equal(dispatched.status, "failed");
+  assert.equal(dispatched.fallbackEligible, false);
+});

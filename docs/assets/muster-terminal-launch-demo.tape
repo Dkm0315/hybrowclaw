@@ -44,7 +44,7 @@ Type "muster channels setup telegram --bot-token-env TELEGRAM_BOT_TOKEN --public
 Enter
 Sleep 3.2s
 
-Type "muster channels setup gchat --verification-token-env GOOGLE_CHAT_SIGNING_SECRET --public-url https://agent.example.com"
+Type "muster channels ready gchat --audience https://agent.example.com/v1/adapters/gchat --no-start"
 Enter
 Sleep 3.2s
 

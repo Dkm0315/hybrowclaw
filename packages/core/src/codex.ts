@@ -6,7 +6,7 @@ import { join as pathJoin } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { runSubprocess } from "./subprocess.js";
+import { isPreDispatchSpawnError, runSubprocess } from "./subprocess.js";
 
 const execFileAsync = promisify(execFile);
 const CODEX_EXEC_SUPPORT_CACHE = new Map<string, boolean>();
@@ -25,6 +25,7 @@ export interface CodexRunInput {
   readonly cwd: string;
   /** User's chosen model, preserved (e.g. gpt-5.5). */
   readonly model?: string;
+  readonly reasoning?: "none" | "low" | "medium" | "high";
   /**
    * muster memory + skill index, injected as a system-level instructions file
    * (-c experimental_instructions_file=). Goes to the system prompt, NOT the
@@ -48,6 +49,8 @@ export interface CodexRunInput {
   readonly env?: Record<string, string>;
   readonly timeoutMs?: number;
   readonly command?: string;
+  /** Native Codex config overrides supplied by the governed host. */
+  readonly configOverrides?: readonly string[];
 }
 
 export interface CodexRunResult {
@@ -62,6 +65,7 @@ export interface CodexRunResult {
   readonly stderr: string;
   readonly durationMs: number;
   readonly errorMessage?: string;
+  readonly fallbackEligible?: boolean;
 }
 
 export async function inspectCodex(command = "codex"): Promise<{ readonly available: boolean; readonly version?: string; readonly supportsExec?: boolean }> {
@@ -101,6 +105,7 @@ export function buildCodexArgs(input: CodexRunInput, outputLastMessageFile: stri
   if (!isResume) args.push("-C", input.cwd);
   args.push("--skip-git-repo-check");
   if (input.model) args.push("-m", input.model);
+  if (input.reasoning) args.push("-c", `model_reasoning_effort=${JSON.stringify(input.reasoning === "none" ? "low" : input.reasoning)}`);
   if (!isResume) args.push("-s", input.sandbox ?? "workspace-write");
   if (input.ignoreRules) args.push("--ignore-rules");
   // `codex exec` is non-interactive (no approval prompt possible) and has NO `-a`
@@ -109,6 +114,7 @@ export function buildCodexArgs(input: CodexRunInput, outputLastMessageFile: stri
   args.push("-c", `approval_policy=${input.approval ?? "never"}`);
   if (input.networkAccess) args.push("-c", "sandbox_workspace_write.network_access=true");
   if (input.instructionsFile) args.push("-c", `experimental_instructions_file=${input.instructionsFile}`);
+  for (const override of input.configOverrides ?? []) args.push("-c", override);
   args.push("-o", outputLastMessageFile);
   if (isResume && input.sessionId) args.push(input.sessionId);
   args.push(input.prompt);
@@ -164,6 +170,7 @@ export async function runCodex(input: CodexRunInput): Promise<CodexRunResult> {
       stderr: "",
       durationMs: Date.now() - started,
       errorMessage: "Installed Codex CLI does not support `codex exec --json`. Update Codex or use the app-server transport; refusing to pass modern exec flags to a legacy interactive Codex binary.",
+      fallbackEligible: true,
     };
   }
   // Inherit the real environment (so CODEX_HOME / auth resolve) and overlay
@@ -205,6 +212,7 @@ export async function runCodex(input: CodexRunInput): Promise<CodexRunResult> {
       stderr,
       durationMs: Date.now() - started,
       errorMessage,
+      fallbackEligible: isPreDispatchSpawnError(error),
     };
   } finally {
     await rm(outputFile, { force: true }).catch(() => {});

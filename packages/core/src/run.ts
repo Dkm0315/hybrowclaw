@@ -1,14 +1,17 @@
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { readdir, writeFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { existsSync, rmSync } from "node:fs";
+import { chmod, mkdtemp, readdir, readFile, writeFile, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { loadAgentRules } from "./agent-rules.js";
 import { defaultHookBus, type HookBus } from "./hooks.js";
 import { appendGoalLoopTurn, buildGoalLoopTurn, rememberedMemoryWrite, type GoalLoopMemoryWrite } from "./goal-loop.js";
 import { runClaudeCode } from "./claude.js";
 import { runCodex } from "./codex.js";
-import { runCodexAppServer } from "./codex-app-server.js";
-import { canReuseHandle, clearSessionHandle, loadSessionHandle, saveSessionHandle } from "./session-handle.js";
+import { clearCodexAppServerConversation, clearCodexAppServerSessions, runCodexAppServer } from "./codex-app-server.js";
+import { canReuseHandle, clearConversationSessionHandles, clearSessionHandle, loadSessionHandle, saveSessionHandle } from "./session-handle.js";
 import { renderConversation } from "./compactor.js";
 import { messagesToTranscript, openSessionStore } from "./sessions.js";
 
@@ -16,6 +19,44 @@ import { messagesToTranscript, openSessionStore } from "./sessions.js";
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 16_000;
 
 const FAST_SIMPLE_QA_RULES = "Answer only the user's request. If unsure, say so. Do not mention internal rules or process.";
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Native provider hosts can contribute thousands of tokens of ambient tools,
+ * apps, and skills. Answer-only turns retain Codex's basic execution/safety
+ * surface, but defer capabilities whose domains cannot be relevant to the
+ * current prompt. Full turns use the provider exactly as configured.
+ */
+const LEAN_CODEX_FEATURES = [
+  "apps",
+  "browser_use",
+  "browser_use_external",
+  "browser_use_full_cdp_access",
+  "computer_use",
+  "goals",
+  "image_generation",
+  "in_app_browser",
+  "multi_agent",
+  "plugins",
+  "workspace_dependencies",
+] as const;
+
+const leanCodexSupport = new Map<string, Promise<readonly string[] | undefined>>();
+const leanCodexWrappers = new Map<string, Promise<string>>();
+const leanCodexWrapperDirs = new Set<string>();
+let leanCodexCleanupRegistered = false;
+
+const EXACT_RESPONSE_RE = /\b(?:reply|respond|answer|say|return|output)\s+(?:(?:to\s+this\s+)?with\s+)?exactly\b/i;
+const GREETING_RE = /^(?:hi|hello|hey|thanks|thank you|good\s+(?:morning|afternoon|evening))[\s!.?]*$/i;
+const AGENTIC_PROMPT_RE = /\b(?:analy[sz]e|approve|artifact|audit|browse|build|cancel|chart|cite|code|commit|compare|compile|create|debug|delete|deploy|design|docx|download|edit|evidence|execute|export|fetch|file|folder|generate|image|install|latest|mcp|modify|pdf|plan|plugin|post|pptx|push|reject|remove|report|repository|research|run|search|send|shell|skill|source|spreadsheet|submit|summari[sz]e|terminal|test|tool|update|upload|url|website|workspace|write|xlsx)\b/i;
+const CONVERSATION_REFERENCE_RE = /(?:^(?:and|also|but|so)\b|\b(?:again|above|continue|earlier|former|last\s+(?:answer|message|one|request|turn)|latter|previous|same|that|those|you\s+(?:mentioned|said))\b|\b(?:how|what)\s+about\b)/i;
+
+interface PromptActivation {
+  readonly mode: "full" | "lean";
+  readonly freshConversation: boolean;
+  readonly reason: "exact_response" | "greeting" | "trusted_context_qa" | "full_capability";
+}
 
 /** Split a conversation key ("channel:...:peer") into the session store's (channel, peer). */
 function splitConversationKey(key: string): { channel: string; peer: string } {
@@ -26,10 +67,66 @@ function splitConversationKey(key: string): { channel: string; peer: string } {
 function hashSystemContext(system: string): string {
   return createHash("sha256").update(system).digest("hex");
 }
+
+function codexCommandForLeanMode(): string {
+  if (process.env.MUSTER_CODEX_COMMAND) return process.env.MUSTER_CODEX_COMMAND;
+  const appBundle = "/Applications/Codex.app/Contents/Resources/codex";
+  return existsSync(appBundle) ? appBundle : "codex";
+}
+
+function supportedLeanCodexFeatures(command: string): Promise<readonly string[] | undefined> {
+  let pending = leanCodexSupport.get(command);
+  if (pending) return pending;
+  pending = (async () => {
+    const help = await execFileAsync(command, ["--help"], { encoding: "utf8", timeout: 5_000, maxBuffer: 1024 * 1024 });
+    if (!/--disable\s+<FEATURE>/.test(`${help.stdout}\n${help.stderr}`)) return undefined;
+    const listing = await execFileAsync(command, ["features", "list"], { encoding: "utf8", timeout: 5_000, maxBuffer: 1024 * 1024 });
+    const available = new Set(listing.stdout.split("\n").map((line) => line.trim().split(/\s+/, 1)[0]).filter(Boolean));
+    const supported = LEAN_CODEX_FEATURES.filter((feature) => available.has(feature));
+    return supported.length ? supported : undefined;
+  })().catch(() => undefined);
+  leanCodexSupport.set(command, pending);
+  return pending;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function cleanupLeanCodexWrappers(): void {
+  for (const dir of leanCodexWrapperDirs) rmSync(dir, { recursive: true, force: true });
+  leanCodexWrapperDirs.clear();
+  leanCodexWrappers.clear();
+}
+
+async function leanCodexCommand(): Promise<string | undefined> {
+  const command = codexCommandForLeanMode();
+  const features = await supportedLeanCodexFeatures(command);
+  if (!features) return undefined;
+  let pending = leanCodexWrappers.get(command);
+  if (!pending) {
+    pending = (async () => {
+      const dir = await mkdtemp(join(tmpdir(), "muster-codex-lean-"));
+      const wrapper = join(dir, "codex-lean");
+      const flags = features.flatMap((feature) => ["--disable", feature]);
+      await writeFile(wrapper, `#!/bin/sh\nexec ${shellQuote(command)} ${flags.map(shellQuote).join(" ")} "$@"\n`, { encoding: "utf8", mode: 0o700 });
+      await chmod(wrapper, 0o700);
+      leanCodexWrapperDirs.add(dir);
+      if (!leanCodexCleanupRegistered) {
+        process.once("exit", cleanupLeanCodexWrappers);
+        leanCodexCleanupRegistered = true;
+      }
+      return wrapper;
+    })();
+    leanCodexWrappers.set(command, pending);
+    pending.catch(() => leanCodexWrappers.delete(command));
+  }
+  return pending;
+}
 import { applySkillEnvForRun, exportClaudeSkillSnapshot, recordSkillUse, resolveAgentSkillAllowlist, selectSkills } from "./skills.js";
 import { addMemory, searchMemoryWithReceipts, type SearchMemoryReceiptResult } from "./memory.js";
 import { runPiEmbeddedAgent, type PiAgentRunResult, type PiSessionMode } from "./pi.js";
-import { completeChat } from "./provider.js";
+import { completeChat, ProviderCompletionError } from "./provider.js";
 import { classifyTask, planRun } from "./router.js";
 import { appendEpisode } from "./store.js";
 import { synthesizeDeltas } from "./stream.js";
@@ -49,6 +146,17 @@ import type {
 
 export interface RunOptions {
   readonly prompt: string;
+  /**
+   * Trusted, per-turn operating context supplied by the host integration.
+   * It is sent as system context where the provider supports one and is kept
+   * separate from the user message and persisted episode prompt.
+   */
+  readonly systemContext?: string;
+  /**
+   * Trusted application data that is valid only for this turn. Native
+   * transports must attach it to the turn rather than the persisted thread.
+   */
+  readonly turnContext?: string;
   readonly runtime?: string;
   readonly taskKind?: TaskKind;
   readonly sensitive?: boolean;
@@ -67,6 +175,20 @@ export interface RunOptions {
   readonly workspaceDir?: string;
   /** CODEX_HOME for the codex runtime (carries the user's subscription auth). */
   readonly codexHome?: string;
+  /** Provider-neutral ids for inherited native tool servers that this governed turn must not use. */
+  readonly inheritedToolDeny?: readonly string[];
+  /** Host-governed native Codex filesystem sandbox. Existing callers retain workspace-write. */
+  readonly nativeSandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  /** Host-governed native Codex network access. Existing callers retain network access. */
+  readonly nativeNetworkAccess?: boolean;
+  /** Exclude ambient TMPDIR and /tmp writable roots so workspace-write means exactly the run workspace. */
+  readonly nativeStrictWorkspace?: boolean;
+  /**
+   * Stable, non-secret host-policy identity for native session reuse. A changed
+   * value rotates the provider thread so stale permissions or tools cannot
+   * survive a governance-policy change.
+   */
+  readonly nativeSessionPolicyKey?: string;
   /** Test/advanced override for the claude-code command binary. */
   readonly claudeCommand?: string;
   /** Native provider session handle to resume (codex thread_id / claude session id). */
@@ -76,8 +198,14 @@ export interface RunOptions {
   readonly nativeSession?: boolean;
   /** Keep native app-server transports alive after the turn. Interactive chat uses this; one-shot commands should not. */
   readonly nativeSessionKeepAlive?: boolean;
+  /** Rotate native provider context after this many completed turns. */
+  readonly nativeSessionMaxTurns?: number;
+  /** Rotate native provider context after this wall-clock age. */
+  readonly nativeSessionMaxAgeMs?: number;
   /** Native transport preference. "warm" reuses app-server/session transports where supported; "exec" forces one process per turn. */
   readonly nativeTransport?: "auto" | "warm" | "exec";
+  /** Long-lived host that owns warm native transports, for targeted shutdown. */
+  readonly nativeTransportOwner?: string;
   /**
    * Conversation identity (e.g. the surface conversation id). When set, the
    * native provider session for THIS conversation is resumed across turns via
@@ -106,6 +234,8 @@ export interface RunOptions {
    * synthetic deltas so the same coalescer/draft pipeline runs everywhere.
    */
   readonly onDelta?: (text: string) => void;
+  /** Provider-visible reasoning summary deltas. Raw hidden reasoning is never forwarded. */
+  readonly onReasoningDelta?: (text: string) => void;
 }
 
 export interface RunOutcome {
@@ -133,10 +263,28 @@ export interface RunTimingBreakdown {
   readonly firstTokenMs?: number;
   readonly providerTransport?: string;
   readonly providerAttemptCount?: number;
+  readonly providerStartupMs?: number;
+  readonly providerQueueMs?: number;
+  readonly providerThreadOpenMs?: number;
+  readonly providerRequestToFirstDeltaMs?: number;
+  readonly providerCacheState?: string;
+  readonly providerThreadOpenState?: string;
   readonly fallbackMs?: number;
   readonly backendFallbackMs?: number;
   readonly memoryWriteMs?: number;
   readonly persistMs: number;
+}
+
+/** Provider-neutral lifecycle boundary used by long-lived gateway/RPC hosts. */
+export function closeWarmProviderTransports(transportOwner?: string): void {
+  clearCodexAppServerSessions(transportOwner);
+  if (transportOwner === undefined) cleanupLeanCodexWrappers();
+}
+
+/** Clear persisted and in-memory native continuity for one conversation only. */
+export async function invalidateNativeConversation(conversationKey: string, cwd = process.cwd()): Promise<number> {
+  clearCodexAppServerConversation(conversationKey);
+  return clearConversationSessionHandles(conversationKey, cwd);
 }
 
 interface LocalFastAnswer {
@@ -148,6 +296,40 @@ interface LocalFastAnswer {
 function defaultScopes(): MemoryScope[] {
   const user = process.env.USER || process.env.USERNAME || "local";
   return [{ kind: "user", id: user }];
+}
+
+function referencesPriorConversation(prompt: string): boolean {
+  const normalized = prompt.trim();
+  if (EXACT_RESPONSE_RE.test(normalized) || GREETING_RE.test(normalized)) return false;
+  const words = normalized.match(/[a-z0-9]+/gi) ?? [];
+  return words.length <= 3 || CONVERSATION_REFERENCE_RE.test(normalized);
+}
+
+function promptActivation(plan: RunPlan, options: RunOptions, hasPromptBuildHooks: boolean): PromptActivation {
+  const prompt = options.prompt.trim();
+  const explicitComplexTask = options.taskKind !== undefined && options.taskKind !== "simple_qa";
+  const explicitContinuity = options.resume === true || Boolean(options.sessionId) || options.contextBudgetTokens !== undefined;
+  const exactResponse = EXACT_RESPONSE_RE.test(prompt);
+  const greeting = GREETING_RE.test(prompt);
+  const trustedContextQa = Boolean(options.systemContext?.trim() || options.turnContext?.trim()) && prompt.length <= 400;
+  const lean = plan.taskKind === "simple_qa"
+    && !explicitComplexTask
+    && !explicitContinuity
+    && !hasPromptBuildHooks
+    && !AGENTIC_PROMPT_RE.test(prompt)
+    && (exactResponse || greeting || trustedContextQa);
+  const reason: PromptActivation["reason"] = !lean
+    ? "full_capability"
+    : exactResponse
+      ? "exact_response"
+      : greeting
+        ? "greeting"
+        : "trusted_context_qa";
+  return {
+    mode: lean ? "lean" : "full",
+    freshConversation: Boolean(options.conversationKey) && lean && !referencesPriorConversation(prompt),
+    reason,
+  };
 }
 
 async function maybeAnswerLocalWorkspacePrompt(prompt: string, cwd: string): Promise<LocalFastAnswer | undefined> {
@@ -228,7 +410,17 @@ interface AttemptResult {
   readonly sessionId?: string;
   readonly firstTokenMs?: number;
   readonly providerTransport?: string;
+  readonly providerStartupMs?: number;
+  readonly providerQueueMs?: number;
+  readonly providerThreadOpenMs?: number;
+  readonly providerRequestToFirstDeltaMs?: number;
+  readonly providerCacheState?: string;
+  readonly providerThreadOpenState?: string;
+  /** Actual ambient provider context after dynamic activation and compatibility fallback. */
+  readonly providerContextMode?: "full" | "lean";
   readonly backendFallbackMs?: number;
+  /** False once a provider turn may have executed tools; unsafe attempts must never be replayed. */
+  readonly fallbackEligible?: boolean;
   readonly tokenUsage?: {
     readonly inputTokens?: number;
     readonly cachedInputTokens?: number;
@@ -242,6 +434,20 @@ function normalizeNativeTransport(value: string | undefined): "auto" | "warm" | 
   return "auto";
 }
 
+function defaultTaskTimeoutMs(taskKind: TaskKind): number {
+  if (taskKind === "simple_qa") return 45_000;
+  if (taskKind === "artifact" || taskKind === "workflow" || taskKind === "coding" || taskKind === "debugging") return 300_000;
+  return 180_000;
+}
+
+function nativeSessionBudget(options: RunOptions): { readonly maxAgeMs?: number; readonly maxTurns?: number } | undefined {
+  if (options.nativeSessionMaxAgeMs === undefined && options.nativeSessionMaxTurns === undefined) return undefined;
+  return {
+    maxAgeMs: options.nativeSessionMaxAgeMs,
+    maxTurns: options.nativeSessionMaxTurns,
+  };
+}
+
 interface PromptParts {
   /** Preamble + user prompt concatenated (pi/native send this — behaviour unchanged). */
   readonly combined: string;
@@ -251,8 +457,14 @@ interface PromptParts {
   readonly system: string;
   /** Stable instructions used for native session identity; volatile recall/skills must not bust warm sessions. */
   readonly stableSystem: string;
+  /** Host-verified context attached natively to only the current provider turn. */
+  readonly applicationContext?: string;
   /** Per-run Claude Code plugin dirs, currently used for temporary skill snapshots. */
   readonly claudePluginDirs?: readonly string[];
+  /** High-confidence answer-only turns can defer unrelated ambient provider capabilities. */
+  readonly capabilityMode: "full" | "lean";
+  /** Do not replay an unrelated provider/session transcript into this self-contained turn. */
+  readonly freshConversation: boolean;
 }
 
 function emptyRecallReceipt(query: string, scopes: readonly MemoryScope[], limit: number): SearchMemoryReceiptResult {
@@ -288,8 +500,8 @@ const runClaudeCodeBackend: CliBackendRunner = async (route, prompts, options) =
   const stored = options.conversationKey && !options.sessionId
     ? await loadSessionHandle(options.conversationKey, "claude", stateCwd)
     : undefined;
-  const contextHash = hashSystemContext(prompts.stableSystem);
-  const reuse = canReuseHandle(stored, claudeCwd, route.model, contextHash);
+  const contextHash = hashSystemContext(`${prompts.stableSystem}\0${options.nativeSessionPolicyKey ?? ""}`);
+  const reuse = !prompts.freshConversation && canReuseHandle(stored, claudeCwd, route.model, contextHash, nativeSessionBudget(options));
   const sessionId = options.conversationKey
     ? (reuse ? stored.handle : (options.sessionId ?? randomUUID()))
     : options.sessionId;
@@ -307,6 +519,7 @@ const runClaudeCodeBackend: CliBackendRunner = async (route, prompts, options) =
   // Persist the session for next turn on success; drop a broken one on failure.
   if (options.conversationKey && sessionId) {
     if (claudeResult.status === "completed") {
+      const updatedAt = new Date().toISOString();
       await saveSessionHandle({
         conversationKey: options.conversationKey,
         backendId: "claude",
@@ -314,7 +527,9 @@ const runClaudeCodeBackend: CliBackendRunner = async (route, prompts, options) =
         cwd: claudeCwd,
         model: route.model,
         contextHash,
-        updatedAt: new Date().toISOString(),
+        createdAt: reuse ? (stored.createdAt ?? stored.updatedAt) : updatedAt,
+        turnCount: reuse ? (stored.turnCount ?? 0) + 1 : 1,
+        updatedAt,
       }, stateCwd);
     } else {
       await clearSessionHandle(options.conversationKey, "claude", stateCwd);
@@ -328,15 +543,43 @@ const runClaudeCodeBackend: CliBackendRunner = async (route, prompts, options) =
     responseText,
     status: claudeResult.status,
     errorMessage: claudeResult.status === "failed" ? (claudeResult.errorMessage || claudeResult.stderr.trim() || "claude command failed") : undefined,
-      route,
-      sessionMode: sessionId ? (reuse ? "continue" : "create") : undefined,
-      sessionId,
-    };
+    route,
+    sessionMode: sessionId ? (reuse ? "continue" : "create") : undefined,
+    sessionId,
+    providerContextMode: prompts.capabilityMode,
+    fallbackEligible: claudeResult.status === "failed" ? (claudeResult.fallbackEligible ?? false) : undefined,
+  };
 };
+
+export async function codexMcpDisableOverrides(
+  ids: readonly string[] | undefined,
+  codexHome?: string,
+): Promise<string[]> {
+  const requested = [...new Set(ids ?? [])];
+  for (const id of requested) {
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error(`Invalid inherited tool server id: ${id}`);
+  }
+  if (!requested.length) return [];
+  const home = codexHome ?? process.env.CODEX_HOME ?? join(homedir(), ".codex");
+  let config = "";
+  try {
+    config = await readFile(join(home, "config.toml"), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const configured = new Set<string>();
+  const section = /^\s*\[mcp_servers\.(?:"([A-Za-z0-9_-]+)"|'([A-Za-z0-9_-]+)'|([A-Za-z0-9_-]+))(?:\.|\])/gm;
+  for (const match of config.matchAll(section)) configured.add(match[1] ?? match[2] ?? match[3]!);
+  // A false override for a missing MCP is not a no-op in Codex: it creates an
+  // incomplete server table and fails configuration parsing with "invalid
+  // transport". Only disable servers that the selected Codex home declares.
+  return requested.filter((id) => configured.has(id)).map((id) => `mcp_servers.${id}.enabled=false`);
+}
 
 const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
   const workspaceDir = options.workspaceDir ?? options.cwd ?? process.cwd();
   const stateCwd = options.cwd ?? process.cwd();
+  const leanCommand = prompts.capabilityMode === "lean" ? await leanCodexCommand().catch(() => undefined) : undefined;
   // muster memory/rules go to a SYSTEM-level instructions file, never the user
   // turn — so the provider's own AGENTS.md still stacks natively and rule 6 (no
   // preamble narration) holds.
@@ -352,10 +595,18 @@ const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
   const stored = useNativeSession && options.conversationKey && !options.sessionId
     ? await loadSessionHandle(options.conversationKey, "codex", stateCwd)
     : undefined;
-  const contextHash = hashSystemContext(prompts.stableSystem);
-  const reuse = canReuseHandle(stored, workspaceDir, route.model, contextHash);
+  const contextHash = hashSystemContext(`${prompts.stableSystem}\0${options.nativeSessionPolicyKey ?? ""}`);
+  const compatible = canReuseHandle(stored, workspaceDir, route.model, contextHash);
+  const reuse = !prompts.freshConversation && canReuseHandle(stored, workspaceDir, route.model, contextHash, nativeSessionBudget(options));
+  const rotateWarmThread = Boolean(stored && !reuse);
   try {
     const codexEnv = options.codexHome ? { CODEX_HOME: options.codexHome } : undefined;
+    const configOverrides = [
+      ...await codexMcpDisableOverrides(options.inheritedToolDeny, options.codexHome),
+      ...(options.nativeStrictWorkspace
+        ? ["sandbox_workspace_write.exclude_tmpdir_env_var=true", "sandbox_workspace_write.exclude_slash_tmp=true"]
+        : []),
+    ];
     const nativeTransport = normalizeNativeTransport(options.nativeTransport ?? process.env.MUSTER_NATIVE_TRANSPORT ?? process.env.MUSTER_CODEX_TRANSPORT);
     const useAppServer = useNativeSession
       && nativeTransport !== "exec"
@@ -365,50 +616,70 @@ const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
           prompt: prompts.user,
           cwd: workspaceDir,
           model: route.model,
-          instructionsFile,
-          networkAccess: true,
+          reasoning: route.reasoning,
+          developerInstructions: prompts.stableSystem || undefined,
+          applicationContext: prompts.applicationContext,
+          sandbox: options.nativeSandbox,
+          networkAccess: options.nativeNetworkAccess ?? true,
+          configOverrides,
           env: codexEnv,
           timeoutMs: options.timeoutMs,
+          threadId: reuse ? stored.handle : (options.resume ? options.sessionId : undefined),
           keepAlive: options.nativeSessionKeepAlive ?? true,
-          cacheKey: options.conversationKey
-            ? `${options.conversationKey}\0${workspaceDir}\0${route.model ?? ""}`
-            : undefined,
+          cacheKey: options.conversationKey,
+          transportOwner: options.nativeTransportOwner,
+          rotateThread: rotateWarmThread,
           onDelta: options.onDelta,
+          onReasoningDelta: options.onReasoningDelta,
+          command: leanCommand,
         })
       : await runCodex({
           prompt: prompts.user,
           cwd: workspaceDir,
           model: route.model,
+          reasoning: route.reasoning,
           instructionsFile,
-          networkAccess: true,
+          sandbox: options.nativeSandbox,
+          networkAccess: options.nativeNetworkAccess ?? true,
+          configOverrides,
           sessionId: reuse ? stored.handle : options.sessionId,
           resume: reuse ? true : options.resume,
           ephemeral: !useNativeSession,
           ignoreRules: options.surfaceId === "cli-chat",
           env: codexEnv,
           timeoutMs: options.timeoutMs,
+          command: leanCommand,
         });
+    const useBackendFallback = useAppServer
+      && codexResult.status === "failed"
+      && codexResult.fallbackEligible === true;
     const backendFallbackStartedAt = Date.now();
-    const finalCodexResult = useAppServer && codexResult.status === "failed"
+    const finalCodexResult = useBackendFallback
       ? await runCodex({
           prompt: prompts.user,
           cwd: workspaceDir,
           model: route.model,
+          reasoning: route.reasoning,
           instructionsFile,
-          networkAccess: true,
+          sandbox: options.nativeSandbox,
+          networkAccess: options.nativeNetworkAccess ?? true,
+          configOverrides,
           sessionId: reuse ? stored.handle : options.sessionId,
           resume: reuse ? true : options.resume,
           ephemeral: false,
           ignoreRules: options.surfaceId === "cli-chat",
           env: codexEnv,
           timeoutMs: options.timeoutMs,
+          command: leanCommand,
         })
       : codexResult;
-    const backendFallbackMs = useAppServer && codexResult.status === "failed" ? Date.now() - backendFallbackStartedAt : 0;
+    const backendFallbackMs = useBackendFallback ? Date.now() - backendFallbackStartedAt : 0;
+    const appServerTimings = useAppServer && "timings" in codexResult ? codexResult.timings : undefined;
     // Persist the thread for next turn on success; drop a broken thread on
     // failure so it is never resumed into a dead end.
     if (useNativeSession && options.conversationKey) {
       if (finalCodexResult.status === "completed" && finalCodexResult.threadId) {
+        const updatedAt = new Date().toISOString();
         await saveSessionHandle({
           conversationKey: options.conversationKey,
           backendId: "codex",
@@ -416,14 +687,16 @@ const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
           cwd: workspaceDir,
           model: route.model,
           contextHash,
-          updatedAt: new Date().toISOString(),
+          createdAt: reuse ? (stored.createdAt ?? stored.updatedAt) : updatedAt,
+          turnCount: reuse ? (stored.turnCount ?? 0) + 1 : 1,
+          updatedAt,
         }, stateCwd);
       } else if (finalCodexResult.status === "failed") {
         await clearSessionHandle(options.conversationKey, "codex", stateCwd);
       }
     }
     const responseText = finalCodexResult.finalMessage.trim();
-    if ((!useAppServer || codexResult.status === "failed") && options.onDelta && finalCodexResult.status === "completed" && responseText) {
+    if ((!useAppServer || useBackendFallback) && options.onDelta && finalCodexResult.status === "completed" && responseText) {
       for (const chunk of synthesizeDeltas(responseText)) options.onDelta(chunk);
     }
     return {
@@ -436,9 +709,19 @@ const runCodexBackend: CliBackendRunner = async (route, prompts, options) => {
       sessionId: finalCodexResult.threadId,
       firstTokenMs: "firstDeltaMs" in finalCodexResult ? finalCodexResult.firstDeltaMs : undefined,
       providerTransport: useAppServer
-        ? (codexResult.status === "failed" ? "warm-fallback-exec" : "warm")
+        ? (useBackendFallback ? "warm-fallback-exec" : "warm")
         : "exec",
+      providerStartupMs: appServerTimings?.startupMs,
+      providerQueueMs: appServerTimings?.queueMs,
+      providerThreadOpenMs: appServerTimings?.threadOpenMs,
+      providerRequestToFirstDeltaMs: appServerTimings?.requestToFirstDeltaMs,
+      providerCacheState: appServerTimings?.cacheState,
+      providerThreadOpenState: appServerTimings?.threadOpenState,
+      providerContextMode: leanCommand ? "lean" : "full",
       backendFallbackMs,
+      fallbackEligible: finalCodexResult.status === "failed"
+        ? ("fallbackEligible" in finalCodexResult ? (finalCodexResult.fallbackEligible ?? false) : false)
+        : undefined,
       tokenUsage: "tokenUsage" in finalCodexResult ? finalCodexResult.tokenUsage : undefined,
     };
   } finally {
@@ -486,6 +769,8 @@ async function attemptRoute(
       sessionMode: piResult.sessionMode,
       sessionId: piResult.sessionId,
       providerTransport: "pi",
+      providerContextMode: prompts.capabilityMode,
+      fallbackEligible: piResult.status === "failed" ? (piResult.fallbackEligible ?? false) : undefined,
     };
   }
   const provider = config.providers[route.provider];
@@ -512,7 +797,7 @@ async function attemptRoute(
     if (store && options.conversationKey) {
       const { channel, peer } = splitConversationKey(options.conversationKey);
       sessionId = store.findOrCreateSession({ channel, peer }).id;
-      const prior = messagesToTranscript(store.loadActiveMessages(sessionId));
+      const prior = prompts.freshConversation ? [] : messagesToTranscript(store.loadActiveMessages(sessionId));
       const rendered = await renderConversation({
         system: prompts.system || undefined,
         prior,
@@ -521,7 +806,7 @@ async function attemptRoute(
       });
       messages = rendered.map((message) => ({ role: message.role === "tool" ? "user" : message.role, content: message.content }));
     }
-    const text = await completeChat({ provider, route, messages });
+    const text = await completeChat({ provider, route, messages, timeoutMs: options.timeoutMs });
     if (options.onDelta && text) {
       for (const chunk of synthesizeDeltas(text)) options.onDelta(chunk);
     }
@@ -529,9 +814,23 @@ async function attemptRoute(
       store.appendMessage(sessionId, "user", prompts.user);
       store.appendMessage(sessionId, "assistant", text);
     }
-    return { responseText: text, status: text ? "completed" : "failed", errorMessage: text ? undefined : "Empty response", route, providerTransport: "http" };
+    return {
+      responseText: text,
+      status: text ? "completed" : "failed",
+      errorMessage: text ? undefined : "Empty response",
+      route,
+      providerTransport: "http",
+      providerContextMode: prompts.capabilityMode,
+      fallbackEligible: text ? undefined : false,
+    };
   } catch (error) {
-    return { responseText: "", status: "failed", errorMessage: error instanceof Error ? error.message : String(error), route };
+    return {
+      responseText: "",
+      status: "failed",
+      errorMessage: error instanceof Error ? error.message : String(error),
+      route,
+      fallbackEligible: error instanceof ProviderCompletionError ? error.fallbackEligible : false,
+    };
   } finally {
     store?.close();
   }
@@ -652,6 +951,8 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
       },
     };
   }
+  const hooks = options.hooks ?? defaultHookBus;
+  const activation = promptActivation(plan, options, hooks.count("prompt.build") > 0);
   const recallStartedAt = Date.now();
   const recallReceipt = options.skipRecall
     ? emptyRecallReceipt(options.prompt, scopes, options.recallLimit ?? 5)
@@ -666,12 +967,13 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
   const skillSelectionStartedAt = Date.now();
   const skillAllowlist = resolveAgentSkillAllowlist(config, options.agentId);
   const skillDiscovery = config.skills?.load;
-  const claudeSkillSnapshot = !options.skipSkillSelection && plan.runtimeId === "claude-code"
+  const skipSkillSelection = options.skipSkillSelection === true || activation.mode === "lean";
+  const claudeSkillSnapshot = !skipSkillSelection && plan.runtimeId === "claude-code"
     ? await exportClaudeSkillSnapshot(cwd, { skillAllowlist, discovery: skillDiscovery })
     : undefined;
   const skills = claudeSkillSnapshot
     ? { block: "", included: [...claudeSkillSnapshot.skillNames], dropped: [], includedReceipts: [...claudeSkillSnapshot.skillReceipts] }
-    : options.skipSkillSelection
+    : skipSkillSelection
       ? { block: "", included: [], dropped: [], includedReceipts: [] }
       : await selectSkills(options.prompt, 500, cwd, { skillAllowlist, discovery: skillDiscovery });
   if (!claudeSkillSnapshot && skills.included.length) await recordSkillUse(skills.included, cwd);
@@ -686,16 +988,17 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
         "Treat this as self-knowledge — never quote or narrate this section.",
       ].filter(Boolean).join(" ")
     : undefined;
-  const hasRunContext = Boolean(identityBlock || skills.block || recalledBlock);
-  const rulesText = rules?.source === "default" && plan.taskKind === "simple_qa" && !hasRunContext
+  const rulesText = rules?.source === "default" && activation.mode === "lean"
     ? FAST_SIMPLE_QA_RULES
     : rules?.text;
   const stablePreamble = [identityBlock, rulesText].filter(Boolean).join("\n\n");
+  const stableSystem = [stablePreamble, options.systemContext?.trim()].filter(Boolean).join("\n\n");
+  const applicationContext = options.turnContext?.trim();
+  const systemPreamble = [stableSystem, applicationContext].filter(Boolean).join("\n\n");
   const volatilePreamble = [skills.block, recalledBlock].filter(Boolean).join("\n\n");
-  const preamble = [stablePreamble, volatilePreamble].filter(Boolean).join("\n\n");
+  const preamble = [systemPreamble, volatilePreamble].filter(Boolean).join("\n\n");
   const assembledPrompt = preamble ? `${preamble}\n\n---\n\n${options.prompt}` : options.prompt;
   let fullPrompt = assembledPrompt;
-  const hooks = options.hooks ?? defaultHookBus;
   const hookStartedAt = Date.now();
   if (hooks.count("prompt.build")) {
     const hookOutcome = await hooks.emit("prompt.build", fullPrompt);
@@ -713,9 +1016,12 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
   const prompts: PromptParts = {
     combined: fullPrompt,
     user: hookRewrote ? fullPrompt : (volatilePreamble ? `${volatilePreamble}\n\n---\n\n${options.prompt}` : options.prompt),
-    system: hookRewrote ? "" : stablePreamble,
-    stableSystem: hookRewrote ? "" : stablePreamble,
+    system: hookRewrote ? "" : systemPreamble,
+    stableSystem: hookRewrote ? "" : stableSystem,
+    applicationContext: hookRewrote ? undefined : applicationContext,
     claudePluginDirs: claudeSkillSnapshot ? [claudeSkillSnapshot.pluginDir] : undefined,
+    capabilityMode: activation.mode,
+    freshConversation: activation.freshConversation,
   };
   const promptBuildMs = Date.now() - promptBuildStartedAt;
 
@@ -734,7 +1040,10 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
       attributes: genAiAttributes({ operation: "chat", system: route.provider, requestModel: route.model }),
     });
     try {
-      const result = await attemptRoute(config, plan, route, prompts, options);
+      const result = await attemptRoute(config, plan, route, prompts, {
+        ...options,
+        timeoutMs: options.timeoutMs ?? defaultTaskTimeoutMs(plan.taskKind),
+      });
       await endSpan(span, {
         status: result.status === "completed" ? "ok" : "error",
         statusMessage: result.errorMessage,
@@ -760,7 +1069,7 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
     providerAttemptCount += 1;
     attempt = await tracedAttempt(plan.route);
 
-    if (attempt.status === "failed" && config.routing.fallbacks?.length) {
+    if (attempt.status === "failed" && attempt.fallbackEligible !== false && config.routing.fallbacks?.length) {
       for (const fallbackRoute of config.routing.fallbacks) {
         const fallbackStartedAt = Date.now();
         evidence.push({
@@ -778,6 +1087,7 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
           break;
         }
         attempt = fallbackAttempt;
+        if (fallbackAttempt.fallbackEligible === false) break;
       }
     }
   } finally {
@@ -809,9 +1119,15 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
   });
   evidence.push({
     kind: "system_check",
+    label: "context_activation",
+    status: "observed",
+    detail: `mode=${activation.mode} reason=${activation.reason} history=${options.conversationKey ? (activation.freshConversation ? "fresh" : "continuity") : "none"} skills=${skipSkillSelection ? "deferred" : `selected:${skills.included.length}`} provider_context=${attempt.providerContextMode ?? "full"} trusted_system_context=${Boolean(options.systemContext?.trim())} trusted_turn_context=${Boolean(options.turnContext?.trim())}`,
+  });
+  evidence.push({
+    kind: "system_check",
     label: "run_timing",
     status: "observed",
-    detail: `total=${Date.now() - runStartedAt}ms planning=${planningMs}ms recall=${recallMs}ms rules=${agentRulesMs}ms skills=${skillSelectionMs}ms prompt=${promptBuildMs}ms hooks=${hookMs}ms provider=${providerMs}ms first_token_ms=${attempt.firstTokenMs ?? "-"} transport=${attempt.providerTransport ?? "unknown"} fallback=${fallbackMs}ms backend_fallback=${attempt.backendFallbackMs ?? 0}ms attempts=${providerAttemptCount}`,
+    detail: `total=${Date.now() - runStartedAt}ms planning=${planningMs}ms recall=${recallMs}ms rules=${agentRulesMs}ms skills=${skillSelectionMs}ms prompt=${promptBuildMs}ms hooks=${hookMs}ms provider=${providerMs}ms first_token_ms=${attempt.firstTokenMs ?? "-"} transport=${attempt.providerTransport ?? "unknown"} startup=${attempt.providerStartupMs ?? "-"}ms queue=${attempt.providerQueueMs ?? "-"}ms thread_open=${attempt.providerThreadOpenMs ?? "-"}ms request_first_delta=${attempt.providerRequestToFirstDeltaMs ?? "-"}ms cache=${attempt.providerCacheState ?? "-"} thread_state=${attempt.providerThreadOpenState ?? "-"} fallback=${fallbackMs}ms backend_fallback=${attempt.backendFallbackMs ?? 0}ms attempts=${providerAttemptCount}`,
   });
   for (const receipt of recallReceipt.receipts) {
     evidence.push({
@@ -880,7 +1196,7 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
       kind: "episode_summary",
       summary: `${plan.taskKind}: ${options.prompt.slice(0, 100)} -> ${attempt.responseText.slice(0, 200)}`,
       provenance: [`run:${plan.runId}`],
-      scopes: [{ kind: "session", id: plan.runId }, ...scopes.filter((scope) => scope.kind !== "global")],
+      scopes: scopes.filter((scope) => scope.kind !== "global"),
       confidence: 0.6,
     }, cwd);
     memoryWrite = rememberedMemoryWrite(remembered);
@@ -912,6 +1228,12 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
     firstTokenMs: attempt.firstTokenMs,
     providerTransport: attempt.providerTransport,
     providerAttemptCount,
+    providerStartupMs: attempt.providerStartupMs,
+    providerQueueMs: attempt.providerQueueMs,
+    providerThreadOpenMs: attempt.providerThreadOpenMs,
+    providerRequestToFirstDeltaMs: attempt.providerRequestToFirstDeltaMs,
+    providerCacheState: attempt.providerCacheState,
+    providerThreadOpenState: attempt.providerThreadOpenState,
     fallbackMs,
     backendFallbackMs: attempt.backendFallbackMs ?? 0,
     memoryWriteMs,

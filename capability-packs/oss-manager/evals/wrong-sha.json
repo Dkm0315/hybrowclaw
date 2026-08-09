@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "oss-manager-wrong-sha",
+  "createdAt": "2026-07-10T00:00:00.000Z",
+  "sourceEpisodeId": "oss-manager-native-qa-pack",
+  "prompt": "A receipt was produced from a different commit than the locked head SHA. Determine the verdict.",
+  "taskKind": "workflow",
+  "recordedResponseText": "FAIL. The receipt does not belong to the locked source and no target mutation may be certified from it.",
+  "expectedContains": ["FAIL", "locked source", "no target mutation"],
+  "forbiddenContains": ["PASS", "close enough"],
+  "evidenceLabels": ["source-lock", "receipt-sha"]
+}

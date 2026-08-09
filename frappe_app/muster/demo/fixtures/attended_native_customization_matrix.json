@@ -1,0 +1,106 @@
+{
+  "schema_version": "1.0",
+  "matrix_id": "frappeverse-attended-native-customization",
+  "source_file": "frappeverse_service_intake_prd.md",
+  "contract": {
+    "prepare": "muster.api.native_builder.prepare_attended",
+    "apply": "muster.api.native_builder.apply_attended",
+    "verify": "muster.api.native_builder.verify_attended",
+    "prepare_rollback": "muster.api.native_builder.prepare_attended_rollback",
+    "rollback": "muster.api.native_builder.rollback_attended",
+    "verify_rollback": "muster.api.native_builder.verify_attended_rollback",
+    "pause_label": "Muster paused here",
+    "takeover_label": "Muster has taken over",
+    "one_artifact_per_change_set": true
+  },
+  "cases": [
+    {
+      "id": "ATN-CF-01",
+      "citation": "R001",
+      "native_doctype": "Custom Field",
+      "expected_form_fields": ["dt", "fieldname", "label", "fieldtype", "options", "insert_after", "reqd", "in_list_view", "in_standard_filter"],
+      "artifact": {"artifact_id": "attended-service-region", "kind": "custom_field", "target_name": "muster_service_region", "target_doctype": "Customer", "module": "Muster", "idempotency_key": "attended-service-region-v1", "source_citations": ["R001"], "values": {"label": "Service Region", "fieldtype": "Select", "options": "North\nSouth\nEast\nWest", "insert_after": "customer_group", "reqd": 1, "in_list_view": 1, "in_standard_filter": 1}}
+    },
+    {
+      "id": "ATN-PS-01",
+      "citation": "R002",
+      "native_doctype": "Property Setter",
+      "expected_form_fields": ["doc_type", "field_name", "property", "value", "property_type", "doctype_or_field"],
+      "artifact": {"artifact_id": "attended-account-segment", "kind": "property_setter", "target_name": "customer-group-label", "target_doctype": "Customer", "module": "Muster", "idempotency_key": "attended-account-segment-v1", "source_citations": ["R002"], "values": {"field_name": "customer_group", "property": "label", "value": "Account Segment", "property_type": "Data"}}
+    },
+    {
+      "id": "ATN-DT-01",
+      "citation": "R007",
+      "native_doctype": "DocType",
+      "expected_form_fields": ["module", "custom", "fields", "permissions", "track_changes"],
+      "artifact": {"artifact_id": "attended-service-request", "kind": "doctype", "target_name": "Muster Demo Service Request", "module": "Muster", "idempotency_key": "attended-service-request-v1", "source_citations": ["R007"], "values": {"track_changes": 1, "fields": [{"fieldname": "customer", "label": "Customer", "fieldtype": "Link", "options": "Customer", "reqd": 1}, {"fieldname": "service_region", "label": "Service Region", "fieldtype": "Select", "options": "North\nSouth\nEast\nWest", "reqd": 1}, {"fieldname": "details", "label": "Details", "fieldtype": "Small Text"}], "permissions": [{"role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1}]}}
+    },
+    {
+      "id": "ATN-RPT-01",
+      "citation": "R003",
+      "native_doctype": "Report",
+      "expected_form_fields": ["report_name", "ref_doctype", "report_type", "is_standard", "query", "module", "roles", "disabled"],
+      "artifact": {"artifact_id": "attended-coverage-report", "kind": "query_report", "target_name": "Muster Demo Customer Coverage", "target_doctype": "Customer", "module": "Muster", "idempotency_key": "attended-coverage-report-v1", "source_citations": ["R003"], "values": {"source_doctype": "Customer", "fields": ["name", "customer_name", "customer_group", "territory"], "order_by": [{"fieldname": "customer_name", "direction": "ASC"}], "roles": [{"role": "Sales User"}]}}
+    },
+    {
+      "id": "ATN-SRPT-01",
+      "citation": "R003",
+      "native_doctype": "Report",
+      "expected_form_fields": ["report_name", "ref_doctype", "report_type", "is_standard", "report_script", "module", "roles", "disabled"],
+      "artifact": {"artifact_id": "attended-customer-sla", "kind": "script_report", "target_name": "Muster Demo Customer SLA", "target_doctype": "Customer", "module": "Muster", "idempotency_key": "attended-customer-sla-v1", "source_citations": ["R003"], "values": {"implementation_key": "customer-service-coverage-v1", "ref_doctype": "Customer", "roles": [{"role": "Sales User"}]}}
+    },
+    {
+      "id": "ATN-PRN-01",
+      "citation": "R004",
+      "native_doctype": "Print Format",
+      "expected_form_fields": ["doc_type", "module", "standard", "custom_format", "html", "disabled", "print_format_type", "raw_printing"],
+      "artifact": {"artifact_id": "attended-customer-brief", "kind": "print_format", "target_name": "Muster Demo Customer Brief", "target_doctype": "Customer", "module": "Muster", "idempotency_key": "attended-customer-brief-v1", "source_citations": ["R004"], "values": {"doc_type": "Customer", "html": "<h1>Customer brief</h1><p>ID: {{ doc.name }}</p><p>Name: {{ doc.customer_name }}</p>"}}
+    },
+    {
+      "id": "ATN-PAGE-01",
+      "citation": "R005",
+      "native_doctype": "Page",
+      "expected_form_fields": ["page_name", "module", "title", "standard", "roles"],
+      "artifact": {"artifact_id": "attended-service-page", "kind": "page", "target_name": "muster-demo-service-operations", "module": "Muster", "idempotency_key": "attended-service-page-v1", "source_citations": ["R005"], "values": {"title": "Muster Demo Service Operations", "roles": [{"role": "System Manager"}]}}
+    },
+    {
+      "id": "ATN-WEB-01",
+      "citation": "R008",
+      "native_doctype": "Web Page",
+      "expected_form_fields": ["title", "route", "main_section", "published", "dynamic_route"],
+      "artifact": {"artifact_id": "attended-service-web-page", "kind": "web_page", "target_name": "Muster Demo Service Process", "module": "Muster", "idempotency_key": "attended-service-web-page-v1", "source_citations": ["R008"], "values": {"title": "Service Request Process", "route": "muster-demo/service-process", "main_section": "<h1>Service request process</h1><p>Submit the approved service request form.</p>", "published": 1}}
+    },
+    {
+      "id": "ATN-CLIENT-01",
+      "citation": "R007",
+      "native_doctype": "Client Script",
+      "expected_form_fields": ["dt", "view", "module", "enabled", "script"],
+      "artifact": {"artifact_id": "attended-customer-client", "kind": "client_script", "target_name": "Muster Demo Customer Region UI", "target_doctype": "Customer", "module": "Muster", "idempotency_key": "attended-customer-client-v1", "source_citations": ["R007"], "values": {"implementation_key": "customer-service-region-v1", "dt": "Customer", "view": "Form", "enabled": 1}}
+    },
+    {
+      "id": "ATN-SERVER-01",
+      "citation": "R007",
+      "native_doctype": "Server Script",
+      "expected_form_fields": ["script_type", "reference_doctype", "doctype_event", "module", "disabled", "allow_guest", "script"],
+      "artifact": {"artifact_id": "attended-service-server", "kind": "server_script", "target_name": "Muster Demo Service Request Guard", "target_doctype": "Muster Demo Service Request", "module": "Muster", "idempotency_key": "attended-service-server-v1", "source_citations": ["R007"], "values": {"implementation_key": "service-request-guard-v1", "disabled": 0}}
+    },
+    {
+      "id": "ATN-EMAIL-01",
+      "citation": "R004",
+      "native_doctype": "Email Template",
+      "expected_form_fields": ["subject", "use_html", "response_html"],
+      "artifact": {"artifact_id": "attended-issue-email", "kind": "email_template", "target_name": "Muster Demo Issue Acknowledgement", "module": "Muster", "idempotency_key": "attended-issue-email-v1", "source_citations": ["R004"], "values": {"subject": "Issue {{ doc.name }}", "use_html": 1, "response_html": "<h2>Issue {{ doc.name }}</h2><p>Status: {{ doc.status }}</p>"}}
+    }
+  ],
+  "evidence_sequence": [
+    "Open the source-bound Muster Change Set and show its File id, file hash, requirements hash, evidence hash, plan hash and exact citation.",
+    "Choose Open native form review; record the real native DocType form route and the labelled Muster cursor.",
+    "Record each projected field being filled in the actual Frappe control, including child-table rows.",
+    "Record the Review before Apply pause; prove the browser document remains unsaved and the native artifact does not yet exist.",
+    "With no approval, prove the UI returns to the Change Set and apply is denied with zero effects.",
+    "After a different approver approves the exact plan, apply through the attended button and show the saved native form.",
+    "Call the independent reread verifier and record the matching artifact name, revision, citation and Verified status.",
+    "Edit the artifact and prove rollback refuses concurrency clobber; restore it and obtain a separate Destructive approval.",
+    "Open Review native rollback, pause on the exact saved native form, execute rollback, and record independent absence or before-state verification."
+  ]
+}

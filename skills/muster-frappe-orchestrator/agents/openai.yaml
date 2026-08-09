@@ -1,0 +1,7 @@
+interface:
+  display_name: "Muster Frappe Orchestrator"
+  short_description: "Coordinate the complete Frappe AI operating layer"
+  brand_color: "#7C3AED"
+  default_prompt: "Use $muster-frappe-orchestrator to plan and deliver this cross-cutting Muster Frappe capability with evidence."
+policy:
+  allow_implicit_invocation: false

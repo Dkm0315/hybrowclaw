@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "oss-manager-negative-control",
+  "createdAt": "2026-07-10T00:00:00.000Z",
+  "sourceEpisodeId": "oss-manager-native-qa-pack",
+  "prompt": "A known-bad negative control exits with code zero. Determine the QA verdict.",
+  "taskKind": "workflow",
+  "recordedResponseText": "FAIL. Exit code alone is not evidence. The negative control needs a successful detection assertion backed by an independent receipt.",
+  "expectedContains": ["FAIL", "Exit code alone", "negative control", "independent receipt"],
+  "forbiddenContains": ["PASS", "OpenClaw", "arbitrary shell"],
+  "evidenceLabels": ["semantic-assertion", "negative-control"]
+}

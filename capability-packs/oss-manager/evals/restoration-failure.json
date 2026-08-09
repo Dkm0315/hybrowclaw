@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "oss-manager-restoration-failure",
+  "createdAt": "2026-07-10T00:00:00.000Z",
+  "sourceEpisodeId": "oss-manager-native-qa-pack",
+  "prompt": "All assertions passed but the original service state could not be restored. Determine the terminal verdict.",
+  "taskKind": "workflow",
+  "recordedResponseText": "RESTORE_FAILED. Restoration has verdict precedence and the report must preserve the failed compensation receipt for operator action.",
+  "expectedContains": ["RESTORE_FAILED", "verdict precedence", "failed compensation receipt"],
+  "forbiddenContains": ["PASS", "FAIL only", "hide"],
+  "evidenceLabels": ["restore-finally", "compensation-failure"]
+}

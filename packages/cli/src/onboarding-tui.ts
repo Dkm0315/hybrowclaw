@@ -154,7 +154,7 @@ const steps: readonly Step[] = [
     title: "Where should your assistant talk?",
     body: "Pick channels separately. Each surface has a different auth model and setup window.",
     choices: [
-      choice("google-chat", "Google Chat", "Workspace bot endpoint, signing secret, and app authentication.", "workspace", "cyan", "Workspace bots are powerful; start with mentioned spaces before broad visibility.", controls("Reply mode", "Draft first", "Visibility", "Mentioned spaces"), channelFields("google-chat")),
+      choice("google-chat", "Google Chat", "Workspace app endpoint, exact authentication audience, and Google-signed requests.", "workspace", "cyan", "Workspace bots are powerful; start with mentioned spaces before broad visibility.", controls("Reply mode", "Draft first", "Visibility", "Mentioned spaces"), channelFields("google-chat")),
       choice("slack", "Slack", "Bot token, app-level token, and Socket Mode install.", "bot", "lavender", "Draft-first keeps humans in control; auto-reply should be limited to low-risk channels.", controls("Reply mode", "Draft first", "Visibility", "Selected channels"), channelFields("slack")),
       choice("teams", "Microsoft Teams", "Bot app ID, tenant ID, client secret, and Teams app package.", "enterprise", "peach", "Teams setup benefits from explicit tenant and org install choices.", controls("Reply mode", "Manual first", "Install scope", "Team")),
       choice("whatsapp", "WhatsApp", "Business phone ID, access token, verify token, and webhook secret.", "business", "lime", "WhatsApp should default to human-reviewed drafts for customer-facing messages.", controls("Reply mode", "Draft first", "Visibility", "Selected numbers"), channelFields("whatsapp")),
@@ -208,8 +208,8 @@ function channelFields(id: string): readonly Field[] {
       { label: "Verify token/env", placeholder: "WHATSAPP_VERIFY_TOKEN" },
     ],
     "google-chat": [
-      { label: "Project ID", placeholder: "GOOGLE_CLOUD_PROJECT" },
-      { label: "Signing secret", placeholder: "GOOGLE_CHAT_SIGNING_SECRET" },
+      { label: "Cloud project number", placeholder: "123456789012" },
+      { label: "Authentication audience", placeholder: "https://agent.example.com/v1/adapters/gchat" },
     ],
     teams: [
       { label: "Bot app ID", placeholder: "TEAMS_BOT_APP_ID" },
@@ -568,7 +568,7 @@ async function applyChannelSelections(state: OnboardingState, cwd: string, confi
   const result = await initGatewayConfig(cwd);
   let gateway: GatewayConfig = result.config;
   const entries: Array<[string, SetupAction]> = [
-    ["google-chat", { kind: "channel", id: "gchat", label: "Google Chat app", command: "muster channels setup gchat --public-url https://your-domain.example", url: "https://console.cloud.google.com/apis/library/chat.googleapis.com", env: ["GOOGLE_CHAT_SIGNING_SECRET"], note: "Gateway token is initialized; add the public webhook URL in Google Chat app setup." }],
+    ["google-chat", { kind: "channel", id: "gchat", label: "Google Chat app", command: "muster channels ready gchat --audience https://your-domain.example/v1/adapters/gchat --no-start", url: "https://console.cloud.google.com/apis/library/chat.googleapis.com", note: "Set the Google Chat API Authentication Audience to this exact HTTPS endpoint. Muster verifies Google-signed bearer requests; no shared signing secret is used." }],
     ["slack", { kind: "channel", id: "slack", label: "Slack app", command: "muster channels setup slack --bot-token-env SLACK_BOT_TOKEN --app-token-env SLACK_APP_TOKEN", url: "https://api.slack.com/apps", env: ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"], note: "Create a Slack app, enable Socket Mode, set env vars, then run the setup command. HTTP webhook mode remains available with --mode http." }],
     ["teams", { kind: "channel", id: "teams", label: "Microsoft Teams app", command: "muster channels setup teams --hmac-secret-env TEAMS_HMAC_SECRET --public-url https://your-domain.example", url: "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade", env: ["TEAMS_HMAC_SECRET"], note: "Register the bot/app, then add the gateway webhook URL." }],
     ["whatsapp", { kind: "channel", id: "whatsapp", label: "WhatsApp Cloud API", command: "muster channels setup whatsapp --access-token-env WHATSAPP_ACCESS_TOKEN --verify-token-env WHATSAPP_VERIFY_TOKEN --phone-number-id-env WHATSAPP_PHONE_NUMBER_ID --public-url https://your-domain.example", url: "https://developers.facebook.com/docs/whatsapp/cloud-api/get-started", env: ["WHATSAPP_ACCESS_TOKEN", "WHATSAPP_VERIFY_TOKEN", "WHATSAPP_PHONE_NUMBER_ID"], note: "Meta credentials are not stored until env vars are present and setup is run." }],

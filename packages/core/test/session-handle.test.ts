@@ -41,17 +41,32 @@ test("saving the same key overwrites; clear removes only that key", async () => 
   assert.equal((await loadSessionHandle("other", "codex", cwd))?.handle, "keep", "clear is surgical");
 });
 
-test("clearConversationSessionHandles removes all known backend handles for one conversation", async () => {
+test("concurrent session-handle saves preserve every conversation", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-sh-concurrent-"));
+  const records = Array.from({ length: 24 }, (_, index) => rec({
+    conversationKey: `conversation-${index}`,
+    handle: `thread-${index}`,
+  }));
+
+  await Promise.all(records.map((record) => saveSessionHandle(record, cwd)));
+
+  const loaded = await Promise.all(records.map((record) => loadSessionHandle(record.conversationKey, record.backendId, cwd)));
+  assert.deepEqual(loaded.map((record) => record?.handle), records.map((record) => record.handle));
+});
+
+test("clearConversationSessionHandles removes every backend handle for one conversation", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-sh-clear-all-"));
   await saveSessionHandle(rec({ backendId: "codex", handle: "codex-thread" }), cwd);
   await saveSessionHandle(rec({ backendId: "claude", handle: "claude-session" }), cwd);
+  await saveSessionHandle(rec({ backendId: "future-provider", handle: "future-session" }), cwd);
   await saveSessionHandle(rec({ backendId: "codex", conversationKey: "other", handle: "keep" }), cwd);
 
   const removed = await clearConversationSessionHandles("telegram:bot:c1", cwd);
 
-  assert.equal(removed, 2);
+  assert.equal(removed, 3);
   assert.equal(await loadSessionHandle("telegram:bot:c1", "codex", cwd), undefined);
   assert.equal(await loadSessionHandle("telegram:bot:c1", "claude", cwd), undefined);
+  assert.equal(await loadSessionHandle("telegram:bot:c1", "future-provider", cwd), undefined);
   assert.equal((await loadSessionHandle("other", "codex", cwd))?.handle, "keep");
 });
 
@@ -64,4 +79,36 @@ test("canReuseHandle: resume only when workspace, model, and injected context ar
   assert.equal(canReuseHandle(record, "/ws/tg", "gpt-5.5", "ctx-b"), false, "changed injected memory/skills/rules → fresh thread");
   assert.equal(canReuseHandle(rec(), "/ws/tg", "gpt-5.5", "ctx-a"), false, "old records without context hash are not reused when context-aware callers opt in");
   assert.equal(canReuseHandle(undefined, "/ws/tg", "gpt-5.5"), false, "no stored handle → fresh thread");
+});
+
+test("canReuseHandle: rotates legacy, old, and over-budget provider threads", () => {
+  const createdAt = "2026-07-13T08:00:00.000Z";
+  const nowMs = Date.parse("2026-07-13T09:00:00.000Z");
+  const budget = { maxTurns: 12, maxAgeMs: 2 * 60 * 60_000, nowMs };
+
+  assert.equal(
+    canReuseHandle(rec({ contextHash: "ctx-a" }), "/ws/tg", "gpt-5.5", "ctx-a", budget),
+    false,
+    "legacy records without bounded-session metadata rotate instead of carrying unbounded history",
+  );
+  assert.equal(
+    canReuseHandle(rec({ contextHash: "ctx-a", createdAt, turnCount: 11 }), "/ws/tg", "gpt-5.5", "ctx-a", budget),
+    true,
+  );
+  assert.equal(
+    canReuseHandle(rec({ contextHash: "ctx-a", createdAt, turnCount: 12 }), "/ws/tg", "gpt-5.5", "ctx-a", budget),
+    false,
+    "turn budget is exclusive",
+  );
+  assert.equal(
+    canReuseHandle(
+      rec({ contextHash: "ctx-a", createdAt: "2026-07-13T06:59:59.999Z", turnCount: 1 }),
+      "/ws/tg",
+      "gpt-5.5",
+      "ctx-a",
+      budget,
+    ),
+    false,
+    "age budget rotates old context",
+  );
 });

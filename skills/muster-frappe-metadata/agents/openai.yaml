@@ -1,0 +1,7 @@
+interface:
+  display_name: "Muster Frappe Metadata"
+  short_description: "Create safe reversible Frappe change sets"
+  brand_color: "#7C3AED"
+  default_prompt: "Use $muster-frappe-metadata to design and verify this Frappe customization as a reversible change set."
+policy:
+  allow_implicit_invocation: true

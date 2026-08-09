@@ -1,0 +1,219 @@
+{
+  "doctype": "DocType",
+  "name": "Muster Mission",
+  "module": "Muster",
+  "autoname": "MST-MSN-.YYYY.-.#####",
+  "title_field": "objective",
+  "track_changes": 1,
+  "search_fields": "objective,status,requested_by,assigned_to",
+  "sort_field": "requested_at",
+  "sort_order": "DESC",
+  "field_order": [
+    "overview_tab",
+    "objective",
+    "status",
+    "progress",
+    "requested_by",
+    "assigned_to",
+    "requested_at",
+    "workflow_section",
+    "source_proposal",
+    "workflow",
+    "workflow_version",
+    "root_agent",
+    "scope_json",
+    "execution_tab",
+    "root_run_id",
+    "correlation_id",
+    "idempotency_key",
+    "budget_section",
+    "budget_json",
+    "usage_json",
+    "completed_at",
+    "result_summary",
+    "failure_summary"
+  ],
+  "fields": [
+    {
+      "fieldname": "overview_tab",
+      "fieldtype": "Tab Break",
+      "label": "Overview"
+    },
+    {
+      "fieldname": "objective",
+      "fieldtype": "Small Text",
+      "label": "Objective",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "label": "Status",
+      "options": "Draft\nQueued\nPlanning\nNeeds Configuration\nReady to Dispatch\nRunning\nWaiting for Approval\nPaused\nCompleted\nFailed\nCancelled\nNeeds Intervention",
+      "default": "Draft",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "progress",
+      "fieldtype": "Percent",
+      "label": "Progress",
+      "default": "0",
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "requested_by",
+      "fieldtype": "Link",
+      "label": "Requested By",
+      "options": "User",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "assigned_to",
+      "fieldtype": "Link",
+      "label": "Assigned Operator",
+      "options": "User"
+    },
+    {
+      "fieldname": "requested_at",
+      "fieldtype": "Datetime",
+      "label": "Requested At",
+      "reqd": 1
+    },
+    {
+      "fieldname": "workflow_section",
+      "fieldtype": "Section Break",
+      "label": "Plan"
+    },
+    {
+      "fieldname": "source_proposal",
+      "fieldtype": "Link",
+      "label": "Source Workflow Proposal",
+      "options": "Muster Workflow Proposal",
+      "read_only": 1
+    },
+    {
+      "fieldname": "workflow",
+      "fieldtype": "Link",
+      "label": "Workflow",
+      "options": "Muster Workflow"
+    },
+    {
+      "fieldname": "workflow_version",
+      "fieldtype": "Link",
+      "label": "Workflow Version",
+      "options": "Muster Workflow Version"
+    },
+    {
+      "fieldname": "root_agent",
+      "fieldtype": "Link",
+      "label": "Root Agent",
+      "options": "Muster Agent"
+    },
+    {
+      "fieldname": "scope_json",
+      "fieldtype": "Code",
+      "label": "Requested Scope",
+      "options": "JSON",
+      "read_only": 1
+    },
+    {
+      "fieldname": "execution_tab",
+      "fieldtype": "Tab Break",
+      "label": "Execution"
+    },
+    {
+      "fieldname": "root_run_id",
+      "fieldtype": "Data",
+      "label": "Root Run ID",
+      "read_only": 1
+    },
+    {
+      "fieldname": "correlation_id",
+      "fieldtype": "Data",
+      "label": "Correlation ID",
+      "read_only": 1
+    },
+    {
+    "fieldname": "idempotency_key",
+    "fieldtype": "Data",
+    "label": "Idempotency Key",
+    "reqd": 1,
+    "read_only": 1,
+    "unique": 1
+    },
+    {
+      "fieldname": "budget_section",
+      "fieldtype": "Section Break",
+      "label": "Budget and Usage"
+    },
+    {
+      "fieldname": "budget_json",
+      "fieldtype": "Code",
+      "label": "Budget",
+      "options": "JSON",
+      "read_only": 1
+    },
+    {
+      "fieldname": "usage_json",
+      "fieldtype": "Code",
+      "label": "Usage",
+      "options": "JSON",
+      "read_only": 1
+    },
+    {
+      "fieldname": "completed_at",
+      "fieldtype": "Datetime",
+      "label": "Completed At",
+      "read_only": 1
+    },
+    {
+      "fieldname": "result_summary",
+      "fieldtype": "Long Text",
+      "label": "Result",
+      "read_only": 1
+    },
+    {
+      "fieldname": "failure_summary",
+      "fieldtype": "Long Text",
+      "label": "Failure",
+      "read_only": 1
+    }
+  ],
+  "permissions": [
+    {
+      "role": "Muster Administrator",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1
+    },
+    {
+      "role": "Muster Automation Manager",
+      "read": 1,
+      "write": 1,
+      "create": 1
+    },
+    {
+      "role": "Muster Operator",
+      "read": 1,
+      "write": 1,
+      "create": 1
+    },
+    {
+      "role": "Muster Approver",
+      "read": 1
+    },
+    {
+      "role": "Muster Auditor",
+      "read": 1,
+      "export": 1
+    },
+    {
+      "role": "Muster Viewer",
+      "read": 1
+    }
+  ]
+}

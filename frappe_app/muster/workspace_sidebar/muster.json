@@ -1,0 +1,25 @@
+{
+ "doctype":"Workspace Sidebar","name":"Muster","title":"Muster","app":"muster","module":"Muster","standard":1,"header_icon":"bot",
+ "items":[
+  {"type":"Section Break","label":"Operate","icon":"play-circle","collapsible":1,"indent":0,"keep_closed":0},
+  {"type":"Link","label":"Mission Control","link_type":"Page","link_to":"muster-control","icon":"activity","child":1},
+  {"type":"Link","label":"Missions","link_type":"DocType","link_to":"Muster Mission","icon":"goal","child":1},
+  {"type":"Link","label":"Approvals","link_type":"DocType","link_to":"Muster Approval","icon":"check-circle","child":1},
+  {"type":"Section Break","label":"Build","icon":"wrench","collapsible":1,"indent":0,"keep_closed":0},
+  {"type":"Link","label":"Agent & Workflow Studio","link_type":"Page","link_to":"agent-workflow-studio","icon":"git-branch","child":1},
+  {"type":"Link","label":"Agents","link_type":"DocType","link_to":"Muster Agent","icon":"bot","child":1},
+  {"type":"Link","label":"Agent Workflows","link_type":"DocType","link_to":"Muster Workflow","icon":"git-branch","child":1},
+  {"type":"Link","label":"Triggers","link_type":"DocType","link_to":"Muster Trigger","icon":"zap","child":1},
+  {"type":"Section Break","label":"Observe","icon":"eye","collapsible":1,"indent":0,"keep_closed":0},
+  {"type":"Link","label":"Runs","link_type":"DocType","link_to":"Muster Run","icon":"history","child":1},
+  {"type":"Link","label":"Activity","link_type":"DocType","link_to":"Muster Activity","icon":"list","child":1},
+  {"type":"Link","label":"Artifacts","link_type":"DocType","link_to":"Muster Artifact","icon":"paperclip","child":1},
+  {"type":"Link","label":"Change Sets","link_type":"DocType","link_to":"Muster Change Set","icon":"file-diff","child":1},
+  {"type":"Section Break","label":"Admin","icon":"settings","collapsible":1,"indent":0,"keep_closed":1,"display_depends_on":"frappe.user.has_role('Muster Administrator') || frappe.user.has_role('System Manager')"},
+  {"type":"Link","label":"Muster Settings","link_type":"DocType","link_to":"Muster Settings","icon":"settings","child":1},
+  {"type":"Link","label":"Site Bindings","link_type":"DocType","link_to":"Muster Site Binding","icon":"link","child":1},
+  {"type":"Link","label":"Policies","link_type":"DocType","link_to":"Muster Policy","icon":"shield","child":1},
+  {"type":"Link","label":"Role Bindings","link_type":"DocType","link_to":"Muster Role Binding","icon":"users","child":1},
+  {"type":"Link","label":"Channels","link_type":"DocType","link_to":"Muster Channel Account","icon":"message-circle","child":1}
+ ]
+}

@@ -1,4 +1,4 @@
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stat } from "node:fs/promises";
 import { loadConfig, saveConfig } from "./config.js";
@@ -65,6 +65,8 @@ export interface BuiltinMcpInstallSpec {
 }
 
 export interface BuiltinIntegrationSetup {
+  readonly auth?: "none" | "api_key" | "oauth" | "local" | "env";
+  readonly setupCommand?: string;
   readonly channels?: readonly string[];
   readonly mcpServers?: readonly string[];
   readonly defaultMcpServers?: readonly string[];
@@ -306,7 +308,8 @@ const OPENCLAW_PLUGIN_CATALOG_EXPANSION: readonly BuiltinPluginCatalogEntry[] = 
 ];
 
 const BUILTIN_PLUGINS: readonly BuiltinPluginCatalogEntry[] = [
-  plugin("frappe-federated-bridge", "business-apps", "muster", "Frappe/ERPNext capability pack for identity, records, governed actions, and plugin-owned context induction.", "high", "business-app", "capability-packs/frappe", ["frappe"], setup({ requiresEnv: ["FRAPPE_SITE_URL", "FRAPPE_API_TOKEN"], setupUrls: ["https://frappeframework.com/docs/user/en/api/rest", "https://docs.erpnext.com/", "https://frappeframework.com/docs"], notes: ["Keep the main Muster binary light: the Frappe plugin builds site/module context from Frappe and ERPNext docs, installed app docs, and live metadata.", "Preferred setup is FRAPPE_SITE_URL plus FRAPPE_API_TOKEN. One-time admin user/password context builds are supported by the plugin at runtime and should not be persisted.", "Context induction should index installed apps, modules, DocTypes, DocFields, Custom Fields, workflows, role permissions, reports, scripts, and docs as scoped memory with graph links."] })),
+  plugin("frappe-federated-bridge", "business-apps", "muster", "Frappe/ERPNext capability pack for identity, records, governed actions, and plugin-owned context induction.", "high", "business-app", "capability-packs/frappe", ["frappe"], setup({ auth: "oauth", setupCommand: "muster frappe setup", setupUrls: ["https://frappeframework.com/docs/user/en/api/rest", "https://docs.erpnext.com/", "https://frappeframework.com/docs"], notes: ["Keep the main Muster binary light: the Frappe plugin builds site/module context from Frappe and ERPNext docs, installed app docs, and live metadata.", "Use `muster frappe setup` for per-user OAuth. Frappe remains the identity and permission authority; legacy API-token environment variables are optional only for bounded context-build operations.", "Context induction should index installed apps, modules, DocTypes, DocFields, Custom Fields, workflows, role permissions, reports, scripts, and docs as scoped memory with graph links."] })),
+  plugin("oss-manager-native-qa", "quality", "muster", "Customer-isolated, multi-agent infrastructure QA with source locks, semantic evidence, compensation-before-mutation, killed-run recovery, and restore-finally verdicts.", "high", "operations-qa", "capability-packs/oss-manager", ["oss-manager", "infrastructure-qa", "sentinel-qa"], setup({ setupUrls: ["https://github.com/hybrowlabs/OSS-Manager"], notes: ["The bundled pack is an executable beta compiler/evaluator with deterministic evidence contracts; deployment-specific inventory, remote executors, durable run orchestration, and live recovery credentials must be configured before live certification.", "No OpenClaw bridge is used. Mutating scenarios require explicit approvals, registered compensation, and an independently verified final restoration state."] }), "end_to_end_workflow"),
   plugin("browser", "web", "openclaw", "Browser automation setup, readiness, smoke-test, and risk-policy surface; execution stays permissioned through Playwright/browser MCP.", "high", "browser", "capability-packs/browser", undefined, setup({ mcpServers: ["browser"], defaultMcpServers: ["browser"], setupUrls: ["https://github.com/microsoft/playwright-mcp"], notes: ["The bundled pack follows Hermes's snapshot-first browser design and keeps raw CDP as an escape hatch, while Muster executes through Playwright/browser MCP.", "Browser automation is high-risk: screenshots or accessibility snapshots should back important UI claims, and authenticated or mutating actions require explicit user approval."] })),
   plugin("web-search", "web", "openclaw", "Search/fetch provider surface for cited research and retrieval.", "medium", "search", "capability-packs/web-search", undefined, setup({ mcpServers: ["parallel-search", "firecrawl"], setupUrls: ["https://docs.parallel.ai/integrations/mcp/search-mcp", "https://www.firecrawl.dev/app/api-keys"], notes: ["Keyless DuckDuckGo search works through the local capability pack; Parallel and Firecrawl are optional upgrades."] })),
   plugin("github", "developer", "hermes", "GitHub issue, PR, repository, and review workflows.", "medium", "developer", "capability-packs/github", undefined, setup({ mcpServers: ["github"], defaultMcpServers: ["github"], requiresEnv: ["GITHUB_PERSONAL_ACCESS_TOKEN"], setupUrls: ["https://github.com/settings/tokens", "https://cli.github.com/manual/gh_auth_login"], notes: ["The bundled capability pack is read-only. Install/configure the GitHub MCP when you want broader issue, PR, repo, or CI operations."] })),
@@ -502,6 +505,9 @@ export async function enableBuiltinPlugin(
   }
   const config = await loadConfig(cwd);
   const packPath = await resolvePackPath(entry);
+  if (entry.packPath && !packPath) {
+    throw new Error(`Built-in plugin "${entry.id}" is unavailable because its capability pack was not included in this installation.`);
+  }
   const loadPaths = new Set(config.plugins?.load?.paths ?? []);
   if (packPath) loadPaths.add(packPath);
   await saveConfig({
@@ -553,6 +559,10 @@ function findBuiltinPlugin(id: string): BuiltinPluginCatalogEntry {
   const entry = BUILTIN_PLUGINS.find((candidate) => candidate.id === id || candidate.aliases?.includes(id));
   if (!entry) throw new Error(`Unknown built-in plugin "${id}". Run muster plugins catalog.`);
   return entry;
+}
+
+export async function resolveBuiltinPluginPackPath(id: string): Promise<string | undefined> {
+  return resolvePackPath(findBuiltinPlugin(id));
 }
 
 function renderBuiltinSkillBody(entry: BuiltinSkillCatalogEntry): string {
@@ -746,6 +756,7 @@ function repoRoot(): string {
 async function resolvePackPath(entry: BuiltinPluginCatalogEntry): Promise<string | undefined> {
   if (!entry.packPath) return undefined;
   for (const candidate of [
+    join(dirname(fileURLToPath(import.meta.url)), "builtin-packs", basename(entry.packPath)),
     join(repoRoot(), entry.packPath),
     join(repoRoot(), "..", entry.packPath),
     join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..", entry.packPath),

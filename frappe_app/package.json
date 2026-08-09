@@ -1,0 +1,11 @@
+{
+  "name": "@muster/frappe",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Native Frappe Desk experience for governed Muster automation",
+  "engines": {"node": ">=24"},
+  "scripts": {
+    "check": "node --check muster/muster/page/muster_control/muster_control.js && node --check muster/public/js/activity_dock.js && node --check muster/public/js/live_work_session.js && node --check muster/public/js/workflow_graph.js && node --check muster/muster/page/agent_workflow_studio/agent_workflow_studio.js && node --check muster/muster/doctype/muster_workflow_proposal/muster_workflow_proposal.js && node --check muster/muster/doctype/muster_development_proposal/muster_development_proposal.js",
+    "test:studio": "node --test tests_js/*.test.cjs"
+  }
+}

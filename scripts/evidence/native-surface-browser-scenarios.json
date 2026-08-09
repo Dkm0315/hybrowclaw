@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "viewports": {
+    "desktop": {"width": 1440, "height": 900},
+    "mobile": {"width": 390, "height": 844}
+  },
+  "global_release_gates": [
+    "record in one continuous normal-speed browser capture with the URL bar visible",
+    "pin and display the Frappe, Muster, CRM, Helpdesk and custom-app revisions",
+    "prove CRM, Helpdesk and custom-app worktrees have no Muster integration edits",
+    "use a disposable record and a second read-only session for every mutation assertion",
+    "reject the clip if the labeled Muster cursor or takeover banner leaves the viewport",
+    "reject the clip if a raw method path, token, selector, traceback or response JSON is shown"
+  ],
+  "scenarios": [
+    {"id":"desk-erpnext-customer-create-desktop","surface":"desk","product":"erpnext","viewport":"desktop","route":"/app/customer","operation":"create","steps":["open","prompt_partial","expect_clarification","reply_complete","expect_takeover","expect_native_pause","independent_read_absent","confirm_native_commit","expect_record_route","independent_read_present"]},
+    {"id":"desk-hrms-employee-update-mobile","surface":"desk","product":"hrms","viewport":"mobile","route":"/app/employee/{disposable_record}","operation":"update","steps":["open","prompt_complete","expect_takeover","expect_native_pause","independent_read_unchanged","confirm_native_commit","independent_read_changed"]},
+    {"id":"crm-lead-create-desktop","surface":"crm","product":"crm","viewport":"desktop","route":"/crm/leads/view/list","operation":"create","steps":["open","prompt_partial","expect_clarification","reply_complete","expect_takeover","expect_native_pause","independent_read_absent","confirm_native_commit","expect_record_route","independent_read_present"]},
+    {"id":"crm-lead-create-mobile","surface":"crm","product":"crm","viewport":"mobile","route":"/crm/leads/view/list","operation":"create","steps":["open","prompt_complete","expect_takeover","expect_cursor_in_viewport","expect_native_pause","independent_read_absent","confirm_native_commit","expect_record_route","independent_read_present"]},
+    {"id":"crm-lead-update-fails-before-touch","surface":"crm","product":"crm","viewport":"desktop","route":"/crm/leads/{disposable_record}","operation":"unsupported_update","steps":["open","prompt_complete","expect_fail_closed","independent_read_unchanged"]},
+    {"id":"helpdesk-ticket-create-desktop","surface":"helpdesk","product":"helpdesk","viewport":"desktop","route":"/helpdesk/tickets/new","operation":"create","steps":["open","prompt_partial","expect_clarification","reply_complete","expect_takeover","expect_native_pause","independent_read_absent","confirm_native_commit","expect_record_route","independent_read_present"]},
+    {"id":"helpdesk-ticket-create-mobile","surface":"helpdesk","product":"helpdesk","viewport":"mobile","route":"/helpdesk/tickets/new","operation":"create","steps":["open","prompt_complete","expect_takeover","expect_cursor_in_viewport","expect_native_pause","independent_read_absent","confirm_native_commit","expect_record_route","independent_read_present"]},
+    {"id":"helpdesk-ticket-update-fails-before-touch","surface":"helpdesk","product":"helpdesk","viewport":"mobile","route":"/helpdesk/tickets/{disposable_record}","operation":"unsupported_update","steps":["open","prompt_complete","expect_fail_closed","independent_read_unchanged"]},
+    {"id":"custom-spa-create-desktop","surface":"custom","product":"custom_app","viewport":"desktop","route":"{manifest.create_route}","operation":"create","steps":["open","expect_manifest_supported","prompt_complete","expect_takeover","expect_native_pause","independent_read_absent","confirm_native_commit","expect_record_route","independent_read_present"]},
+    {"id":"custom-spa-stale-update-mobile","surface":"custom","product":"custom_app","viewport":"mobile","route":"{manifest.record_route}","operation":"stale_update","steps":["open","expect_manifest_supported","prompt_complete","expect_takeover","expect_cursor_in_viewport","expect_native_pause","second_session_mutate","confirm_native_commit","expect_fail_closed","independent_read_second_session_value"]}
+  ]
+}

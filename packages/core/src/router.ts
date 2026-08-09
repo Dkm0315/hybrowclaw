@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { MusterConfig, RunPlan, RunRequest, TaskKind } from "./types.js";
 
 const CODING_HINTS = /\b(code|repo|bug|test|build|compile|patch|pr|commit|typescript|python|frappe|stack trace)\b/i;
-const ARCH_HINTS = /\b(architecture|design|system|tradeoff|roadmap|prd|cto|plan|strategy)\b/i;
+const ARCH_HINTS = /(?:\b(?:architecture|system design|technical design|solution design|platform design|trade-?offs?|roadmap|prd|strategy)\b|\bimplementation plan\b|\bproject plan\b|\bdesign\s+(?:an?|the)\s+(?:system|architecture|platform|service|api)\b)/i;
 const RESEARCH_HINTS = /\b(research|compare|latest|market|paper|trend|source|web)\b/i;
 const ARTIFACT_HINTS = /\b(pdf|excel|ppt|presentation|artifact|report|docx|spreadsheet)\b/i;
 const PRIVATE_HINTS = /\b(secret|credential|customer|bank|bfsi|nda|private|logs|production)\b/i;

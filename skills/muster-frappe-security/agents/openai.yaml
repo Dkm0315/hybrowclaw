@@ -1,0 +1,7 @@
+interface:
+  display_name: "Muster Frappe Security"
+  short_description: "Verify tenant RBAC and delegated-agent safety"
+  brand_color: "#7C3AED"
+  default_prompt: "Use $muster-frappe-security to threat-model and negatively verify this integration."
+policy:
+  allow_implicit_invocation: true

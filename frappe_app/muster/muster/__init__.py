@@ -1,0 +1,2 @@
+"""Muster module DocTypes."""
+

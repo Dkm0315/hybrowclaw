@@ -10,15 +10,16 @@
     "hc": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/ensure-bin-mode.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "tsx --test test/*.test.ts",
-    "prepublishOnly": "rm -rf dist && tsc -p tsconfig.json"
+    "prepublishOnly": "rm -rf dist && tsc -p tsconfig.json && node scripts/ensure-bin-mode.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-tui": "^0.79.1",
     "@musterhq/core": "workspace:*",
-    "@musterhq/gateway": "workspace:*"
+    "@musterhq/gateway": "workspace:*",
+    "qrcode-terminal": "^0.12.0"
   },
   "description": "Muster CLI — governed agent harness for production AI agents.",
   "license": "MIT",

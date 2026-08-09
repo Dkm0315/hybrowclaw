@@ -1,0 +1,137 @@
+{
+  "doctype": "DocType",
+  "name": "Muster Workflow Version",
+  "module": "Muster",
+  "autoname": "format:{workflow}-v{version}",
+  "title_field": "name",
+  "is_submittable": 1,
+  "track_changes": 1,
+  "field_order": [
+    "version_tab",
+    "workflow",
+    "version",
+    "schema_version",
+    "contract",
+    "idempotency_key",
+    "published_by",
+    "published_at",
+    "snapshot_section",
+    "graph_json",
+    "snapshot_hash",
+    "execution_manifest_json",
+    "execution_manifest_hash"
+  ],
+  "fields": [
+    {
+      "fieldname": "version_tab",
+      "fieldtype": "Tab Break",
+      "label": "Version"
+    },
+    {
+      "fieldname": "workflow",
+      "fieldtype": "Link",
+      "label": "Workflow",
+      "options": "Muster Workflow",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "version",
+      "fieldtype": "Int",
+      "label": "Version",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "schema_version",
+      "fieldtype": "Data",
+      "label": "Schema Version",
+      "default": "1",
+      "reqd": 1,
+      "read_only": 1
+    },
+    {
+      "fieldname": "contract",
+      "fieldtype": "Data",
+      "label": "Portable Contract",
+      "default": "AgentGraphDefinition",
+      "reqd": 1,
+      "read_only": 1
+    },
+    {
+      "fieldname": "idempotency_key",
+      "fieldtype": "Data",
+      "label": "Publication Idempotency Key",
+      "read_only": 1
+    },
+    {
+      "fieldname": "published_by",
+      "fieldtype": "Link",
+      "label": "Published By",
+      "options": "User",
+      "read_only": 1
+    },
+    {
+      "fieldname": "published_at",
+      "fieldtype": "Datetime",
+      "label": "Published At",
+      "read_only": 1
+    },
+    {
+      "fieldname": "snapshot_section",
+      "fieldtype": "Section Break",
+      "label": "Immutable Snapshot"
+    },
+    {
+      "fieldname": "graph_json",
+      "fieldtype": "Code",
+      "label": "Graph",
+      "options": "JSON",
+      "reqd": 1,
+      "read_only": 1
+    },
+    {
+      "fieldname": "snapshot_hash",
+      "fieldtype": "Data",
+      "label": "SHA-256",
+      "reqd": 1,
+      "read_only": 1
+    },
+    {
+      "fieldname": "execution_manifest_json",
+      "fieldtype": "Code",
+      "label": "Trusted Execution Manifest",
+      "options": "JSON",
+      "read_only": 1,
+      "description": "Immutable host-issued browser plans; never model or mission context."
+    },
+    {
+      "fieldname": "execution_manifest_hash",
+      "fieldtype": "Data",
+      "label": "Execution Manifest SHA-256",
+      "read_only": 1
+    }
+  ],
+  "permissions": [
+    {
+      "role": "Muster Administrator",
+      "read": 1,
+      "create": 1,
+      "submit": 1
+    },
+    {
+      "role": "Muster Automation Manager",
+      "read": 1,
+      "create": 1,
+      "submit": 1
+    },
+    {
+      "role": "Muster Operator",
+      "read": 1
+    },
+    {
+      "role": "Muster Auditor",
+      "read": 1
+    }
+  ]
+}

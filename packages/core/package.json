@@ -14,10 +14,10 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/copy-builtin-packs.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "tsx --test test/*.test.ts",
-    "prepublishOnly": "rm -rf dist && tsc -p tsconfig.json"
+    "prepublishOnly": "rm -rf dist && tsc -p tsconfig.json && node scripts/copy-builtin-packs.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.79.1",

@@ -84,6 +84,7 @@ const REQUIRED_QA_CASES: Readonly<Record<RequiredQaSuiteId, readonly string[]>> 
     "cramped_transcript_receipts",
     "key_classifier",
     "responsive_widths",
+    "real_pty_interaction",
   ],
   provider_latency: ["sample_1", "overhead_p50_gate"],
   mcp_auth_failure: ["missing_token", "expired_token", "invalid_token", "valid_token", "logout_recovery"],

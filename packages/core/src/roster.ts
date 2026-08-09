@@ -1060,6 +1060,7 @@ function resolveSourcePath(source: RosterSource, cwd: string): string | undefine
 
 function authModesForPlugin(plugin: ReturnType<typeof listBuiltinPlugins>[number], hosts: readonly RosterDetectedHostConnector[]): readonly string[] {
   const auth = new Set<string>();
+  if (plugin.setup?.auth && plugin.setup.auth !== "none") auth.add(plugin.setup.auth);
   if (plugin.setup?.requiresEnv?.length || plugin.setup?.requiresAnyEnv?.length) auth.add("env");
   for (const connector of hosts) auth.add(connector.auth);
   if (plugin.setup?.mcpServers?.length || plugin.setup?.defaultMcpServers?.length) {
@@ -1085,6 +1086,18 @@ function planBuiltinPluginProjection(plugin: ReturnType<typeof listBuiltinPlugin
       command: `muster plugins enable ${plugin.id}`,
       auth: plugin.setup?.requiresEnv?.length || plugin.setup?.requiresAnyEnv?.length ? ["env"] : [],
       source: plugin.packPath,
+    });
+  }
+
+  if (plugin.setup?.auth && !["none", "local"].includes(plugin.setup.auth)) {
+    targets.push({
+      kind: "setup_plan",
+      id: plugin.id,
+      owner: "muster",
+      status: "needs_credentials",
+      command: plugin.setup.setupCommand ?? `muster plugins setup ${plugin.id}`,
+      auth: [plugin.setup.auth],
+      source: plugin.id,
     });
   }
 
@@ -1402,6 +1415,7 @@ function builtinPluginDepthEvidence(plugin: ReturnType<typeof listBuiltinPlugins
   if (plugin.setup?.channels?.length) evidence.add("gateway_adapter_setup");
   if (plugin.setup?.mcpServers?.length || plugin.setup?.defaultMcpServers?.length) evidence.add("mcp_setup_metadata");
   if (plugin.setup?.requiresEnv?.length || plugin.setup?.requiresAnyEnv?.length) evidence.add("credential_metadata");
+  if (plugin.setup?.auth) evidence.add("auth_metadata");
   if (plugin.setup?.setupUrls?.length) evidence.add("setup_urls");
   if (hosts.length) evidence.add("explicit_host_scan");
   return [...evidence].sort();

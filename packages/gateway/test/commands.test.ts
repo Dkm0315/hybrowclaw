@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { defaultConfig } from "@musterhq/core";
+import { addMemory, defaultConfig } from "@musterhq/core";
 import { dispatchCommand, parseCommand, resolveCustomCommand } from "../src/commands.js";
 import type { SurfaceMessage } from "../src/envelope.js";
 import type { PairedSender } from "../src/pairing.js";
+import { pairingScopes } from "../src/pairing.js";
 
 const PAIRED: PairedSender = { pairingId: "pair_abc", surfaceId: "telegram:bot", senderId: "555", approvedAt: "2026-06-15T00:00:00Z" };
 const FRAPPE_PAIRED: PairedSender = {
@@ -43,6 +47,7 @@ test("dispatchCommand: /help is answered in-gateway with the command list", asyn
   assert.match(reply.text, /\/whoami/);
   assert.match(reply.text, /\/tools/);
   assert.match(reply.text, /\/tokens/);
+  assert.match(reply.text, /\/pair/);
   assert.doesNotMatch(reply.text, /\/muster/);
 });
 
@@ -70,22 +75,70 @@ test("dispatchCommand: /tools is role-aware and exposes system controls only to 
 
   const frappe = await dispatchCommand(msg("/tools"), { ...ctx, paired: FRAPPE_PAIRED });
   assert.ok(frappe);
-  assert.match(frappe.text, /Frappe lookup/);
+  assert.match(frappe.text, /Find records/);
   assert.match(frappe.text, /HRBP tools/);
   assert.match(frappe.text, /System controls/);
+  assert.doesNotMatch(frappe.text, /Normal task, code/);
 });
 
-test("dispatchCommand: /pair tells an already-paired chat there is nothing to do", async () => {
+test("dispatchCommand: /agents presents the configured Frappe assistant instead of deployment defaults", async () => {
+  const reply = await dispatchCommand(msg("/agents"), {
+    ...ctx,
+    paired: FRAPPE_PAIRED,
+    gateway: {
+      token: "test",
+      frappe: {
+        assistant: {
+          name: "OxygenHR Assistant",
+          description: "HR operations and employee workflows",
+          organization: "OxygenHR",
+        },
+      },
+    },
+  });
+  assert.ok(reply);
+  assert.match(reply.text, /OxygenHR Assistant/);
+  assert.match(reply.text, /HR operations and employee workflows/);
+  assert.equal(reply.presentation?.kind, "menu");
+  assert.match(reply.text, /Dhairya Marwaha/);
+  assert.doesNotMatch(reply.text, /dhairya@example\.test/);
+  assert.doesNotMatch(reply.text, /deployment defaults/i);
+});
+
+test("dispatchCommand: /pair never falls through to the provider when Frappe OAuth is unavailable", async () => {
   const reply = await dispatchCommand(msg("/pair"), ctx);
   assert.ok(reply);
-  assert.match(reply.text, /already paired/i);
-  assert.match(reply.text, /pair_abc/);
+  assert.match(reply.text, /Frappe connection unavailable/i);
+  assert.match(reply.text, /no Frappe OAuth connection configured/i);
 });
 
 test("dispatchCommand: /stop is acknowledged in-gateway", async () => {
   const reply = await dispatchCommand(msg("/stop"), ctx);
   assert.ok(reply);
   assert.match(reply.text, /No active gateway command/i);
+});
+
+test("dispatchCommand: /memory reports only evidence visible to the current authority", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-memory-command-"));
+  await addMemory({
+    summary: "Visible preference",
+    provenance: ["test"],
+    scopes: pairingScopes(PAIRED),
+  }, cwd);
+  await addMemory({
+    summary: "Hidden preference",
+    provenance: ["test"],
+    scopes: [{ kind: "pairing", id: "another:sender" }],
+  }, cwd);
+
+  const reply = await dispatchCommand(msg("/memory"), { ...ctx, cwd });
+  assert.ok(reply);
+  assert.match(reply.text, /1 memory item is currently visible/);
+  assert.deepEqual(reply.presentation?.tables?.[0]?.rows.at(-1), [
+    "Evidence", "Checked 2 stored items; only eligible items counted",
+  ]);
+  assert.doesNotMatch(reply.text, /pair_abc|another:sender|Visible preference|Hidden preference/);
+  assert.doesNotMatch(reply.text, /hash|sha256|backend|provider|model/i);
 });
 
 test("resolveCustomCommand: matches exact or prefix surfaces and renders prompt templates", () => {

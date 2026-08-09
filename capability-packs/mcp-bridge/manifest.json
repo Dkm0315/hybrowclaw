@@ -6,7 +6,7 @@
   "kind": "tool",
   "slot": "mcp",
   "entrypoint": "src/index.ts",
-  "description": "MCP catalog setup guidance, config linting, security review, and install/test workflow planning based on Hermes and OpenClaw MCP patterns.",
+  "description": "Provider-neutral MCP setup, config linting, explicit auth/readiness, tool allowlists, bounded redacted receipts, timeout/failure isolation, and opt-in provider-hosted capability reuse.",
   "permissions": [],
   "sandbox": "read_only",
   "evals": [
@@ -18,7 +18,7 @@
     "mcp_bridge_install_workflow",
     "mcp_bridge_tool_policy"
   ],
-  "status": "v0: setup, lint, and workflow planning only; actual install/test/OAuth runs through Muster's native mcp commands.",
+  "status": "Beta setup and policy layer: native MCP commands still own install, OAuth, connection, and execution. This pack now defines explicit auth/readiness gates, allowlists, bounded redacted call receipts, timeout/result/call limits, per-server isolation, generic customer-pack dependencies, and provider-hosted reuse only after explicit discovery and approval.",
   "readiness": {
     "level": "setup_plan",
     "status": "beta",
@@ -48,6 +48,8 @@
     },
     "evidence": {
       "unitTests": [
+        "packages/core/test/artifact-mcp-hardening.test.ts",
+        "packages/core/test/mcp.test.ts",
         "packages/core/test/capability-load.test.ts",
         "packages/core/test/capability.test.ts"
       ],

@@ -1,0 +1,6 @@
+{
+ "doctype":"DocType","name":"Muster Policy","module":"Muster","autoname":"field:policy_name","title_field":"policy_name","track_changes":1,
+ "field_order":["overview_tab","policy_name","enabled","priority","description","rules_tab","rules"],
+ "fields":[{"fieldname":"overview_tab","fieldtype":"Tab Break","label":"Overview"},{"fieldname":"policy_name","fieldtype":"Data","label":"Policy Name","reqd":1,"unique":1,"in_list_view":1},{"fieldname":"enabled","fieldtype":"Check","label":"Enabled","default":"1","in_list_view":1},{"fieldname":"priority","fieldtype":"Int","label":"Priority","default":"100"},{"fieldname":"description","fieldtype":"Small Text","label":"Purpose"},{"fieldname":"rules_tab","fieldtype":"Tab Break","label":"Rules"},{"fieldname":"rules","fieldtype":"Table","label":"Rules","options":"Muster Policy Rule","reqd":1}],
+ "permissions":[{"role":"Muster Administrator","read":1,"write":1,"create":1,"delete":1},{"role":"Muster Automation Manager","read":1},{"role":"Muster Auditor","read":1},{"role":"System Manager","read":1,"write":1,"create":1,"delete":1}]
+}

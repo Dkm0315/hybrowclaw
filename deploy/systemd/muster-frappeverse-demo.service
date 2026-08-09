@@ -1,0 +1,18 @@
+[Unit]
+Description=Muster Frappeverse clean development bench
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/goblin/frappeverse/frappeverse-demo-v16
+Environment=HOME=/home/goblin
+Environment=PATH=/home/goblin/.local/bin:/home/goblin/.nvm/versions/node/v24.17.0/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/goblin/.local/bin/bench start
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

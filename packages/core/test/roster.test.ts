@@ -676,7 +676,7 @@ test("buildRosterSupportMatrix explains ownership, reuse, install, and auth with
     category: "business-apps",
     support: ["owned_pack"],
     risk: "high",
-    auth: ["env"],
+    auth: ["oauth"],
     packPath: "capability-packs/frappe",
     mcpServers: [],
     channels: [],
@@ -758,8 +758,9 @@ test("planRosterBuiltinProjection routes capabilities to their runtime owners", 
   const frappe = planRosterBuiltinProjection("frappe-federated-bridge");
   assert.deepEqual(frappe.targets.map((target) => `${target.kind}:${target.owner}:${target.id}`), [
     "capability_pack:muster:frappe-federated-bridge",
+    "setup_plan:muster:frappe-federated-bridge",
   ]);
-  assert.match(frappe.gates.map((gate) => `${gate.id}:${gate.status}:${gate.summary}`).join("\n"), /credentials:needs_action:capability_pack:frappe-federated-bridge requires env/);
+  assert.match(frappe.gates.map((gate) => `${gate.id}:${gate.status}:${gate.summary}`).join("\n"), /credentials:needs_action:setup_plan:frappe-federated-bridge requires oauth/);
 
   const unknown = planRosterBuiltinProjection("does-not-exist");
   assert.equal(unknown.status, "blocked");

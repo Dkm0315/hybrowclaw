@@ -18,9 +18,15 @@ export interface SubprocessResult {
 export interface SubprocessError extends Error {
   stdout?: string;
   stderr?: string;
-  code?: number | null;
+  code?: string | number | null;
   signal?: NodeJS.Signals | null;
   killed?: boolean;
+}
+
+/** ENOENT/EACCES are emitted by spawn before the provider process can accept a turn. */
+export function isPreDispatchSpawnError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ENOENT" || code === "EACCES";
 }
 
 /**

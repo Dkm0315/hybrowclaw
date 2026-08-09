@@ -312,10 +312,11 @@ test('telegram webhook with telegram.stream="draft" streams the reply as a live-
       }),
     });
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { ok: true, streamed: true });
-    assert.deepEqual(calls.map(methodOf), ["sendMessage", "editMessageText"], "draft send then final edit");
-    assert.equal(calls[0].body.text, "deploy is green");
-    assert.deepEqual(calls[1].body, { chat_id: "-100200300", message_id: 77, text: "deploy is green" });
+    assert.deepEqual(await response.json(), { ok: true, accepted: true });
+    await running.waitForIdle();
+    assert.deepEqual(calls.map(methodOf), ["sendChatAction", "sendMessage", "editMessageText"], "typing presence, draft send, then final edit");
+    assert.equal(calls[1].body.text, "deploy is green");
+    assert.deepEqual(calls[2].body, { chat_id: "-100200300", message_id: 77, text: "deploy is green" });
   } finally {
     await running.close();
     llm.close();

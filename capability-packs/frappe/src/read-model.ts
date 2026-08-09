@@ -120,22 +120,90 @@ const ERP_PRIOR_ALIASES: readonly FrappeSemanticAlias[] = [
   alias("leave", "Leave Application", "HR", 0.86),
   alias("holiday", "Leave Application", "HR", 0.82),
   alias("time off", "Leave Application", "HR", 0.82),
+  alias("request off", "Leave Application", "HR", 0.9),
   alias("attendance", "Attendance", "HR", 0.9),
   alias("clock in", "Employee Checkin", "HR", 0.94),
   alias("clock out", "Employee Checkin", "HR", 0.94),
   alias("regularise", "Attendance Request", "HR", 0.9),
   alias("regularize", "Attendance Request", "HR", 0.9),
+  alias("attendance correction", "Attendance Request", "HR", 0.92),
+  alias("check in correction", "Attendance Request", "HR", 0.9),
+  alias("check out correction", "Attendance Request", "HR", 0.9),
+  alias("correct check in", "Attendance Request", "HR", 0.9),
+  alias("correct check out", "Attendance Request", "HR", 0.9),
+  alias("forgot clock in", "Attendance Request", "HR", 0.94),
+  alias("forgot clock out", "Attendance Request", "HR", 0.94),
+  alias("missed clock in", "Attendance Request", "HR", 0.92),
+  alias("missed clock out", "Attendance Request", "HR", 0.92),
   alias("salary", "Salary Slip", "Payroll", 0.86),
   alias("payslip", "Salary Slip", "Payroll", 0.9),
   alias("earning components", "Salary Slip", "Payroll", 0.82),
   alias("claim", "Expense Claim", "Expense", 0.84),
   alias("reimbursement", "Expense Claim", "Expense", 0.9),
+  alias("reimbursed", "Expense Claim", "Expense", 0.9),
+  alias("paid back", "Expense Claim", "Expense", 0.88),
   alias("cab claim", "Expense Claim", "Expense", 0.92),
   alias("travel claim", "Expense Claim", "Expense", 0.88),
   alias("ticket", "HD Ticket", "Support", 0.86),
   alias("support issue", "HD Ticket", "Support", 0.88),
   alias("laptop issue", "HD Ticket", "Support", 0.82),
+  alias("task", "Task", "Projects", 0.9),
+  alias("assigned work", "Task", "Projects", 0.86),
+  alias("work item", "Task", "Projects", 0.84),
+  alias("open work", "Task", "Projects", 0.8),
+  alias("todo", "ToDo", "Workflow", 0.92),
+  alias("to do", "ToDo", "Workflow", 0.9),
+  alias("to-do", "ToDo", "Workflow", 0.9),
+  alias("todo list", "ToDo", "Workflow", 0.94),
+  alias("action list", "ToDo", "Workflow", 0.92),
+  alias("action item", "ToDo", "Workflow", 0.9),
+  alias("personal action", "ToDo", "Workflow", 0.88),
+  alias("customer bill", "Sales Invoice", "Accounts", 0.92),
+  alias("customer invoice", "Sales Invoice", "Accounts", 0.94),
+  alias("supplier bill", "Purchase Invoice", "Accounts", 0.92),
+  alias("vendor bill", "Purchase Invoice", "Accounts", 0.92),
+  alias("hiring candidate", "Job Applicant", "Recruitment", 0.92),
+  alias("job candidate", "Job Applicant", "Recruitment", 0.9),
+  alias("learning session", "Training Event", "HR", 0.88),
+  alias("training session", "Training Event", "HR", 0.92),
+  alias("performance review", "Appraisal", "HR", 0.94),
+  alias("my objectives", "Goal", "HR", 0.86),
+  alias("shift change", "Shift Request", "HR", 0.92),
+  alias("work travel request", "Travel Request", "Expense", 0.94),
+  alias("business trip request", "Travel Request", "Expense", 0.92),
+  alias("employee advance", "Employee Advance", "Expense", 0.94),
+  alias("cash advance", "Employee Advance", "Expense", 0.9),
+  alias("onboarding checklist", "Employee Onboarding", "HR", 0.94),
+  alias("new joiner onboarding", "Employee Onboarding", "HR", 0.92),
+  alias("resignation status", "Employee Separation", "HR", 0.9),
+  alias("open role", "Job Opening", "Recruitment", 0.88),
+  alias("people considered for open roles", "Job Applicant", "Recruitment", 0.96),
+  alias("candidate interview", "Interview", "Recruitment", 0.92),
+  alias("offer letter", "Job Offer", "Recruitment", 0.92),
+  alias("project work", "Task", "Projects", 0.94),
+  alias("time entry", "Timesheet", "Projects", 0.94),
+  alias("time log", "Timesheet", "Projects", 0.9),
+  alias("support request", "HD Ticket", "Support", 0.94),
+  alias("help request", "HD Ticket", "Support", 0.9),
+  alias("company equipment", "Asset", "Assets", 0.94),
+  alias("equipment transfer", "Asset Movement", "Assets", 0.92),
+  alias("customer order", "Sales Order", "Selling", 0.94),
+  alias("supplier order", "Purchase Order", "Buying", 0.94),
+  alias("vendor order", "Purchase Order", "Buying", 0.94),
+  alias("payment received", "Payment Entry", "Accounts", 0.9),
+  alias("payment made", "Payment Entry", "Accounts", 0.9),
+  alias("journal adjustment", "Journal Entry", "Accounts", 0.9),
+  alias("stock movement", "Stock Entry", "Stock", 0.9),
+  alias("customer delivery", "Delivery Note", "Stock", 0.9),
+  alias("supplier receipt", "Purchase Receipt", "Stock", 0.9),
+  alias("potential customer", "Lead", "CRM", 0.9),
+  alias("sales deal", "Opportunity", "CRM", 0.9),
+  alias("my department", "Employee", "HR", 0.94),
+  alias("which department", "Employee", "HR", 0.92),
+  alias("who do i report to", "Employee", "HR", 0.96),
+  alias("reporting manager", "Employee", "HR", 0.94),
   alias("approval", "Workflow Action", "Workflow", 0.8),
+  alias("pending approval", "ToDo", "Workflow", 0.84),
   alias("pending action", "ToDo", "Workflow", 0.78),
   alias("announcement", "Notice", "HR", 0.72),
   alias("resign", "Employee Separation", "HR", 0.72),
@@ -254,9 +322,14 @@ export function frappeFastRoute(args: FrappeFastRouteInput): FrappeFastRouteDeci
   const prompt = args.prompt.trim();
   const text = normalizeText(prompt);
   const aliases = [...(args.aliases ?? []), ...ERP_PRIOR_ALIASES];
-  const candidateAliases = aliases
+  const allowed = new Set((args.allowedDoctypes ?? []).map((value) => value.trim()).filter(Boolean));
+  const matchedAliases = aliases
     .filter((item) => aliasMatches(text, item.phrase))
-    .sort((a, b) => b.confidence - a.confidence);
+    .filter((item) => !ROUTE_METADATA_DOCTYPES.has(item.canonical))
+    .filter((item) => allowed.size === 0 || ["greeting", "help"].includes(item.canonical) || allowed.has(item.canonical));
+  const curatedAliases = matchedAliases.filter((item) => item.source === "admin_curated" && item.confidence >= 0.99);
+  const candidateAliases = (curatedAliases.length ? curatedAliases : matchedAliases)
+    .sort((a, b) => aliasMatchScore(text, b) - aliasMatchScore(text, a) || b.confidence - a.confidence);
   const candidateDoctypes = unique(candidateAliases.map((item) => item.canonical).filter((value) => !["greeting", "help"].includes(value)));
   const intent = classifyOperationalIntent(text, candidateAliases);
   const hasFreshIndex = args.hasFreshIndex !== false;
@@ -303,6 +376,11 @@ export function frappeFastRoute(args: FrappeFastRouteInput): FrappeFastRouteDeci
     reason: routeReason(intent, answerPath, candidateDoctypes),
   };
 }
+
+const ROUTE_METADATA_DOCTYPES = new Set([
+  "DocField", "DocPerm", "DocShare", "DocType", "Custom DocPerm", "Custom Field",
+  "Has Role", "Module Def", "Property Setter", "Role", "User Permission",
+]);
 
 export function canonicalFrappeEnvelope<TPayload>(
   input: Omit<FrappeCanonicalEnvelope<TPayload>, "schemaVersion" | "observedAt" | "validUntil"> & { readonly observedAt?: string; readonly ttlMs?: number },
@@ -407,17 +485,63 @@ function frappePostgresDdl(site: string): FrappeReadModelPlan["postgres"] {
 
 function classifyOperationalIntent(text: string, aliases: readonly FrappeSemanticAlias[]): FrappeOperationalIntent {
   if (/^(hi|hello|hey|yo|namaste|good\s+(morning|evening|afternoon))[\s!.]*$/.test(text)) return "greeting";
-  if (/\b(help|what can you do|commands|guide)\b/.test(text)) return "help";
-  if (/\b(status|connected|health|ready)\b/.test(text)) return "status";
   if (/\b(pdf|ppt|pptx|excel|xlsx|docx|document|deck|workbook|report file)\b/.test(text)) return "office_artifact";
   if (/\b(report|dashboard|summary|analytics|variance|trend)\b/.test(text)) return "report";
+  // Deployment-curated API phrases describe read contracts. Words such as
+  // "apply" in "jobs I can apply for" must not turn those reads into writes.
+  if (aliases.some((item) => item.source === "admin_curated" && item.confidence >= 0.99)) return "record_lookup";
+  if (requestsReadOnlyReview(text) && aliases.length) return "record_lookup";
+  if (aliases.length && USER_INITIATED_PREPARATION.test(text)) return "record_create";
+  if (aliases.length && /\b(?:which|what)\b[^.!?]*\b(?:can i|am i allowed|may i)\b|\b(?:can i|am i allowed|may i)\b[^.!?]*\b(?:see|view|review|read|access)\b/.test(text)) return "record_lookup";
+  if (/\b(?:did i|have i|has my|were there|was there|what is on|what s on|where (?:does|do|did)|show|list|see|view|find|check|latest|recent|pending|open|count|how many)\b/.test(text)) return "record_lookup";
   if (/\b(create|raise|apply|submit|file|draft|add|put in)\b/.test(text)) return "record_create";
   if (/\b(update|change|cancel|revoke|approve|reject|close|assign)\b/.test(text)) return /\b(approve|reject)\b/.test(text) ? "workflow_action" : "record_update";
   if (/\b(can i|allowed|permission|access|not visible|denied)\b/.test(text)) return "permission_explanation";
   if (/\b(why|failed|error|blocked|not working|cannot|can't|wont|won't)\b/.test(text)) return "troubleshooting";
-  if (/\b(show|list|get|find|check|track|latest|pending|open)\b/.test(text)) return "record_lookup";
+  if (/\b(show|list|get|find|check|track|latest|pending|open|count)\b/.test(text)
+    || /\b(?:how many|what do i have|what is on my|what's on my|which of my)\b/.test(text)) return "record_lookup";
+  if (/\b(status|connected|health|ready)\b/.test(text)) return "status";
   if (aliases.length) return "record_lookup";
+  if (/\b(help|what can you do|commands|guide)\b/.test(text)) return "help";
   return "unknown";
+}
+
+// normalizeText strips apostrophes, so "don't" arrives here as "don t". Every
+// negator form below is written in its post-normalization shape so an explicit
+// refusal of a mutation can never fall through to a write route.
+const READ_ONLY_NEGATORS = "(?:do not|do n t|don t|dont|does not|does n t|doesn t|will not|won t|can not|cannot|can t|should not|shouldn t|never|without|no need to)";
+const READ_ONLY_MUTATION_VERBS = "(?:create|creating|raise|raising|apply|applying|submit|submitting|file|filing|draft|drafting|add|adding|update|updating|change|changing|cancel|cancel(?:l)?ing|revoke|revoking|approve|approving|reject|rejecting|close|closing|assign|assigning|save|saving|delete|deleting|remove|removing)";
+const READ_ONLY_NEGATED_MUTATION = new RegExp(`\\b${READ_ONLY_NEGATORS}\\b[^.!?]{0,80}\\b${READ_ONLY_MUTATION_VERBS}\\b`);
+const READ_ONLY_WITHOUT_MUTATION = /\bwithout\s+(?:creating|submitting|saving|applying|approving|rejecting|updating|changing|filing|deleting|assigning)\b/;
+const READ_ONLY_NOTHING_CHANGES = /\bnothing\s+(?:should|must|is\s+to\s+be)\s+(?:be\s+)?(?:created|submitted|saved|changed)\b/;
+
+// "Plan to apply leave", "help me file a claim": the user is preparing a real
+// transaction. This must stay a create/update route so the guided flow gathers
+// mandatory fields and previews. The flow itself never auto-writes — the actual
+// mutation is separately approval-gated — so honoring "do not create anything"
+// here means "prepare and preview only", not "silently write".
+const MUTATION_PREPARATION = /\b(?:plan to|plan for|help me(?: to)?\s+(?:create|raise|apply|submit|file|draft|add|update|change|cancel|approve|reject|assign|book|request)|prepare (?:to|a|an|my|the)|get ready to|walk me through (?:creating|raising|applying|submitting|filing|drafting|updating)|steps to (?:create|raise|apply|submit|file|draft|update)|set up (?:a|an|my)|draft (?:a|an|my))\b/;
+
+// A matched site alias supplies the business object. This only establishes
+// that the user wants to begin a guided transaction, independent of app names.
+const USER_INITIATED_PREPARATION = /\b(?:(?:i\s+)?(?:need|want|would like|d like)\s+to|help me(?: to)?|please)\s+(?:request|apply|claim|correct|regulari[sz]e|book|raise|file|submit|create|start|prepare|get\s+(?:reimbursed|paid\s+back))\b/;
+
+// Pure explanation / how-does-it-work requests want understanding, not a write.
+const EXPLANATORY_REQUEST = /\b(?:explain|tell me|walk me through|what is|what s|how do i|how does|how to)\b[^.!?]*\b(?:process|works?|steps|requirements|flow|policy|apply|application|request)\b/;
+const EXPLANATORY_MARKERS = /\b(?:information only|info only|read[- ]?only|for information|just information|do not act|no action|reference only)\b/;
+const EXPLANATORY_INSPECT = /\b(?:explain|review|inspect|preview)\s+(?:only|the\s+(?:checks|requirements|workflow|process))\b/;
+
+// The user refuses the mutation and explicitly redirects to reading data.
+const READ_REDIRECT = /\b(?:show|list|see|view|display|find|get|check|tell me|give me)\b[^.!?]*\b(?:instead|current|pending|open|my|status|list)\b/;
+
+function requestsReadOnlyReview(text: string): boolean {
+  // A concrete preparation of a mutation stays a write route (guided, preview-first).
+  if (MUTATION_PREPARATION.test(text) || USER_INITIATED_PREPARATION.test(text)) return false;
+  if (EXPLANATORY_REQUEST.test(text) || EXPLANATORY_MARKERS.test(text) || EXPLANATORY_INSPECT.test(text)) return true;
+  if (READ_ONLY_NEGATED_MUTATION.test(text) && (READ_REDIRECT.test(text) || !MUTATION_PREPARATION.test(text))) return true;
+  if (READ_ONLY_WITHOUT_MUTATION.test(text)) return true;
+  if (READ_ONLY_NOTHING_CHANGES.test(text)) return true;
+  return false;
 }
 
 function requiredChecksFor(intent: FrappeOperationalIntent, path: FrappeAnswerPath): string[] {
@@ -443,11 +567,55 @@ function alias(phrase: string, canonical: string, module: string, confidence: nu
 
 function aliasMatches(text: string, phrase: string): boolean {
   const normalizedPhrase = normalizeText(phrase);
-  return text === normalizedPhrase || text.includes(normalizedPhrase) || normalizedPhrase.split(/\s+/).every((part) => part.length > 2 && text.includes(part));
+  if (text === normalizedPhrase || text.includes(normalizedPhrase)) return true;
+
+  const textTerms = new Set(normalizeSearchTerms(text));
+  const meaningfulPhraseTerms = normalizeSearchTerms(normalizedPhrase).filter((part) => part.length > 2);
+  return meaningfulPhraseTerms.length > 0 && meaningfulPhraseTerms.every((part) => textTerms.has(part));
+}
+
+function aliasMatchScore(text: string, item: FrappeSemanticAlias): number {
+  const phrase = normalizeText(item.phrase);
+  const words = phrase.split(/\s+/).filter(Boolean);
+  const textTerms = new Set(normalizeSearchTerms(text));
+  const phraseTerms = normalizeSearchTerms(phrase);
+  const sourceWeight = item.source === "admin_curated" ? 32
+    : item.source === "erpnext_prior" ? 26
+      : item.source === "report_name" ? 20
+        : item.source === "field_label" ? 16
+          : 12;
+  const contiguous = text.includes(phrase) ? 24 : 0;
+  const completePhrase = phraseTerms.length > 1 && phraseTerms.every((term) => textTerms.has(term))
+    ? phraseTerms.length * 28
+    : 0;
+  return item.confidence * 100 + sourceWeight + contiguous + completePhrase + Math.min(words.length, 4) * 18;
 }
 
 function normalizeText(value: string): string {
-  return value.toLowerCase().replace(/[^\p{L}\p{N}\s/-]/gu, " ").replace(/\s+/g, " ").trim();
+  return value.toLowerCase().replace(/[/-]+/g, " ").replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
+}
+
+function normalizeSearchTerms(value: string): string[] {
+  return normalizeText(value).split(/\s+/).filter(Boolean).map((term) => {
+    const workplaceAlias: Readonly<Record<string, string>> = {
+      chhutti: "leave",
+      chhuttiya: "leave",
+      chhuttiyan: "leave",
+      chuti: "leave",
+      chutti: "leave",
+      chuttiya: "leave",
+      chuttiyan: "leave",
+      hazri: "attendance",
+      kaam: "work",
+      tanakhwa: "salary",
+      tankhwa: "salary",
+    };
+    if (workplaceAlias[term]) return workplaceAlias[term];
+    if (term.length > 4 && term.endsWith("ies")) return `${term.slice(0, -3)}y`;
+    if (term.length > 4 && /(ches|shes|sses|xes|zes)$/.test(term)) return term.slice(0, -2);
+    if (term.length > 3 && term.endsWith("s") && !term.endsWith("ss")) return term.slice(0, -1);
+    return term;
+  });
 }
 
 function unique(values: readonly string[]): string[] {

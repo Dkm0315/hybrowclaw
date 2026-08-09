@@ -9,11 +9,13 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "pnpm -r build",
-    "typecheck": "pnpm --filter @musterhq/core build && pnpm --filter @musterhq/gateway build && pnpm --filter @musterhq/core typecheck && pnpm --filter @musterhq/gateway typecheck && pnpm --filter @musterhq/cli typecheck && pnpm --filter @musterhq/ui typecheck",
+    "build": "pnpm --dir capability-packs/frappe build && pnpm -r build",
+    "typecheck": "pnpm --dir capability-packs/frappe build && pnpm --filter @musterhq/core build && pnpm --filter @musterhq/gateway build && pnpm --filter @musterhq/core typecheck && pnpm --filter @musterhq/gateway typecheck && pnpm --filter @musterhq/cli typecheck && pnpm --filter @musterhq/ui typecheck",
     "test": "pnpm -r test",
     "hc": "tsx packages/cli/src/index.ts",
-    "portal:data": "node scripts/generate-portal-data.mjs"
+    "portal:data": "node scripts/generate-portal-data.mjs",
+    "evidence:video": "node scripts/evidence/video-evidence.mjs",
+    "test:evidence": "node --test --test-concurrency=1 scripts/evidence/test/*.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -1,0 +1,9 @@
+{
+ "doctype":"Desktop Icon","name":"Muster","label":"Muster","app":"muster","standard":1,"hidden":0,
+ "icon_type":"App","link_type":"External","link":"/desk/muster-control","sidebar":"Muster",
+ "icon_image":"/assets/muster/images/muster-mark.png","logo_url":"/assets/muster/images/muster-mark.png",
+ "restrict_removal":1,"roles":[
+  {"role":"Muster Administrator"},{"role":"Muster Automation Manager"},{"role":"Muster Operator"},
+  {"role":"Muster Approver"},{"role":"Muster Auditor"},{"role":"Muster Viewer"}
+ ]
+}

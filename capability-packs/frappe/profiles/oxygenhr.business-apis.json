@@ -1,0 +1,432 @@
+[
+  {
+    "id": "leave_balance",
+    "operation": "read",
+    "doctype": "Leave Application",
+    "phrases": [
+      "leave balance",
+      "how much leave do i have left",
+      "how many leaves do i have",
+      "remaining leave"
+    ],
+    "method": "cn_leave_shift_managment.api.custom_get_leave_details",
+    "params": {
+      "employee": "$employee",
+      "date": "$today"
+    },
+    "responsePath": "message.leave_balance",
+    "resultLabel": "Leave balance",
+    "includeWhen": {
+      "field": "dont_show_in_frontend",
+      "equals": 0
+    },
+    "fields": [
+      { "target": "title", "sources": ["type", "leave_type_name", "custom_leave_type_name", "leave_type"] },
+      { "target": "available", "sources": ["balance", "available_leaves", "remaining_leaves", "leave_balance"] },
+      { "target": "used", "sources": ["availed", "leaves_taken", "used_leaves"] }
+    ],
+    "view": {
+      "title": "Your leave balance",
+      "summary": "Here is the leave currently available to you.",
+      "columns": [
+        { "field": "title", "label": "Leave type" },
+        { "field": "available", "label": "Available" },
+        { "field": "used", "label": "Used" }
+      ]
+    }
+  },
+  {
+    "id": "employee_self_profile",
+    "operation": "read",
+    "doctype": "Employee",
+    "phrases": [
+      "my employee profile",
+      "my employment details",
+      "my hr profile",
+      "my work profile",
+      "show me my work profile",
+      "show my profile"
+    ],
+    "method": "recruitment.api.get_current_employee",
+    "params": {},
+    "responsePath": "message",
+    "resultLabel": "Employee profile",
+    "includeWhen": {
+      "field": "status",
+      "equals": "Active"
+    },
+    "fields": [
+      { "target": "employee_id", "sources": ["name"] },
+      { "target": "employee_name", "sources": ["employee_name"] },
+      { "target": "designation", "sources": ["designation_name", "designation"] },
+      { "target": "department", "sources": ["department_name", "department"] },
+      { "target": "company", "sources": ["company_name", "company"] },
+      { "target": "date_of_joining", "sources": ["date_of_joining"] },
+      { "target": "employment_type", "sources": ["employment_type"] },
+      { "target": "status", "sources": ["status"] }
+    ],
+    "view": {
+      "title": "Your employee profile",
+      "summary": "Current employment details from your connected employee record.",
+      "columns": [
+        { "field": "employee_name", "label": "Employee" },
+        { "field": "designation", "label": "Designation" },
+        { "field": "department", "label": "Department" },
+        { "field": "company", "label": "Company" },
+        { "field": "status", "label": "Status" }
+      ]
+    }
+  },
+  {
+    "id": "employee_direct_reports",
+    "operation": "read",
+    "doctype": "Employee",
+    "phrases": [
+      "my direct reports",
+      "people reporting to me",
+      "my reportees",
+      "who reports to me",
+      "who are my direct reports",
+      "who is on my team"
+    ],
+    "method": "cn_leave_shift_managment.api.get_reportees",
+    "params": {
+      "user": "$user"
+    },
+    "responsePath": "message",
+    "resultLabel": "Direct reports",
+    "fields": [
+      { "target": "employee_id", "sources": ["name"] },
+      { "target": "employee_name", "sources": ["employee_name"] },
+      { "target": "company", "sources": ["company"] }
+    ],
+    "view": {
+      "title": "Your direct reports",
+      "summary": "Employees returned for your authenticated reporting relationship.",
+      "columns": [
+        { "field": "employee_name", "label": "Employee" },
+        { "field": "employee_id", "label": "Employee ID" },
+        { "field": "company", "label": "Company" }
+      ]
+    }
+  },
+  {
+    "id": "attendance_current_shift",
+    "operation": "read",
+    "doctype": "Attendance",
+    "phrases": [
+      "my current shift",
+      "my attendance shift",
+      "what shift am i on",
+      "what are my work timings",
+      "when does my shift start",
+      "when does my shift end"
+    ],
+    "method": "cn_leave_shift_managment.api.get_employee_shift",
+    "params": {
+      "user": "$user"
+    },
+    "responsePath": "message",
+    "resultLabel": "Current shift",
+    "fields": [
+      { "target": "shift_id", "sources": ["shift"] },
+      { "target": "shift_name", "sources": ["shift_name"] },
+      { "target": "start_time", "sources": ["start_time"] },
+      { "target": "end_time", "sources": ["end_time"] }
+    ],
+    "view": {
+      "title": "Your current shift",
+      "summary": "The shift currently associated with your authenticated account.",
+      "columns": [
+        { "field": "shift_name", "label": "Shift" },
+        { "field": "start_time", "label": "Starts" },
+        { "field": "end_time", "label": "Ends" }
+      ]
+    }
+  },
+  {
+    "id": "attendance_today_summary",
+    "operation": "read",
+    "doctype": "Attendance",
+    "phrases": [
+      "today attendance summary",
+      "my attendance today",
+      "today working hours summary",
+      "was i present today",
+      "am i present today",
+      "did i attend today",
+      "did i check in today",
+      "did i clock in today",
+      "have i checked in today"
+    ],
+    "method": "cn_leave_shift_managment.api.get_quick_summary",
+    "params": {
+      "employee": "$employee",
+      "from_date": "$today",
+      "to_date": "$today"
+    },
+    "responsePath": "message",
+    "resultLabel": "Attendance summary",
+    "fields": [
+      { "target": "present_days", "sources": ["present"] },
+      { "target": "leave_days", "sources": ["leaves"] },
+      { "target": "absent_days", "sources": ["absent"] },
+      { "target": "average_working_hours", "sources": ["avg_working_hours"] },
+      { "target": "average_overtime", "sources": ["avg_overtime"] },
+      { "target": "average_late_by", "sources": ["avg_late_by"] },
+      { "target": "holidays", "sources": ["holidays"] },
+      { "target": "week_offs", "sources": ["week_offs"] },
+      { "target": "attendance_requests", "sources": ["my_attendance_requests"] }
+    ],
+    "view": {
+      "title": "Today's attendance summary",
+      "summary": "Attendance totals for your employee record for today.",
+      "columns": [
+        { "field": "present_days", "label": "Present" },
+        { "field": "leave_days", "label": "Leave" },
+        { "field": "absent_days", "label": "Absent" },
+        { "field": "average_working_hours", "label": "Working hours" },
+        { "field": "average_late_by", "label": "Late by" }
+      ]
+    }
+  },
+  {
+    "id": "leave_holidays_today",
+    "operation": "read",
+    "doctype": "Leave Application",
+    "phrases": [
+      "holiday today",
+      "is today a holiday",
+      "today holiday list",
+      "do i have office today",
+      "do i need to work today",
+      "is the office open today"
+    ],
+    "method": "helpdesk.api.holidays.get_holidays_for_employee",
+    "params": {
+      "employee_id": "$employee",
+      "from_date": "$today",
+      "to_date": "$today"
+    },
+    "responsePath": "message",
+    "resultLabel": "Today's holidays",
+    "fields": [
+      { "target": "holiday_id", "sources": ["name"] },
+      { "target": "holiday_name", "sources": ["holiday_name"] },
+      { "target": "date", "sources": ["date"] },
+      { "target": "type", "sources": ["type"] }
+    ],
+    "view": {
+      "title": "Today's holidays",
+      "summary": "Holiday entries applicable to your employee record today.",
+      "emptyTitle": "No holiday today",
+      "emptySummary": "Today is not listed as a holiday for you.",
+      "columns": [
+        { "field": "holiday_name", "label": "Holiday" },
+        { "field": "date", "label": "Date" },
+        { "field": "type", "label": "Type" }
+      ]
+    }
+  },
+  {
+    "id": "expense_shared_with_me",
+    "operation": "read",
+    "doctype": "Expense Claim",
+    "phrases": [
+      "expenses shared with me",
+      "shared expense claims",
+      "my shared reimbursements",
+      "my pending expense claims",
+      "do i have any expense claims pending",
+      "show my expense claims"
+    ],
+    "method": "chatnext_expense_trips.expense_claim.get_shared_expenses_for_employee",
+    "params": {},
+    "responsePath": "message.data",
+    "resultLabel": "Shared expense claims",
+    "fields": [
+      { "target": "expense_claim", "sources": ["expense_claim"] },
+      { "target": "posting_date", "sources": ["posting_date"] },
+      { "target": "status", "sources": ["status"] },
+      { "target": "approval_status", "sources": ["approval_status"] },
+      { "target": "claimed_amount", "sources": ["total_claimed_amount"] },
+      { "target": "sanctioned_amount", "sources": ["total_sanctioned_amount"] }
+    ],
+    "view": {
+      "title": "Expenses shared with you",
+      "summary": "Expense claims shared with your authenticated employee account.",
+      "columns": [
+        { "field": "expense_claim", "label": "Claim" },
+        { "field": "posting_date", "label": "Posting date" },
+        { "field": "approval_status", "label": "Approval" },
+        { "field": "claimed_amount", "label": "Claimed" },
+        { "field": "sanctioned_amount", "label": "Sanctioned" }
+      ]
+    }
+  },
+  {
+    "id": "work_announcements",
+    "operation": "read",
+    "doctype": "Announcement",
+    "phrases": [
+      "company announcements",
+      "work announcements",
+      "latest announcements"
+    ],
+    "method": "chatnext_work_connect.chatnext_work_connect.api.announcement.get_announcements",
+    "params": {},
+    "responsePath": "message.data.announcements",
+    "resultLabel": "Announcements",
+    "fields": [
+      { "target": "announcement_id", "sources": ["id"] },
+      { "target": "title", "sources": ["title"] },
+      { "target": "type", "sources": ["type"] },
+      { "target": "priority", "sources": ["priority"] },
+      { "target": "publish_date", "sources": ["publish_date"] },
+      { "target": "expiry_date", "sources": ["expiry_date"] },
+      { "target": "is_read", "sources": ["is_read"] },
+      { "target": "is_acknowledged", "sources": ["is_acknowledged"] }
+    ],
+    "view": {
+      "title": "Company announcements",
+      "summary": "The latest announcements visible to your authenticated account.",
+      "emptyTitle": "No new announcements",
+      "emptySummary": "There are no company announcements for you right now.",
+      "columns": [
+        { "field": "title", "label": "Announcement" },
+        { "field": "type", "label": "Type" },
+        { "field": "priority", "label": "Priority" },
+        { "field": "publish_date", "label": "Published" },
+        { "field": "is_read", "label": "Read" }
+      ]
+    }
+  },
+  {
+    "id": "recruitment_internal_openings",
+    "operation": "read",
+    "doctype": "Job Opening",
+    "phrases": [
+      "internal job openings",
+      "internal opportunities",
+      "ijp openings",
+      "jobs i can apply for internally",
+      "internal jobs i can apply for",
+      "any openings for me",
+      "what roles are open for me"
+    ],
+    "method": "recruitment.api.channels.ijp.list_openings",
+    "params": {
+      "employee": "$employee"
+    },
+    "responsePath": "message",
+    "resultLabel": "Internal job openings",
+    "includeWhen": {
+      "field": "status",
+      "equals": "Open"
+    },
+    "fields": [
+      { "target": "opening_id", "sources": ["name"] },
+      { "target": "job_title", "sources": ["job_title"] },
+      { "target": "status", "sources": ["status"] },
+      { "target": "posted_on", "sources": ["posted_on"] },
+      { "target": "closes_on", "sources": ["closes_on"] },
+      { "target": "designation", "sources": ["designation"] },
+      { "target": "department", "sources": ["department"] },
+      { "target": "location", "sources": ["location"] },
+      { "target": "company", "sources": ["company"] }
+    ],
+    "view": {
+      "title": "Internal job openings",
+      "summary": "Open internal opportunities available to your employee record.",
+      "columns": [
+        { "field": "job_title", "label": "Role" },
+        { "field": "designation", "label": "Designation" },
+        { "field": "department", "label": "Department" },
+        { "field": "location", "label": "Location" },
+        { "field": "closes_on", "label": "Closes" }
+      ]
+    }
+  },
+  {
+    "id": "recruitment_referral_openings",
+    "operation": "read",
+    "doctype": "Job Opening",
+    "phrases": [
+      "referral job openings",
+      "employee referral openings",
+      "jobs i can refer"
+    ],
+    "method": "recruitment.api.channels.refer.list_openings",
+    "params": {
+      "employee": "$employee"
+    },
+    "responsePath": "message",
+    "resultLabel": "Referral job openings",
+    "includeWhen": {
+      "field": "status",
+      "equals": "Open"
+    },
+    "fields": [
+      { "target": "opening_id", "sources": ["name"] },
+      { "target": "job_title", "sources": ["job_title"] },
+      { "target": "status", "sources": ["status"] },
+      { "target": "posted_on", "sources": ["posted_on"] },
+      { "target": "closes_on", "sources": ["closes_on"] },
+      { "target": "designation", "sources": ["designation"] },
+      { "target": "department", "sources": ["department"] },
+      { "target": "location", "sources": ["location"] },
+      { "target": "company", "sources": ["company"] }
+    ],
+    "view": {
+      "title": "Referral job openings",
+      "summary": "Open roles available through the employee referral channel.",
+      "columns": [
+        { "field": "job_title", "label": "Role" },
+        { "field": "designation", "label": "Designation" },
+        { "field": "department", "label": "Department" },
+        { "field": "location", "label": "Location" },
+        { "field": "closes_on", "label": "Closes" }
+      ]
+    }
+  },
+  {
+    "id": "todo_delegation_summary",
+    "operation": "read",
+    "doctype": "ToDo",
+    "phrases": [
+      "todo delegation summary",
+      "my delegated task summary",
+      "delegated todos overview",
+      "work delegated to me",
+      "work has been delegated to me",
+      "tasks delegated to me",
+      "anything assigned to me",
+      "what is assigned to me",
+      "what is on my plate"
+    ],
+    "method": "cn_todo_manager.chatnext_todo_manager.api.delegated_tasks.get_delegated_tasks_summary",
+    "params": {
+      "user": "$user"
+    },
+    "responsePath": "message.summary",
+    "resultLabel": "Delegated task summary",
+    "fields": [
+      { "target": "total_delegated", "sources": ["total_delegated"] },
+      { "target": "open_tasks", "sources": ["open_tasks"] },
+      { "target": "closed_tasks", "sources": ["closed_tasks"] },
+      { "target": "overdue_tasks", "sources": ["overdue_tasks"] },
+      { "target": "recent_delegations", "sources": ["recent_delegations"] }
+    ],
+    "view": {
+      "title": "Delegated task summary",
+      "summary": "Current delegation totals for your authenticated user account.",
+      "columns": [
+        { "field": "total_delegated", "label": "Delegated" },
+        { "field": "open_tasks", "label": "Open" },
+        { "field": "closed_tasks", "label": "Closed" },
+        { "field": "overdue_tasks", "label": "Overdue" },
+        { "field": "recent_delegations", "label": "Recent" }
+      ]
+    }
+  }
+]

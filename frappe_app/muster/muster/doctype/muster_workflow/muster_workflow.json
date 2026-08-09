@@ -1,0 +1,185 @@
+{
+  "doctype": "DocType",
+  "name": "Muster Workflow",
+  "module": "Muster",
+  "autoname": "field:workflow_name",
+  "title_field": "workflow_name",
+  "track_changes": 1,
+  "field_order": [
+    "overview_tab",
+    "workflow_name",
+    "status",
+    "version",
+    "description",
+    "root_agent",
+    "policy",
+    "limits_section",
+    "max_duration_minutes",
+    "max_tool_calls",
+    "max_model_calls",
+    "max_tokens",
+    "max_cost",
+    "max_artifact_bytes",
+    "graph_tab",
+    "nodes",
+    "edges",
+    "publication_tab",
+    "published_version",
+    "published_at"
+  ],
+  "fields": [
+    {
+      "fieldname": "overview_tab",
+      "fieldtype": "Tab Break",
+      "label": "Overview"
+    },
+    {
+      "fieldname": "workflow_name",
+      "fieldtype": "Data",
+      "label": "Workflow Name",
+      "reqd": 1,
+      "unique": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "label": "Status",
+      "options": "Draft\nPublished\nPaused\nRetired",
+      "default": "Draft",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "version",
+      "fieldtype": "Int",
+      "label": "Draft Revision",
+      "default": "1",
+      "read_only": 1
+    },
+    {
+      "fieldname": "description",
+      "fieldtype": "Small Text",
+      "label": "Outcome",
+      "reqd": 1
+    },
+    {
+      "fieldname": "root_agent",
+      "fieldtype": "Link",
+      "label": "Root Agent",
+      "options": "Muster Agent",
+      "reqd": 1
+    },
+    {
+      "fieldname": "policy",
+      "fieldtype": "Link",
+      "label": "Policy",
+      "options": "Muster Policy",
+      "reqd": 1
+    },
+    {
+      "fieldname": "limits_section",
+      "fieldtype": "Section Break",
+      "label": "Budgets"
+    },
+    {
+      "fieldname": "max_duration_minutes",
+      "fieldtype": "Int",
+      "label": "Maximum Duration (minutes)",
+      "default": "60",
+      "reqd": 1
+    },
+    {
+      "fieldname": "max_cost",
+      "fieldtype": "Currency",
+      "label": "Maximum Cost"
+    },
+    {
+      "fieldname": "max_tool_calls",
+      "fieldtype": "Int",
+      "label": "Maximum Tool Calls",
+      "default": "100",
+      "reqd": 1
+    },
+    {
+      "fieldname": "max_model_calls",
+      "fieldtype": "Int",
+      "label": "Maximum Model Calls",
+      "default": "50",
+      "reqd": 1
+    },
+    {
+      "fieldname": "max_tokens",
+      "fieldtype": "Int",
+      "label": "Maximum Tokens",
+      "default": "500000",
+      "reqd": 1
+    },
+    {
+      "fieldname": "max_artifact_bytes",
+      "fieldtype": "Int",
+      "label": "Maximum Artifact Bytes",
+      "default": "104857600",
+      "reqd": 1
+    },
+    {
+      "fieldname": "graph_tab",
+      "fieldtype": "Tab Break",
+      "label": "Graph"
+    },
+    {
+      "fieldname": "nodes",
+      "fieldtype": "Table",
+      "label": "Nodes",
+      "options": "Muster Workflow Node",
+      "reqd": 1
+    },
+    {
+      "fieldname": "edges",
+      "fieldtype": "Table",
+      "label": "Edges",
+      "options": "Muster Workflow Edge"
+    },
+    {
+      "fieldname": "publication_tab",
+      "fieldtype": "Tab Break",
+      "label": "Publication"
+    },
+    {
+      "fieldname": "published_version",
+      "fieldtype": "Link",
+      "label": "Published Version",
+      "options": "Muster Workflow Version",
+      "read_only": 1
+    },
+    {
+      "fieldname": "published_at",
+      "fieldtype": "Datetime",
+      "label": "Published At",
+      "read_only": 1
+    }
+  ],
+  "permissions": [
+    {
+      "role": "Muster Administrator",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1
+    },
+    {
+      "role": "Muster Automation Manager",
+      "read": 1,
+      "write": 1,
+      "create": 1
+    },
+    {
+      "role": "Muster Operator",
+      "read": 1
+    },
+    {
+      "role": "Muster Auditor",
+      "read": 1
+    }
+  ]
+}

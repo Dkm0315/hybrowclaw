@@ -1,0 +1,167 @@
+{
+    "doctype": "DocType",
+    "name": "Muster Channel Identity",
+    "module": "Muster",
+    "autoname": "hash",
+    "track_changes": 1,
+    "field_order": [
+        "identity_tab",
+        "channel_account",
+        "user",
+        "status",
+        "external_subject",
+        "external_username",
+        "verification_section",
+        "provider_link_id",
+        "permission_epoch",
+        "idempotency_fingerprint",
+        "pending_start_url",
+        "verified_at",
+        "verified_by",
+        "expires_at",
+        "last_seen_at",
+        "revoked_at"
+    ],
+    "fields": [
+        {
+            "fieldname": "identity_tab",
+            "fieldtype": "Tab Break",
+            "label": "Identity"
+        },
+        {
+            "fieldname": "channel_account",
+            "fieldtype": "Link",
+            "label": "Channel Account",
+            "options": "Muster Channel Account",
+            "reqd": 1,
+            "in_list_view": 1
+        },
+        {
+            "fieldname": "user",
+            "fieldtype": "Link",
+            "label": "Frappe User",
+            "options": "User",
+            "reqd": 1,
+            "in_list_view": 1
+        },
+        {
+            "fieldname": "status",
+            "fieldtype": "Select",
+            "label": "Status",
+            "options": "Pending\nVerified\nSuspended\nExpired\nRevoked",
+            "default": "Pending",
+            "reqd": 1,
+            "in_list_view": 1
+        },
+        {
+            "fieldname": "external_subject",
+            "fieldtype": "Data",
+            "label": "External Subject",
+            "unique": 1,
+            "read_only": 1
+        },
+        {
+            "fieldname": "external_username",
+            "fieldtype": "Data",
+            "label": "External Username"
+        },
+        {
+            "fieldname": "verification_section",
+            "fieldtype": "Section Break",
+            "label": "Verification"
+        },
+        {
+            "fieldname": "provider_link_id",
+            "fieldtype": "Data",
+            "label": "Provider Link ID",
+            "read_only": 1
+        },
+        {
+            "fieldname": "permission_epoch",
+            "fieldtype": "Data",
+            "label": "Permission Epoch",
+            "read_only": 1
+        },
+        {
+            "fieldname": "idempotency_fingerprint",
+            "fieldtype": "Data",
+            "label": "Issue Idempotency Fingerprint",
+            "read_only": 1,
+            "hidden": 1
+        },
+        {
+            "fieldname": "pending_start_url",
+            "fieldtype": "Password",
+            "label": "Pending Start URL",
+            "hidden": 1
+        },
+        {
+            "fieldname": "verified_at",
+            "fieldtype": "Datetime",
+            "label": "Verified At",
+            "read_only": 1
+        },
+        {
+            "fieldname": "verified_by",
+            "fieldtype": "Link",
+            "label": "Verified By",
+            "options": "User",
+            "read_only": 1
+        },
+        {
+            "fieldname": "expires_at",
+            "fieldtype": "Datetime",
+            "label": "Pending Link Expires",
+            "read_only": 1
+        },
+        {
+            "fieldname": "last_seen_at",
+            "fieldtype": "Datetime",
+            "label": "Last Seen",
+            "read_only": 1
+        },
+        {
+            "fieldname": "revoked_at",
+            "fieldtype": "Datetime",
+            "label": "Revoked At",
+            "read_only": 1
+        }
+    ],
+    "permissions": [
+        {
+            "role": "Muster Administrator",
+            "read": 1,
+            "write": 1,
+            "create": 1,
+            "delete": 1
+        },
+        {
+            "role": "Muster Automation Manager",
+            "read": 1,
+            "write": 1,
+            "create": 1
+        },
+        {
+            "role": "Muster Operator",
+            "read": 1,
+            "write": 1,
+            "create": 1
+        },
+        {
+            "role": "Muster Approver",
+            "read": 1,
+            "write": 1,
+            "create": 1
+        },
+        {
+            "role": "Muster Auditor",
+            "read": 1
+        },
+        {
+            "role": "Muster Viewer",
+            "read": 1,
+            "write": 1,
+            "create": 1
+        }
+    ]
+}

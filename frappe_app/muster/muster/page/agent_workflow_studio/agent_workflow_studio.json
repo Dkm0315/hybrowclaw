@@ -1,0 +1,16 @@
+{
+  "doctype": "Page",
+  "name": "agent-workflow-studio",
+  "page_name": "agent-workflow-studio",
+  "title": "Muster Agent & Workflow Studio",
+  "module": "Muster",
+  "standard": "Yes",
+  "system_page": 0,
+  "icon": "git-branch",
+  "roles": [
+    {"role": "Muster Administrator"},
+    {"role": "Muster Automation Manager"},
+    {"role": "Muster Operator"},
+    {"role": "Muster Auditor"}
+  ]
+}

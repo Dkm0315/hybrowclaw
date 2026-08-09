@@ -38,6 +38,9 @@ export interface SurfaceArtifact {
   readonly name: string;
   readonly mime: string;
   readonly path: string;
+  /** Optional host-verified integrity binding for durable run artifacts. */
+  readonly sizeBytes?: number;
+  readonly sha256?: string;
 }
 
 export interface ApprovalRequest {
@@ -51,6 +54,8 @@ export interface SurfaceReply {
   readonly text: string;
   readonly artifacts?: readonly SurfaceArtifact[];
   readonly approvalRequest?: ApprovalRequest;
+  /** Optional rich interaction; text remains the canonical accessible fallback. */
+  readonly presentation?: import("./presentation.js").SurfacePresentation;
 }
 
 /** Returned instead of a reply when the sender has not been paired yet. */
@@ -63,9 +68,16 @@ export function isPairingChallenge(value: SurfaceReply | PairingChallenge): valu
   return (value as PairingChallenge).status === "pairing_required";
 }
 
-/** Session lane shared by every message in one surface conversation. */
-export function conversationSessionId(message: Pick<SurfaceMessage, "surfaceId" | "conversationId">): string {
-  return `${message.surfaceId}:${message.conversationId}`;
+/**
+ * Provider session lane. Group conversations are split by sender so one user
+ * cannot inherit another user's provider history. Callers without a sender id
+ * retain the legacy conversation-only key for migration/inspection tooling.
+ */
+export function conversationSessionId(
+  message: Pick<SurfaceMessage, "surfaceId" | "conversationId"> & Partial<Pick<SurfaceMessage, "senderId">>,
+): string {
+  const conversation = `${message.surfaceId}:${message.conversationId}`;
+  return message.senderId ? `${conversation}:sender:${message.senderId}` : conversation;
 }
 
 export function parseSurfaceMessage(value: unknown): SurfaceMessage {

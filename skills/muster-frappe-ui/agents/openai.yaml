@@ -1,0 +1,7 @@
+interface:
+  display_name: "Muster Frappe UI"
+  short_description: "Build the native visible Frappe automation UI"
+  brand_color: "#7C3AED"
+  default_prompt: "Use $muster-frappe-ui to build this Frappe v16 desktop and mobile automation experience."
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,12 @@
+# app<TAB>repository<TAB>reviewed_bootstrap_branch<TAB>immutable_commit<TAB>required
+erpnext	https://github.com/frappe/erpnext.git	version-16	<PIN_ERPNEXT_V16_40_CHAR_SHA>	true
+hrms	https://github.com/frappe/hrms.git	version-16	<PIN_HRMS_V16_40_CHAR_SHA>	true
+telephony	https://github.com/frappe/telephony.git	develop	<PIN_TELEPHONY_40_CHAR_SHA>	true
+crm	https://github.com/frappe/crm.git	main	<PIN_CRM_V1_40_CHAR_SHA>	true
+helpdesk	https://github.com/frappe/helpdesk.git	main	<PIN_HELPDESK_V1_40_CHAR_SHA>	true
+muster	https://github.com/musterhq/muster-frappe.git	main	<PIN_MUSTER_40_CHAR_SHA>	true
+payments	https://github.com/frappe/payments.git	develop	<PIN_PAYMENTS_40_CHAR_SHA>	true
+insights	https://github.com/frappe/insights.git	main	<PIN_INSIGHTS_40_CHAR_SHA>	true
+builder	https://github.com/frappe/builder.git	develop	<PIN_BUILDER_40_CHAR_SHA>	true
+drive	https://github.com/frappe/drive.git	main	<PIN_DRIVE_40_CHAR_SHA>	true
+lms	https://github.com/frappe/lms.git	develop	<PIN_LMS_40_CHAR_SHA>	true

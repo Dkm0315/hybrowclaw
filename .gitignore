@@ -6,6 +6,14 @@ dist/
 packages/ui/public/hybrowclaw-state.json
 .claude/
 .muster/
+.playwright-cli/
+output/
+outputs/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+/exec
+/packages/gateway/exec
 
 # Workflow scratch scripts
 .workflows/

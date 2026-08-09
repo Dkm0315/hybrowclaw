@@ -1,0 +1,28 @@
+[
+  {
+    "id": "field-ops-demo",
+    "label": "Field Operations Demo",
+    "app": "field_ops_demo",
+    "supported_major": 1,
+    "base": "/operations",
+    "path_prefixes": ["/operations/"],
+    "root_markers": ["[data-v-app]"],
+    "doctypes": ["Service Visit"],
+    "operations": ["create", "update", "delete"],
+    "routes": {
+      "Service Visit": {
+        "list": "/visits",
+        "create": "/visits/new",
+        "record": "/visits/{name}",
+        "create_buttons": [],
+        "commit_buttons": {"create": ["Create"], "update": ["Save"], "delete": ["Delete"]},
+        "field_hints": {
+          "customer": ["Customer", "Choose customer"],
+          "scheduled_on": ["Scheduled On"],
+          "status": ["Status"],
+          "notes": ["Notes", "Visit instructions"]
+        }
+      }
+    }
+  }
+]

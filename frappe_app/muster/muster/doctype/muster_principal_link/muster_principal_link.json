@@ -1,0 +1,8 @@
+{
+ "doctype":"DocType","name":"Muster Principal Link","module":"Muster","autoname":"hash","title_field":"user","track_changes":1,
+ "field_order":["identity_tab","user","status","provider","provider_subject","site_binding","scopes_section","scopes_json","linked_at","last_synced_at","revoked_at"],
+ "fields":[
+  {"fieldname":"identity_tab","fieldtype":"Tab Break","label":"Identity"},{"fieldname":"user","fieldtype":"Link","label":"Frappe User","options":"User","reqd":1,"in_list_view":1},{"fieldname":"status","fieldtype":"Select","label":"Status","options":"Pending\nActive\nSuspended\nRevoked","default":"Pending","reqd":1,"in_list_view":1},{"fieldname":"provider","fieldtype":"Data","label":"Provider","reqd":1},{"fieldname":"provider_subject","fieldtype":"Data","label":"Provider Subject","reqd":1,"unique":1},{"fieldname":"site_binding","fieldtype":"Link","label":"Site Binding","options":"Muster Site Binding","reqd":1},{"fieldname":"scopes_section","fieldtype":"Section Break","label":"External Claims (Informational)"},{"fieldname":"scopes_json","fieldtype":"Code","label":"Scopes","options":"JSON","read_only":1,"description":"Claims never grant Frappe permissions by themselves."},{"fieldname":"linked_at","fieldtype":"Datetime","label":"Linked At","read_only":1},{"fieldname":"last_synced_at","fieldtype":"Datetime","label":"Last Synced","read_only":1},{"fieldname":"revoked_at","fieldtype":"Datetime","label":"Revoked At","read_only":1}
+ ],
+ "permissions":[{"role":"Muster Administrator","read":1,"write":1,"create":1},{"role":"Muster Auditor","read":1},{"role":"System Manager","read":1,"write":1,"create":1}]
+}

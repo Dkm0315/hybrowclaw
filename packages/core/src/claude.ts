@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { runSubprocess } from "./subprocess.js";
+import { isPreDispatchSpawnError, runSubprocess } from "./subprocess.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -36,6 +36,7 @@ export interface ClaudeCodeRunResult {
   readonly stderr: string;
   readonly durationMs: number;
   readonly errorMessage?: string;
+  readonly fallbackEligible?: boolean;
 }
 
 export async function inspectClaudeCode(command = "claude"): Promise<{ readonly available: boolean; readonly version?: string }> {
@@ -75,7 +76,8 @@ export async function runClaudeCode(input: ClaudeCodeRunInput): Promise<ClaudeCo
       stdout: detail.stdout?.trim() ?? "",
       stderr: detail.stderr?.trim() ?? "",
       durationMs: Date.now() - started,
-      errorMessage: detail.message
+      errorMessage: detail.message,
+      fallbackEligible: isPreDispatchSpawnError(error),
     };
   }
 }

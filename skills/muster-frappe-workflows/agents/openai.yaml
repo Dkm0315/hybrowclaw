@@ -1,0 +1,7 @@
+interface:
+  display_name: "Muster Frappe Workflows"
+  short_description: "Build durable hierarchical automation graphs"
+  brand_color: "#7C3AED"
+  default_prompt: "Use $muster-frappe-workflows to model this task as a durable agent and subagent workflow."
+policy:
+  allow_implicit_invocation: true
