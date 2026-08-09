@@ -346,7 +346,10 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
     evidence.stage = "start-session";
     await tmux(["new-session", "-d", "-s", session, "-x", "120", "-y", "40", "-c", workspace, command]);
     evidence.stage = "wait-baseline";
-    const baseline = await waitForPtyScreen(session, (screen) => screen.includes("╭─ chat") && screen.includes("│ ›"));
+    const baseline = await waitForPtyScreen(session, (screen) => {
+      const visible = stripAnsi(screen);
+      return visible.includes("╭─ chat") && visible.includes("│ ›");
+    });
     screens.push(`baseline\n${stripAnsi(baseline)}`);
 
     evidence.stage = "open-completion";
@@ -453,7 +456,7 @@ async function waitForPtyScreen(
     if (predicate(latest)) return latest;
     await delay(50);
   } while (Date.now() < deadline);
-  const tail = stripAnsi(latest).split("\n").slice(-12).join("\n").trim();
+  const tail = stripAnsi(latest).split("\n").filter((line) => line.trim()).slice(-12).join("\n").trim();
   throw new Error(
     `Timed out waiting for terminal state. Last composer=${JSON.stringify(composerValue(latest))}; screen tail=${JSON.stringify(tail)}`,
   );
