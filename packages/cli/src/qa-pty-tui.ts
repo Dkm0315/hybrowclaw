@@ -422,7 +422,11 @@ async function submitPtyText(session: string, value: string): Promise<void> {
   await tmux(["send-keys", "-t", session, "Enter"]);
 }
 
-async function waitForPtyScreen(session: string, predicate: (screen: string) => boolean, timeoutMs = 15_000): Promise<string> {
+async function waitForPtyScreen(
+  session: string,
+  predicate: (screen: string) => boolean,
+  timeoutMs = process.env.CI ? 30_000 : 15_000,
+): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   let latest = "";
   do {

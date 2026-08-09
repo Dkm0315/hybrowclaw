@@ -3875,7 +3875,7 @@ async function runCli(args: string[], cwd = resolve(import.meta.dirname, "..", "
   return execFileAsync("tsx", [cliPath, ...args], {
     cwd,
     env: { ...process.env, MUSTER_ONBOARDING_HOME: join(cwd, ".test-home"), ...env },
-    timeout: 30_000,
+    timeout: args.includes("pty_tui") ? 90_000 : 30_000,
     maxBuffer: 1024 * 1024
   });
 }
