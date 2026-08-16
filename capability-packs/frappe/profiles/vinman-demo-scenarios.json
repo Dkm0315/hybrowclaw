@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "namespace": "MUSTER-DEMO-",
+  "profile": "vinman-engineering-change",
+  "isolation": {
+    "recordSelector": { "field": "name", "operator": "starts_with", "value": "MUSTER-DEMO-" },
+    "customerRecordsMutable": false,
+    "setupMode": "governed_change_set",
+    "teardownMode": "reverse_dependency_order",
+    "writesRequireApproval": true
+  },
+  "scenarios": [
+    {
+      "id": "revision-escape",
+      "title": "Repair an engineering revision escape",
+      "intentionalFault": "The new Control Plan revision retains a downstream Process Flow and PPFMEA from the prior drawing revision.",
+      "expectedFinding": ["Requires regeneration", "Inconsistent"],
+      "restoration": "Restore the downstream revision and child-table snapshots captured by setup evidence."
+    },
+    {
+      "id": "guided-workflow",
+      "title": "Teach the customized workflow with human approval",
+      "intentionalFault": "A demo record is valid but has not completed the next customer-specific business step.",
+      "expectedFinding": ["Blocked"],
+      "restoration": "Restore the namespaced record to its pre-guidance workflow state."
+    },
+    {
+      "id": "authorized-customization-repair",
+      "title": "Repair a customization under role-bound approval",
+      "intentionalFault": "A namespaced validation script incorrectly rejects a valid revised operation.",
+      "expectedFinding": ["Blocked"],
+      "restoration": "Restore the namespaced script from its verified before-hash."
+    },
+    {
+      "id": "v16-migration",
+      "title": "Escalate a v15 to v16 migration failure",
+      "intentionalFault": "A namespaced script or report references a removed v15 schema surface.",
+      "expectedFinding": ["Blocked", "Requires regeneration"],
+      "restoration": "Keep the namespaced legacy reference for repeat recording and delete only the approved demo support ticket afterward."
+    }
+  ],
+  "acceptance": {
+    "repeatableRuns": 3,
+    "databaseAndApiAgreement": true,
+    "rbacNegativeTests": true,
+    "crossPrincipalLeakageAllowed": false,
+    "supportCanContinueWithoutReinterview": true
+  }
+}

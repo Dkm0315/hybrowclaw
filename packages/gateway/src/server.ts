@@ -28,6 +28,7 @@ import {
 import { FRAPPE_TELEGRAM_LINK_PATH, FrappeTelegramLinkCoordinator, openSqliteFrappeTelegramLinkCoordinator } from "./frappe-telegram-link.js";
 import type { FrappeTelegramAuthority, TelegramChatType } from "./frappe-telegram-link.js";
 import { frappeChannelQuickReply, frappeEvidenceQuickReply, frappePermissionContextForTurn, frappeTaskKindForIntent, isFrappeBusinessIntent } from "./frappe-channel.js";
+import { createFrappeSupportDraft, isFrappeIssueReportRequest, resolveFrappeSupportDestination } from "./frappe-support.js";
 import { googleChatAudienceIsValid, type GatewayConfig, type GatewayGovernanceAssignment } from "./gateway-config.js";
 import {
   classifyGatewayRequest,
@@ -1105,6 +1106,14 @@ function pairedIdentityNeedsRefresh(
     || paired.displayNamesResolvedAt !== authorized.displayNamesResolvedAt;
 }
 
+function pairedIdentityFromAuthorization(authorization: FrappeOAuthAuthorization): PairedIdentity {
+  return {
+    provider: "frappe",
+    ...authorization.identity,
+    resolvedAt: new Date().toISOString(),
+  };
+}
+
 export async function handleSurfaceMessage(
   message: SurfaceMessage,
   options: Pick<GatewayServerOptions, "config" | "cwd" | "nativeTransportOwner" | "frappeOAuth"> & {
@@ -1284,6 +1293,17 @@ export async function handleSurfaceMessage(
   }
   if (frappeInteractionKey && parsedCommand && ["accept", "create"].includes(parsedCommand.name)) {
     const pendingInteraction = options.enterprise?.frappeInteractionStore.read(frappeInteractionKey);
+    if (pendingInteraction && options.frappeOAuth) {
+      try {
+        frappeAuthorization = await options.frappeOAuth.authorizationForActor({
+          surfaceId: message.surfaceId,
+          senderId: message.senderId,
+          pairingId: paired.pairingId,
+        }, pendingInteraction.site);
+      } catch {
+        frappeAuthorization = undefined;
+      }
+    }
     return acceptPendingFrappeCreation({
       pending: pendingInteraction,
       authorization: frappeAuthorization,
@@ -1295,6 +1315,18 @@ export async function handleSurfaceMessage(
   const storedFrappeInteraction = frappeInteractionKey && !parsedCommand
     ? options.enterprise?.frappeInteractionStore.read(frappeInteractionKey)
     : undefined;
+  if (storedFrappeInteraction && options.frappeOAuth
+      && frappeAuthorization?.site !== storedFrappeInteraction.site) {
+    try {
+      frappeAuthorization = await options.frappeOAuth.authorizationForActor({
+        surfaceId: message.surfaceId,
+        senderId: message.senderId,
+        pairingId: paired.pairingId,
+      }, storedFrappeInteraction.site);
+    } catch {
+      frappeAuthorization = undefined;
+    }
+  }
   const interruptsFrappeInteraction = storedFrappeInteraction
     ? isIndependentFrappeRequest(message.text, storedFrappeInteraction)
     : false;
@@ -1307,22 +1339,60 @@ export async function handleSurfaceMessage(
   if (paired.identity?.provider === "frappe" && frappeAuthorization) {
     options.onStatus?.(frappeContinuation ? "Checking the next required detail" : "Checking your current access");
   }
+  const supportDraft = paired.identity?.provider === "frappe" && isFrappeIssueReportRequest(message.text)
+    ? createFrappeSupportDraft({
+        prompt: message.text,
+        identity: paired.identity,
+        context: options.trustedFrappe,
+        config: options.gateway?.frappe?.support,
+      })
+    : undefined;
+  if (supportDraft && options.frappeOAuth
+      && frappeAuthorization?.site !== supportDraft.destination.site) {
+    try {
+      frappeAuthorization = await options.frappeOAuth.authorizationForActor({
+        surfaceId: message.surfaceId,
+        senderId: message.senderId,
+        pairingId: paired.pairingId,
+      }, supportDraft.destination.site);
+    } catch {
+      frappeAuthorization = undefined;
+    }
+  }
+  if (supportDraft && !frappeAuthorization) {
+    const connectionId = supportDraft.destination.connectionId;
+    const presentation: SurfacePresentation = {
+      kind: "status",
+      title: "Connect support once",
+      summary: "The issue evidence is ready, but this channel sender has not authorized the configured Helpdesk destination.",
+      notice: "Nothing was sent. Connect the support account, then repeat the request from the affected record.",
+      actions: connectionId
+        ? [{ id: "connect-support", label: "Connect support", command: `/pair start ${connectionId}`, style: "primary" }]
+        : [{ id: "connections", label: "Review connections", command: "/pair", style: "primary" }],
+    };
+    return { text: renderPresentationText(presentation), presentation };
+  }
+  const turnIdentity = frappeAuthorization
+    ? pairedIdentityFromAuthorization(frappeAuthorization)
+    : paired.identity;
   const frappeTurnContext = paired.identity?.provider === "frappe" && frappeAuthorization
     ? await frappePermissionContextForTurn({
-        prompt: frappeContinuation?.prompt ?? message.text,
+        prompt: supportDraft ? `create ${supportDraft.destination.doctype}` : frappeContinuation?.prompt ?? message.text,
         surfaceId: message.surfaceId,
-        identity: paired.identity,
+        identity: turnIdentity!,
         authorization: frappeAuthorization,
         registry: options.registry,
-        ...(frappeContinuation ? { continuation: frappeContinuation.continuation } : {}),
+        ...(supportDraft
+          ? { continuation: { doctype: supportDraft.destination.doctype, operation: "create" as const, values: supportDraft.values } }
+          : frappeContinuation ? { continuation: frappeContinuation.continuation } : {}),
       })
     : undefined;
   if (frappeInteractionKey && frappeTurnContext?.pendingInteraction && options.enterprise) {
     const nowMs = Date.now();
     options.enterprise.frappeInteractionStore.put({
       key: frappeInteractionKey,
-      site: paired.identity!.site,
-      principal: paired.identity!.user,
+      site: frappeAuthorization?.site ?? paired.identity!.site,
+      principal: frappeAuthorization?.identity.user ?? paired.identity!.user,
       surfaceId: message.surfaceId,
       conversationId: message.conversationId,
       senderId: message.senderId,
@@ -4899,6 +4969,16 @@ export function gatewayStartupErrors(gateway: GatewayConfig): readonly string[] 
       tenantIds.add(tenant.id);
       try { normalizedHttpsOrigin(tenant.site); } catch { errors.push(`Frappe Telegram tenant ${tenant.id || "<empty>"} requires a valid HTTPS site origin`); }
       if (!tenant.allowedScopes.length) errors.push(`Frappe Telegram tenant ${tenant.id || "<empty>"} requires at least one allowed scope`);
+    }
+  }
+  if (gateway.frappe?.support) {
+    try {
+      const support = resolveFrappeSupportDestination(gateway.frappe.support);
+      if (support.connectionId && !gateway.frappe.oauth?.connections.some((connection) => connection.id === support.connectionId)) {
+        errors.push(`Frappe support connection ${support.connectionId} is not configured under frappe.oauth.connections`);
+      }
+    } catch {
+      errors.push("Frappe support site must be a canonical HTTPS origin and use a supported ticket type");
     }
   }
   if (gateway.slack?.botToken) {

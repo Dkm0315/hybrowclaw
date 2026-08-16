@@ -363,3 +363,224 @@ test("a node cannot escape its portable graph by selecting an undeclared target"
     store.close();
   }
 });
+
+test("a loop node keeps working and streaming progress until verification", async () => {
+  const store = new SqliteFrappeRunEventStore(":memory:");
+  const iterations: number[] = [];
+  const loopWorkflow: AgentGraphDefinition = {
+    ...workflow(),
+    entryNodeId: "repair_until_verified",
+    nodes: [{
+      id: "repair_until_verified",
+      kind: "loop",
+      loop: { maxIterations: 5, progressPredicate: "live validation advances", cancellationCheckpoint: true, budget },
+    }],
+    edges: [],
+  };
+  const bridge = new DurableFrappeMissionBridge({
+    store,
+    executeNode: async (input) => {
+      iterations.push(input.iteration);
+      assert.equal(input.previousProgressMarker, input.iteration === 1 ? undefined : `state-${input.iteration - 1}`);
+      return {
+        summary: input.iteration === 3 ? "Correction re-read and verified." : `Completed bounded repair step ${input.iteration}.`,
+        continuation: {
+          state: input.iteration === 3 ? "verified" : "continue",
+          progressMarker: `state-${input.iteration}`,
+        },
+        evidenceIds: [`evidence-${input.iteration}`],
+      };
+    },
+  });
+  try {
+    await bridge.submit(mission({ workflow: loopWorkflow }), scope);
+    await bridge.waitForIdle();
+    const status = await bridge.status(scope, "mission-native-1");
+    assert.equal(status?.status, "completed");
+    assert.deepEqual(iterations, [1, 2, 3]);
+    const progress = status?.events.filter((event) => event.type === "node_progress") ?? [];
+    assert.deepEqual(progress.map((event) => event.payload?.continuationState), ["continue", "continue", "verified"]);
+    assert.deepEqual(progress.map((event) => event.payload?.iteration), [1, 2, 3]);
+    assert.equal(status?.events.filter((event) => event.type === "node_completed").length, 1);
+    assert.equal(progress.every((event) => !JSON.stringify(event).includes("chain-of-thought")), true);
+  } finally {
+    await bridge.close();
+    store.close();
+  }
+});
+
+test("a long node streams redacted provider-visible progress before completion", async () => {
+  const store = new SqliteFrappeRunEventStore(":memory:");
+  const oneNode: AgentGraphDefinition = { ...workflow(), nodes: [{ id: "plan", kind: "agent" }], edges: [], entryNodeId: "plan" };
+  const bridge = new DurableFrappeMissionBridge({
+    store,
+    executeNode: async (input) => {
+      await input.recordProgress?.("Inspecting /home/goblin/private/repo with API_TOKEN=secret-value");
+      return { summary: "Inspection completed." };
+    },
+  });
+  try {
+    await bridge.submit(mission({ workflow: oneNode }), scope);
+    await bridge.waitForIdle();
+    const status = await bridge.status(scope, "mission-native-1");
+    const progress = status?.events.find((event) => event.type === "node_progress");
+    assert.equal(progress?.summary, "Inspecting the workspace with API_TOKEN=[redacted]");
+    assert.equal(progress?.payload?.progressKind, "provider_summary");
+    assert.equal(status?.status, "completed");
+    assert.ok((progress?.sequence ?? 0) < (status?.events.find((event) => event.type === "node_completed")?.sequence ?? 0));
+  } finally {
+    await bridge.close();
+    store.close();
+  }
+});
+
+test("a loop fails closed when an executor repeats a progress marker", async () => {
+  const store = new SqliteFrappeRunEventStore(":memory:");
+  const loopWorkflow: AgentGraphDefinition = {
+    ...workflow(),
+    entryNodeId: "repair_until_verified",
+    nodes: [{
+      id: "repair_until_verified",
+      kind: "loop",
+      loop: { maxIterations: 5, progressPredicate: "live validation advances", cancellationCheckpoint: true, budget },
+    }],
+    edges: [],
+  };
+  const bridge = new DurableFrappeMissionBridge({
+    store,
+    executeNode: async () => ({
+      summary: "Still checking the same state.",
+      continuation: { state: "continue", progressMarker: "unchanged-state" },
+      evidenceIds: ["evidence-unchanged"],
+    }),
+  });
+  try {
+    await bridge.submit(mission({ workflow: loopWorkflow }), scope);
+    await bridge.waitForIdle();
+    const status = await bridge.status(scope, "mission-native-1");
+    assert.equal(status?.status, "failed");
+    assert.equal(status?.events.filter((event) => event.type === "node_progress").length, 1);
+    assert.deepEqual(status?.events.slice(-2).map((event) => event.type), ["node_failed", "mission_failed"]);
+  } finally {
+    await bridge.close();
+    store.close();
+  }
+});
+
+test("a loop cannot claim verification without durable evidence", async () => {
+  const store = new SqliteFrappeRunEventStore(":memory:");
+  const loopWorkflow: AgentGraphDefinition = {
+    ...workflow(),
+    entryNodeId: "repair_until_verified",
+    nodes: [{
+      id: "repair_until_verified",
+      kind: "loop",
+      loop: { maxIterations: 2, progressPredicate: "live validation advances", cancellationCheckpoint: true, budget },
+    }],
+    edges: [],
+  };
+  const bridge = new DurableFrappeMissionBridge({
+    store,
+    executeNode: async () => ({
+      summary: "The correction appears valid.",
+      continuation: { state: "verified", progressMarker: "claimed-verification" },
+    }),
+  });
+  try {
+    await bridge.submit(mission({ workflow: loopWorkflow }), scope);
+    await bridge.waitForIdle();
+    const status = await bridge.status(scope, "mission-native-1");
+    assert.equal(status?.status, "failed");
+    assert.equal(status?.events.some((event) => event.type === "node_completed"), false);
+    assert.deepEqual(status?.events.slice(-2).map((event) => event.type), ["node_failed", "mission_failed"]);
+  } finally {
+    await bridge.close();
+    store.close();
+  }
+});
+
+test("a loop pauses for genuine input and resumes the same objective", async () => {
+  const store = new SqliteFrappeRunEventStore(":memory:");
+  const steering: string[][] = [];
+  const loopWorkflow: AgentGraphDefinition = {
+    ...workflow(),
+    entryNodeId: "repair_until_verified",
+    nodes: [{
+      id: "repair_until_verified",
+      kind: "loop",
+      loop: { maxIterations: 3, progressPredicate: "required business input is supplied", cancellationCheckpoint: true, budget },
+    }],
+    edges: [],
+  };
+  const bridge = new DurableFrappeMissionBridge({
+    store,
+    executeNode: async (input) => {
+      steering.push([...input.steering]);
+      return input.iteration === 1
+        ? { summary: "Choose the approved effective date to continue.", continuation: { state: "needs_input", progressMarker: "awaiting-effective-date" } }
+        : { summary: "Effective date applied and the correction is verified.", continuation: { state: "verified", progressMarker: "verified-effective-date" }, evidenceIds: ["evidence-effective-date"] };
+    },
+  });
+  try {
+    await bridge.submit(mission({ workflow: loopWorkflow }), scope);
+    await waitFor(async () => (await bridge.status(scope, "mission-native-1"))?.status === "paused");
+    await bridge.control(control("steer", 20, { instruction: "Use 2026-08-17 as the approved effective date." }));
+    await bridge.control(control("resume", 21));
+    await bridge.waitForIdle();
+    const status = await bridge.status(scope, "mission-native-1");
+    assert.equal(status?.status, "completed");
+    assert.deepEqual(steering, [[], ["Use 2026-08-17 as the approved effective date."]]);
+    assert.deepEqual(status?.events.filter((event) => ["pause_requested", "paused", "steered", "resumed"].includes(event.type)).map((event) => event.type), [
+      "pause_requested", "paused", "steered", "resumed",
+    ]);
+  } finally {
+    await bridge.close();
+    store.close();
+  }
+});
+
+test("a recovered loop resumes after its last durable progress marker", async () => {
+  const store = new SqliteFrappeRunEventStore(":memory:");
+  const loopWorkflow: AgentGraphDefinition = {
+    ...workflow(),
+    entryNodeId: "repair_until_verified",
+    nodes: [{
+      id: "repair_until_verified",
+      kind: "loop",
+      loop: { maxIterations: 4, progressPredicate: "live validation advances", cancellationCheckpoint: true, budget },
+    }],
+    edges: [],
+  };
+  let secondIterationStarted = false;
+  const first = new DurableFrappeMissionBridge({
+    store,
+    executeNode: async (input) => {
+      if (input.iteration === 1) {
+        return { summary: "First repair persisted.", continuation: { state: "continue", progressMarker: "state-1" }, evidenceIds: ["evidence-state-1"] };
+      }
+      secondIterationStarted = true;
+      return new Promise((_resolve, reject) => input.signal.addEventListener("abort", () => reject(input.signal.reason), { once: true }));
+    },
+  });
+  await first.submit(mission({ workflow: loopWorkflow }), scope);
+  await waitFor(() => secondIterationStarted);
+  await first.close();
+
+  const resumed: Array<{ iteration: number; marker?: string }> = [];
+  const recovered = new DurableFrappeMissionBridge({
+    store,
+    executeNode: async (input) => {
+      resumed.push({ iteration: input.iteration, ...(input.previousProgressMarker ? { marker: input.previousProgressMarker } : {}) });
+      return { summary: "Recovered repair verified.", continuation: { state: "verified", progressMarker: "state-2-verified" }, evidenceIds: ["evidence-state-2"] };
+    },
+  });
+  try {
+    await recovered.submit(mission({ workflow: loopWorkflow }), scope);
+    await recovered.waitForIdle();
+    assert.deepEqual(resumed, [{ iteration: 2, marker: "state-1" }]);
+    assert.equal((await recovered.status(scope, "mission-native-1"))?.status, "completed");
+  } finally {
+    await recovered.close();
+    store.close();
+  }
+});

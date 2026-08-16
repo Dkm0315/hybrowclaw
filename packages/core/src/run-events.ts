@@ -21,6 +21,7 @@ export type RunEventType =
   | "lease_heartbeat"
   | "effect_started"
   | "effect_committed"
+  | "node_progress"
   | "node_completed"
   | "node_failed"
   | "pause_requested"
@@ -94,7 +95,7 @@ export class RunEventConflictError extends Error {
 }
 
 const TERMINAL = new Set<MissionStatus>(["cancelled", "compensated", "needs_intervention", "completed"]);
-const FENCED_TYPES = new Set<RunEventType>(["lease_heartbeat", "effect_started", "effect_committed", "node_completed", "node_failed"]);
+const FENCED_TYPES = new Set<RunEventType>(["lease_heartbeat", "effect_started", "effect_committed", "node_progress", "node_completed", "node_failed"]);
 const FORBIDDEN_PAYLOAD_KEY = /^(?:password|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|chain[_-]?of[_-]?thought|reasoning)$/i;
 
 function containsForbiddenPayload(value: unknown, seen = new Set<object>()): boolean {
@@ -205,6 +206,11 @@ export function reduceRunEvent(state: MissionRuntimeState, event: RunEvent): Mis
       nodes.set(id, { ...currentNode!, effectsInFlight: effects });
       break;
     }
+    case "node_progress":
+      if (status !== "running" || currentNode!.status !== "running") {
+        throw new RunEventConflictError(`Progress requires running node "${requireNode(event)}".`);
+      }
+      break;
     case "node_completed": {
       const id = requireNode(event);
       if (currentNode!.effectsInFlight.size > 0) throw new RunEventConflictError(`Node "${id}" has effects in flight.`);

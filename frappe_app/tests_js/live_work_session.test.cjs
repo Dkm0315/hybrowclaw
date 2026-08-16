@@ -75,6 +75,26 @@ test("distinguishes waiting, server-side, and returned user control", () => {
   assert.equal(model.viewModel({status: "Completed"}, []).presence.label, "User control");
 });
 
+test("shows node progress as the current visible action without private reasoning", () => {
+  const view = model.viewModel({name: "M-1", status: "Running"}, [{
+    sequence: 2,
+    event_type: "node_progress",
+    summary: "Checked the current engineering revision",
+    payload_json: JSON.stringify({
+      verificationStatus: "in_progress",
+      reasoning: "private chain of thought",
+      chain_of_thought: "must not render",
+    }),
+  }]);
+  assert.equal(view.presence.key, "server");
+  assert.equal(view.activeLabel, "Latest progress");
+  assert.equal(view.activeAction, "Checked the current engineering revision");
+  assert.deepEqual(Array.from(view.details.verifications), []);
+  assert.equal(view.events[0].payload.verificationStatus, "in_progress");
+  assert.equal(view.events[0].payload.reasoning, undefined);
+  assert.equal(view.events[0].payload.chain_of_thought, undefined);
+});
+
 test("allows high-level affected fields while stripping secrets and private reasoning", () => {
   const parsed = model.parsePayload(JSON.stringify({
     actionLabel: "Update customer terms",

@@ -14,6 +14,7 @@ export * from "./frappe-ingress.js";
 export * from "./frappe-ask-intent.js";
 export * from "./frappe-ask-artifact.js";
 export * from "./frappe-channel.js";
+export * from "./frappe-support.js";
 export * from "./frappe-oauth.js";
 export * from "./frappe-connect.js";
 export * from "./frappe-telegram-link.js";

@@ -69,6 +69,32 @@ test("frappe setup refuses incomplete OAuth references", async () => {
   );
 });
 
+test("frappe support setup preserves the default customer connection and maps a Helpdesk customer", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-cli-frappe-support-"));
+  const customerCredential = join(cwd, "customer.json");
+  const supportCredential = join(cwd, "support.json");
+  const redirectUri = "https://gateway.example.test/frappe2/oauth/callback";
+  await writeFile(customerCredential, JSON.stringify({ site: "https://vinman.example.test", clientId: "vinman", redirectUri }));
+  await writeFile(supportCredential, JSON.stringify({ site: "https://support.example.test", clientId: "support", redirectUri }));
+  await chmod(customerCredential, 0o600);
+  await chmod(supportCredential, 0o600);
+  await runCli(["frappe", "setup", "--site-url", "https://vinman.example.test", "--oauth-credential-file", "customer.json", "--connection-id", "vinman"], cwd);
+  const result = await runCli([
+    "frappe", "setup",
+    "--site-url", "https://support.example.test",
+    "--oauth-credential-file", "support.json",
+    "--connection-id", "hybrow-support",
+    "--support",
+    "--support-customer", "Vinman App",
+  ], cwd);
+
+  assert.match(result.stdout, /support_destination=https:\/\/support\.example\.test doctype=HD Ticket customer=Vinman App/);
+  const gateway = JSON.parse(await readFile(join(cwd, ".muster", "gateway.json"), "utf8"));
+  assert.equal(gateway.frappe.oauth.defaultConnection, "vinman");
+  assert.deepEqual(gateway.frappe.oauth.connections.map((entry: { id: string }) => entry.id), ["vinman", "hybrow-support"]);
+  assert.equal(gateway.frappe.support.customer, "Vinman App");
+});
+
 test("frappe setup rejects missing, mismatched, and accessible credential files", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-cli-frappe-setup-validation-"));
   const missing = await runCliAllowFailure(["frappe", "setup", "--site-url", "https://oxygen.example.test", "--oauth-credential-file", "missing.json"], cwd);

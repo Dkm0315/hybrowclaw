@@ -97,14 +97,23 @@ class TestGatewayProjection(FrappeTestCase):
                 fencingToken=1,
                 payload={"leaseExpiresAt": str(started + timedelta(minutes=5))},
             ),
-            event(4, "node_completed", nodeId=node, attemptId=attempt, fencingToken=1),
-            event(5, "mission_completed"),
+            event(
+                4,
+                "node_progress",
+                nodeId=node,
+                attemptId=attempt,
+                fencingToken=1,
+                summary="Checked the current engineering revision",
+                payload={"verificationStatus": "in_progress"},
+            ),
+            event(5, "node_completed", nodeId=node, attemptId=attempt, fencingToken=1),
+            event(6, "mission_completed"),
         ]
         return {
             "missionId": self.mission.name,
             "rootRunId": root,
             "status": "completed",
-            "nextSequence": 6,
+            "nextSequence": 7,
             "nodes": [
                 {
                     "nodeId": node,
@@ -127,8 +136,16 @@ class TestGatewayProjection(FrappeTestCase):
         second = project_gateway_snapshot(self.mission.name, snapshot, self.binding)
 
         self.assertEqual(first["status"], "Completed")
-        self.assertEqual(second["events"], 5)
-        self.assertEqual(frappe.db.count("Muster Activity", {"mission": self.mission.name}), 5)
+        self.assertEqual(second["events"], 6)
+        self.assertEqual(frappe.db.count("Muster Activity", {"mission": self.mission.name}), 6)
+        progress = frappe.db.get_value(
+            "Muster Activity",
+            {"mission": self.mission.name, "event_type": "node_progress"},
+            ["summary", "payload_json"],
+            as_dict=True,
+        )
+        self.assertEqual(progress.summary, "Checked the current engineering revision")
+        self.assertNotIn("reasoning", progress.payload_json)
         self.assertEqual(frappe.db.count("Muster Work Unit", {"mission": self.mission.name}), 1)
         self.assertEqual(frappe.db.count("Muster Run", {"mission": self.mission.name}), 2)
         self.mission.reload()

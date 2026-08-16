@@ -25,6 +25,7 @@ _EVENT_TYPES = {
     "lease_heartbeat",
     "effect_started",
     "effect_committed",
+    "node_progress",
     "node_completed",
     "node_failed",
     "pause_requested",

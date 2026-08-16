@@ -100,6 +100,7 @@ export interface GatewayCommandCatalogEntry {
 
 const CONTROL_COMMANDS: Readonly<Record<string, string>> = {
   pair: "Pair this channel sender with its Frappe identity",
+  "report-issue": "Package the current Frappe evidence and raise it in the configured Helpdesk",
   new: "Start a fresh provider thread without clearing memory",
   reset: "Reset provider session handles for this conversation",
   stop: "Stop or inspect the active conversational run",

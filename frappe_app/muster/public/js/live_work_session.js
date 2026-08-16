@@ -98,7 +98,7 @@
         if (Array.isArray(values)) values.forEach((value) => fields.push(String(value).slice(0, 140)));
       });
       if (payload.approval && typeof payload.approval === "object") approvals.push(payload.approval);
-      if (event.type.includes("verification") || payload.nodeKind === "verification" || payload.verification || payload.verificationStatus) {
+      if (event.type !== "node_progress" && (event.type.includes("verification") || payload.nodeKind === "verification" || payload.verification || payload.verificationStatus)) {
         verifications.push(String(payload.verification || payload.verificationStatus || event.summary).slice(0, 240));
       }
     });
@@ -114,6 +114,7 @@
       presence: derivePresence(mission, events),
       route: routeFrom(events),
       details: detailsFrom(events),
+      activeLabel: active?.type === "node_progress" ? "Latest progress" : "Current verified action",
       activeAction: active?.payload?.actionLabel || active?.payload?.toolAction || active?.summary || "Waiting for the first verified action",
       pointer: isExplicitUiAction(active) ? active.payload.pointer : null,
     };
@@ -222,7 +223,7 @@
           <div class="muster-live-browser-bar"><span></span><span></span><span></span><code>${html(route || t("Server-side work — no Desk route reported"))}</code>${route ? `<a href="${html(route)}">${html(t("Open"))}</a>` : ""}</div>
           <div class="muster-live-canvas" data-presence="${presence.key}">
             ${cursorMarkup}
-            <div class="muster-live-action"><small>${html(t("Current verified action"))}</small><strong>${html(model.activeAction)}</strong></div>
+            <div class="muster-live-action"><small>${html(t(model.activeLabel))}</small><strong>${html(model.activeAction)}</strong></div>
             <div class="muster-live-target"><div><small>${html(t("Target"))}</small><strong>${html([details.doctype, details.recordName].filter(Boolean).join(" · ") || t("Not reported yet"))}</strong></div><div class="muster-live-fields"><small>${html(t("Fields affected"))}</small>${fieldMarkup}</div></div>
             ${customizationMarkup}${approvalMarkup}${verificationMarkup}
           </div>

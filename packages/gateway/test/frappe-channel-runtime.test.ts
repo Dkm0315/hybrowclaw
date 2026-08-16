@@ -228,3 +228,116 @@ test("a guided Frappe create keeps required-field state across natural follow-up
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+test("issue reporting targets the configured Helpdesk OAuth grant and preserves governed creation", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-frappe-support-report-"));
+  const base = defaultConfig();
+  const pending = await requestPairing("telegram:vinman", "42", cwd);
+  const paired = await approvePairing(pending.code, cwd, {
+    provider: "frappe",
+    site: "https://vinman.example.test",
+    user: "engineer@example.test",
+    userName: "NPD Engineer",
+    roles: ["NPD User"],
+  });
+  const enterprise = createInMemoryGatewayEnterpriseRuntime();
+  const interactionCalls: Record<string, unknown>[] = [];
+  const safeWriteCalls: Record<string, unknown>[] = [];
+  const registry: FlowToolRegistry = {
+    "frappe-federated-bridge__frappe_fast_route": async () => ({ intent: "record_create", candidateDoctypes: ["HD Ticket"] }),
+    "frappe-federated-bridge__frappe_chat_interaction_plan": async (args) => {
+      interactionCalls.push(args);
+      return {
+        kind: "guided_crud",
+        title: "Review support ticket",
+        doctype: "HD Ticket",
+        operation: "create",
+        requiredFields: [],
+        table: { columns: ["Field", "Value"], rows: [["Subject", String((args.values as Record<string, unknown>).subject)]] },
+      };
+    },
+    "frappe-federated-bridge__frappe_safe_write": async (args) => {
+      safeWriteCalls.push(args);
+      if (!args.approvalReceipt) return {
+        status: "approval_required",
+        approvalProposal: {
+          proposalId: "frappe-approval:hybrow-support",
+          mutationHash: "support-mutation-hash",
+          site: "https://support.hybrowlabs.com",
+          principal: "engineer@example.test",
+          operation: "create",
+          doctype: "HD Ticket",
+          fields: ["subject", "description"],
+          permissionEpoch: "permission-1",
+          schemaRevision: "schema-1",
+          dataRevision: "data-1",
+          issuedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 300_000).toISOString(),
+          nonce: "nonce-support-1",
+          humanSummary: "Create an evidence-rich Helpdesk ticket.",
+          bindingRequirements: [],
+        },
+      };
+      return {
+        status: "executed",
+        result: { created: { name: "HD-TICKET-0042" } },
+        verification: { verified: true, fetched: { name: "HD-TICKET-0042" } },
+      };
+    },
+  };
+  const authorizationSites: string[] = [];
+  const frappeOAuth = {
+    authorizationForActor: async (_actor: unknown, expectedSite?: string) => {
+      authorizationSites.push(expectedSite ?? "");
+      if (expectedSite === "https://support.hybrowlabs.com") return {
+        connectionId: "hybrow-support",
+        site: expectedSite,
+        header: "Bearer support-user-secret",
+        identity: { site: expectedSite, user: "engineer@example.test", userName: "NPD Engineer", roles: ["Customer"] },
+      };
+      if (expectedSite === "https://vinman.example.test") return {
+        connectionId: "vinman",
+        site: expectedSite,
+        header: "Bearer vinman-user-secret",
+        identity: { site: expectedSite, user: "engineer@example.test", userName: "NPD Engineer", roles: ["NPD User"] },
+      };
+      return undefined;
+    },
+  } as unknown as FrappeOAuthCoordinator;
+  const send = (text: string) => handleSurfaceMessage({
+    surfaceId: "telegram:vinman",
+    conversationId: "chat-1",
+    senderId: "42",
+    pairingId: paired.pairingId,
+    text,
+  }, {
+    config: { ...base, providers: {}, runtimes: {}, routing: { ...base.routing, defaultRuntime: "native" } },
+    gateway: { token: "test", frappe: { approvalSigningKey: "support-signing-key", support: { connectionId: "hybrow-support", customer: "Vinman Engineering Private Limited" } } },
+    cwd,
+    registry,
+    frappeOAuth,
+    enterprise,
+  });
+  try {
+    const reply = await send("Report this engineering revision mismatch to support");
+    assert.match("text" in reply ? reply.text : "", /review the support ticket/i);
+    assert.deepEqual("presentation" in reply ? reply.presentation?.actions?.map((action) => action.label) : [], ["Approve & send to support", "Cancel ticket"]);
+    assert.ok(authorizationSites.includes("https://support.hybrowlabs.com"));
+    assert.equal(interactionCalls.at(-1)?.siteUrl, "https://support.hybrowlabs.com");
+    assert.equal(interactionCalls.at(-1)?.apiToken, "support-user-secret");
+    assert.doesNotMatch(JSON.stringify(interactionCalls.at(-1)), /vinman-user-secret/);
+    assert.equal((interactionCalls.at(-1)?.values as Record<string, unknown>).customer, "Vinman Engineering Private Limited");
+    assert.match(String((interactionCalls.at(-1)?.values as Record<string, unknown>).description), /Source site/);
+    const created = await send("/accept");
+    assert.match("text" in created ? created.text : "", /HD-TICKET-0042/);
+    assert.equal("presentation" in created ? created.presentation?.tables?.[0]?.rows[0]?.[1] : undefined,
+      "https://support.hybrowlabs.com/app/hd-ticket/HD-TICKET-0042");
+    assert.equal(safeWriteCalls.length, 2);
+    assert.equal(safeWriteCalls[0]?.siteUrl, "https://support.hybrowlabs.com");
+    assert.equal(safeWriteCalls[1]?.siteUrl, "https://support.hybrowlabs.com");
+    assert.equal((safeWriteCalls[0]?.doc as Record<string, unknown>).customer, "Vinman Engineering Private Limited");
+  } finally {
+    await enterprise.close?.();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});

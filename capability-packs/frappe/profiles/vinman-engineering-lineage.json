@@ -1,0 +1,188 @@
+{
+  "schemaVersion": 1,
+  "id": "vinman-engineering-change",
+  "label": "Vinman engineering change lineage",
+  "source": {
+    "site": "frappeverse.local",
+    "app": "vinman_app",
+    "observedOn": "2026-08-16",
+    "purpose": "First deep deployment profile for the generic Muster lineage validator; no customer records or credentials are embedded."
+  },
+  "manifest": {
+    "schemaVersion": 1,
+    "id": "vinman-engineering-change",
+    "label": "Engineering change",
+    "stages": [
+      { "id": "drawing-review", "label": "Drawing Review", "doctype": "Drawing Review" },
+      { "id": "apqp", "label": "APQP plan", "doctype": "APQP Timing chart" },
+      { "id": "control-plan", "label": "Control Plan", "doctype": "Control Plan" },
+      { "id": "process-flow", "label": "Process Flow", "doctype": "Process Flow" },
+      { "id": "ppfmea", "label": "PPFMEA", "doctype": "PPFMEA" },
+      { "id": "routing", "label": "Routing", "doctype": "Routing" },
+      { "id": "bom", "label": "BOM", "doctype": "BOM" },
+      { "id": "work-order", "label": "Work Order", "doctype": "Work Order" },
+      { "id": "job-card", "label": "Job Card", "doctype": "Job Card" },
+      { "id": "quality-inspection", "label": "Quality Inspection", "doctype": "Quality Inspection" },
+      { "id": "ppap", "label": "Part Submission Warrant", "doctype": "Part Submission Warrant" }
+    ],
+    "relationships": [
+      {
+        "id": "drawing-review-to-apqp",
+        "from": "drawing-review",
+        "to": "apqp",
+        "cardinality": "one",
+        "required": true,
+        "identity": [
+          { "from": "part_no", "to": "part_no", "label": "Part" },
+          { "from": "customer", "to": "customer", "label": "Customer" }
+        ],
+        "revision": [],
+        "content": []
+      },
+      {
+        "id": "apqp-to-control-plan",
+        "from": "apqp",
+        "to": "control-plan",
+        "cardinality": "many",
+        "required": true,
+        "identity": [
+          { "from": "part_no", "to": "part_no", "label": "Part" },
+          { "from": "customer", "to": "customer", "label": "Customer" }
+        ],
+        "revision": [
+          { "from": "rev_no", "to": "custom_control_plan_rev_number", "label": "Plan revision", "comparison": "exact", "mismatchStatus": "Requires review" }
+        ],
+        "content": []
+      },
+      {
+        "id": "control-plan-to-process-flow",
+        "from": "control-plan",
+        "to": "process-flow",
+        "cardinality": "one",
+        "required": true,
+        "identity": [
+          { "from": "name", "to": "control_plan", "label": "Control Plan", "comparison": "exact" },
+          { "from": "part_no", "to": "part_no", "label": "Part" }
+        ],
+        "revision": [
+          { "from": "drawing_rev_no", "to": "drawing_review_no", "label": "Drawing revision", "mismatchStatus": "Requires regeneration" }
+        ],
+        "content": [
+          { "from": "process_table[].process_no", "to": "process_table[].process_no", "label": "Process numbers", "comparison": "ordered" },
+          { "from": "process_table[].process_name", "to": "process_table[].process_name", "label": "Operation sequence", "comparison": "ordered" },
+          { "from": "process_table[].productprocessspecificationtolerance", "to": "process_table[].process_specification", "label": "Process specification", "comparison": "ordered" },
+          { "from": "process_table[].nature_of_change", "to": "process_table[].nature_of_change", "label": "Change rationale", "comparison": "ordered" }
+        ]
+      },
+      {
+        "id": "control-plan-to-ppfmea",
+        "from": "control-plan",
+        "to": "ppfmea",
+        "cardinality": "one",
+        "required": true,
+        "identity": [
+          { "from": "name", "to": "control_plan", "label": "Control Plan", "comparison": "exact" },
+          { "from": "part_no", "to": "part_no", "label": "Part" }
+        ],
+        "revision": [
+          { "from": "drawing_rev_no", "to": "drawing_review_no", "label": "Drawing revision", "mismatchStatus": "Requires regeneration" }
+        ],
+        "content": [
+          { "from": "process_table[].process_no", "to": "ppfmea_child_table[].process_no", "label": "Process numbers", "comparison": "ordered" },
+          { "from": "process_table[].process_name", "to": "ppfmea_child_table[].process_name", "label": "Risk-assessed operations", "comparison": "ordered" },
+          { "from": "process_table[].product", "to": "ppfmea_child_table[].product", "label": "Controlled characteristics", "comparison": "ordered" },
+          { "from": "process_table[].productprocessspecificationtolerance", "to": "ppfmea_child_table[].product_specification", "label": "Risk specification", "comparison": "ordered" },
+          { "from": "process_table[].nature_of_change", "to": "ppfmea_child_table[].nature_of_change", "label": "Change rationale", "comparison": "ordered" }
+        ]
+      },
+      {
+        "id": "control-plan-to-bom",
+        "from": "control-plan",
+        "to": "bom",
+        "cardinality": "one",
+        "required": true,
+        "identity": [
+          { "from": "name", "to": "custom_control_plan", "label": "Control Plan", "comparison": "exact" },
+          { "from": "part_no", "to": "item", "label": "Part" }
+        ],
+        "revision": [],
+        "content": [
+          { "from": "process_table[].process_name", "to": "operations[].operation", "label": "Manufacturing operations", "comparison": "ordered", "mismatchStatus": "Requires regeneration" }
+        ]
+      },
+      {
+        "id": "bom-to-routing",
+        "from": "bom",
+        "to": "routing",
+        "cardinality": "one",
+        "required": true,
+        "identity": [
+          { "from": "routing", "to": "name", "label": "Routing", "comparison": "exact" }
+        ],
+        "revision": [],
+        "content": [
+          { "from": "operations[].operation", "to": "operations[].operation", "label": "Routing operations", "comparison": "ordered" }
+        ]
+      },
+      {
+        "id": "bom-to-work-order",
+        "from": "bom",
+        "to": "work-order",
+        "cardinality": "many",
+        "required": false,
+        "identity": [
+          { "from": "name", "to": "bom_no", "label": "BOM", "comparison": "exact" },
+          { "from": "item", "to": "production_item", "label": "Part" }
+        ],
+        "revision": [],
+        "content": [
+          { "from": "operations[].operation", "to": "operations[].operation", "label": "Released operations", "comparison": "ordered", "mismatchStatus": "Requires review" }
+        ]
+      },
+      {
+        "id": "work-order-to-job-card",
+        "from": "work-order",
+        "to": "job-card",
+        "cardinality": "many",
+        "required": false,
+        "identity": [
+          { "from": "name", "to": "work_order", "label": "Work Order", "comparison": "exact" },
+          { "from": "production_item", "to": "production_item", "label": "Part" }
+        ],
+        "revision": [],
+        "content": [
+          { "from": "operations[].operation", "to": "operation", "label": "Released job operation", "comparison": "set", "mismatchStatus": "Requires review" }
+        ]
+      },
+      {
+        "id": "control-plan-to-quality-inspection",
+        "from": "control-plan",
+        "to": "quality-inspection",
+        "cardinality": "many",
+        "required": false,
+        "identity": [
+          { "from": "name", "to": "custom_control_plan_no", "label": "Control Plan", "comparison": "exact" },
+          { "from": "part_no", "to": "item_code", "label": "Part" }
+        ],
+        "revision": [],
+        "content": [
+          { "from": "process_table[].product", "to": "readings[].specification", "label": "Inspection characteristics", "comparison": "set", "mismatchStatus": "Requires regeneration" }
+        ]
+      },
+      {
+        "id": "control-plan-to-ppap",
+        "from": "control-plan",
+        "to": "ppap",
+        "cardinality": "one",
+        "required": true,
+        "identity": [
+          { "from": "part_no", "to": "part_no", "label": "Part" }
+        ],
+        "revision": [
+          { "from": "drawing_rev_no", "to": "eng_change_level", "label": "Engineering change level", "mismatchStatus": "Requires review" }
+        ],
+        "content": []
+      }
+    ]
+  }
+}
