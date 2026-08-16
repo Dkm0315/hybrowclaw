@@ -102,6 +102,19 @@ test("idempotent effects deduplicate matching receipts and reject conflicts", ()
   assert.throws(() => reduceRunEvent(duplicateOperation, event(7, "effect_committed", { nodeId: "work", attemptId: "attempt-1", fencingToken: 1, idempotencyKey: "op-1", receiptHash: "sha256:b" })), /conflicting receipt/);
 });
 
+test("durable node progress preserves a running fenced node without completing it", () => {
+  const state = reduceRunEvent(leasedState(), event(4, "node_progress", {
+    nodeId: "work",
+    attemptId: "attempt-1",
+    fencingToken: 1,
+    summary: "Applied one bounded repair and started verification.",
+    payload: { iteration: 1, progressMarker: "observed-state-2" },
+  }));
+  assert.equal(state.status, "running");
+  assert.equal(state.nodes.get("work")?.status, "running");
+  assert.equal(state.nextSequence, 5);
+});
+
 test("cancellation prevents new work and waits for effect safe points", () => {
   let state = leasedState();
   state = reduceRunEvent(state, event(4, "effect_started", { nodeId: "work", attemptId: "attempt-1", fencingToken: 1, idempotencyKey: "op-1" }));

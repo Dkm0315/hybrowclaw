@@ -529,7 +529,7 @@ Usage:
   muster gateway webhook telegram --public-url https://your-domain.example
   muster gateway poll                 # local Telegram long-poll fallback; daemonize with gateway daemon start --with-telegram-poll
   muster pairing list | approve <code> [--frappe-site URL --frappe-token-env ENV | --frappe-user USER] [--employee EMP --role ROLE]
-  muster frappe setup --site-url URL --oauth-credential-file PATH [--callback-mode gateway|frappe] [--result-path /api/method/...] [--identity-path /api/method/...] [--identity-ttl-ms 60000]
+  muster frappe setup --site-url URL --oauth-credential-file PATH [--connection-id ID] [--support] [--support-customer NAME] [--callback-mode gateway|frappe] [--result-path /api/method/...] [--identity-path /api/method/...] [--identity-ttl-ms 60000]
   muster frappe connect <https-site-origin> [--muster-url https://muster.example] [--wait|--no-wait] [--no-open] [--no-qr] [--timeout-ms 300000]
   muster frappe doctor [--connection-id ID]
   muster flow replay <run-id> [--live-agents]
@@ -569,12 +569,17 @@ async function frappeCommand(args: string[]): Promise<void> {
     return;
   }
   if (action !== "setup") {
-    throw new Error("Usage: muster frappe setup --site-url URL --oauth-credential-file PATH [--callback-mode gateway|frappe] [--result-path /api/method/...] [--identity-path /api/method/...] [--identity-ttl-ms 60000] | muster frappe doctor [--connection-id ID]");
+    throw new Error("Usage: muster frappe setup --site-url URL --oauth-credential-file PATH [--connection-id ID] [--support] [--support-customer NAME] [--callback-mode gateway|frappe] [--result-path /api/method/...] [--identity-path /api/method/...] [--identity-ttl-ms 60000] | muster frappe doctor [--connection-id ID]");
   }
 
   const site = readFlag(args, "--site-url");
   const credentialFile = readFlag(args, "--oauth-credential-file");
   const connectionId = readFlag(args, "--connection-id") ?? "frappe-default";
+  const supportConnection = args.includes("--support");
+  const supportCustomer = readFlag(args, "--support-customer");
+  if (supportCustomer && !supportConnection) {
+    throw new Error("--support-customer requires --support.");
+  }
   const assistantName = readFlag(args, "--assistant-name") ?? "Muster Frappe assistant";
   const organization = readFlag(args, "--organization");
   const domain = readFlag(args, "--domain");
@@ -642,9 +647,12 @@ async function frappeCommand(args: string[]): Promise<void> {
       },
       oauth: {
         ...existingFrappe?.oauth,
-        defaultConnection: connectionId,
+        defaultConnection: supportConnection
+          ? existingFrappe?.oauth?.defaultConnection ?? connectionId
+          : connectionId,
         connections: [...connections, connection],
       },
+      ...(supportConnection ? { support: { site: requestedSite, connectionId, doctype: "HD Ticket" as const, ...(supportCustomer ? { customer: supportCustomer } : {}) } } : {}),
     },
   };
   await saveGatewayConfig(nextGateway as GatewayConfig);
@@ -655,6 +663,7 @@ async function frappeCommand(args: string[]): Promise<void> {
   console.log("capability_pack=frappe-federated-bridge enabled=true");
   console.log(`assistant=${assistantName} organization=${organization ?? "-"} domain=${domain ?? "-"}`);
   console.log(`oauth_connection=${connectionId} credential_file=configured callback_mode=${inspection.callbackMode}`);
+  if (supportConnection) console.log(`support_destination=${requestedSite} doctype=HD Ticket customer=${supportCustomer ?? "-"}`);
   console.log(`oauth_redirect=${inspection.redirectUri} identity_refresh_ms=${inspection.identityTtlMs}`);
   console.log("oauth_secrets=not_printed not_accepted_on_command_line=true");
   console.log(`oauth_registration=${requestedSite}/app/oauth-client`);

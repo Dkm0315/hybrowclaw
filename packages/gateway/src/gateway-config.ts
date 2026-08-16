@@ -28,6 +28,24 @@ export interface GatewayFrappeAssistantConfig {
   readonly operatingInstructions?: readonly string[];
 }
 
+/**
+ * Deployment-owned support destination. The connection is resolved through
+ * the same actor-bound Frappe OAuth vault as every other write; this object
+ * never contains a token or expands the source user's permissions.
+ */
+export interface GatewayFrappeSupportConfig {
+  /** Canonical HTTPS origin of the support site. */
+  readonly site?: string;
+  /** OAuth connection id configured under frappe.oauth.connections. */
+  readonly connectionId?: string;
+  /** Support record type exposed by the destination site. */
+  readonly doctype?: "HD Ticket" | "Issue";
+  /** Optional deployment default, still validated by the live destination. */
+  readonly priority?: string;
+  /** Optional Helpdesk customer mapped by the deployment, never inferred from a sender. */
+  readonly customer?: string;
+}
+
 export interface GatewayFrappeTelegramTenant {
   readonly id: string;
   /** Exact trusted Frappe origin for this tenant. */
@@ -65,6 +83,8 @@ export interface GatewayConfig {
     /** Stable non-secret identifier for this Muster installation. */
     readonly installationId?: string;
     readonly assistant?: GatewayFrappeAssistantConfig;
+    /** Evidence-rich issue reporting destination. */
+    readonly support?: GatewayFrappeSupportConfig;
     /** Reviewed, read-only business API contracts available to the Frappe capability pack. */
     readonly businessApis?: readonly Record<string, unknown>[];
     /** Optional permission-scoped read-model location; defaults inside .muster/data. */

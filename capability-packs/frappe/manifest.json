@@ -21,7 +21,7 @@
     "evals/identity-resolution.json",
     "evals/permission-scoping.json"
   ],
-  "digest": "sha256:145bc3a0c0cd00231774b3e1062cd8243cda279e9efcf96ebb164cd6331d18f9",
+  "digest": "sha256:0ce0cf0b34d8d0387ead397a217a0b6289af5b16d78fc50fd5757d9d0473efbd",
   "description": "Permission-scoped Frappe/ERPNext tools with federated OAuth identity and an executable enterprise read model. Frappe remains the authorization authority. SQLite provides local/test persistence while the Postgres deployment contract preserves the same site, principal, permission-epoch, and revision boundaries. Customer deployments are data-only profiles; no customer-specific answers live in the pack code.",
   "implementedTools": [
     "frappe_identity_resolve",
@@ -44,10 +44,12 @@
     "frappe_enterprise_contract",
     "frappe_enterprise_sync",
     "frappe_customer_profile_validate",
-    "frappe_hierarchy_scope"
+    "frappe_hierarchy_scope",
+    "frappe_customization_graph",
+    "frappe_lineage_validate",
+    "frappe_lineage_remediation_plan"
   ],
   "plannedTools": [
-    "frappe_customization_context",
     "frappe_semantic_data_resolve",
     "frappe_records_update",
     "frappe_dataset_fetch_for_artifact"
@@ -97,7 +99,11 @@
       "unitTests": [
         "packages/core/test/capability-load.test.ts",
         "packages/core/test/capability.test.ts",
-        "packages/core/test/frappe-pack.test.ts"
+        "packages/core/test/frappe-pack.test.ts",
+        "capability-packs/frappe/test/customization-graph.test.ts",
+        "capability-packs/frappe/test/lineage-live.test.ts",
+        "capability-packs/frappe/test/lineage-remediation.test.ts",
+        "capability-packs/frappe/test/lineage.test.ts"
       ],
       "qaSuites": [
         "pack_readiness"

@@ -16,7 +16,7 @@ export interface FrappeRunEvent {
   readonly sequence: number;
   readonly type:
     | "mission_started" | "node_started" | "lease_claimed" | "lease_heartbeat"
-    | "effect_started" | "effect_committed" | "node_completed" | "node_failed"
+    | "effect_started" | "effect_committed" | "node_progress" | "node_completed" | "node_failed"
     | "pause_requested" | "paused" | "resumed" | "steered"
     | "cancellation_requested" | "cancelling" | "cancelled"
     | "compensation_started" | "compensation_completed" | "compensation_failed"
@@ -177,7 +177,7 @@ const SECRET_ASSIGNMENT = /\b(password|passwd|secret|api[_-]?key|access[_-]?toke
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_.:@\/-]{0,255}$/;
 const EVENT_TYPES = new Set<FrappeRunEvent["type"]>([
   "mission_started", "node_started", "lease_claimed", "lease_heartbeat",
-  "effect_started", "effect_committed", "node_completed", "node_failed",
+  "effect_started", "effect_committed", "node_progress", "node_completed", "node_failed",
   "pause_requested", "paused", "resumed", "steered",
   "cancellation_requested", "cancelling", "cancelled", "compensation_started",
   "compensation_completed", "compensation_failed", "mission_failed", "mission_completed",

@@ -46,10 +46,18 @@ import {
   requiredFieldsFromEffectiveMetadata,
   type FrappeEffectiveDocTypeMetadata,
 } from "./read-service.js";
+import { buildFrappeCustomizationGraph, buildFrappeCustomizationGraphFromIndex } from "./customization-graph.js";
+import { validateFrappeLineage } from "./lineage.js";
+import { loadLiveFrappeLineageEvidence } from "./lineage-live.js";
+import { planFrappeLineageRemediation, type FrappeReviewedLineageManifest } from "./lineage-remediation.js";
 
 export * from "./enterprise.js";
 export * from "./read-service.js";
 export * from "./change-set.js";
+export * from "./customization-graph.js";
+export * from "./lineage.js";
+export * from "./lineage-live.js";
+export * from "./lineage-remediation.js";
 
 export interface FrappeToolContext {
   readonly fetch?: typeof globalThis.fetch;
@@ -1957,9 +1965,20 @@ export async function frappe_safe_write(
     if (fetched.ok && recordObject(fetched.data.data)) {
       const fetchedDoc = recordObject(fetched.data.data)!;
       const expectedState = argString(args, "expected_state") ?? argString(args, "expected_status");
-      const postcondition = Object.entries(docRecord).every(([key, value]) => JSON.stringify(fetchedDoc[key]) === JSON.stringify(value))
+      const mismatches = Object.entries(docRecord)
+        .flatMap(([key, value]) => approvedValueMismatches(value, fetchedDoc[key], key));
+      const postcondition = mismatches.length === 0
         && (!expectedState || fetchedDoc.workflow_state === expectedState || fetchedDoc.status === expectedState || fetchedDoc.docstatus === expectedState);
-      verification = { verified: postcondition, fetched: fetchedDoc, ...(postcondition ? {} : { reason: "Frappe returned a document that does not satisfy the requested postcondition." }) };
+      const stateMismatch = expectedState && fetchedDoc.workflow_state !== expectedState && fetchedDoc.status !== expectedState && fetchedDoc.docstatus !== expectedState;
+      verification = {
+        verified: postcondition,
+        fetched: fetchedDoc,
+        ...(postcondition ? {} : {
+          reason: stateMismatch
+            ? `Frappe returned a document outside the approved state ${expectedState}.`
+            : `Frappe returned a document that differs from the approved values at: ${mismatches.slice(0, 12).join(", ") || "unknown path"}.`,
+        }),
+      };
       evidenceLog.push(postcondition ? "verify_result:ok" : "verify_result:failed");
     } else {
       verification = { verified: false, reason: fetched.ok ? "Frappe verification returned no document." : fetched.error };
@@ -2522,6 +2541,112 @@ export async function frappe_hierarchy_scope(
   }
 }
 
+export async function frappe_customization_graph(
+  args: Record<string, unknown>,
+  context: FrappeToolContext,
+): Promise<ReturnType<typeof buildFrappeCustomizationGraph> | FrappeError> {
+  try {
+    if (Array.isArray(args.records)) {
+      const auth = await resolveRuntimeAuth(args, context);
+      if ("error" in auth) return auth;
+      const principal = await resolveAuthenticatedPrincipal(context, auth);
+      if (typeof principal !== "string") return principal;
+      const permissionEpoch = (await resolveFrappePermissionEpoch(context, auth, principal)).epoch;
+      const schemaRevision = argString(args, "schemaRevision");
+      const dataRevision = argString(args, "dataRevision");
+      if (!schemaRevision || !dataRevision) {
+        return { error: "Indexed graph construction requires schemaRevision and dataRevision from the trusted index snapshot." };
+      }
+      const recordSites = new Set((args.records as FrappeIndexRecord[]).map((record) => new URL(record.site).origin));
+      if (recordSites.size !== 1 || !recordSites.has(new URL(auth.siteUrl).origin)) return { error: "Indexed graph evidence does not belong to the authenticated Frappe site." };
+      return buildFrappeCustomizationGraphFromIndex({
+        records: args.records as FrappeIndexRecord[], principal, permissionEpoch, schemaRevision, dataRevision,
+      });
+    }
+    return { error: "frappe_customization_graph requires records from the trusted Frappe index." };
+  } catch (error) {
+    return { error: `Frappe customization graph rejected its evidence: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+export async function frappe_lineage_validate(
+  args: Record<string, unknown>,
+  context: FrappeToolContext,
+): Promise<ReturnType<typeof validateFrappeLineage> | FrappeError> {
+  const manifest = recordObject(args.manifest);
+  const rootStage = argString(args, "rootStage");
+  const rootName = argString(args, "rootName");
+  if (!manifest || !rootStage || !rootName) {
+    return { error: "frappe_lineage_validate requires a reviewed lineage manifest, rootStage, and rootName. Evidence is loaded directly from authenticated Frappe." };
+  }
+  try {
+    const auth = await resolveRuntimeAuth(args, context);
+    if ("error" in auth) return auth;
+    const principal = await resolveAuthenticatedPrincipal(context, auth);
+    if (typeof principal !== "string") return principal;
+    const permissionEpoch = (await resolveFrappePermissionEpoch(context, auth, principal)).epoch;
+    const documents = await loadLiveFrappeLineageEvidence({
+      context: {
+        fetch: context.fetch!,
+        siteUrl: auth.siteUrl,
+        auth: auth.auth.kind === "token"
+          ? { authorization: authorizationHeader(auth.auth.value) }
+          : { cookie: auth.auth.value },
+      },
+      manifest: manifest as unknown as Parameters<typeof validateFrappeLineage>[0]["manifest"],
+      rootStage,
+      rootName,
+      principal,
+      permissionEpoch,
+      maxRecords: positiveInteger(args.maxRecords, 500),
+    });
+    return validateFrappeLineage({
+      manifest: manifest as unknown as Parameters<typeof validateFrappeLineage>[0]["manifest"],
+      documents,
+    });
+  } catch (error) {
+    return { error: `Frappe lineage validation rejected its evidence: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+export async function frappe_lineage_remediation_plan(
+  args: Record<string, unknown>,
+  context: FrappeToolContext,
+): Promise<ReturnType<typeof planFrappeLineageRemediation> | FrappeError> {
+  const reviewedManifest = recordObject(args.reviewedManifest) as unknown as FrappeReviewedLineageManifest | undefined;
+  const rootStage = argString(args, "rootStage");
+  const rootName = argString(args, "rootName");
+  if (!reviewedManifest || !recordObject(reviewedManifest.manifest) || !rootStage || !rootName) {
+    return { error: "frappe_lineage_remediation_plan requires reviewedManifest, rootStage, and rootName. It proposes changes but never executes them." };
+  }
+  try {
+    const auth = await resolveRuntimeAuth(args, context);
+    if ("error" in auth) return auth;
+    const principal = await resolveAuthenticatedPrincipal(context, auth);
+    if (typeof principal !== "string") return principal;
+    const permissionEpoch = (await resolveFrappePermissionEpoch(context, auth, principal)).epoch;
+    const documents = await loadLiveFrappeLineageEvidence({
+      context: {
+        fetch: context.fetch!,
+        siteUrl: auth.siteUrl,
+        auth: auth.auth.kind === "token"
+          ? { authorization: authorizationHeader(auth.auth.value) }
+          : { cookie: auth.auth.value },
+      },
+      manifest: reviewedManifest.manifest,
+      rootStage,
+      rootName,
+      principal,
+      permissionEpoch,
+      maxRecords: positiveInteger(args.maxRecords, 500),
+    });
+    const validation = validateFrappeLineage({ manifest: reviewedManifest.manifest, documents });
+    return planFrappeLineageRemediation({ reviewedManifest, documents, validation });
+  } catch (error) {
+    return { error: `Frappe lineage remediation refused the request: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
 /** Loader entrypoint contract: tools record, registered as frappe-federated-bridge__<name>. */
 export const tools = {
   frappe_identity_resolve,
@@ -2545,6 +2670,9 @@ export const tools = {
   frappe_enterprise_sync,
   frappe_customer_profile_validate,
   frappe_hierarchy_scope,
+  frappe_customization_graph,
+  frappe_lineage_validate,
+  frappe_lineage_remediation_plan,
 };
 
 function inferDoctype(prompt: string, args: Record<string, unknown>): string {
@@ -2652,6 +2780,38 @@ function hasMeaningfulValue(value: unknown): boolean {
   if (value === undefined || value === null) return false;
   if (typeof value === "string") return value.trim().length > 0;
   return true;
+}
+
+function matchesApprovedValue(expected: unknown, observed: unknown): boolean {
+  if (expected === null && observed === undefined) return true;
+  if (Array.isArray(expected)) {
+    return Array.isArray(observed)
+      && expected.length === observed.length
+      && expected.every((item, index) => matchesApprovedValue(item, observed[index]));
+  }
+  if (expected && typeof expected === "object") {
+    if (!observed || typeof observed !== "object" || Array.isArray(observed)) return false;
+    const observedRecord = observed as Record<string, unknown>;
+    return Object.entries(expected as Record<string, unknown>)
+      .every(([key, value]) => matchesApprovedValue(value, observedRecord[key]));
+  }
+  return Object.is(expected, observed);
+}
+
+function approvedValueMismatches(expected: unknown, observed: unknown, path: string): string[] {
+  if (expected === null && observed === undefined) return [];
+  if (Array.isArray(expected)) {
+    if (!Array.isArray(observed)) return [path];
+    const mismatches = expected.flatMap((item, index) => approvedValueMismatches(item, observed[index], `${path}[${index}]`));
+    return expected.length === observed.length ? mismatches : [`${path}.length`, ...mismatches];
+  }
+  if (expected && typeof expected === "object") {
+    if (!observed || typeof observed !== "object" || Array.isArray(observed)) return [path];
+    const observedRecord = observed as Record<string, unknown>;
+    return Object.entries(expected as Record<string, unknown>)
+      .flatMap(([key, value]) => approvedValueMismatches(value, observedRecord[key], `${path}.${key}`));
+  }
+  return Object.is(expected, observed) ? [] : [path];
 }
 
 function modulePrior(module: string, apps: string[], doctypes: string[], concepts: string[]): FrappeModuleContext {

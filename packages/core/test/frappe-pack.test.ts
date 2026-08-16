@@ -45,7 +45,7 @@ function frappeTool(name: string): FrappePackTool {
 }
 
 /** Stub Frappe site: logged-user endpoint, resource list, resource create, and a 403 PermissionError doctype. */
-function startFrappeStub(options: { readonly rolesMethodStatus?: number; readonly rejectedQueryField?: string } = {}): Promise<{ url: string; requests: RecordedRequest[]; close: () => void }> {
+function startFrappeStub(options: { readonly rolesMethodStatus?: number; readonly rejectedQueryField?: string; readonly omitNullChildFields?: boolean } = {}): Promise<{ url: string; requests: RecordedRequest[]; close: () => void }> {
   const requests: RecordedRequest[] = [];
   let leaveApplication: Record<string, unknown> = {
     name: "HR-LAP-0001",
@@ -197,6 +197,21 @@ function startFrappeStub(options: { readonly rolesMethodStatus?: number; readonl
         }
         if (url.startsWith("/api/resource/Leave%20Application/HR-LAP-0001") && request.method === "PUT") {
           const changes = JSON.parse(body) as Record<string, unknown>;
+          if (Array.isArray(changes.details)) {
+            changes.details = changes.details.map((row, index) => {
+              const supplied = options.omitNullChildFields
+                ? Object.fromEntries(Object.entries(row as Record<string, unknown>).filter(([, value]) => value !== null))
+                : row as Record<string, unknown>;
+              return {
+                name: `HR-LAP-DETAIL-${index + 1}`,
+                parent: "HR-LAP-0001",
+                parentfield: "details",
+                parenttype: "Leave Application",
+                doctype: "Leave Application Detail",
+                ...supplied,
+              };
+            });
+          }
           leaveApplication = { ...leaveApplication, ...changes, modified: "2026-07-14 09:05:00.000000" };
           return respond(200, { data: leaveApplication });
         }
@@ -1178,6 +1193,40 @@ test("frappe_safe_write uses Frappe's document permission result for governed up
   }
 });
 
+test("frappe_safe_write verifies approved child rows while allowing Frappe metadata", async () => {
+  const site = await startFrappeStub({ omitNullChildFields: true });
+  try {
+    const safeWrite = frappeTool("frappe_safe_write");
+    const cwd = await mkdtemp(join(tmpdir(), "muster-frappe-child-update-"));
+    const signingKey = "test-only-frappe-child-update-key";
+    const context = contextFor(site.url, "api-key:api-secret", {
+      FRAPPE_APPROVAL_SIGNING_KEY: signingKey,
+      FRAPPE_READ_MODEL_PATH: join(cwd, "frappe-read-model.db"),
+    });
+    const mutation = {
+      operation: "update",
+      doctype: "Leave Application",
+      docname: "HR-LAP-0001",
+      expected_modified: "2026-07-14 09:00:00.000000",
+      doc: { details: [{ date: "2026-07-20", duration: 1, optional_note: null }] },
+    };
+    const proposal = await safeWrite(mutation, context) as Record<string, unknown>;
+    const approval = signFrappeApproval(
+      proposal.approvalProposal as Parameters<typeof signFrappeApproval>[0],
+      "approver@example.test",
+      signingKey,
+      String((proposal.approvalProposal as Record<string, unknown>).issuedAt),
+    );
+    const approved = await safeWrite({ ...mutation, approvalReceipt: approval }, context) as Record<string, unknown>;
+    assert.equal(approved.status, "executed");
+    assert.equal((approved.verification as Record<string, unknown>).verified, true);
+    const details = ((approved.verification as Record<string, unknown>).fetched as Record<string, unknown>).details as Record<string, unknown>[];
+    assert.equal(details[0]?.parent, "HR-LAP-0001");
+  } finally {
+    site.close();
+  }
+});
+
 test("frappe_artifact_brief emits fixture/live metadata linking site, user, DocTypes, permission scope, prompt, and output", async () => {
   const artifact = await frappeTool("frappe_artifact_brief")({
     mode: "fixture",
@@ -1705,6 +1754,7 @@ test("the frappe pack loads through loadCapabilityPack and runs inside a flow", 
         "frappe-federated-bridge__frappe_context_build",
         "frappe-federated-bridge__frappe_context_setup_plan",
         "frappe-federated-bridge__frappe_customer_profile_validate",
+        "frappe-federated-bridge__frappe_customization_graph",
         "frappe-federated-bridge__frappe_docs_context",
         "frappe-federated-bridge__frappe_enterprise_contract",
         "frappe-federated-bridge__frappe_enterprise_sync",
@@ -1713,6 +1763,8 @@ test("the frappe pack loads through loadCapabilityPack and runs inside a flow", 
         "frappe-federated-bridge__frappe_hybrid_retrieve",
         "frappe-federated-bridge__frappe_identity_resolve",
         "frappe-federated-bridge__frappe_installed_context",
+        "frappe-federated-bridge__frappe_lineage_remediation_plan",
+        "frappe-federated-bridge__frappe_lineage_validate",
         "frappe-federated-bridge__frappe_module_context",
         "frappe-federated-bridge__frappe_permission_check",
         "frappe-federated-bridge__frappe_query_classify",
