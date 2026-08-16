@@ -19,18 +19,18 @@
 5. Clear the prior mission transcript, not the indexed site context.
 6. Start screen recording before the prompt is entered.
 
-## Clip 1: Engineering revision escape
+## Clip 1: Repair an engineering revision escape
 
 **Target length:** 18-25 seconds
 
 **Fault:** Drawing and Control Plan are at the revised specification while Process Flow or PPFMEA still carries the previous operation/tolerance.
 
-**Prompt:** `This component was revised last week. Why are production and inspection still following the old specification?`
+**Prompt:** `drawing changed but job card and inspection still old. why this happening? please fix`
 
 **Shot sequence:**
 
 1. Show the revised component and ask the question.
-2. Muster streams short progress: mapping the engineering chain, comparing revisions, checking production and inspection dependencies.
+2. Muster streams short progress in business language while comparing the connected engineering, production, and inspection records.
 3. The interface moves to the first divergent record and highlights expected versus observed values.
 4. Muster explains the operational impact in business language.
 5. Choose the reviewed correction and approve it.
@@ -38,60 +38,61 @@
 
 **End frame:** `Revision B is now consistent through Process Flow and PPFMEA. Production release checks pass.`
 
-## Clip 2: Investigation and support handoff
+## Clip 2: Teach the customized workflow
 
 **Target length:** 15-22 seconds
 
-**Fault:** An enabled namespaced customization causes a repeatable mismatch and Error Log entry.
+**Fault:** A valid demo record has not completed the next customer-specific business step.
 
-**Prompt:** `Report this issue to support with enough evidence that I do not have to explain it again.`
+**Prompt:** `this is not moving ahead. what i have to do?`
 
 **Shot sequence:**
 
-1. Begin on the failing record with the error visible.
-2. Muster correlates the record, customization, schema/app versions, and relevant sanitized error evidence.
-3. Show the ticket preview: business impact, expected/observed state, affected links, likely code/configuration area, reproduction, and validation plan.
-4. Human approves ticket creation.
-5. Muster creates the ticket in the configured Helpdesk and opens the real ticket link.
+1. Begin on the record at the point where the user is unsure what comes next.
+2. Muster explains the current stage and highlights the next required business field or action.
+3. It explains what belongs there and why, then waits long enough for the user to read.
+4. The user approves the meaningful action on screen.
+5. Muster continues through the customized path and verifies the resulting state without another prompt.
 
-**End frame:** The Helpdesk ticket contains complete evidence and a continuation reference for support/development.
+**End frame:** The user sees the completed business step and understands the same path for future work.
 
-## Clip 3: Customization-aware guidance
+## Clip 3: Permission-aware customization repair
 
 **Target length:** 15-20 seconds
 
-**Fault:** A namespaced validation rule blocks a workflow transition with a customer-specific message.
+**Fault:** A namespaced validation script incorrectly rejects a valid revised operation.
 
-**Prompt:** `Why can I not move this forward, and what do I need to correct?`
+**Prompt:** `why this error coming? i did everything correctly. please check and fix`
 
 **Shot sequence:**
 
 1. Show the blocked action and its business message.
-2. Muster identifies the effective mandatory fields, Property Setter, workflow transition, and governing customization from live metadata.
-3. The cursor moves to each missing business field while Muster explains the expected value in user language.
-4. The user supplies or selects the missing value.
-5. Muster retries the reviewed transition and verifies the resulting workflow state.
+2. Muster proves that the entered business information and user sequence are correct.
+3. It explains the outdated rule in business language; technical detail is shown only to an authorized role.
+4. Muster previews the smallest script correction and expected effect.
+5. The authorized user approves it; Muster applies, retries, and verifies the original workflow.
 
-**End frame:** The transition succeeds with a concise explanation of what changed and a link to the record.
+**End frame:** The transition succeeds, the user is not blamed for a system defect, and the audit receipt identifies the approving role.
 
-## Clip 4: v15-to-v16 migration diagnosis
+## Clip 4: v15-to-v16 migration support handoff
 
 **Target length:** 18-25 seconds
 
 **Fault:** A `MUSTER-DEMO-*` script or report references a schema surface removed or renamed in v16.
 
-**Prompt:** `This customization stopped working after the upgrade. Diagnose it and prepare a safe correction.`
+**Prompt:** `after update this page not opening. check what happened and send to support`
 
 **Shot sequence:**
 
 1. Show the failing migrated screen or report.
 2. Muster compares the installed app/schema version with the script/report dependency graph.
 3. It identifies the stale reference and shows the affected UI behavior without exposing source secrets.
-4. Show the correction preview and deterministic validation plan.
-5. Human approves the namespaced demo correction.
-6. Muster applies it, reloads the affected route, and verifies the behavior and regression checks.
+4. Muster prepares an API-led Helpdesk draft containing business impact, affected links, versions, reproduction, sanitized errors, and validation evidence.
+5. Show customer `Vinman Engineering Private Limited`, subject, and evidence summary; nothing has been sent yet.
+6. Human approves `Approve & send to support`.
+7. Muster creates and rereads the ticket through the configured Helpdesk OAuth connection; a parallel existing tab shows the new ticket arriving.
 
-**End frame:** `Migration correction verified on v16` with the affected route and evidence receipt.
+**End frame:** The verified ticket link is open with enough evidence for support to continue without re-interviewing the user.
 
 ## Acceptance gate
 

@@ -312,7 +312,7 @@ test("issue reporting targets the configured Helpdesk OAuth grant and preserves 
     text,
   }, {
     config: { ...base, providers: {}, runtimes: {}, routing: { ...base.routing, defaultRuntime: "native" } },
-    gateway: { token: "test", frappe: { approvalSigningKey: "support-signing-key", support: { connectionId: "hybrow-support", customer: "Vinman App" } } },
+    gateway: { token: "test", frappe: { approvalSigningKey: "support-signing-key", support: { connectionId: "hybrow-support", customer: "Vinman Engineering Private Limited" } } },
     cwd,
     registry,
     frappeOAuth,
@@ -320,12 +320,13 @@ test("issue reporting targets the configured Helpdesk OAuth grant and preserves 
   });
   try {
     const reply = await send("Report this engineering revision mismatch to support");
-    assert.match("text" in reply ? reply.text : "", /review your request/i);
+    assert.match("text" in reply ? reply.text : "", /review the support ticket/i);
+    assert.deepEqual("presentation" in reply ? reply.presentation?.actions?.map((action) => action.label) : [], ["Approve & send to support", "Cancel ticket"]);
     assert.ok(authorizationSites.includes("https://support.hybrowlabs.com"));
     assert.equal(interactionCalls.at(-1)?.siteUrl, "https://support.hybrowlabs.com");
     assert.equal(interactionCalls.at(-1)?.apiToken, "support-user-secret");
     assert.doesNotMatch(JSON.stringify(interactionCalls.at(-1)), /vinman-user-secret/);
-    assert.equal((interactionCalls.at(-1)?.values as Record<string, unknown>).customer, "Vinman App");
+    assert.equal((interactionCalls.at(-1)?.values as Record<string, unknown>).customer, "Vinman Engineering Private Limited");
     assert.match(String((interactionCalls.at(-1)?.values as Record<string, unknown>).description), /Source site/);
     const created = await send("/accept");
     assert.match("text" in created ? created.text : "", /HD-TICKET-0042/);
@@ -334,7 +335,7 @@ test("issue reporting targets the configured Helpdesk OAuth grant and preserves 
     assert.equal(safeWriteCalls.length, 2);
     assert.equal(safeWriteCalls[0]?.siteUrl, "https://support.hybrowlabs.com");
     assert.equal(safeWriteCalls[1]?.siteUrl, "https://support.hybrowlabs.com");
-    assert.equal((safeWriteCalls[0]?.doc as Record<string, unknown>).customer, "Vinman App");
+    assert.equal((safeWriteCalls[0]?.doc as Record<string, unknown>).customer, "Vinman Engineering Private Limited");
   } finally {
     await enterprise.close?.();
     await rm(cwd, { recursive: true, force: true });

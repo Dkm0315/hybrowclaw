@@ -22,6 +22,9 @@ test("support reporting has a safe default and recognizes natural requests", () 
   assert.equal(resolveFrappeSupportDestination().site, DEFAULT_FRAPPE_SUPPORT_SITE);
   assert.equal(resolveFrappeSupportDestination().doctype, "HD Ticket");
   assert.equal(isFrappeIssueReportRequest("Please raise this with support"), true);
+  assert.equal(isFrappeIssueReportRequest("after update this page not opening. check and send to support"), true);
+  assert.equal(isFrappeIssueReportRequest("create a support ticket for me"), false);
+  assert.equal(isFrappeIssueReportRequest("do not send this to support"), false);
   assert.equal(isFrappeIssueReportRequest("Explain this control plan"), false);
 });
 
@@ -48,6 +51,7 @@ test("support evidence is bounded, linked, and redacts credentials", () => {
       appVersions: { frappe: "16.27.1", vinman_app: "version-16" },
       reproduction: ["Open the revised Control Plan.", "Compare the linked Process Flow revision."],
       validation: ["lineage:Inconsistent", "permission_scope:engineer@example.test"],
+      errorEvidence: ["TypeError at migrated report boundary", "api_key=must-not-leak"],
       evidenceIds: ["lineage:abc123"],
     },
   });
@@ -61,6 +65,8 @@ test("support evidence is bounded, linked, and redacts credentials", () => {
   assert.match(draft.description, /Drawing revision B should reach production/);
   assert.match(draft.description, /process-flow\/PF-0042/);
   assert.match(draft.description, /lineage:Inconsistent/);
+  assert.match(draft.description, /TypeError at migrated report boundary/);
+  assert.doesNotMatch(draft.description, /must-not-leak/);
 });
 
 test("support destination rejects non-canonical or credential-bearing origins", () => {

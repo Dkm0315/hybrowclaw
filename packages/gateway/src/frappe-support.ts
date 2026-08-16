@@ -28,15 +28,18 @@ export interface FrappeSupportInvestigationEvidence {
   readonly appVersions?: Readonly<Record<string, string>>;
   readonly reproduction?: readonly string[];
   readonly validation?: readonly string[];
+  /** Sanitized, bounded error fingerprints or log excerpts; never raw logs. */
+  readonly errorEvidence?: readonly string[];
   readonly evidenceIds?: readonly string[];
 }
 
-const REPORT_ISSUE_RE = /(?:^\s*\/report-issue\b|\b(?:report|raise|log|escalate)\b.{0,60}\b(?:this|it|issue|problem|mismatch|failure)\b.{0,40}\b(?:to\s+)?support\b|\b(?:send|escalate)\b.{0,36}\b(?:this|it|issue|problem|mismatch|failure)\b.{0,24}\b(?:to\s+)?support\b)/i;
+const REPORT_ISSUE_RE = /(?:^\s*\/report-issue\b|\b(?:report|raise|log|escalate)\b.{0,60}\b(?:this|it|issue|problem|mismatch|failure)\b.{0,40}\b(?:to\s+)?support\b|\b(?:send|escalate)\b.{0,36}\b(?:this|it|issue|problem|mismatch|failure)\b.{0,24}\b(?:to\s+)?support\b|\b(?:check\s+(?:and\s+)?)?send\s+(?:this\s+|it\s+)?to\s+support\b)/i;
+const NEGATED_REPORT_ISSUE_RE = /\b(?:do\s+not|don't|dont|no\s+need\s+to|without)\b.{0,28}\b(?:send|report|raise|create|open|log|escalate)\b.{0,36}\bsupport\b/i;
 const SECRET_RE = /\b(access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|api[_ -]?key|authorization|cookie|password)\b\s*[:=]\s*[^\s,;]+/gi;
 const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi;
 
 export function isFrappeIssueReportRequest(prompt: string): boolean {
-  return REPORT_ISSUE_RE.test(prompt);
+  return !NEGATED_REPORT_ISSUE_RE.test(prompt) && REPORT_ISSUE_RE.test(prompt);
 }
 
 export function resolveFrappeSupportDestination(config?: GatewayFrappeSupportConfig): FrappeSupportDestination {
@@ -81,6 +84,7 @@ export function createFrappeSupportDraft(input: {
     ["Affected records", investigation.affectedRecords],
     ["Likely customization locations", investigation.likelyLocations],
     ["Application and schema versions", investigation.appVersions],
+    ["Sanitized error evidence", investigation.errorEvidence],
     ["Reproduction", investigation.reproduction],
     ["Validation results", investigation.validation],
     ["Evidence references", investigation.evidenceIds],
@@ -111,6 +115,7 @@ function normalizeInvestigation(evidence: FrappeSupportInvestigationEvidence | u
     likelyLocations: bulletList(evidence.likelyLocations),
     affectedRecords,
     appVersions: versions,
+    errorEvidence: bulletList(evidence.errorEvidence),
     reproduction: numberedList(evidence.reproduction),
     validation: bulletList(evidence.validation),
     evidenceIds: bulletList(evidence.evidenceIds?.filter((id) => /^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}$/.test(id))),

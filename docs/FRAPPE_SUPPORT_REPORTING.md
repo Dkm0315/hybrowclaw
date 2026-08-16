@@ -24,7 +24,7 @@ muster frappe setup \
   --site-url https://support.hybrowlabs.com \
   --oauth-credential-file ~/.muster/credentials/hybrow-support.json \
   --connection-id hybrow-support \
-  --support-customer "Vinman App" \
+  --support-customer "Vinman Engineering Private Limited" \
   --support
 ```
 
@@ -47,6 +47,12 @@ From the affected Frappe record or workspace, the user can say:
 Report this engineering revision mismatch to support
 ```
 
+Vague user language is also accepted when the destination is explicit:
+
+```text
+after update this page not opening. check what happened and send to support
+```
+
 or run:
 
 ```text
@@ -54,10 +60,11 @@ or run:
 ```
 
 Muster builds a draft containing the reporter, source site, current record,
-permission-filtered evidence, a verified record link, and a recommended
-reproduction boundary. The user reviews the live Helpdesk fields and selects
-`Accept & create`. The final response contains the verified Helpdesk ticket
-reference and link.
+permission-filtered evidence, a verified record link, sanitized error evidence,
+and a recommended reproduction boundary. The user reviews the compact subject,
+customer, and priority preview and selects `Approve & send to support`. The long
+evidence remains in the API payload rather than overwhelming the approval UI.
+The final response contains the reread Helpdesk ticket reference and link.
 
 ## Engineering Change Escape demo
 

@@ -12,31 +12,31 @@
   "scenarios": [
     {
       "id": "revision-escape",
-      "title": "Engineering revision stops before production",
+      "title": "Repair an engineering revision escape",
       "intentionalFault": "The new Control Plan revision retains a downstream Process Flow and PPFMEA from the prior drawing revision.",
       "expectedFinding": ["Requires regeneration", "Inconsistent"],
       "restoration": "Restore the downstream revision and child-table snapshots captured by setup evidence."
     },
     {
-      "id": "support-handoff",
-      "title": "Evidence-complete support handoff",
-      "intentionalFault": "An enabled customization produces a repeatable mismatch with a captured Error Log.",
-      "expectedFinding": ["Inconsistent"],
-      "restoration": "Disable only the namespaced demo customization and delete the namespaced support draft after approval."
+      "id": "guided-workflow",
+      "title": "Teach the customized workflow with human approval",
+      "intentionalFault": "A demo record is valid but has not completed the next customer-specific business step.",
+      "expectedFinding": ["Blocked"],
+      "restoration": "Restore the namespaced record to its pre-guidance workflow state."
     },
     {
-      "id": "custom-message",
-      "title": "Customization-aware guidance",
-      "intentionalFault": "A namespaced validation rule blocks a transition using a business-specific message.",
+      "id": "authorized-customization-repair",
+      "title": "Repair a customization under role-bound approval",
+      "intentionalFault": "A namespaced validation script incorrectly rejects a valid revised operation.",
       "expectedFinding": ["Blocked"],
-      "restoration": "Remove the namespaced validation rule after its before-hash is verified."
+      "restoration": "Restore the namespaced script from its verified before-hash."
     },
     {
       "id": "v16-migration",
-      "title": "v15 to v16 migration diagnosis",
+      "title": "Escalate a v15 to v16 migration failure",
       "intentionalFault": "A namespaced script or report references a removed v15 schema surface.",
       "expectedFinding": ["Blocked", "Requires regeneration"],
-      "restoration": "Reinstate the namespaced legacy reference for repeat recording or remove it after the corrected path is verified."
+      "restoration": "Keep the namespaced legacy reference for repeat recording and delete only the approved demo support ticket afterward."
     }
   ],
   "acceptance": {

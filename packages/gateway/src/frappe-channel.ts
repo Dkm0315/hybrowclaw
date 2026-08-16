@@ -164,6 +164,7 @@ function guidedInteractionPresentation(
   pending: NonNullable<FrappePermissionContextResult["pendingInteraction"]>,
   interaction: Readonly<Record<string, unknown>>,
 ): SurfacePresentation {
+  const supportTicket = pending.doctype === "HD Ticket";
   const next = pending.requiredFields[0];
   if (next) {
     const optionText = next.options?.length ? ` Choose one: ${next.options.join(", ")}.` : "";
@@ -176,15 +177,18 @@ function guidedInteractionPresentation(
   }
   const rows = Object.entries(pending.values)
     .filter(([, value]) => value !== undefined && value !== null && String(value).trim())
+    .filter(([field]) => !supportTicket || ["subject", "customer", "priority"].includes(field))
     .map(([field, value]) => [humanizeField(field), String(value)]);
   return {
     kind: "form",
-    title: "Review your request",
-    summary: "I have the required information. Review it before anything is saved.",
+    title: supportTicket ? "Review the support ticket" : "Review your request",
+    summary: supportTicket
+      ? "I gathered the affected record, business impact, reproduction steps, versions, and sanitized error evidence. Check the summary below; nothing has been sent yet."
+      : "I have the required information. Review it before anything is saved.",
     ...(rows.length ? { tables: [{ id: "request-preview", columns: ["Field", "Value"], rows }] } : {}),
     actions: [
-      { id: "accept", label: "Accept & create", command: "/accept", style: "primary", kind: "confirm" },
-      { id: "cancel", label: "Cancel this request", command: "/cancel" },
+      { id: "accept", label: supportTicket ? "Approve & send to support" : "Accept & create", command: "/accept", style: "primary", kind: "confirm" },
+      { id: "cancel", label: supportTicket ? "Cancel ticket" : "Cancel this request", command: "/cancel" },
     ],
   };
 }
