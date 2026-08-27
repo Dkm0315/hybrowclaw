@@ -3,9 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Muster — Governed Agent Harness for Production AI Agents</title>
-  <meta name="description" content="Muster is an open-source governed agent harness for long-running AI agents with scoped memory, token ledger, eval-gated learning, MCP, browser automation, and Frappe / ERPNext support." />
-  <meta name="keywords" content="Muster, Muster agent harness, governed agent harness, AI agent framework, production AI agents, scoped memory, token ledger, eval-gated learning, MCP, browser automation, Frappe, ERPNext, Gemini, open-source models, self-hosted LLMs, multi-provider LLM routing" />
+  <title>Open Source AI Agent Framework — Muster</title>
+  <meta name="description" content="Muster is an open source AI agent framework you can self-host and audit: scoped memory, a local token ledger, and file changes observed from the filesystem instead of taken from the agent's self-report." />
+  <meta name="keywords" content="open source AI agent framework, self-hosted AI agent, AI agent with memory, AI agent audit trail, OpenClaw alternative, Hermes agent alternative, resume codex sessions, ERPNext AI agent, MCP agent, token ledger" />
   <meta name="application-name" content="Muster" />
   <meta name="apple-mobile-web-app-title" content="Muster" />
   <meta name="robots" content="index, follow, max-image-preview:large" />
@@ -27,14 +27,14 @@
   <!-- Open Graph -->
   <meta property="og:type" content="website" />
   <meta property="og:site_name" content="Muster" />
-  <meta property="og:title" content="Muster — Governed Agent Harness for Production AI Agents" />
-  <meta property="og:description" content="Open-source governed agent harness for long-running AI agents with scoped memory, token ledger, eval-gated learning, MCP, browser automation, and Frappe / ERPNext support." />
+  <meta property="og:title" content="Open Source AI Agent Framework — Muster" />
+  <meta property="og:description" content="Self-hosted, MIT-licensed, and auditable: scoped memory, a local token ledger, and file changes observed from the filesystem rather than self-reported by the agent." />
   <meta property="og:url" content="https://themuster.dev/" />
   <meta property="og:image" content="https://themuster.dev/assets/brand/muster-og.png" />
   <!-- Twitter -->
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="Muster — Governed Agent Harness for Production AI Agents" />
-  <meta name="twitter:description" content="Open-source governed agent harness for agents that should not leak memory, waste tokens, or learn without tests." />
+  <meta name="twitter:title" content="Open Source AI Agent Framework — Muster" />
+  <meta name="twitter:description" content="An open source AI agent framework for agents that should not leak memory, waste tokens, or learn without tests." />
   <meta name="twitter:image" content="https://themuster.dev/assets/brand/muster-og.png" />
   <!-- Fonts: Clash Display (headings) + Hanken Grotesk (body) via Fontshare; JetBrains Mono for code only. -->
   <link rel="preconnect" href="https://api.fontshare.com" crossorigin />
@@ -68,8 +68,8 @@
           "@id": "https://themuster.dev/#software",
           "name": "Muster",
           "alternateName": "Muster Agent Harness",
-          "description": "Open-source governed agent harness for production AI agents with scoped memory, token ledger, eval-gated learning, MCP capabilities, browser automation, and Frappe / ERPNext support.",
-          "keywords": "Muster agent harness, governed agent harness, AI agent harness, production AI agents, scoped memory, token ledger, eval-gated learning, MCP agent harness, browser automation, Frappe AI, ERPNext AI",
+          "description": "Open source AI agent framework you can self-host and audit: scoped memory, a local token ledger, eval-gated learning, MCP capabilities, browser automation, ERPNext / Frappe support, and file changes observed from the filesystem rather than self-reported.",
+          "keywords": "open source AI agent framework, self-hosted AI agent, AI agent with memory, AI agent audit trail, OpenClaw alternative, Hermes agent alternative, resume codex sessions, ERPNext AI agent, MCP agent, token ledger",
           "codeRepository": "https://github.com/Dkm0315/muster",
           "programmingLanguage": "TypeScript",
           "license": "https://github.com/Dkm0315/muster/blob/main/LICENSE",
@@ -114,12 +114,12 @@
     <nav aria-label="Main">
       <a href="#problem">Problem</a>
       <a href="#solution">Controls</a>
-      <a href="#use-cases">Use cases</a>
       <a href="#capabilities">Capabilities</a>
-      <a href="/agent-harness.html">Agent harness</a>
+      <a href="/agent-harness.html">Self-hosted</a>
+      <a href="/live-inline-diff.html">Audit trail</a>
       <a href="/guides.html">Guides</a>
-      <a href="/frappe-ai.html">Frappe AI</a>
-      <a href="#architecture">Architecture</a>
+      <a href="/frappe-ai.html">ERPNext AI</a>
+      <a href="#compare">Compare</a>
       <a href="#proof">Proof</a>
       <a href="/docs.html">Docs</a>
       <a class="nav-cta" href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
@@ -135,10 +135,12 @@
     <section class="hero" id="hero">
       <div class="hero-inner">
         <p class="kicker hero-step">control layer for AI agents</p>
-        <h1 class="hero-step">One governed point for agents, tools, memory, models, and evals.</h1>
+        <h1 class="hero-step">The open source AI agent framework you can audit.</h1>
         <p class="sub hero-step">
-          Muster is the control layer where independent AI systems assemble,
-          route through policy, and leave an auditable trail.
+          Self-hosted and MIT-licensed. Muster is the control layer where
+          independent AI systems assemble, route through policy, and leave an
+          auditable trail — file changes observed from the filesystem, memory
+          scoped by tenant and role, tokens recorded in your own ledger.
         </p>
         <p class="sub hero-step">
           Many moving parts. One controlled runtime.
@@ -426,6 +428,51 @@
       <p class="proof-link reveal-child"><a href="https://github.com/Dkm0315/muster/blob/main/benchmark/RESULTS.md" rel="noopener">Read the full methodology &amp; reproduce →</a></p>
     </section>
 
+    <!-- ===================== COMPARISONS ===================== -->
+    <section class="band" id="compare" data-reveal>
+      <p class="sec-kicker reveal-child">Comparisons</p>
+      <h2 class="reveal-child">How Muster compares to the alternatives.</h2>
+      <p class="sec-sub reveal-child">Written honestly, including the parts where the other project wins. Muster does not compete on plugin count — against ecosystems with tens of thousands of commits, breadth is not a winnable race. The argument is narrower: file changes derived from the workspace instead of taken from the agent's self-report.</p>
+      <div class="capability-board reveal-child">
+        <article class="capability-panel">
+          <span class="cap-label">openclaw alternative</span>
+          <h3>Muster vs OpenClaw</h3>
+          <p>OpenClaw has 387.8k stars and the bigger plugin economy. Muster has receipted, observed edit truth. Both MIT, both self-hosted.</p>
+          <p class="proof-link"><a href="/muster-vs-openclaw.html">Read the comparison -&gt;</a></p>
+        </article>
+        <article class="capability-panel">
+          <span class="cap-label">hermes agent alternative</span>
+          <h3>Muster vs Hermes Agent</h3>
+          <p>Hermes wins on 40+ tools and seven execution backends. Muster wins on scoped memory boundaries and an auditable edit trail.</p>
+          <p class="proof-link"><a href="/muster-vs-hermes-agent.html">Read the comparison -&gt;</a></p>
+        </article>
+        <article class="capability-panel">
+          <span class="cap-label">qm alternative</span>
+          <h3>Muster vs QM</h3>
+          <p>The nearest neighbour. QM is ahead on grant-based sharing and durable sandboxes; Muster is ahead on deterministic receipts.</p>
+          <p class="proof-link"><a href="/muster-vs-qm.html">Read the comparison -&gt;</a></p>
+        </article>
+        <article class="capability-panel">
+          <span class="cap-label">ai agent audit trail</span>
+          <h3>Live inline diff evidence</h3>
+          <p>Head to head against Codex: 0 of 5 self-reported edits, versus an 86ms observed, git-apply-verified diff with a reproducible receipt.</p>
+          <p class="proof-link"><a href="/live-inline-diff.html">See the evidence -&gt;</a></p>
+        </article>
+        <article class="capability-panel">
+          <span class="cap-label">resume codex sessions</span>
+          <h3>Resume Codex sessions</h3>
+          <p>Muster stores the Codex thread id on a searchable local session record, so <code>muster chat --continue</code> reopens the same thread days later.</p>
+          <p class="proof-link"><a href="/resume-codex-sessions.html">How it works -&gt;</a></p>
+        </article>
+        <article class="capability-panel">
+          <span class="cap-label">erpnext ai agent</span>
+          <h3>ERPNext and Frappe</h3>
+          <p>The one place Muster's integration is genuinely deep rather than declared: DocTypes, fields, workflows, roles, permissions and reports in context.</p>
+          <p class="proof-link"><a href="/frappe-ai.html">Read more -&gt;</a></p>
+        </article>
+      </div>
+    </section>
+
     <!-- ===================== POSITIONING ===================== -->
     <section class="band band-alt" id="positioning" data-reveal>
       <p class="sec-kicker reveal-child">Positioning</p>
@@ -489,6 +536,10 @@
       <span>MIT License</span>
       <span class="footer-sep">·</span>
       <a href="/docs.html">Docs</a>
+      <span class="footer-sep">·</span>
+      <a href="/live-inline-diff.html">Audit trail</a>
+      <span class="footer-sep">·</span>
+      <a href="/muster-vs-openclaw.html">Comparisons</a>
       <span class="footer-sep">·</span>
       <a href="/portal.html">Portal preview</a>
     </div>

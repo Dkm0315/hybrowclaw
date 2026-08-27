@@ -29,6 +29,38 @@
 $ muster channels setup slack
 $ muster gateway start --port 7460
 $ muster pairing approve &lt;code&gt;</pre><div class="cards five"><article class="card reveal-child"><h3>Signature checks</h3><p>Slack request signing can be verified before the payload reaches the agent loop.</p></article><article class="card reveal-child"><h3>Pairing required</h3><p>Unknown senders receive a pairing challenge instead of direct agent access.</p></article><article class="card reveal-child"><h3>Token ledger</h3><p>Slack turns are still normal Muster runs with usage and replay-waste visibility.</p></article><article class="card reveal-child"><h3>Tool policy</h3><p>Commands and MCP tools remain behind explicit policy and setup checks.</p></article><article class="card reveal-child"><h3>Draft streaming</h3><p>The gateway contains Slack draft posting and update support for smoother channel replies.</p></article></div></section>
+
+    <section class="band band-alt" data-reveal>
+      <p class="sec-kicker reveal-child">In practice</p>
+      <h2 class="reveal-child">A Slack bot is the easiest way to accidentally remove every control you built.</h2>
+      <div class="prose reveal-child">
+        <p>Most agent deployments start in a terminal, where the person running the agent is the person who configured it. Slack changes that in one step. Suddenly anyone in the workspace can address the agent, including guests, including people from other teams, including an integration posting on behalf of someone who has left. If the Slack path does not enforce the same rules as the CLI path, the Slack path becomes the way around them.</p>
+        <h3>The adapter is a mapping, not a second agent</h3>
+        <p>Muster's Slack adapter converts Slack events into the same <code>SurfaceMessage</code> envelope every other surface produces &mdash; terminal, web, Telegram, Google Chat, Teams, Discord, WhatsApp. That envelope carries who sent the request, which scope is active, which provider route applies, and what tool policy is in force. There is no separate Slack agent with its own permissions to keep in sync, because there is no second agent.</p>
+        <h3>Two gates before the model sees anything</h3>
+        <p>The first gate is cryptographic. When a signing secret is configured, Slack's request signature is verified before the payload reaches the agent loop, so a forged webhook does not get a turn. The second gate is human. An unknown sender receives a pairing challenge rather than direct access, and an operator approves the code. That is deliberately a small amount of friction placed at exactly the point where a new person gains the ability to spend your tokens and call your tools.</p>
+        <h3>Scope follows the sender</h3>
+        <p>Once paired, a Slack sender maps into memory lanes rather than a shared history: tenant, workspace, user, role, and session. What one person's conversation taught the agent does not automatically become available in someone else's channel, which is the failure people usually discover only after it has already happened. Retrieval is filtered by which lanes the current run is entitled to see, and there are tests whose entire job is to try to make one scope leak into another.</p>
+        <h3>Slack turns still cost money, visibly</h3>
+        <p>A Slack turn is a normal Muster run: usage in and out, estimated cost, and a replay-waste flag land in the local ledger. This matters more in chat than in a terminal, because chat threads get long and a naive harness resends the whole thread every time. Across five benchmark scenarios and 170 turns, replay-everything sends 875.8k tokens where Muster sends 355.2k &mdash; and the longest thread in that set shows the largest gap, at 62.7%.</p>
+        <p>Commands and MCP tools stay behind the same explicit policy and setup checks they have everywhere else, and the gateway supports draft posting and updates so replies can stream into a channel rather than landing as one delayed block.</p>
+        <p class="proof-link"><a href="/mcp-agent-harness.html">Govern the MCP tools it can call -&gt;</a> <a href="/guide-governed-memory.html">How memory scoping works -&gt;</a> <a href="/docs.html">Gateway docs -&gt;</a></p>
+      </div>
+    </section>
   </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>&copy; <span id="year">2026</span> Muster &mdash; open source, MIT</span>
+      <span class="footer-sep">&middot;</span>
+      <a href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/docs.html">Docs</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/live-inline-diff.html">Audit trail</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/muster-vs-openclaw.html">Comparisons</a>
+    </div>
+  </footer>
 </body>
 </html>

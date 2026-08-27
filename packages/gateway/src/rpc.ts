@@ -2,7 +2,13 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { closeWarmProviderTransports, dataDir, executeRun, listTokenRecords } from "@musterhq/core";
-import type { MusterConfig } from "@musterhq/core";
+import type {
+  KanbanStatus,
+  MusterConfig,
+  SelectionScoreBreakdown,
+  WorkspaceChangeKind,
+  WorkspacePatchEvent,
+} from "@musterhq/core";
 import {
   SqliteFrappeRunEventStore,
   type AcceptedFrappeRunCommand,
@@ -41,7 +47,38 @@ export interface RpcResponse {
 export type RpcEvent =
   | { readonly type: "message.stop"; readonly sessionId: string; readonly text: string; readonly runId: string }
   | { readonly type: "ledger.tick"; readonly sessionId: string; readonly runId: string; readonly inputTokens: number; readonly outputTokens: number; readonly costUsd?: number }
-  | { readonly type: "session.created"; readonly sessionId: string };
+  | { readonly type: "session.created"; readonly sessionId: string }
+  /**
+   * Observed workspace edit. `source` is pinned to the observer literal because the
+   * audit trail is only trustworthy when it watches the workspace — Codex's app-server
+   * emits zero item/fileChange/patchUpdated events in practice (STRATEGY_V2 §2.2), so a
+   * backend self-report can never be the provenance of this variant. `diff` may be null
+   * when it was omitted (binary, oversized, redacted path, budget); the hashes never are.
+   */
+  | {
+      readonly type: "workspace.patch";
+      readonly path: string;
+      readonly changeKind: WorkspaceChangeKind;
+      readonly diff: string | null;
+      readonly beforeHash: string | null;
+      readonly afterHash: string | null;
+      readonly sequence: number;
+      readonly source: WorkspacePatchEvent["source"];
+    }
+  | {
+      readonly type: "task.transition";
+      readonly taskId: string;
+      readonly from: KanbanStatus;
+      readonly to: KanbanStatus;
+      readonly rationale?: string;
+    }
+  | {
+      readonly type: "task.assigned";
+      readonly taskId: string;
+      readonly modelId: string;
+      readonly scoreBreakdown: readonly SelectionScoreBreakdown[];
+      readonly contextTokens: number;
+    };
 
 export interface RpcCore {
   handle(request: RpcRequest): Promise<RpcResponse>;

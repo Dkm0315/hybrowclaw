@@ -3,11 +3,12 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Governed Memory for Long-Running AI Agents — Muster Guide</title>
-  <meta name="description" content="Governed AI agents need scoped memory boundaries across tenant, workspace, user, role, and session so personalization does not become leakage." />
+  <title>AI Agent With Memory — Muster</title>
+  <meta name="description" content="Building an AI agent with memory that survives past one session: scoped lanes across tenant, workspace, user, role and session, so recall stays useful without becoming a leak." />
+  <meta name="keywords" content="AI agent with memory, AI agent memory, persistent agent memory, scoped memory, long-term memory for LLM agents, self-hosted AI agent" />
   <meta name="robots" content="index, follow, max-image-preview:large" />
   <link rel="canonical" href="https://themuster.dev/guide-governed-memory.html" />
-  <meta property="og:type" content="article" /><meta property="og:site_name" content="Muster" /><meta property="og:title" content="Governed Memory for Long-Running AI Agents" /><meta property="og:description" content="How scoped memory boundaries keep personalization useful without becoming a leak." /><meta property="og:url" content="https://themuster.dev/guide-governed-memory.html" /><meta property="og:image" content="https://themuster.dev/assets/brand/muster-og.png" />
+  <meta property="og:type" content="article" /><meta property="og:site_name" content="Muster" /><meta property="og:title" content="AI Agent With Memory — Muster" /><meta property="og:description" content="How scoped memory lanes let an agent remember across sessions without leaking between users, workspaces, or tenants." /><meta property="og:url" content="https://themuster.dev/guide-governed-memory.html" /><meta property="og:image" content="https://themuster.dev/assets/brand/muster-og.png" />
   <meta name="twitter:card" content="summary_large_image" /><meta name="twitter:image" content="https://themuster.dev/assets/brand/muster-og.png" />
   <link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=clash-display@600,700&f[]=hanken-grotesk@400,500,600,700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" />
@@ -17,7 +18,7 @@
   <div id="scroll-progress" aria-hidden="true"></div><div id="hero-stage" aria-hidden="true"><canvas id="hero-canvas"></canvas></div>
   <header class="topbar"><a class="brand" href="/" aria-label="Muster home"><img src="/assets/brand/muster-logo.png" alt="Muster" /></a><nav aria-label="Main"><a href="/">Home</a><a href="/guides.html">Guides</a><a href="/agent-harness.html">Agent harness</a><a href="/docs.html">Docs</a><a class="nav-cta" href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a></nav></header>
   <main>
-    <section class="hero"><div class="hero-inner"><p class="kicker hero-step">guide · governed memory</p><h1 class="hero-step">Governed memory for long-running AI agents.</h1><p class="sub hero-step">The longer an agent runs, the more memory helps. The same memory also becomes a risk unless scope is explicit.</p></div></section>
+    <section class="hero"><div class="hero-inner"><p class="kicker hero-step">guide · agent memory</p><h1 class="hero-step">Building an AI agent with memory that does not leak.</h1><p class="sub hero-step">The longer an agent runs, the more memory helps. The same memory also becomes a risk unless scope is explicit — which tenant, workspace, user, role, and session a fact belongs to, enforced at retrieval rather than trusted at write time.</p></div></section>
     <section class="band" data-reveal>
       <p class="sec-kicker reveal-child">Memory boundaries</p>
       <h2 class="reveal-child">Useful memory is not the same thing as global memory.</h2>

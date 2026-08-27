@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Resume Codex Sessions — Muster</title>
+  <meta name="description" content="Resume Codex sessions from your own machine: Muster stores the Codex thread id alongside a searchable session record, so muster chat --continue picks the same thread back up days later." />
+  <meta name="keywords" content="resume codex sessions, continue codex session, codex thread id, codex cli session history, self-hosted AI agent, open source AI agent framework" />
+  <meta name="robots" content="index, follow, max-image-preview:large" />
+  <link rel="canonical" href="https://themuster.dev/resume-codex-sessions.html" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="Muster" />
+  <meta property="og:title" content="Resume Codex Sessions — Muster" />
+  <meta property="og:description" content="Muster keeps the Codex thread id in a searchable local session record, so a Codex-backed run can be resumed by name days later." />
+  <meta property="og:url" content="https://themuster.dev/resume-codex-sessions.html" />
+  <meta property="og:image" content="https://themuster.dev/assets/brand/muster-og.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:image" content="https://themuster.dev/assets/brand/muster-og.png" />
+  <link rel="preconnect" href="https://api.fontshare.com" crossorigin />
+  <link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=clash-display@600,700&f[]=hanken-grotesk@400,500,600,700&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" />
+  <script type="module" src="/src/main.ts"></script>
+  <script type="application/ld+json">
+    {"@context":"https://schema.org","@type":"TechArticle","headline":"Resume Codex Sessions — Muster","description":"How Muster stores the Codex thread id in a local session record so a Codex-backed run can be resumed by name.","url":"https://themuster.dev/resume-codex-sessions.html","mainEntityOfPage":"https://themuster.dev/resume-codex-sessions.html","author":{"@type":"Organization","name":"Muster","url":"https://themuster.dev/"},"publisher":{"@type":"Organization","name":"Muster","url":"https://themuster.dev/"},"dateModified":"2026-08-27"}
+  </script>
+</head>
+<body>
+  <div id="scroll-progress" aria-hidden="true"></div>
+  <div id="hero-stage" aria-hidden="true"><canvas id="hero-canvas"></canvas></div>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Muster home"><img src="/assets/brand/muster-logo.png" alt="Muster" /></a>
+    <nav aria-label="Main">
+      <a href="/">Home</a>
+      <a href="/live-inline-diff.html">Live diff</a>
+      <a href="/docs.html">Docs</a>
+      <a href="/guides.html">Guides</a>
+      <a class="nav-cta" href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+    </nav>
+  </header>
+  <main>
+    <section class="hero">
+      <div class="hero-inner">
+        <p class="kicker hero-step">workflow · codex runtime</p>
+        <h1 class="hero-step">Resume Codex sessions by name, days later.</h1>
+        <p class="sub hero-step">Muster runs Codex as a runtime and keeps the thread id in its own local session record. <code>muster chat --continue work</code> reopens the same Codex thread, with the recalled memory, token ledger, and observed file changes still attached to it.</p>
+        <div class="hero-actions hero-step">
+          <a class="btn-cta" href="/docs.html">Read the docs</a>
+          <a class="btn-ghost" href="https://github.com/Dkm0315/muster" rel="noopener">Star on GitHub →</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" data-reveal>
+      <p class="sec-kicker reveal-child">The commands</p>
+      <h2 class="reveal-child">Name it once, continue it whenever.</h2>
+      <div class="cards five">
+        <article class="card reveal-child"><h3><code>muster chat --session work</code></h3><p>Runs a session-backed turn in a named session. The name is the handle you will resume by.</p></article>
+        <article class="card reveal-child"><h3><code>muster chat --continue work</code></h3><p>Reopens that named chat. With no name, it continues the most recent one.</p></article>
+        <article class="card reveal-child"><h3><code>/resume &lt;name|id&gt;</code></h3><p>Inside the terminal chat, switches to a prior named chat or a raw session id without leaving the TUI.</p></article>
+        <article class="card reveal-child"><h3><code>muster sessions search</code></h3><p>Search across stored sessions, or <code>show &lt;id&gt;</code> and <code>recent</code> to inspect one.</p></article>
+        <article class="card reveal-child"><h3><code>muster run --runtime codex</code></h3><p>One-shot runs against the Codex runtime, with <code>--session continue</code> to attach to the running thread.</p></article>
+      </div>
+    </section>
+
+    <section class="band band-alt" data-reveal>
+      <p class="sec-kicker reveal-child">How it works</p>
+      <h2 class="reveal-child">The thread id is stored on your machine, not remembered by the terminal.</h2>
+      <div class="prose reveal-child">
+        <p>Codex exposes two ways to continue prior work. The CLI accepts <code>codex exec resume</code>, and the app-server protocol accepts a <code>resumeThread</code> call against a known thread id. Both require you to have kept the thread id from last time. That is the part that usually goes missing — the id scrolls past in a JSON stream, the terminal closes, and the thread becomes unreachable even though the rollout is still on disk.</p>
+        <p>Muster's Codex adapter parses the <code>--json</code> event stream specifically to capture <code>thread_id</code>, and stores it on the session record next to your messages, recalled memories, and token usage. When you later run <code>muster chat --continue work</code>, the stored id is passed straight back into Codex's resume path. If Codex reports that the thread is gone — the adapter recognises "no rollout found", "unknown thread", and the equivalent session-not-found phrasings — Muster starts a fresh thread rather than failing the run, and carries your own session history forward regardless.</p>
+        <p>That distinction is worth stating plainly, because it is where a lot of "session memory" claims quietly overstate themselves: <strong>Muster's session record is the durable thing; the Codex thread is an optimisation on top of it.</strong> If the provider-side rollout expires, you lose the backend's internal context, not your history, your scoped memory, or your ledger.</p>
+
+        <h3>What comes back with the session</h3>
+        <ul>
+          <li><strong>Your messages.</strong> Stored locally and replayed as context, independent of any provider's retention policy.</li>
+          <li><strong>Scoped memory.</strong> Recalls are filtered by the lanes the session is entitled to see — tenant, workspace, user, role, session — so continuing an old session does not widen its access.</li>
+          <li><strong>The token ledger.</strong> Usage accrues against the session, including replay-waste flags when a continuation is resending far more history than it needs.</li>
+          <li><strong>Observed file changes.</strong> If the run touched a repository, the change set was derived from git and the filesystem rather than from Codex's patch notifications — which, measured live, fired zero times across five runs.</li>
+        </ul>
+
+        <h3>Keeping continuations cheap</h3>
+        <p>The naive way to continue a session is to resend the whole transcript every turn. It works, and it is why long agent threads get expensive out of proportion to what they are doing. Muster measures this on a deterministic five-scenario benchmark of 170 turns: replay-everything sends 875.8k tokens where Muster sends 355.2k, a 59.4% reduction, rising to 62.7% on the longest thread. No model is called during that benchmark — reproduce it with <code>muster benchmark</code>.</p>
+        <p>The practical consequence for resumed sessions is that a fifty-turn thread stays workable. The ledger shows what each continuation actually cost, and flags the runs where replay overhead dominated, so an expensive session is visible before the invoice rather than after it.</p>
+
+        <h3>Codex is a runtime, not the product</h3>
+        <p>Muster treats Codex as one adapter behind its own contract, alongside a native runtime, Claude Code, Cursor SDK, OpenHands and Pi. Sessions, memory scoping, the token ledger, and the observed file-change stream sit above the runtime boundary, so switching backends mid-project does not throw away the record. <code>muster runtime doctor</code> checks that the Codex CLI is reachable and correctly configured before you depend on it.</p>
+        <p>This also means the audit story does not change when the backend does. Whichever runtime executed the turn, the file-change evidence came from watching the workspace, and the receipt for it reproduces byte-identically on a different machine.</p>
+        <p class="proof-link"><a href="/live-inline-diff.html">How observed file changes work →</a> <a href="/docs.html">Read the docs →</a></p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>© <span id="year">2026</span> Muster — open source, MIT</span>
+      <span class="footer-sep">·</span>
+      <a href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+      <span class="footer-sep">·</span>
+      <a href="/docs.html">Docs</a>
+      <span class="footer-sep">·</span>
+      <a href="/live-inline-diff.html">Live diff evidence</a>
+    </div>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>QM Alternative — Muster</title>
+  <meta name="description" content="QM gives every person and room its own scoped memory, files and permissions. Muster adds an observed-truth file-change audit and a token ledger. An honest comparison of two scope-first, self-hosted AI agent frameworks." />
+  <meta name="keywords" content="QM alternative, alternative to QM agent, yc qm agent, self-hosted AI agent, AI agent with memory, AI agent audit trail" />
+  <meta name="robots" content="index, follow, max-image-preview:large" />
+  <link rel="canonical" href="https://themuster.dev/muster-vs-qm.html" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="Muster" />
+  <meta property="og:title" content="QM Alternative — Muster" />
+  <meta property="og:description" content="QM ships scope-owned memory and grant-based skill sharing. Muster ships receipted, observed file-change truth. The closest comparison Muster has." />
+  <meta property="og:url" content="https://themuster.dev/muster-vs-qm.html" />
+  <meta property="og:image" content="https://themuster.dev/assets/brand/muster-og.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:image" content="https://themuster.dev/assets/brand/muster-og.png" />
+  <link rel="preconnect" href="https://api.fontshare.com" crossorigin />
+  <link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=clash-display@600,700&f[]=hanken-grotesk@400,500,600,700&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" />
+  <script type="module" src="/src/main.ts"></script>
+  <script type="application/ld+json">
+    {"@context":"https://schema.org","@type":"Article","headline":"QM Alternative — Muster","description":"An honest comparison between QM and Muster for teams choosing a scope-first, self-hosted, open-source AI agent framework.","url":"https://themuster.dev/muster-vs-qm.html","mainEntityOfPage":"https://themuster.dev/muster-vs-qm.html","author":{"@type":"Organization","name":"Muster","url":"https://themuster.dev/"},"publisher":{"@type":"Organization","name":"Muster","url":"https://themuster.dev/"},"dateModified":"2026-08-27"}
+  </script>
+</head>
+<body>
+  <div id="scroll-progress" aria-hidden="true"></div>
+  <div id="hero-stage" aria-hidden="true"><canvas id="hero-canvas"></canvas></div>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Muster home"><img src="/assets/brand/muster-logo.png" alt="Muster" /></a>
+    <nav aria-label="Main">
+      <a href="/">Home</a>
+      <a href="/live-inline-diff.html">Live diff</a>
+      <a href="/docs.html">Docs</a>
+      <a href="/guides.html">Guides</a>
+      <a class="nav-cta" href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+    </nav>
+  </header>
+  <main>
+    <section class="hero">
+      <div class="hero-inner">
+        <p class="kicker hero-step">comparison · qm alternative</p>
+        <h1 class="hero-step">QM alternative: Muster, the same scope instinct with a receipted edit trail.</h1>
+        <p class="sub hero-step">QM is the closest thing to Muster that exists. Both refuse a single shared memory blob, both drive other coding backends behind one core, both are MIT. QM is further along on sharing. Muster is further along on proving what the agent actually did.</p>
+        <div class="hero-actions hero-step">
+          <a class="btn-cta" href="/live-inline-diff.html">See the head-to-head evidence</a>
+          <a class="btn-ghost" href="https://github.com/Dkm0315/muster" rel="noopener">Read the source →</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" data-reveal>
+      <p class="sec-kicker reveal-child">Side by side</p>
+      <h2 class="reveal-child">Two projects that agree on the problem.</h2>
+      <p class="sec-sub reveal-child">QM figures were read from the Y Combinator repository during the Muster strategy review on 2026-08-27. Muster publishes no star count of its own.</p>
+      <div class="proof-table cmp reveal-child" role="region" aria-label="QM compared with Muster">
+        <table>
+          <thead>
+            <tr><th>Dimension</th><th>QM (Y Combinator)</th><th>Muster</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>License / first release</td><td>MIT, July 2026</td><td class="muster">MIT</td></tr>
+            <tr><td>Scale (2026-08-27)</td><td>14.3k stars, 185 commits</td><td class="muster">Young project, no star claim made</td></tr>
+            <tr><td>Scope model</td><td>Per-person and per-room scopes, each with its own memory, files, keychain, permissions and crons</td><td class="muster">Tenant, workspace, user, role and session memory lanes with leakage tests</td></tr>
+            <tr><td>Sharing</td><td><strong>Skills shareable by grant</strong>, admin-gated promotion to org scope</td><td class="muster">Grants with audience, purpose, expiry and revocation — designed, not yet shipped</td></tr>
+            <tr><td>Skill distribution</td><td>Skill packs imported from git</td><td class="muster">Capability packs — 34 declared, 2 substantial</td></tr>
+            <tr><td>Backends driven</td><td>Pi, OpenCode, Codex, Claude Code behind one core</td><td class="muster">Native, Codex, Claude Code, Cursor SDK, OpenHands, Pi behind one contract</td></tr>
+            <tr><td>Isolation</td><td><strong>Durable sandbox per scope</strong>; Postgres-backed</td><td class="muster">Local-first store; sandboxing is not Muster's differentiator</td></tr>
+            <tr><td>File-change record</td><td>Reported by the driven backend</td><td class="muster"><strong>Observed from git + filesystem</strong>, sha256 before/after</td></tr>
+            <tr><td>Audit receipts</td><td>Not a stated design goal</td><td class="muster"><strong>Deterministic <code>receiptHash</code></strong> — reproducible off-machine</td></tr>
+            <tr><td>Token accounting</td><td>Provider-side</td><td class="muster">Local ledger with replay-waste flags</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="proof-link reveal-child"><a href="/live-inline-diff.html">How the observed file-change stream was measured →</a></p>
+    </section>
+
+    <section class="band band-alt" data-reveal>
+      <p class="sec-kicker reveal-child">The honest read</p>
+      <h2 class="reveal-child">The nearest neighbour, and the one comparison where Muster is not outgunned on breadth.</h2>
+      <div class="prose reveal-child">
+        <p>Most agent-framework comparisons are Muster against something an order of magnitude larger. QM is not that. It shipped in July 2026 with 185 commits, and it arrived at several of the same conclusions Muster did, independently: that a single global memory is wrong, that scopes need to own their own files and permissions rather than share a namespace, and that the right architecture drives existing coding backends rather than writing another one.</p>
+        <p>Where QM is clearly ahead is <strong>sharing</strong>. QM skills are owned by a scope and shareable by explicit grant, with admin-gated promotion into the organisation. That is a complete answer to a question Muster has specified but not yet shipped. Muster's own strategy document is blunt about it: shared memory will not ship as a shared folder — it ships as grants carrying audience, purpose, expiry and revocation, or it does not ship. Until that lands, QM's grant model is the working implementation and Muster's is a design.</p>
+        <p>QM's durable per-scope sandbox is also a real advantage. If your requirement is that each person's or room's agent runs in its own isolated, persistent environment with its own keychain and crons, QM does that today and it is a well-chosen primitive.</p>
+
+        <h3>Where Muster is ahead: the edit trail</h3>
+        <p>QM's core drives Pi, OpenCode, Codex and Claude Code. That is the same inversion Muster makes — good architecture, and it means QM inherits the same blind spot every backend-driving harness inherits: the file-change record is whatever the driven backend reports.</p>
+        <p>Muster measured what that costs. Across five live runs against the Codex app-server protocol — three protocol probes and two full head-to-head recordings — Codex's structured file-change notification fired <strong>zero times out of five</strong> while every edit landed on disk, and both head-to-head runs recorded zero <code>turn/diff/updated</code> notifications as well. A harness driving Codex and trusting its patch stream would have logged an empty change set for real work, and would have had no way to notice.</p>
+        <p>Muster's workspace observer derives the change set instead of receiving it. It pins a git revision when the run starts and re-derives the full diff from git plus the filesystem each cycle, hashing every file before and after, with watch events used only as a trigger to re-derive. It is strictly read-only against your repo and its git index. In the two head-to-head runs it caught the edit in <strong>86ms and 75ms</strong> against a 1000ms budget, with the diff verified by <code>git apply</code>. Two observer processes in different temporary directories, roughly forty minutes apart, produced a byte-identical <code>receiptHash</code> for the same logical change — which is what makes it a citable artifact rather than a local log line.</p>
+
+        <h3>Where Muster is ahead: cost visibility and gated learning</h3>
+        <p>Muster keeps a local token ledger per run, including a replay-waste flag when a run resends far more history than it needed to. On a deterministic five-scenario benchmark of 170 turns, a naive replay-everything harness sends 875.8k tokens where Muster sends 355.2k — a 59.4% reduction, reproducible with <code>muster benchmark</code> and with no model calls involved.</p>
+        <p>Learning is gated the same way. Feedback becomes a test fixture before it is promoted into durable behaviour, so every behavioural change carries a check that it still does what it was supposed to do.</p>
+
+        <h3>Choose QM when</h3>
+        <ul>
+          <li>Per-person and per-room isolation with a durable sandbox is the core requirement.</li>
+          <li>You need skill sharing by grant, with org-level promotion, working today.</li>
+          <li>You want Postgres-backed infrastructure and git-imported skill packs.</li>
+        </ul>
+
+        <h3>Choose Muster when</h3>
+        <ul>
+          <li>The file-change record has to be derived from the workspace, not from the backend's self-report.</li>
+          <li>You need deterministic receipts that reproduce on a machine that was not there.</li>
+          <li>Token spend and replay waste need to be visible in your own ledger.</li>
+          <li>Frappe or ERPNext is the system of record.</li>
+        </ul>
+        <p>If you are evaluating both, the deciding question is narrow: does anyone downstream need to verify the agent's edits independently of the agent? If yes, that is the gap Muster closes. If no, QM's sharing and sandboxing are further along.</p>
+        <p class="proof-link"><a href="/muster-vs-openclaw.html">Compare against OpenClaw →</a> <a href="/muster-vs-hermes-agent.html">Compare against Hermes Agent →</a> <a href="/docs.html">Read the docs →</a></p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>© <span id="year">2026</span> Muster — open source, MIT</span>
+      <span class="footer-sep">·</span>
+      <a href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+      <span class="footer-sep">·</span>
+      <a href="/docs.html">Docs</a>
+      <span class="footer-sep">·</span>
+      <a href="/live-inline-diff.html">Live diff evidence</a>
+    </div>
+  </footer>
+</body>
+</html>

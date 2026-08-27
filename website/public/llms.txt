@@ -1,44 +1,81 @@
 # Muster
 
-Muster is an open-source governed agent harness for production AI agents.
+Muster is an open source AI agent framework you can self-host and audit. It is
+MIT-licensed, written in TypeScript, and stores sessions, memory and the token
+ledger locally.
 
 Website: https://themuster.dev/
 Repository: https://github.com/Dkm0315/muster
-Docs: https://themuster.dev/docs.html
-Frappe AI: https://themuster.dev/frappe-ai.html
-Agent harness: https://themuster.dev/agent-harness.html
-MCP agent harness: https://themuster.dev/mcp-agent-harness.html
-Slack AI agent: https://themuster.dev/slack-ai-agent.html
-Telegram AI agent: https://themuster.dev/telegram-ai-agent.html
-Google Chat AI agent: https://themuster.dev/google-chat-ai-agent.html
-Browser automation agent: https://themuster.dev/browser-automation-agent.html
-Guides: https://themuster.dev/guides.html
-What is an agent harness?: https://themuster.dev/guide-agent-harness.html
-MCP agent harness with token visibility: https://themuster.dev/guide-mcp-agent-harness.html
-Frappe AI with DocType-aware retrieval: https://themuster.dev/guide-frappe-ai.html
-Governed memory for long-running AI agents: https://themuster.dev/guide-governed-memory.html
+License: MIT
 
-Core positioning:
-- Governed agent harness for long-running AI agents
-- Scoped memory, token ledger, eval-gated learning, MCP capabilities
-- Browser automation and Frappe / ERPNext support
-- Gateway adapters for Telegram, Slack, Google Chat, Teams, Discord, WhatsApp, and web surfaces
-- Frappe AI and ERPNext AI context packs for DocTypes, fields, workflows, reports, scripts, and permission-aware setup
-- Multi-provider routing while keeping governance outside the model provider
+## What makes it different
 
-Useful pages:
-- Home: https://themuster.dev/
-- Docs: https://themuster.dev/docs.html
-- Frappe AI: https://themuster.dev/frappe-ai.html
-- Agent harness: https://themuster.dev/agent-harness.html
+Most agent harnesses record file changes from what the agent reports it did.
+Muster derives them by observing the workspace. It pins a git baseline when a
+run starts, re-derives the full change set from git plus the filesystem every
+cycle, hashes file content before and after, and emits a deterministic receipt.
+
+Measured live on 2026-08-27 (docs/STRATEGY_V2.md §9), across 5 runs against the
+Codex app-server protocol — 3 protocol probes and 2 head-to-head recordings:
+
+- Codex `item/fileChange/patchUpdated`: 0 of 5 real edits reported
+- Codex `turn/diff/updated`: 0 in both head-to-head runs
+- Muster observer `workspace.patch`: reported the edit in both runs it was
+  attached to, diff verified by `git apply`
+- Detection latency: 86ms (earlier run 75ms) against a 1000ms budget
+- Cross-run receipt determinism: two observer processes, different temp dirs,
+  ~40 minutes apart, same logical change → byte-identical receiptHash
+
+The finding is version- and model-specific and should be re-measured against
+each Codex release rather than assumed permanent.
+
+## Honest limits
+
+- Muster ships 34 capability packs, of which only 2 are substantial.
+- It does not compete on plugin breadth. OpenClaw (387.8k stars, 83,433 commits)
+  and Hermes Agent (237.1k stars, 25,737 commits) have far deeper ecosystems.
+- Grant-based memory sharing (audience, purpose, expiry, revocation) is
+  specified but not yet shipped; QM's grant model works today.
+- `workspace.patch.diff` would broadcast raw file content unredacted; nothing
+  emits it yet, and a redaction layer must land before anything does.
+- Muster publishes no star count of its own. It is early.
+
+## Core capabilities
+
+- Observed file-change truth with deterministic, reproducible receipts
+- Append-only event spine: 22 typed events, monotonic sequences, fencing tokens,
+  idempotency keys, and a reducer invariant rejecting secrets or chain-of-thought
+- Scoped memory lanes: tenant, workspace, user, role, session — with leakage tests
+- Local token ledger with replay-waste flags; `muster benchmark` measures 875.8k
+  naive tokens vs 355.2k (59.4% reduction) across 5 scenarios / 170 turns,
+  deterministically and with no model calls
+- Eval-gated learning: feedback becomes a test fixture before behaviour changes
+- Pluggable runtimes: native, Codex, Claude Code, Cursor SDK, OpenHands, Pi
+- MCP capability policy: include/exclude, OAuth setup, result caps, circuit breakers
+- Channel gateway: terminal, web, Telegram, Slack, Google Chat, Teams, Discord, WhatsApp
+- ERPNext / Frappe context packs: DocTypes, fields, workflows, reports, scripts,
+  permission-aware setup — the one integration that is deep rather than declared
+- Multi-provider routing that keeps governance outside the model provider
+
+## Pages
+
+- Open source AI agent framework (home): https://themuster.dev/
+- AI agent audit trail / live inline diff: https://themuster.dev/live-inline-diff.html
+- Self-hosted AI agent: https://themuster.dev/agent-harness.html
+- AI agent with memory: https://themuster.dev/guide-governed-memory.html
+- Resume Codex sessions: https://themuster.dev/resume-codex-sessions.html
+- ERPNext AI agent: https://themuster.dev/frappe-ai.html
+- OpenClaw alternative: https://themuster.dev/muster-vs-openclaw.html
+- Hermes Agent alternative: https://themuster.dev/muster-vs-hermes-agent.html
+- QM alternative: https://themuster.dev/muster-vs-qm.html
 - MCP agent harness: https://themuster.dev/mcp-agent-harness.html
 - Slack AI agent: https://themuster.dev/slack-ai-agent.html
 - Telegram AI agent: https://themuster.dev/telegram-ai-agent.html
 - Google Chat AI agent: https://themuster.dev/google-chat-ai-agent.html
 - Browser automation agent: https://themuster.dev/browser-automation-agent.html
-- Guides: https://themuster.dev/guides.html
+- Docs: https://themuster.dev/docs.html
+- Guides index: https://themuster.dev/guides.html
 - What is an agent harness?: https://themuster.dev/guide-agent-harness.html
 - MCP agent harness with token visibility: https://themuster.dev/guide-mcp-agent-harness.html
 - Frappe AI with DocType-aware retrieval: https://themuster.dev/guide-frappe-ai.html
-- Governed memory for long-running AI agents: https://themuster.dev/guide-governed-memory.html
 - GitHub: https://github.com/Dkm0315/muster

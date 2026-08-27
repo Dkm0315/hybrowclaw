@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { appendFile, mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import { addMemory, formatMemoryScope, inspectMemoryStore, memoryDbPath, memoryPath, parseMemoryScope, probeMemorySearchLatency, promoteMemory, rebuildMemoryIndex, recallMemory, searchMemory, searchMemoryWithReceipts } from "../src/index.js";
+import { addMemory, findMemory, formatMemoryScope, inspectMemoryStore, isVisibleInScopes, memoryDbPath, memoryPath, parseMemoryScope, probeMemorySearchLatency, promoteMemory, rebuildMemoryIndex, recallMemory, searchMemory, searchMemoryWithReceipts } from "../src/index.js";
 
 test("searchMemory only returns objects visible to every required scope", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-memory-"));
@@ -386,3 +387,182 @@ test("parseMemoryScope rejects malformed scopes", () => {
   assert.throws(() => parseMemoryScope("user"), /Invalid memory scope/);
   assert.throws(() => parseMemoryScope("unknown:1"), /Invalid memory scope/);
 });
+
+test("FTS recall stems query terms so singular queries match plural summaries", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-memory-stemming-"));
+  const scopes = [parseMemoryScope("tenant:hybrow"), parseMemoryScope("user:dhairya")];
+  const deploys = await addMemory({
+    summary: "Tenant A deploys to erp-a.example.com",
+    provenance: ["stemming:test"],
+    scopes,
+  }, cwd);
+  const runs = await addMemory({
+    summary: "Backup job runs nightly at 02:00 UTC.",
+    provenance: ["stemming:test"],
+    scopes,
+  }, cwd);
+  const deployment = await addMemory({
+    summary: "Deployment window opens on Friday.",
+    provenance: ["stemming:test"],
+    scopes,
+  }, cwd);
+
+  assert.deepEqual((await searchMemory({ scopes, query: "deploy" }, cwd)).map((object) => object.id), [deploys.id]);
+  assert.deepEqual((await searchMemory({ scopes, query: "deploys" }, cwd)).map((object) => object.id), [deploys.id]);
+  // Porter folds -s/-ing to a shared stem, so "running", "runs", and "run" are one term.
+  assert.deepEqual((await searchMemory({ scopes, query: "running" }, cwd)).map((object) => object.id), [runs.id]);
+  assert.deepEqual((await searchMemory({ scopes, query: "run" }, cwd)).map((object) => object.id), [runs.id]);
+  // Boundary: SQLite's porter tokenizer does not fold -ment, so "deploy" never reaches "deployment".
+  assert.ok(!(await searchMemory({ scopes, query: "deploy" }, cwd)).some((object) => object.id === deployment.id));
+
+  const receipts = await searchMemoryWithReceipts({ scopes, query: "where does tenant a deploy", limit: 3, match: "any" }, cwd);
+  assert.equal(receipts.backend, "sqlite-fts5");
+  assert.ok(receipts.receipts.some((receipt) => receipt.memory.id === deploys.id));
+});
+
+test("stemmed recall still blocks cross-scope leakage", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-memory-stemming-leak-"));
+  const mine = [parseMemoryScope("tenant:hybrow"), parseMemoryScope("user:dhairya")];
+  const theirs = [parseMemoryScope("tenant:hybrow"), parseMemoryScope("user:someone-else")];
+  const own = await addMemory({ summary: "Tenant A deploys to erp-a.example.com", provenance: ["leak:test"], scopes: mine }, cwd);
+  const forbidden = await addMemory({ summary: "Tenant B deploys to erp-b.example.com", provenance: ["leak:test"], scopes: theirs }, cwd);
+
+  const rebuilt = await rebuildMemoryIndex(cwd);
+  assert.equal(rebuilt.inspection.index.readable, true);
+
+  const visible = await searchMemory({ scopes: mine, query: "deploy" }, cwd);
+  assert.deepEqual(visible.map((object) => object.id), [own.id]);
+  const globalView = await searchMemory({ scopes: [parseMemoryScope("global:global")], query: "deploy" }, cwd);
+  assert.equal(globalView.length, 0);
+  assert.equal(isVisibleInScopes(await findMemory(forbidden.id, cwd) ?? own, mine), false);
+});
+
+test("legacy default-tokenizer index auto-migrates to the stemming schema on open", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-memory-index-migration-"));
+  const scopes = [parseMemoryScope("tenant:hybrow"), parseMemoryScope("user:dhairya")];
+  const memory = await addMemory({
+    summary: "Tenant A deploys to erp-a.example.com",
+    provenance: ["migration:test"],
+    scopes,
+  }, cwd);
+  downgradeMemoryIndexToDefaultTokenizer(cwd);
+
+  // The pre-porter index really cannot answer the singular query.
+  assert.equal(ftsMatchCount(cwd, "deploy"), 0);
+  assert.equal(ftsMatchCount(cwd, "deploys"), 1);
+  const stale = await inspectMemoryStore(cwd);
+  assert.equal(stale.index.schema, undefined);
+  assert.equal(stale.checks.find((check) => check.label === "index_schema")?.status, "warning");
+
+  const migrated = await searchMemory({ scopes, query: "deploy" }, cwd);
+  assert.deepEqual(migrated.map((object) => object.id), [memory.id]);
+
+  const healthy = await inspectMemoryStore(cwd);
+  assert.match(healthy.index.schema ?? "", /porter unicode61/);
+  assert.equal(healthy.checks.find((check) => check.label === "index_schema")?.status, "passed");
+  assert.equal(healthy.index.fresh, true);
+  assert.equal(ftsMatchCount(cwd, "deploy"), 1);
+});
+
+test("memory entry points reject missing or wrong-typed input with named-field errors", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-memory-negative-input-"));
+  const scopes = [parseMemoryScope("user:dhairya")];
+  const seeded = await addMemory({ summary: "Seeded fact for negative input checks.", provenance: ["negative:test"], scopes }, cwd);
+
+  await rejectsNamedField(() => addMemory({ summary: "No provenance", scopes } as never, cwd), /addMemory requires provenance: at least one non-empty source/);
+  await rejectsNamedField(() => addMemory({ summary: "Blank provenance", provenance: ["  "], scopes } as never, cwd), /addMemory requires provenance/);
+  await rejectsNamedField(() => addMemory({ provenance: ["p"], scopes } as never, cwd), /addMemory requires summary/);
+  await rejectsNamedField(() => addMemory({ summary: "   ", provenance: ["p"], scopes } as never, cwd), /addMemory requires summary/);
+  await rejectsNamedField(() => addMemory({ summary: "No scopes", provenance: ["p"] } as never, cwd), /addMemory requires scopes/);
+  await rejectsNamedField(() => addMemory({ summary: "Bad scopes", provenance: ["p"], scopes: "user:dhairya" } as never, cwd), /addMemory requires scopes/);
+  await rejectsNamedField(() => addMemory({ summary: "Null scope entry", provenance: ["p"], scopes: [null] } as never, cwd), /Invalid memory scope entry/);
+  await rejectsNamedField(() => addMemory({ summary: "Bad provenance entry", provenance: [7], scopes } as never, cwd), /addMemory requires provenance: every entry must be a string/);
+  await rejectsNamedField(() => addMemory({ summary: "Bad confidence", provenance: ["p"], scopes, confidence: "high" } as never, cwd), /addMemory requires confidence/);
+  await rejectsNamedField(() => addMemory({ summary: "Bad confidence", provenance: ["p"], scopes, confidence: 4 } as never, cwd), /addMemory requires confidence/);
+  await rejectsNamedField(() => addMemory({ summary: "Bad observedAt", provenance: ["p"], scopes, observedAt: "not-a-date" } as never, cwd), /addMemory requires observedAt/);
+  await rejectsNamedField(() => addMemory({ summary: "Bad redaction", provenance: ["p"], scopes, redactionState: "secret" } as never, cwd), /addMemory requires redactionState/);
+  await rejectsNamedField(() => addMemory(undefined as never, cwd), /addMemory requires an input object/);
+
+  await rejectsNamedField(() => searchMemory({ query: "anything" } as never, cwd), /searchMemory requires scopes/);
+  await rejectsNamedField(() => searchMemory({ scopes: [] } as never, cwd), /searchMemory requires scopes/);
+  await rejectsNamedField(() => searchMemory({ scopes, query: 42 } as never, cwd), /searchMemory requires query/);
+  await rejectsNamedField(() => searchMemory({ scopes, limit: "ten" } as never, cwd), /searchMemory requires limit/);
+  await rejectsNamedField(() => searchMemory({ scopes, match: "fuzzy" } as never, cwd), /searchMemory requires match/);
+  await rejectsNamedField(() => searchMemory(null as never, cwd), /searchMemory requires an input object/);
+
+  await rejectsNamedField(() => searchMemoryWithReceipts({ query: "anything" } as never, cwd), /searchMemoryWithReceipts requires scopes/);
+  await rejectsNamedField(() => searchMemoryWithReceipts({ scopes, candidateLimit: "many" } as never, cwd), /searchMemoryWithReceipts requires candidateLimit/);
+  await rejectsNamedField(() => searchMemoryWithReceipts({ scopes, minScore: "high" } as never, cwd), /searchMemoryWithReceipts requires minScore/);
+  await rejectsNamedField(() => searchMemoryWithReceipts({ scopes, expandLinked: "yes" } as never, cwd), /searchMemoryWithReceipts requires expandLinked/);
+
+  await rejectsNamedField(() => promoteMemory({ targetScopes: scopes } as never, cwd), /promoteMemory requires id/);
+  await rejectsNamedField(() => promoteMemory({ id: seeded.id } as never, cwd), /promoteMemory requires targetScopes/);
+  await rejectsNamedField(() => promoteMemory({ id: seeded.id, targetScopes: [] } as never, cwd), /promoteMemory requires targetScopes/);
+  await rejectsNamedField(() => promoteMemory({ id: seeded.id, targetScopes: scopes, allowGlobal: "yes" } as never, cwd), /promoteMemory requires allowGlobal/);
+  await rejectsNamedField(() => promoteMemory(undefined as never, cwd), /promoteMemory requires an input object/);
+
+  await rejectsNamedField(() => findMemory(undefined as never, cwd), /findMemory requires id/);
+  await rejectsNamedField(() => probeMemorySearchLatency({ scopes, runs: "five" } as never, cwd), /probeMemorySearchLatency requires runs/);
+  await rejectsNamedField(() => probeMemorySearchLatency({ query: "x" } as never, cwd), /probeMemorySearchLatency requires scopes/);
+
+  throwsNamedField(() => parseMemoryScope(undefined as never), /parseMemoryScope requires value/);
+  throwsNamedField(() => formatMemoryScope(undefined as never), /formatMemoryScope requires scope/);
+  throwsNamedField(() => isVisibleInScopes(undefined as never, scopes), /isVisibleInScopes requires an input object/);
+  throwsNamedField(() => isVisibleInScopes({ ...seeded, scopes: undefined } as never, scopes), /isVisibleInScopes requires object.scopes/);
+  throwsNamedField(() => isVisibleInScopes(seeded, undefined as never), /isVisibleInScopes requires allowedScopes/);
+});
+
+test("isVisibleInScopes hides malformed zero-scope memories from direct reads", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-memory-zero-scope-visibility-"));
+  const memory = await addMemory({ summary: "Scoped fact.", provenance: ["zero:test"], scopes: [parseMemoryScope("user:dhairya")] }, cwd);
+
+  assert.equal(isVisibleInScopes(memory, [parseMemoryScope("user:dhairya")]), true);
+  assert.equal(isVisibleInScopes({ ...memory, scopes: [] }, [parseMemoryScope("user:dhairya")]), false);
+});
+
+function downgradeMemoryIndexToDefaultTokenizer(cwd: string): void {
+  const db = new DatabaseSync(memoryDbPath(cwd));
+  try {
+    db.exec(`
+      DROP TRIGGER IF EXISTS memory_ai;
+      DROP TRIGGER IF EXISTS memory_ad;
+      DROP TRIGGER IF EXISTS memory_au;
+      DROP TABLE IF EXISTS memory_fts;
+      CREATE VIRTUAL TABLE memory_fts USING fts5(searchable_text, content='memory', content_rowid='rowid');
+      INSERT INTO memory_fts(memory_fts) VALUES('rebuild');
+      DELETE FROM memory_meta WHERE key = 'index_schema';
+    `);
+  } finally {
+    db.close();
+  }
+}
+
+function ftsMatchCount(cwd: string, term: string): number {
+  const db = new DatabaseSync(memoryDbPath(cwd));
+  try {
+    const row = db.prepare("SELECT COUNT(*) AS count FROM memory_fts WHERE memory_fts MATCH ?").get(`"${term}"`) as { count?: number } | undefined;
+    return Number(row?.count ?? 0);
+  } finally {
+    db.close();
+  }
+}
+
+async function rejectsNamedField(run: () => Promise<unknown>, pattern: RegExp): Promise<void> {
+  await assert.rejects(run, (error: unknown) => {
+    assertNamedFieldError(error, pattern);
+    return true;
+  });
+}
+
+function throwsNamedField(run: () => unknown, pattern: RegExp): void {
+  assert.throws(run, (error: unknown) => {
+    assertNamedFieldError(error, pattern);
+    return true;
+  });
+}
+
+function assertNamedFieldError(error: unknown, pattern: RegExp): void {
+  assert.ok(error instanceof Error, `expected an Error, received ${String(error)}`);
+  assert.ok(!(error instanceof TypeError), `expected a named-field Error, received TypeError: ${error.message}`);
+  assert.match(error.message, pattern);
+}

@@ -366,14 +366,26 @@ a { color: inherit; text-decoration: none; }
 .docs-grid .rail { position: sticky; top: 0; align-self: start; max-height: 100vh; overflow-y: auto; }
 .docs-main { max-width: 880px; }
 .docs-section { margin-bottom: 56px; scroll-margin-top: 24px; }
-.docs-section h1 {
+/* One h1 per page: `.docs-title` is the page heading, and each section below it
+   starts at h2. The section rule keeps the visual weight the old per-section h1
+   had — only the tag changed, not the design. */
+.docs-title {
+  font-family: var(--mono);
+  font-size: 15px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin: 0 0 32px;
+  font-weight: 600;
+}
+.docs-section h2 {
   font-family: var(--mono);
   font-size: 22px;
   margin: 0 0 10px;
   padding-bottom: 8px;
   border-bottom: 1px solid var(--line);
 }
-.docs-section h2 { font-size: 15px; margin: 26px 0 8px; color: var(--accent); font-weight: 600; }
+.docs-section h3 { font-size: 15px; margin: 26px 0 8px; color: var(--accent); font-weight: 600; }
 .docs-section p { margin: 0 0 12px; color: var(--ink-dim); }
 .docs-section strong { color: var(--ink); }
 .docs-section em { color: var(--ink); }

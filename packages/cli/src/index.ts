@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { printBanner, renderBanner } from "./banner.js";
 import { createMusterAutocompleteProvider, formatWorkingIndicator, runMusterChatTui, type MusterChatSink, type MusterCompletionCatalog, type PickerOption } from "./chat-tui.js";
+import { startLiveDiffFeed } from "./live-diff.js";
 import { hasCompletedMusterOnboarding, runMusterOnboardingTui } from "./onboarding-tui.js";
 import { runFrappe2RealPromptsQa } from "./qa-frappe2.js";
 import { runFrappeConnectCommand } from "./frappe-connect-command.js";
@@ -185,6 +186,11 @@ import {
   renderIntegrityReport,
   connectMcpServers,
   clearCodexAppServerSessions,
+  discoverCodexSessions,
+  importCodexSession,
+  matchCodexThread,
+  resolveCodexForkChain,
+  type CodexSessionSummary,
   artifact_goal_passes,
   artifact_structural_verify,
   docx_document,
@@ -298,6 +304,9 @@ async function main(): Promise<void> {
       return;
     case "claude":
       await claude(args);
+      return;
+    case "codex":
+      await codexCommand(args);
       return;
     case "episodes":
       await episodes();
@@ -443,6 +452,8 @@ Usage:
   muster chat --session work --history
   muster claude inspect
   muster claude ask "prompt" [--model sonnet] [--effort low] [--timeout-ms 30000]
+  muster codex sessions [--limit 20] [--since 7d] [--here] [--all] [--json]
+  muster codex resume <thread-id-prefix> [--session name] [--import-only] [--here]
   muster episodes
   muster feedback <episode-id> --useful|--not-useful [--correct] [--reason "..."]
   muster candidates
@@ -852,6 +863,20 @@ interface ChatState {
   pendingMenu?: ChatMenu;
   pendingSuggestion?: ChatSelectedSuggestion;
   statusSink?: MusterChatSink;
+  /** undefined ⇒ follow the environment default; see liveDiffEnabled. */
+  liveDiff?: boolean;
+  /**
+   * Workspace the turn executes in. Set by `muster codex resume` so a resumed
+   * Codex thread keeps editing the repo it was started against, not wherever
+   * the user happened to type the command. undefined ⇒ process.cwd().
+   */
+  workspaceCwd?: string;
+  /**
+   * Native Codex thread to continue on the NEXT turn only. `executeRun` forwards
+   * it to `thread/resume`, then persists its own handle for the conversation, so
+   * this is cleared once used (see resumeCodexThread).
+   */
+  resumeThreadId?: string;
 }
 
 const DEFAULT_CHAT_SESSION = "main";
@@ -886,6 +911,7 @@ const CHAT_COMMANDS: readonly ChatCommandDef[] = [
   { name: "model", usage: "/model <name>", description: "switch active model for the current provider" },
   { name: "runtime", usage: "/runtime [id]", description: "list or switch active runtime" },
   { name: "speed", usage: "/speed [session|fast]", description: "choose full memory mode or low-latency warm native mode" },
+  { name: "live-diff", usage: "/live-diff [on|off]", description: "show inline file diffs live while a turn edits files", aliases: ["livediff", "diffs"] },
   { name: "sessions", usage: "/sessions [limit]", description: "list recent named chats", aliases: ["ls"] },
   { name: "resume", usage: "/resume <name|id>", description: "switch to a prior named chat or session id", aliases: ["use"] },
   { name: "name", usage: "/name <name>", description: "switch current reference name" },
@@ -988,8 +1014,12 @@ async function chat(commandArgs: string[]): Promise<void> {
     speedMode: commandArgs.includes("--fast") ? "fast" : "session",
     scopes: readFlags(commandArgs, "--scope").map(parseMemoryScope),
     recallLimit: readNumberFlag(commandArgs, "--recall-limit"),
+    liveDiff: readLiveDiffFlag(commandArgs),
+    // First turn only: after it lands, executeRun stores a session handle for
+    // this conversation and later turns resume the thread without the flag.
+    resumeThreadId: readFlag(commandArgs, "--codex-thread"),
   };
-  const prompt = stripFlags(commandArgs, ["--session", "--name", "--runtime", "--provider", "--model", "--scope", "--recall-limit", "--timeout-ms", "--continue", "--tools", "--complete", "--limit"]).filter((arg) => !["--commands", "--shortcuts", "--list", "--sessions", "--history", "--fast", "--session-speed", "--skip-onboarding", "--no-onboarding"].includes(arg)).join(" ").trim();
+  const prompt = stripFlags(commandArgs, ["--session", "--name", "--runtime", "--provider", "--model", "--scope", "--recall-limit", "--timeout-ms", "--continue", "--tools", "--complete", "--limit", "--codex-thread"]).filter((arg) => !["--commands", "--shortcuts", "--list", "--sessions", "--history", "--fast", "--session-speed", "--skip-onboarding", "--no-onboarding", "--live-diff", "--no-live-diff"].includes(arg)).join(" ").trim();
   if (commandArgs.includes("--list") || commandArgs.includes("--sessions")) {
     printChatSessions(readNumberFlag(commandArgs, "--limit") ?? 15);
     return;
@@ -1059,6 +1089,8 @@ Usage:
   muster chat --session work "prompt"       # session-backed turn in a named session
   muster chat --fast "prompt"               # warm native session with light context
   muster chat --continue [name]             # resume by name, or most recent named chat
+  muster chat --codex-thread <id> "prompt"  # continue a native Codex thread (see muster codex sessions)
+  muster chat --no-live-diff                # stop streaming inline file diffs during a turn
   muster chat --session work --history      # show a named session
   muster chat --tools [toolset]             # list built-in tools
   muster chat --commands                    # show compact command catalog
@@ -1476,6 +1508,9 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
       return true;
     case "speed":
       switchChatSpeed(args, state);
+      return true;
+    case "live-diff":
+      toggleChatLiveDiff(args, state);
       return true;
     case "sessions":
     case "resume-list":
@@ -1965,6 +2000,18 @@ async function runChatTurn(text: string, state: ChatState, options: { timeoutMs?
   const agentId = routed?.agentId;
   const config = await loadConfig();
   const mentionedCapabilities = await printMentionedCapabilityChecks(prompt, config, { interactive: Boolean(state.statusSink) });
+  // The turn SHOWS its own edits: every observed workspace patch becomes a diff
+  // card in the transcript while the run streams (docs/STRATEGY_V2.md §9).
+  const workspaceCwd = chatWorkspaceCwd(state);
+  const liveDiff = await startLiveDiffFeed({
+    cwd: workspaceCwd,
+    emit: (line) => emitChatLine(state, line),
+    enabled: liveDiffEnabled(state),
+  });
+  // Consumed by THIS turn only: once the run completes, executeRun has stored a
+  // session handle for the conversation and every later turn resumes from that.
+  const resumeThreadId = state.resumeThreadId;
+  state.resumeThreadId = undefined;
   const stopWorking = state.statusSink ? startTuiWorkingStatus(state.statusSink, agentId) : startWorkingStatus(agentId);
   let outcome: RunOutcome;
   try {
@@ -1975,7 +2022,7 @@ async function runChatTurn(text: string, state: ChatState, options: { timeoutMs?
       model: state.model,
       scopes: state.scopes.length ? state.scopes : undefined,
       recallLimit: state.recallLimit,
-      cwd: process.cwd(),
+      cwd: workspaceCwd,
       conversationKey: chatConversationKey(state.sessionName),
       surfaceId: "cli-chat",
       agentId,
@@ -1986,13 +2033,68 @@ async function runChatTurn(text: string, state: ChatState, options: { timeoutMs?
       nativeSession: true,
       nativeSessionKeepAlive: options.keepAlive ?? true,
       timeoutMs: options.timeoutMs,
+      ...(resumeThreadId ? { sessionId: resumeThreadId, resume: true } : {}),
     });
   } finally {
     stopWorking();
+    await liveDiff.finish().catch(() => {});
   }
   persistChatTranscriptIfMissing(state.sessionName, prompt, outcome);
   printAssistantResponse(outcome);
   openMentionedCapabilityPicker(state, mentionedCapabilities, config);
+}
+
+/**
+ * Precedence: explicit flag or /live-diff → env kill switch → on. The kill
+ * switch exists so a hostile-terminal or CI environment can silence the feed
+ * without touching a config file.
+ */
+/** The workspace a turn runs against — the resumed Codex thread's repo, or here. */
+function chatWorkspaceCwd(state: ChatState): string {
+  return state.workspaceCwd ?? process.cwd();
+}
+
+function liveDiffEnabled(state: ChatState): boolean {
+  if (state.liveDiff !== undefined) return state.liveDiff;
+  if (process.env.MUSTER_NO_LIVE_DIFF === "1" || process.env.MUSTER_LIVE_DIFF === "0") return false;
+  return true;
+}
+
+function readLiveDiffFlag(commandArgs: readonly string[]): boolean | undefined {
+  if (commandArgs.includes("--no-live-diff")) return false;
+  if (commandArgs.includes("--live-diff")) return true;
+  return undefined;
+}
+
+/**
+ * One line into whatever surface the turn owns. In the TUI that is the live
+ * transcript sink; on a plain TTY the spinner line is cleared first so a card
+ * never lands mid-frame.
+ */
+function emitChatLine(state: ChatState, line: string): void {
+  if (state.statusSink) {
+    state.statusSink.appendLine(line);
+    return;
+  }
+  if (process.stdout.isTTY) {
+    process.stdout.write(`\r\x1b[2K${line}\n`);
+    return;
+  }
+  console.log(line);
+}
+
+function toggleChatLiveDiff(args: string, state: ChatState): void {
+  const mode = args.trim().toLowerCase();
+  if (!mode) {
+    console.log(color(`live-diff=${liveDiffEnabled(state) ? "on" : "off"} — inline file diffs stream into this chat as the turn edits files`, "dim"));
+    return;
+  }
+  if (mode !== "on" && mode !== "off") {
+    console.log(color("Usage: /live-diff on or /live-diff off", "yellow"));
+    return;
+  }
+  state.liveDiff = mode === "on";
+  console.log(color(`live-diff=${mode}`, "green"));
 }
 
 function startTuiWorkingStatus(sink: MusterChatSink, agentId: string | undefined): () => void {
@@ -7622,6 +7724,203 @@ async function runPiPrompt(
   console.log("\n" + (result.stdout || result.errorMessage || "Pi returned no output") + "\n");
   console.log(`episode=${runId}`);
   if (result.status === "failed") process.exitCode = 1;
+}
+
+/**
+ * `muster codex` — pick up the Codex threads the user already has.
+ *
+ * Muster's codex backend resumes provider threads natively (`thread/resume`),
+ * and a rollout file under CODEX_HOME carries exactly the id that call wants.
+ * So "resume" is not a re-enactment: the transcript is imported so Muster's
+ * search/memory/ledger see the history, and the NEXT turn continues the real
+ * Codex thread with its own server-side context intact.
+ */
+async function codexCommand(args: string[]): Promise<void> {
+  const subcommand = args[0];
+  if (!subcommand || subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
+    printCodexHelp();
+    return;
+  }
+  if (subcommand === "sessions" || subcommand === "list" || subcommand === "ls") {
+    await codexSessionsCommand(args.slice(1));
+    return;
+  }
+  if (subcommand === "resume") {
+    await codexResumeCommand(args.slice(1));
+    return;
+  }
+  throw new Error("Usage: muster codex <sessions|resume>");
+}
+
+function printCodexHelp(): void {
+  console.log(`muster codex — resume the Codex threads you already have
+
+Usage:
+  muster codex sessions [--limit 20] [--since 7d] [--here] [--all] [--json]
+  muster codex resume <thread-id-prefix> [--session name] [--import-only] [--here]
+
+Options:
+  --limit n        rows to list (default 20)
+  --since 7d       only threads active within a span (7d, 24h, 30m) or since an ISO date
+  --here           only threads whose workspace is the current directory
+  --all            include multi-agent subagent threads (hidden by default)
+  --json           machine-readable output
+  --codex-home p   read a CODEX_HOME other than the default
+  --session name   muster chat session to attach the resumed thread to
+  --import-only    import the transcript without opening chat`);
+}
+
+interface CodexScanFlags {
+  readonly codexHome?: string;
+  readonly limit: number;
+  readonly since?: string;
+  readonly cwd?: string;
+  readonly includeSubagents: boolean;
+}
+
+function readCodexScanFlags(args: string[], defaultLimit: number): CodexScanFlags {
+  const codexHome = readFlag(args, "--codex-home");
+  const since = readFlag(args, "--since");
+  return {
+    ...(codexHome ? { codexHome } : {}),
+    limit: readNumberFlag(args, "--limit") ?? defaultLimit,
+    ...(since ? { since } : {}),
+    ...(args.includes("--here") ? { cwd: process.cwd() } : {}),
+    includeSubagents: args.includes("--all"),
+  };
+}
+
+async function codexSessionsCommand(args: string[]): Promise<void> {
+  const flags = readCodexScanFlags(args, 20);
+  const result = await discoverCodexSessions(flags);
+  if (args.includes("--json")) {
+    console.log(JSON.stringify(result, undefined, 2));
+    return;
+  }
+  if (!result.sessions.length) {
+    console.log(`No Codex sessions found under ${result.root}.`);
+    if (result.subagentsHidden) console.log(`${result.subagentsHidden} subagent thread(s) hidden — pass --all to include them.`);
+    return;
+  }
+  console.log(color("id        project                age     turns  first message", "cyan"));
+  for (const session of result.sessions) {
+    console.log([
+      session.threadId.slice(0, 8),
+      codexProjectLabel(session).padEnd(21).slice(0, 21),
+      formatCodexAge(session.lastActivityAt).padStart(6),
+      `${session.turnCount}${session.turnCountExact ? "" : "+"}`.padStart(6),
+      trimToWidth(session.firstUserMessage, 60),
+    ].join(" "));
+  }
+  const notes = [
+    `${result.sessions.length} of ${result.candidates} rollouts`,
+    ...(result.subagentsHidden ? [`${result.subagentsHidden} subagent hidden (--all)`] : []),
+    ...(result.skipped.length ? [`${result.skipped.length} unreadable`] : []),
+  ];
+  console.log(color(notes.join(" · "), "dim"));
+  console.log(color("Resume one: muster codex resume <id>", "dim"));
+}
+
+function codexProjectLabel(session: CodexSessionSummary): string {
+  const label = session.cwd.replace(/[/\\]+$/, "").split(/[/\\]/).pop();
+  return label || "(unknown)";
+}
+
+/** A turn count is only a floor when the scan was truncated; say so with "+". */
+function trimToWidth(value: string, width: number): string {
+  const flattened = value.replace(/\s+/g, " ").trim();
+  if (!flattened) return color("(no user message)", "dim");
+  return flattened.length <= width ? flattened : `${flattened.slice(0, width - 1)}…`;
+}
+
+function formatCodexAge(iso: string, nowMs = Date.now()): string {
+  const at = Date.parse(iso);
+  if (!Number.isFinite(at)) return "?";
+  const seconds = Math.max(0, Math.round((nowMs - at) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  if (seconds < 86_400) return `${Math.round(seconds / 3600)}h`;
+  return `${Math.round(seconds / 86_400)}d`;
+}
+
+async function codexResumeCommand(args: string[]): Promise<void> {
+  const prefix = stripFlags(args, ["--limit", "--since", "--codex-home", "--session"])
+    .filter((arg) => !arg.startsWith("--"))[0];
+  if (!prefix) throw new Error("Usage: muster codex resume <thread-id-prefix> [--session name]");
+  // A resume is deliberate, so scan wider than the listing default and include
+  // subagents: the user may well want to continue a specific delegated thread.
+  const flags = readCodexScanFlags(args, 200);
+  const result = await discoverCodexSessions({ ...flags, includeSubagents: true });
+  const match = matchCodexThread(result.sessions, prefix);
+  if (match.kind === "none") {
+    throw new Error(`No Codex session matches "${prefix}". Run: muster codex sessions --limit 50`);
+  }
+  if (match.kind === "ambiguous") {
+    const ids = match.candidates.slice(0, 8).map((session) => `  ${session.threadId}  ${codexProjectLabel(session)}`).join("\n");
+    throw new Error(`"${prefix}" matches ${match.candidates.length} Codex sessions:\n${ids}\nUse more characters.`);
+  }
+  const session = match.session;
+
+  const store = openSessionStore();
+  let imported: Awaited<ReturnType<typeof importCodexSession>>;
+  try {
+    imported = await importCodexSession(session, store);
+  } finally {
+    store.close();
+  }
+
+  const chain = resolveCodexForkChain(result.sessions, session.threadId);
+  console.log(color(`codex thread ${session.threadId}`, "cyan"));
+  console.log(`workspace   ${session.cwd || "(unknown)"}`);
+  console.log(`model       ${session.model ?? "(unknown)"}`);
+  console.log(`imported    ${imported.appended} new message(s), ${imported.alreadyPresent} already present → session ${imported.sessionId}`);
+  if (imported.diverged) {
+    console.log(color("stored transcript diverged from the rollout — nothing appended, history left intact", "yellow"));
+  }
+  if (imported.stats.truncated) {
+    console.log(color(`rollout is larger than the import budget; imported the first ${(imported.stats.bytesRead / 1e6).toFixed(0)} MB`, "yellow"));
+  }
+  if (chain.length > 1) {
+    console.log(`fork chain  ${chain.map((entry) => entry.threadId.slice(0, 8)).join(" → ")}`);
+  }
+
+  if (args.includes("--import-only")) {
+    console.log(color("Imported only. Drop --import-only to continue the thread in chat.", "dim"));
+    return;
+  }
+
+  const state: ChatState = {
+    sessionName: safeChatSessionName(readFlag(args, "--session") ?? `codex-${session.threadId.slice(0, 8)}`),
+    scopes: [],
+    speedMode: "session",
+    resumeThreadId: session.threadId,
+    ...(codexResumeWorkspace(session, args) ? { workspaceCwd: codexResumeWorkspace(session, args) } : {}),
+  };
+  ensureNamedChatSession(state.sessionName);
+  console.log(`chat        ${state.sessionName} (next turn continues the native Codex thread)`);
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    const prefix = state.workspaceCwd ? `cd ${state.workspaceCwd} && ` : "";
+    console.log(color("No TTY. Continue this thread with:", "dim"));
+    console.log(color(`  ${prefix}muster chat --session ${state.sessionName} --codex-thread ${session.threadId} "your next message"`, "dim"));
+    return;
+  }
+  await interactiveChat(state);
+}
+
+/**
+ * Run the resumed thread in the workspace it was started in — a Codex thread's
+ * context is full of paths from that repo. Falls back to the current directory
+ * when the original is gone (a temp dir, an unmounted volume), because a stale
+ * cwd would fail the run outright.
+ */
+function codexResumeWorkspace(session: CodexSessionSummary, args: string[]): string | undefined {
+  if (args.includes("--here")) return undefined;
+  if (!session.cwd || session.cwd === process.cwd()) return undefined;
+  if (!existsSync(session.cwd)) {
+    console.log(color(`original workspace ${session.cwd} is gone — running in ${process.cwd()}`, "yellow"));
+    return undefined;
+  }
+  return session.cwd;
 }
 
 async function claude(args: string[]): Promise<void> {

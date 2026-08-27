@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenClaw Alternative — Muster</title>
+  <meta name="description" content="An honest OpenClaw alternative comparison: OpenClaw has 387.8k stars and the bigger plugin ecosystem; Muster has an observed-truth audit trail, scoped memory, and a token ledger. Both MIT, both self-hosted." />
+  <meta name="keywords" content="OpenClaw alternative, alternative to OpenClaw, open source AI agent framework, self-hosted AI agent, AI agent audit trail" />
+  <meta name="robots" content="index, follow, max-image-preview:large" />
+  <link rel="canonical" href="https://themuster.dev/muster-vs-openclaw.html" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="Muster" />
+  <meta property="og:title" content="OpenClaw Alternative — Muster" />
+  <meta property="og:description" content="OpenClaw wins on ecosystem breadth. Muster wins on observed-truth audit. An honest side-by-side for self-hosted AI agent teams." />
+  <meta property="og:url" content="https://themuster.dev/muster-vs-openclaw.html" />
+  <meta property="og:image" content="https://themuster.dev/assets/brand/muster-og.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:image" content="https://themuster.dev/assets/brand/muster-og.png" />
+  <link rel="preconnect" href="https://api.fontshare.com" crossorigin />
+  <link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=clash-display@600,700&f[]=hanken-grotesk@400,500,600,700&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" />
+  <script type="module" src="/src/main.ts"></script>
+  <script type="application/ld+json">
+    {"@context":"https://schema.org","@type":"Article","headline":"OpenClaw Alternative — Muster","description":"An honest comparison between OpenClaw and Muster for teams choosing a self-hosted, open-source AI agent framework.","url":"https://themuster.dev/muster-vs-openclaw.html","mainEntityOfPage":"https://themuster.dev/muster-vs-openclaw.html","author":{"@type":"Organization","name":"Muster","url":"https://themuster.dev/"},"publisher":{"@type":"Organization","name":"Muster","url":"https://themuster.dev/"},"dateModified":"2026-08-27"}
+  </script>
+</head>
+<body>
+  <div id="scroll-progress" aria-hidden="true"></div>
+  <div id="hero-stage" aria-hidden="true"><canvas id="hero-canvas"></canvas></div>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Muster home"><img src="/assets/brand/muster-logo.png" alt="Muster" /></a>
+    <nav aria-label="Main">
+      <a href="/">Home</a>
+      <a href="/live-inline-diff.html">Live diff</a>
+      <a href="/docs.html">Docs</a>
+      <a href="/guides.html">Guides</a>
+      <a class="nav-cta" href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+    </nav>
+  </header>
+  <main>
+    <section class="hero">
+      <div class="hero-inner">
+        <p class="kicker hero-step">comparison · openclaw alternative</p>
+        <h1 class="hero-step">OpenClaw alternative: Muster, for teams that have to prove what the agent did.</h1>
+        <p class="sub hero-step">Both are MIT-licensed and self-hosted. OpenClaw has vastly more surface area and a real plugin economy. Muster has one thing OpenClaw does not: a file-change record derived from the filesystem instead of from what the agent claims it did.</p>
+        <div class="hero-actions hero-step">
+          <a class="btn-cta" href="/live-inline-diff.html">See the head-to-head evidence</a>
+          <a class="btn-ghost" href="https://github.com/Dkm0315/muster" rel="noopener">Read the source →</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" data-reveal>
+      <p class="sec-kicker reveal-child">Side by side</p>
+      <h2 class="reveal-child">Where each project is genuinely stronger.</h2>
+      <p class="sec-sub reveal-child">Scale numbers below were read from the OpenClaw repository during the Muster strategy review on 2026-08-27. Muster deliberately publishes no star count of its own — it is a young project and the number would not tell you anything useful.</p>
+      <div class="proof-table cmp reveal-child" role="region" aria-label="OpenClaw compared with Muster">
+        <table>
+          <thead>
+            <tr><th>Dimension</th><th>OpenClaw</th><th>Muster</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>License</td><td>MIT</td><td class="muster">MIT</td></tr>
+            <tr><td>Scale (2026-08-27)</td><td>387.8k stars, 81.4k forks, 83,433 commits</td><td class="muster">Young project, no star claim made</td></tr>
+            <tr><td>Chat surfaces</td><td>WhatsApp, Telegram, Slack, Discord, Google Chat, Signal, iMessage</td><td class="muster">Terminal, web, Telegram, Slack, Google Chat, Teams, Discord, WhatsApp</td></tr>
+            <tr><td>Extension ecosystem</td><td>Plugin SDK with years of integration work behind it</td><td class="muster">34 capability packs, of which only 2 are substantial</td></tr>
+            <tr><td>Interfaces</td><td>Control UI, CLI and TUI; voice, canvas, camera</td><td class="muster">CLI and TUI, gateway, portal preview</td></tr>
+            <tr><td>File-change record</td><td>Reported by the backend agent</td><td class="muster"><strong>Observed from git + filesystem</strong>, sha256 before/after</td></tr>
+            <tr><td>Audit receipts</td><td>Not a stated design goal</td><td class="muster"><strong>Deterministic <code>receiptHash</code></strong> — byte-identical across machines</td></tr>
+            <tr><td>Memory boundaries</td><td>Per-conversation history</td><td class="muster">Scoped lanes: tenant, workspace, user, role, session</td></tr>
+            <tr><td>Token accounting</td><td>Provider dashboards</td><td class="muster">Local ledger with replay-waste flags</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="proof-link reveal-child"><a href="/live-inline-diff.html">How the observed file-change stream was measured →</a></p>
+    </section>
+
+    <section class="band band-alt" data-reveal>
+      <p class="sec-kicker reveal-child">The honest read</p>
+      <h2 class="reveal-child">Do not pick Muster to get a bigger ecosystem. You will not.</h2>
+      <div class="prose reveal-child">
+        <p>If you are searching for an OpenClaw alternative because OpenClaw is missing a connector you need, Muster is the wrong answer. OpenClaw has 83,433 commits of integration work and a Plugin SDK that other people actively build against. Muster ships 34 capability packs and, on internal review, 32 of them are thin declarations rather than deep integrations. That is written down in Muster's own strategy document, not softened for a marketing page. Breadth is a race Muster has explicitly decided not to enter.</p>
+        <p>There is a narrower reason to switch, and it is the only one worth arguing. It concerns what your agent framework can <strong>prove</strong> after the run is over.</p>
+
+        <h3>Self-report is not an audit trail</h3>
+        <p>Almost every agent harness records file changes the same way: the coding backend emits a structured event saying "I edited this file," and the harness writes that event down. This works until the agent stops emitting the event — and modern coding agents stop constantly, because they do most of their real editing by shelling out to <code>sed</code>, <code>python</code>, <code>apply_patch</code>, or a here-document, none of which route through the structured patch channel.</p>
+        <p>Muster measured this rather than assuming it. Across five live runs against the Codex app-server protocol — three protocol probes and two full head-to-head recordings — Codex's structured file-change notification fired <strong>zero times out of five</strong>, while every one of those edits landed on disk. A harness that trusts the backend records nothing in that situation and does not know it recorded nothing. That is the failure mode that makes an audit trail worse than useless: it is confidently empty.</p>
+        <p>Muster's workspace observer does not subscribe to the agent's claims. It pins a baseline git revision when the run starts, then repeatedly re-derives the full change set from git and the filesystem, hashing every file before and after. Watch events are treated as a trigger to re-derive, never as data — so dropping a watch event costs latency, never correctness. In the two head-to-head runs it reported the edit in <strong>86ms and 75ms</strong>, against a 1000ms budget, with a diff verified by <code>git apply</code>.</p>
+
+        <h3>Receipts that survive leaving the machine</h3>
+        <p>The second half matters more for anyone who has to answer to a compliance reviewer. Muster's observer emits a <code>receiptHash</code> for each observed change. Two separate observer processes, in different temporary directories, roughly forty minutes apart, producing the same logical change, produced a byte-identical receipt hash. That makes the receipt a citable artifact rather than a run-local log line — you can hand it to someone who was not there and they can re-derive it.</p>
+        <p>On top of that sits an append-only event spine with 22 typed event types, monotonic sequence enforcement, fencing tokens that reject stale writers, idempotency keys that detect conflicting receipts, and a reducer-level invariant that refuses to admit any payload containing secrets or model chain-of-thought. The point of that last rule is boring and important: an audit log you cannot show to an auditor because it might contain a leaked key is not an audit log.</p>
+
+        <h3>Where the two overlap</h3>
+        <p>Both projects are MIT, both run entirely on your own infrastructure, and both let you route to whichever models you want rather than locking governance inside one provider's product. If your requirement is "self-hosted AI agent that talks to my team on Slack and Telegram," both will do it, and OpenClaw will do it with more polish today. Muster's channel gateway covers terminal, web, Telegram, Slack, Google Chat, Teams, Discord, and WhatsApp through one envelope, which is enough for most internal deployments but is not an ecosystem.</p>
+
+        <h3>Choose OpenClaw when</h3>
+        <ul>
+          <li>You want the largest available library of ready-made integrations and plugins.</li>
+          <li>Voice, canvas, camera, or a polished control UI are requirements rather than nice-to-haves.</li>
+          <li>You need a big community answering questions at 2am.</li>
+        </ul>
+
+        <h3>Choose Muster when</h3>
+        <ul>
+          <li>Someone will eventually ask "which files did the agent touch, and how do you know?" — and "the agent told us" is not an acceptable answer.</li>
+          <li>You need memory that is scoped by tenant, workspace, user, role, and session, with leakage tests, rather than one shared history.</li>
+          <li>You want token spend visible in your own ledger, including replay waste, instead of only in a provider dashboard.</li>
+          <li>You work in Frappe or ERPNext, where Muster's integration depth is genuinely deeper than the general-purpose alternatives.</li>
+        </ul>
+        <p>The blunt summary: OpenClaw is the better product today for almost everything except the one thing Muster was built to do. If observed-truth auditing is not on your requirements list, stay where you are.</p>
+        <p class="proof-link"><a href="/muster-vs-hermes-agent.html">Compare against Hermes Agent →</a> <a href="/muster-vs-qm.html">Compare against QM →</a> <a href="/docs.html">Read the docs →</a></p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>© <span id="year">2026</span> Muster — open source, MIT</span>
+      <span class="footer-sep">·</span>
+      <a href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+      <span class="footer-sep">·</span>
+      <a href="/docs.html">Docs</a>
+      <span class="footer-sep">·</span>
+      <a href="/live-inline-diff.html">Live diff evidence</a>
+    </div>
+  </footer>
+</body>
+</html>
