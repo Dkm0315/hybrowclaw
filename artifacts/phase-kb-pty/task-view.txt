@@ -1,0 +1,12 @@
+Fixture task 3 · codex-cli/gpt-5.6-sol · in_progress
+transcript
+> Please complete fixture task 3.
+· Checking fixture task 3 carefully.
+● Fixture transcript 3 is visible.
+
+work · no files edited in this attempt
+
+c comment · a approve · r retry · x cancel · o open in $EDITOR · tab file · esc
+review actions are recorded; send-to-agent and merge mechanics land in K-C
+
+PTY: right, right, enter from the board.

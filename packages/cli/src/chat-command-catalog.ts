@@ -22,7 +22,7 @@ export const CHAT_COMMANDS: readonly ChatCommandDef[] = [
   { name: "speed", usage: "/speed [session|fast]", description: "choose full context or faster replies" },
   { name: "live-diff", usage: "/live-diff [on|off]", description: "show file changes while they happen", aliases: ["livediff", "diffs"] },
   { name: "diff", usage: "/diff", description: "open or close this turn's file changes" },
-  { name: "tasks", usage: "/tasks [\"<goal>\" | why <taskId> | assign <taskId> <cardId>]", description: "plan and run work across agents" },
+  { name: "tasks", usage: "/tasks [board | \"<goal>\" | why <taskId> | assign <taskId> <cardId>]", description: "open your task board or plan work across agents" },
   { name: "reasoning", usage: "/reasoning [auto|low|medium|high|compact|full]", description: "choose thinking effort or summary detail", aliases: ["think"] },
   { name: "senses", usage: "/senses", description: "see available screen and browser access" },
   { name: "sessions", usage: "/sessions [limit]", description: "see recent conversations", aliases: ["ls"] },

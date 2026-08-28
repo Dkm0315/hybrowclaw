@@ -102,3 +102,49 @@ The program is DONE when this day completes with an empty new-ick count.
 - Contention-flake watchlist: doctor scorecard, kanban-stress budget.
 - Debt honestly parked: run.ts spine adoption (frozen with frappe branch),
   redaction before workspace.patch leaves the process, npm publish pipeline.
+
+## THE DEPTH BAR — how the leaders would build each feature (owner-mandated)
+
+The visible feature is 20%. The leaders' invisible 80%, now REQUIRED per
+feature. A lane that ships the 20% without its 80% has shipped nothing.
+
+### Streaming & chat — the Claude Code bar
+- Warm first token < 2s, cancellation reflected < 150ms, keystroke echo never
+  blocked by background work.
+- Stream invariants mechanically held: no duplicated finals, no lost pre-tool
+  text, no split fences (stream.ts exists for this — every painter uses it).
+- A broken stream RESUMES or fails with a cure card; never a hung spinner.
+- Latency budgets asserted in CI using the timing plumbing that already
+  exists (codex-app-server timings; run.ts phase line).
+
+### Orchestrator & board — the vibe-kanban / T3 bar
+- Crash recovery: kill -9 muster mid-task → relaunch reconstructs the board
+  from facts; orphaned processes reaped or reattached with evidence; no
+  zombie worktrees (hygiene sweep on open).
+- Stall detection: a task silent past its idle budget shows WHY (last event,
+  last output line) and offers retry/cancel — never a forever-spinner card.
+- Parallel N tasks: fair scheduling, multiplexed narration without frame
+  tearing, per-task cost isolation; board open < 150ms from keypress.
+- Event append is idempotent + fsync-safe; two muster processes on one board
+  do not corrupt it (single-writer lease, honest second-process message).
+- Workers are DURABLE (chat-on-steroids steal): parked/woken/retired
+  explicitly, never leaked; compaction/handoff uses claim→commit→abort
+  transactions with fences.
+
+### Sessions & memory — the Hermes bar
+- Search stays < 100ms at 100k messages (FTS, indexed, measured).
+- Never lose a turn: append before ack, fsync policy stated and tested;
+  two processes in one dir are safe.
+- Compaction is a transaction with fallback, not a rewrite.
+
+### Capabilities — the Codex app bar
+- Discovery cached with TTL + explicit refresh; NEVER blocks the composer.
+- Auth flows resumable; a failed enable explains itself and retries clean.
+
+### Cross-cutting stability chaos drills (each with a defined, tested outcome)
+- kill -9 mid-turn · disk full on session write · corrupt config.json ·
+  provider 500/timeout storm · clock skew · 10MB paste · 500-file diff turn.
+
+### Speed budgets (CI-asserted)
+launch→prompt < 300ms · board open < 150ms · picker open < 50ms · /tools
+open < 120ms · history replay 1k msgs < 200ms.

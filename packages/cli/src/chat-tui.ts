@@ -15,11 +15,15 @@ import {
   type SelectItem,
   type SelectListTheme,
   type SettingsListTheme,
+  type Terminal,
 } from "@earendil-works/pi-tui";
 import { createCoalescer } from "@musterhq/core";
+import type { BoardView, MessageRow } from "@musterhq/core";
 import { effortDisplayLabel, modelDisplayLabel, modelProvider, type ComposerPickerSelection, type ComposerPickerState, type EffortValue } from "./model-catalog.js";
 import { decodeCapabilitySelection, isCapabilityConfirmationText } from "./capabilities-overlay.js";
 import { LiveFileOverlay, LiveFileTurnAccumulator, renderLiveFilePlain } from "./live-file-view.js";
+import { BoardScreen, parseSgrMouseSequence, stripMouseSequences, type SgrMouseEvent } from "./board-screen.js";
+import { openFileWithEditorGuard, TaskView } from "./task-view.js";
 
 export interface MusterChatCommand {
   readonly name: string;
@@ -99,6 +103,19 @@ export interface MusterChatSink {
   updateLiveDiff(turn: LiveFileTurnAccumulator): void;
   /** Ctrl+D and /diff share this exact toggle. */
   toggleLiveDiff(): void;
+  /** Replace chat with the full-screen task board. Returns false when no board is available. */
+  openBoard(force?: boolean): Promise<boolean>;
+}
+
+export interface BoardModeController {
+  readonly cwd: string;
+  loadView(): BoardView | Promise<BoardView>;
+  loadMessages(sessionId: string): readonly MessageRow[] | Promise<readonly MessageRow[]>;
+  diff(taskId: string): LiveFileTurnAccumulator;
+  comment(taskId: string, text: string, anchor?: { readonly path: string; readonly line: number }): void | Promise<void>;
+  approve(taskId: string): void | Promise<void>;
+  retry(taskId: string): void | Promise<void>;
+  cancel(taskId: string): void | Promise<void>;
 }
 
 export interface RunMusterChatTuiOptions extends MusterAutocompleteOptions {
@@ -113,6 +130,7 @@ export interface RunMusterChatTuiOptions extends MusterAutocompleteOptions {
   readonly onDecisionKey?: (data: string, sink: MusterChatSink) => boolean;
   /** Printed to stdout after teardown when the session exits via /exit. */
   readonly farewell?: string;
+  readonly board?: BoardModeController;
 }
 
 export interface MusterChatHarness {
@@ -936,11 +954,41 @@ function selectSubmenu(
   return list;
 }
 
+class SuspendableProcessTerminal implements Terminal {
+  private readonly inner = new ProcessTerminal();
+  private onInput: ((data: string) => void) | undefined;
+  private onResize: (() => void) | undefined;
+  private suspended = false;
+  get columns(): number { return this.inner.columns; }
+  get rows(): number { return this.inner.rows; }
+  get kittyProtocolActive(): boolean { return this.inner.kittyProtocolActive; }
+  start(onInput: (data: string) => void, onResize: () => void): void { this.onInput = onInput; this.onResize = onResize; this.suspended = false; this.inner.start(onInput, onResize); }
+  stop(): void { this.suspended = false; this.inner.stop(); }
+  async drainInput(maxMs?: number, idleMs?: number): Promise<void> { await this.inner.drainInput(maxMs, idleMs); }
+  write(data: string): void { if (!this.suspended) this.inner.write(data); }
+  moveBy(lines: number): void { if (!this.suspended) this.inner.moveBy(lines); }
+  hideCursor(): void { if (!this.suspended) this.inner.hideCursor(); }
+  showCursor(): void { if (!this.suspended) this.inner.showCursor(); }
+  clearLine(): void { if (!this.suspended) this.inner.clearLine(); }
+  clearFromCursor(): void { if (!this.suspended) this.inner.clearFromCursor(); }
+  clearScreen(): void { if (!this.suspended) this.inner.clearScreen(); }
+  setTitle(title: string): void { if (!this.suspended) this.inner.setTitle(title); }
+  setProgress(active: boolean): void { if (!this.suspended) this.inner.setProgress(active); }
+  suspend(): void { if (this.suspended) return; this.inner.stop(); this.suspended = true; }
+  resume(): void {
+    if (!this.suspended || !this.onInput || !this.onResize) return;
+    this.suspended = false;
+    this.inner.start(this.onInput, this.onResize);
+  }
+}
+
 export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promise<void> {
-  const terminal = new ProcessTerminal();
+  const terminal = new SuspendableProcessTerminal();
   const tui = new TUI(terminal, true);
   const editor = createMusterChatEditor(tui);
   const screen = new MusterChatScreen(tui, editor, options.statusLine, options.headerLines ?? [], options.initialLines ?? [], options.onInterrupt);
+  const boardMode = options.board ? new BoardModeHost(tui, terminal, screen, editor, options.board) : undefined;
+  screen.onOpenBoard = (force) => boardMode?.open(force) ?? Promise.resolve(false);
   editor.setAutocompleteProvider(createMusterAutocompleteProvider(options));
   editor.onSubmit = (text) => {
     void screen.submit(text, options.onSubmit);
@@ -948,6 +996,16 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
   tui.addChild(screen);
   tui.setFocus(editor);
   tui.addInputListener((data) => {
+    const mouse = parseSgrMouseSequence(data);
+    if (mouse && boardMode?.handleMouse(mouse)) return { consume: true };
+    const stripped = stripMouseSequences(data);
+    if (!stripped) return { consume: true };
+    if (stripped !== data) return { data: stripped };
+    if (boardMode?.active) return undefined;
+    if (matchesKey(stripped, "f3")) {
+      void screen.openBoard(false);
+      return { consume: true };
+    }
     if (options.onDecisionKey?.(data, screen)) {
       editor.setText("");
       tui.requestRender(true);
@@ -995,6 +1053,7 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
   await screen.refreshStatusLine();
   const rawEscapeHandler = (chunk: Buffer | string): void => {
     const data = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+    if (boardMode?.active || parseSgrMouseSequence(data)) return;
     if (data === "\x1b" && screen.consumeLiveDiffEscapeSuppression()) return;
     if (data === "\x1b" && screen.closeLiveDiff()) return;
     if (data === "\x1b" && screen.interruptTurn()) return;
@@ -1011,11 +1070,121 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
     tui.requestRender(true);
   });
   process.stdin.off("data", rawEscapeHandler);
+  boardMode?.dispose();
   tui.stop();
   await terminal.drainInput(150, 25).catch(() => {});
   // Printed AFTER the TUI tears down: anything written into the transcript at
   // exit time is erased with the alternate screen.
   if (screen.exited) process.stdout.write(`${dim(options.farewell ?? "bye")}\n`);
+}
+
+class BoardModeHost {
+  private view: BoardView = { columns: { backlog: [], ready: [], running: [], review: [], done: [] }, cards: {} };
+  private messages: readonly MessageRow[] = [];
+  private board: BoardScreen | undefined;
+  private task: TaskView | undefined;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private refreshing = false;
+  get active(): boolean { return Boolean(this.board || this.task); }
+  constructor(
+    private readonly tui: TUI,
+    private readonly terminal: SuspendableProcessTerminal,
+    private readonly chat: MusterChatScreen,
+    private readonly editor: Editor,
+    private readonly controller: BoardModeController,
+  ) {}
+  async open(force = false): Promise<boolean> {
+    this.view = await this.controller.loadView();
+    if (!force && Object.keys(this.view.cards).length === 0) return false;
+    if (this.active) return true;
+    this.tui.removeChild(this.chat);
+    this.board = new BoardScreen({
+      view: () => this.view,
+      rows: () => this.tui.terminal.rows,
+      requestRender: () => this.tui.requestRender(),
+      openTask: (taskId) => { void this.openTask(taskId); },
+      close: () => this.close(),
+    });
+    this.tui.addChild(this.board);
+    this.tui.setFocus(this.board);
+    this.tui.terminal.write("\x1b[?1002h\x1b[?1006h");
+    this.board.start();
+    this.timer = setInterval(() => { void this.refresh(); }, 250);
+    this.tui.requestRender(true);
+    return true;
+  }
+  handleMouse(event: SgrMouseEvent): boolean {
+    return this.board?.handleMouse(event) ?? Boolean(this.task);
+  }
+  dispose(): void { this.stopTimer(); this.board?.stop(); if (this.active) this.tui.terminal.write("\x1b[?1002l\x1b[?1006l"); }
+  private async refresh(): Promise<void> {
+    if (this.refreshing || !this.active) return;
+    this.refreshing = true;
+    try {
+      this.view = await this.controller.loadView();
+      const card = this.taskCard();
+      if (card?.sessionId) this.messages = await this.controller.loadMessages(card.sessionId);
+      this.tui.requestRender();
+    } finally { this.refreshing = false; }
+  }
+  private taskId: string | undefined;
+  private taskCard() { return this.taskId ? this.view.cards[this.taskId] : undefined; }
+  private async openTask(taskId: string): Promise<void> {
+    const card = this.view.cards[taskId];
+    if (!card) return;
+    this.taskId = taskId;
+    this.messages = card.sessionId ? await this.controller.loadMessages(card.sessionId) : [];
+    if (this.board) { this.board.stop(); this.tui.removeChild(this.board); }
+    this.task = new TaskView({
+      card: () => this.view.cards[taskId] ?? card,
+      messages: () => this.messages,
+      diff: () => this.controller.diff(taskId),
+      rows: () => this.tui.terminal.rows,
+      cwd: this.controller.cwd,
+      requestRender: (force) => this.tui.requestRender(force),
+      close: () => this.closeTask(),
+      comment: (text, anchor) => this.controller.comment(taskId, text, anchor),
+      approve: () => this.controller.approve(taskId),
+      retry: () => this.controller.retry(taskId),
+      cancel: () => this.controller.cancel(taskId),
+      openEditor: async (path, line) => {
+        this.tui.terminal.write("\x1b[?1002l\x1b[?1006l\x1b[?25h");
+        this.terminal.suspend();
+        try {
+          await openFileWithEditorGuard(path, { cwd: this.controller.cwd, line, setRawMode: () => {}, write: () => {} });
+        } finally {
+          this.terminal.resume();
+          this.tui.terminal.write("\x1b[?1002h\x1b[?1006h\x1b[?25l");
+          this.tui.requestRender(true);
+        }
+      },
+    });
+    this.tui.addChild(this.task);
+    this.tui.setFocus(this.task);
+    this.tui.requestRender(true);
+  }
+  private closeTask(): void {
+    if (!this.task || !this.board) return;
+    this.tui.removeChild(this.task);
+    this.task = undefined;
+    this.taskId = undefined;
+    this.tui.addChild(this.board);
+    this.board.start();
+    this.tui.setFocus(this.board);
+    this.tui.requestRender(true);
+  }
+  private close(): void {
+    this.stopTimer();
+    this.board?.stop();
+    if (this.task) this.tui.removeChild(this.task);
+    if (this.board) this.tui.removeChild(this.board);
+    this.task = undefined; this.board = undefined; this.taskId = undefined;
+    this.tui.terminal.write("\x1b[?1002l\x1b[?1006l");
+    this.tui.addChild(this.chat);
+    this.tui.setFocus(this.editor);
+    this.tui.requestRender(true);
+  }
+  private stopTimer(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
 }
 
 class MusterChatScreen implements Component, MusterChatSink {
@@ -1031,6 +1200,7 @@ class MusterChatScreen implements Component, MusterChatSink {
   private suppressRawLiveDiffEscape = false;
   exited = false;
   onStop?: () => void;
+  onOpenBoard?: (force?: boolean) => Promise<boolean>;
 
   constructor(
     private readonly tui: TUI,
@@ -1062,6 +1232,9 @@ class MusterChatScreen implements Component, MusterChatSink {
   }
 
   appendUser(text: string): void {
+    // Breathing room, the Claude Code rhythm: one blank row before each user
+    // turn so blocks read as blocks, never as a stacked log.
+    if (this.lines.length && stripAnsi(this.lines[this.lines.length - 1] ?? "").trim() !== "") this.appendLine("");
     this.appendLine(formatUserLine(text));
   }
 
@@ -1201,6 +1374,10 @@ class MusterChatScreen implements Component, MusterChatSink {
     this.tui.requestRender(true);
   }
 
+  openBoard(force = false): Promise<boolean> {
+    return this.onOpenBoard?.(force) ?? Promise.resolve(false);
+  }
+
   closeLiveDiff(suppressRawEscape = false): boolean {
     if (!this.liveDiffHandle) return false;
     this.suppressRawLiveDiffEscape = suppressRawEscape;
@@ -1286,14 +1463,11 @@ class MusterChatScreen implements Component, MusterChatSink {
     // terminals, cells beyond the frame otherwise keep stale glyphs from
     // earlier wide paints (observed as phantom "["/"]" at screen edges).
     const padTo = Math.max(frameWidth, this.tui.terminal.columns || frameWidth);
-    // THE LAYOUT LAW (owner-named): the typing area lives at the BOTTOM of the
-    // terminal; responses live above it. While content is shorter than the
-    // viewport, filler rows push the composer down; once content overflows,
-    // filler vanishes and natural scrollback takes over.
-    const termRows = Math.max(8, this.tui.terminal.rows || 24);
-    const contentRows = fittedHeader.length + transcript.length + status.length + composer.length;
-    const filler = Array.from({ length: Math.max(0, termRows - contentRows - 1) }, () => "");
-    const rows = [...fittedHeader, ...transcript, ...filler, ...status, ...composer].map((line) => padAnsi(line, padTo));
+    // THE LAYOUT LAW, corrected by the owner's eye: content and input travel
+    // TOGETHER — the composer sits directly under the last message, drifting
+    // to the bottom naturally as the screen fills. A filler void between the
+    // reply and the prompt (tried once) reads as broken; never reintroduce it.
+    const rows = [...fittedHeader, ...transcript, ...status, ...composer].map((line) => padAnsi(line, padTo));
     this.lastRenderedRows = rows.length;
     return rows;
   }
@@ -1375,6 +1549,8 @@ class HarnessSink implements MusterChatSink {
   toggleLiveDiff(): void {
     for (const line of renderLiveFilePlain(this.liveDiffTurn)) this.appendLine(line);
   }
+
+  openBoard(): Promise<boolean> { return Promise.resolve(false); }
 
   async submit(text: string): Promise<boolean> {
     const value = text.trim();

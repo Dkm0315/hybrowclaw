@@ -127,6 +127,7 @@ test("chat command parsing covers every orchestration verb, quoted or bare", () 
   assert.deepEqual(parseChatOrchestrationCommand("/tasks harden the ragbot API"), { kind: "mission", goal: "harden the ragbot API" });
   assert.deepEqual(parseChatOrchestrationCommand("/tasks “smart quoted goal”"), { kind: "mission", goal: "smart quoted goal" });
   assert.deepEqual(parseChatOrchestrationCommand("/tasks"), { kind: "board" });
+  assert.deepEqual(parseChatOrchestrationCommand("/tasks board"), { kind: "board" });
   assert.deepEqual(parseChatOrchestrationCommand("/tasks why t4"), { kind: "why", taskId: "t4" });
   assert.deepEqual(parseChatOrchestrationCommand("/tasks assign t4 claude-code/claude-fable-5"), {
     kind: "assign", taskId: "t4", cardId: "claude-code/claude-fable-5",

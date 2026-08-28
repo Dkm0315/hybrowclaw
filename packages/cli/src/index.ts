@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { printBanner, renderBanner } from "./banner.js";
-import { buildCompactHeaderLines, createMusterAutocompleteProvider, createNarrationPainter, formatAssistantBlock, formatCostChip, formatStatusLine, formatToolLine, formatUserLine, formatWorkingIndicator, routeEngineLine, runMusterChatTui, type MusterChatSink, type MusterCompletionCatalog, type PickerOption, type ReasoningMode } from "./chat-tui.js";
+import { buildCompactHeaderLines, createMusterAutocompleteProvider, createNarrationPainter, formatAssistantBlock, formatCostChip, formatStatusLine, formatToolLine, formatUserLine, formatWorkingIndicator, routeEngineLine, runMusterChatTui, type BoardModeController, type MusterChatSink, type MusterCompletionCatalog, type PickerOption, type ReasoningMode } from "./chat-tui.js";
 import { startLiveDiffFeed } from "./live-diff.js";
 import { LiveFileTurnAccumulator, renderLiveFilePlain } from "./live-file-view.js";
 import {
@@ -8,6 +8,8 @@ import {
   parseBoardCliCommand,
   parseOrchestrationInvocation,
   runOrchestrationCommand,
+  openBoardStore,
+  readBoardEvents,
   type BackendAuth,
   type MissionTaskRunInput,
   type MissionTaskRunResult,
@@ -245,7 +247,8 @@ import {
   formatReasoningDecision,
   parseReasoningPreference,
   withReasoningEconomy,
-  type ReasoningPreference
+  projectBoardView,
+  type ReasoningPreference,
 } from "@musterhq/core";
 import {
   inheritedEcosystem,
@@ -1491,6 +1494,7 @@ async function interactiveChat(state: ChatState): Promise<void> {
       // turn runs (startTuiWorkingStatus paints it, the turn's end clears it).
       // A permanently ticking idle timer was the reported clutter.
       statusLine: async () => "",
+      board: createChatBoardController(state),
       onInterrupt: () => interruptChatTurn(),
       onDecisionKey: (data, sink) => handleChatDecisionKey(data, state, sink),
       onSubmit: async (text, sink) => {
@@ -2152,6 +2156,13 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
     case "assign": {
       // The kanban engine's only user surface: orchestration is invoked from the
       // conversation, and every card it prints comes back out of the event log.
+      if (state.statusSink && name === "tasks" && (!args.trim() || args.trim() === "board")) {
+        const opened = await state.statusSink.openBoard(args.trim() === "board");
+        if (opened) {
+          if (!args.trim()) emitChatLine(state, color("[b] board", "dim"));
+          return true;
+        }
+      }
       const parsed = parseOrchestrationInvocation(name === "kanban" ? "board" : name, args);
       if (parsed) await runOrchestrationCommand(parsed, chatOrchestrationDeps(state));
       return true;
@@ -3096,21 +3107,49 @@ function buildOrchestrationDeps(input: {
       await ensureDefaultConfig(input.cwd);
       const config = await loadConfig(input.cwd);
       const runtime = runtimeForCardId(task.cardId);
-      const onDelta = createNarrationChunker(task.onNarration);
-      const handle = await spawnSubagent(config, {
-        task: `${task.task.title}\n\n${task.task.goal}`,
-        parentKey: `mission:${input.sessionName}`,
-        runOptions: {
-          ...(runtime ? { runtime } : {}),
-          onDelta,
-          surfaceId: `mission:${input.sessionName}:${task.task.id}`,
-          skipRecall: true,
-          skipSkillSelection: true,
-          skipAgentRules: true,
+      const prompt = `${task.task.title}\n\n${task.task.goal}`;
+      const sessionStore = openSessionStore(input.cwd);
+      try {
+        const prior = sessionStore.loadActiveMessages(task.sessionId);
+        if (prior.at(-1)?.role !== "user" || prior.at(-1)?.content !== prompt) sessionStore.appendMessage(task.sessionId, "user", prompt);
+      } finally { sessionStore.close(); }
+      let liveText = "";
+      const narrate = createNarrationChunker(task.onNarration);
+      const onDelta = (chunk: string): void => { liveText += chunk; taskLiveMessages.set(task.sessionId, liveText); narrate(chunk); };
+      const accumulator = new LiveFileTurnAccumulator();
+      taskDiffTurns.set(task.task.id, accumulator);
+      const diffFeed = await startLiveDiffFeed({
+        cwd: input.cwd,
+        emit: () => {},
+        onPatch: (event) => {
+          let content = "";
+          try { content = readFileSync(resolve(event.root, event.path), "utf8"); } catch { /* deletion */ }
+          accumulator.add(event, content);
         },
-      }, input.cwd);
-      const run = await handle.done;
+      });
+      let run: Awaited<Awaited<ReturnType<typeof spawnSubagent>>["done"]>;
+      try {
+        const handle = await spawnSubagent(config, {
+          task: prompt,
+          parentKey: `mission:${input.sessionName}`,
+          runOptions: {
+            ...(runtime ? { runtime } : {}),
+            onDelta,
+            surfaceId: `mission:${input.sessionName}:${task.task.id}`,
+            skipRecall: true,
+            skipSkillSelection: true,
+            skipAgentRules: true,
+          },
+        }, input.cwd);
+        run = await handle.done;
+      } finally {
+        await diffFeed.finish().catch(() => {});
+        taskLiveMessages.delete(task.sessionId);
+      }
       const summary = (run.resultText ?? run.errorMessage ?? "").split("\n").map((line) => line.trim()).find(Boolean) ?? "no output";
+      const finalText = run.resultText ?? run.errorMessage ?? summary;
+      const finishedStore = openSessionStore(input.cwd);
+      try { finishedStore.appendMessage(task.sessionId, "assistant", finalText); } finally { finishedStore.close(); }
       const costUsd = await costForRunId(run.runId, input.cwd);
       return {
         ok: run.status === "completed",
@@ -3131,6 +3170,136 @@ function chatOrchestrationDeps(state: ChatState): OrchestrationDeps {
     ...(state.provider ? { provider: state.provider } : {}),
     ...(state.model ? { model: state.model } : {}),
   });
+}
+
+const taskDiffTurns = new Map<string, LiveFileTurnAccumulator>();
+const taskLiveMessages = new Map<string, string>();
+
+function createChatBoardController(state: ChatState): BoardModeController {
+  const cwd = chatWorkspaceCwd(state);
+  const sessionName = state.sessionName;
+  const withStore = async <T>(fn: (store: Awaited<ReturnType<typeof openBoardStore>>) => Promise<T>): Promise<T> => {
+    const store = await openBoardStore({ sessionName, cwd });
+    return fn(store);
+  };
+  return {
+    cwd,
+    async loadView() { return projectBoardView(await readBoardEvents(sessionName, cwd)); },
+    loadMessages(sessionId) {
+      const store = openSessionStore(cwd);
+      try {
+        const rows = store.loadActiveMessages(sessionId);
+        const live = taskLiveMessages.get(sessionId);
+        return live ? [...rows, { id: Number.MAX_SAFE_INTEGER, sessionId, role: "assistant", content: live, tokenCount: 0, createdAt: new Date().toISOString() }] : rows;
+      } finally { store.close(); }
+    },
+    diff(taskId) { return taskDiffTurns.get(taskId) ?? new LiveFileTurnAccumulator(); },
+    comment(taskId, text, anchor) {
+      return withStore(async (store) => {
+        const attemptId = store.state().tasks.get(taskId)?.currentAttemptId;
+        if (!attemptId) throw new Error("This task has no attempt to comment on.");
+        await store.commit(
+          { actorId: "human:cli", actorKind: "human", summary: `record comment on ${taskId}` },
+          { type: "comment_recorded", taskId, attemptId, comment: text, ...(anchor ? { path: anchor.path, line: anchor.line } : {}) },
+        );
+      });
+    },
+    approve(taskId) {
+      return withStore(async (store) => {
+        const entry = store.state().tasks.get(taskId);
+        if (!entry?.currentAttemptId) throw new Error("This task has no attempt to approve.");
+        await store.commit(
+          { actorId: "human:cli", actorKind: "human", summary: `request approval for ${taskId}` },
+          { type: "approval_requested", taskId, attemptId: entry.currentAttemptId, reviewerId: "human:cli" },
+        );
+      });
+    },
+    retry(taskId) {
+      return withStore(async (store) => {
+        let entry = store.state().tasks.get(taskId);
+        if (!entry?.assignment) throw new Error("This task has no assignment to retry.");
+        if (entry.status === "review") {
+          await store.commit(
+            { actorId: "human:cli", actorKind: "human", summary: `retry ${taskId}` },
+            { type: "task_review_rejected", taskId, reviewerId: "human:cli", reason: "operator requested a new attempt" },
+          );
+        } else if (entry.status === "blocked") {
+          await store.commit(
+            { actorId: "human:cli", actorKind: "human", summary: `ready ${taskId} for retry` },
+            { type: "task_ready", taskId, satisfiedDependencies: entry.task.dependsOn },
+          );
+          entry = store.state().tasks.get(taskId);
+          if (entry?.status === "ready" && entry.assignment) {
+            await store.commit(
+              { actorId: "human:cli", actorKind: "human", summary: `restore assignment for ${taskId} retry` },
+              { type: "task_assigned", taskId, assignment: entry.assignment },
+            );
+          }
+        } else if (entry.status === "needs_intervention") {
+          await store.commit(
+            { actorId: "human:cli", actorKind: "human", summary: `requeue ${taskId} for retry` },
+            { type: "task_intervention_resolved", taskId, resolution: "requeue", note: "operator requested a new attempt" },
+          );
+          entry = store.state().tasks.get(taskId);
+          if (entry?.status === "ready" && entry.assignment) {
+            await store.commit(
+              { actorId: "human:cli", actorKind: "human", summary: `restore assignment for ${taskId} retry` },
+              { type: "task_assigned", taskId, assignment: entry.assignment },
+            );
+          }
+        }
+        entry = store.state().tasks.get(taskId);
+        if (entry?.status !== "assigned" || !entry.assignment) throw new Error(`Task is ${entry?.status ?? "missing"}; retry requires review or a stopped attempt.`);
+        const attemptId = `attempt-${taskId}-${entry.attempts + 1}`;
+        await store.commit(
+          { actorId: "human:cli", actorKind: "human", summary: `start retry ${attemptId}` },
+          { type: "task_attempt_started", taskId, attemptId, agentId: entry.assignment.agentId },
+        );
+        taskDiffTurns.set(taskId, new LiveFileTurnAccumulator());
+        const task = entry.task;
+        const sessionId = entry.sessionId;
+        const cardId = entry.assignment.cardId;
+        if (!sessionId) throw new Error("This task has no bound session.");
+        const deps = chatOrchestrationDeps(state);
+        void deps.execute({
+          task, attemptId, sessionId, cardId, agentId: entry.assignment.agentId,
+          onNarration: (note) => {
+            void openBoardStore({ sessionName, cwd }).then((liveStore) => liveStore.commit(
+              { actorId: "orchestrator:chat", actorKind: "system", summary: `${taskId} progress` },
+              { type: "task_progress", taskId, note: note.slice(0, 240) },
+            )).catch(() => {});
+          },
+        }).then(async (result) => {
+          const liveStore = await openBoardStore({ sessionName, cwd });
+          const current = liveStore.state().tasks.get(taskId);
+          if (current?.status !== "in_progress" || current.currentAttemptId !== attemptId) return;
+          await liveStore.commit(
+            { actorId: "orchestrator:chat", actorKind: "system", summary: `${result.ok ? "complete" : "fail"} ${attemptId}` },
+            result.ok
+              ? { type: "task_attempt_completed", taskId, attemptId, ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}) }
+              : { type: "task_attempt_failed", taskId, attemptId, error: result.summary || "retry failed", ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}) },
+          );
+        }).catch(async (error) => {
+          const liveStore = await openBoardStore({ sessionName, cwd });
+          const current = liveStore.state().tasks.get(taskId);
+          if (current?.status === "in_progress" && current.currentAttemptId === attemptId) await liveStore.commit(
+            { actorId: "orchestrator:chat", actorKind: "system", summary: `fail ${attemptId}` },
+            { type: "task_attempt_failed", taskId, attemptId, error: error instanceof Error ? error.message : String(error) },
+          );
+        });
+      });
+    },
+    cancel(taskId) {
+      return withStore(async (store) => {
+        const entry = store.state().tasks.get(taskId);
+        if (entry?.status !== "in_progress" || !entry.currentAttemptId) throw new Error("Only a running attempt can be cancelled.");
+        await store.commit(
+          { actorId: "human:cli", actorKind: "human", summary: `cancel ${entry.currentAttemptId}` },
+          { type: "task_attempt_cancelled", taskId, attemptId: entry.currentAttemptId, reason: "cancelled by operator" },
+        );
+      });
+    },
+  };
 }
 
 /** The non-chat door onto the same task state: `muster tasks list|why|assign`. */

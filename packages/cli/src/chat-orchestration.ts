@@ -116,7 +116,7 @@ export type OrchestrationCommand =
 /** Command names this module owns, in catalog order. */
 export const ORCHESTRATION_COMMAND_NAMES: readonly string[] = ["tasks"];
 
-const TASKS_USAGE = 'Usage: /tasks "<goal>" | /tasks why <taskId> | /tasks assign <taskId> <cardId>';
+const TASKS_USAGE = 'Usage: /tasks board | /tasks "<goal>" | /tasks why <taskId> | /tasks assign <taskId> <cardId>';
 const WHY_USAGE = "Usage: /tasks why <taskId> — show the 9-gate table behind that assignment";
 const ASSIGN_USAGE = "Usage: /tasks assign <taskId> <cardId> — override the routed model (recorded as user-override)";
 
@@ -152,6 +152,7 @@ export function parseOrchestrationInvocation(name: string, args: string): Orches
     case "tasks": {
       if (!rest) return { kind: "board" };
       const [action, ...parts] = rest.split(/\s+/);
+      if (action === "board") return parts.length === 0 ? { kind: "board" } : { kind: "usage", usage: TASKS_USAGE };
       if (action === "why") return parts[0] ? { kind: "why", taskId: parts[0] } : { kind: "usage", usage: WHY_USAGE };
       if (action === "assign") return parts.length >= 2
         ? { kind: "assign", taskId: parts[0]!, cardId: parts.slice(1).join(" ") }

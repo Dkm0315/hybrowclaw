@@ -105,3 +105,27 @@ codex→claude switch with continuity · effort change via composer picker
 reflected in the actual run · /tools to a usable capability in ≤5 keystrokes ·
 directory-mismatch banner · an edit turn with live diff · /help sanity. Suites
 are the regression floor only.
+
+## Micro-nuance law — the polish DNA (owner-ratified addendum, 2026-08-28)
+
+Color carries MEANING, never decoration. The reference is Claude Code's own
+rendering; every muster surface applies the same semantic layer:
+
+1. THINKING IS A LAYER: reasoning text renders violet-tinted italic with a ✻
+   marker — distinguishable from the answer at a glance, before reading.
+2. INLINE SEMANTICS IN PROSE: within assistant sentences, `code spans` get a
+   distinct tint, file paths and branch names and commands are colored as
+   what they are. Meaningful tokens are colored inside sentences.
+3. MARKDOWN RENDERS: bold→bold, italic→italic, bullets with colored markers,
+   headers distinct, fenced code on a subtle background. Raw ** or ` glyphs
+   in painted prose are a bug.
+4. STATUS BY COLOR ON ACTION BULLETS: ⏺ pending=dim, success=warm green,
+   failure=red — readable before the words.
+5. WARNINGS ARE A SYSTEM: ⚠ + yellow + one concrete action. Errors: red +
+   the cure. Never prose apologies.
+6. THE WORKING LINE HAS PERSONALITY: sparkle glyph + verb + elapsed; the
+   spinner row is allowed exactly this much whimsy and no more.
+7. USER TURNS SIT ON A SUBTLE BACKGROUND BAND spanning the row — the
+   distinction mechanism, with the naked-prompt composer (no box) below.
+Applies to: chat transcript, task view, board cards, history replay, chips,
+/status, doctor — every painted surface, one renderer, zero drift.

@@ -1348,7 +1348,7 @@ export interface TaskAssignment {
   readonly consultationId?: string;
 }
 
-export type KanbanAttemptStatus = "running" | "completed" | "failed";
+export type KanbanAttemptStatus = "running" | "completed" | "failed" | "cancelled";
 
 /** One retained execution try. A retry appends a new record; it never rewrites this one. */
 export interface KanbanAttemptState {
@@ -1382,6 +1382,9 @@ export type KanbanEventBody =
   /** Legacy lifecycle fact retained so existing JSONL histories remain replayable. */
   | { readonly type: "task_started"; readonly taskId: string; readonly agentId: string; readonly attemptId: string }
   | { readonly type: "task_progress"; readonly taskId: string; readonly note: string; readonly percentComplete?: number }
+  | { readonly type: "comment_recorded"; readonly taskId: string; readonly attemptId: string; readonly comment: string; readonly path?: string; readonly line?: number }
+  | { readonly type: "approval_requested"; readonly taskId: string; readonly attemptId: string; readonly reviewerId: string }
+  | { readonly type: "task_attempt_cancelled"; readonly taskId: string; readonly attemptId: string; readonly reason: string }
   | { readonly type: "task_submitted_for_review"; readonly taskId: string; readonly artifactDigests?: readonly string[] }
   | { readonly type: "task_review_rejected"; readonly taskId: string; readonly reviewerId: string; readonly reason: string }
   | { readonly type: "task_completed"; readonly taskId: string; readonly reviewerId: string; readonly receiptHash: string }
@@ -1871,6 +1874,18 @@ export function reduceKanbanEvent(state: KanbanBoardState, event: KanbanEvent): 
       commit(event.taskId, prior, { status: "blocked", attemptHistory, reason: error });
       break;
     }
+    case "task_attempt_cancelled": {
+      const prior = requireTask(event.taskId);
+      if (prior.status !== "in_progress") throw new KanbanEventConflictError(`Task "${event.taskId}" must be in progress when an attempt is cancelled (was ${prior.status}).`);
+      const attempt = prior.attemptHistory.get(event.attemptId);
+      if (!attempt || prior.currentAttemptId !== event.attemptId) throw new KanbanEventConflictError(`Attempt "${event.attemptId}" is not the current attempt on task "${event.taskId}".`);
+      if (attempt.status !== "running") throw new KanbanEventConflictError(`Attempt "${event.attemptId}" is already ${attempt.status}.`);
+      const reason = requireText(event.reason, "task_attempt_cancelled reason");
+      const attemptHistory = new Map(prior.attemptHistory);
+      attemptHistory.set(event.attemptId, { ...attempt, status: "cancelled", finishedAt: event.at, error: reason });
+      commit(event.taskId, prior, { status: "blocked", attemptHistory, reason });
+      break;
+    }
     case "task_started": {
       const prior = requireTask(event.taskId);
       if (prior.status !== "assigned") throw new KanbanEventConflictError(`Task "${event.taskId}" must be assigned before it starts (was ${prior.status}).`);
@@ -1893,6 +1908,23 @@ export function reduceKanbanEvent(state: KanbanBoardState, event: KanbanEvent): 
       if (event.percentComplete !== undefined && (!Number.isFinite(event.percentComplete) || event.percentComplete < 0 || event.percentComplete > 100)) {
         throw new KanbanEventConflictError("task_progress percentComplete must be between 0 and 100.");
       }
+      commit(event.taskId, prior, {});
+      break;
+    }
+    case "comment_recorded": {
+      const prior = requireTask(event.taskId);
+      if (!prior.attemptHistory.has(requireText(event.attemptId, "comment_recorded attemptId"))) throw new KanbanEventConflictError(`Unknown attempt "${event.attemptId}" on task "${event.taskId}".`);
+      requireText(event.comment, "comment_recorded comment");
+      if (event.path !== undefined) requireText(event.path, "comment_recorded path");
+      if (event.line !== undefined && (!Number.isInteger(event.line) || event.line < 1)) throw new KanbanEventConflictError("comment_recorded line must be a positive integer.");
+      commit(event.taskId, prior, {});
+      break;
+    }
+    case "approval_requested": {
+      const prior = requireTask(event.taskId);
+      if (prior.status !== "review") throw new KanbanEventConflictError(`Task "${event.taskId}" must be in review before approval is requested (was ${prior.status}).`);
+      if (!prior.attemptHistory.has(requireText(event.attemptId, "approval_requested attemptId"))) throw new KanbanEventConflictError(`Unknown attempt "${event.attemptId}" on task "${event.taskId}".`);
+      requireText(event.reviewerId, "approval_requested reviewerId");
       commit(event.taskId, prior, {});
       break;
     }
@@ -2057,6 +2089,7 @@ function updateProjectedCard(card: BoardViewCard, event: KanbanEvent): BoardView
     case "task_attempt_started": patch = { status: "in_progress", currentAttempt: event.attemptId, startedAt: event.at }; break;
     case "task_attempt_completed": patch = { status: "review", costUsd: event.costUsd }; break;
     case "task_attempt_failed": patch = { status: "blocked", costUsd: event.costUsd }; break;
+    case "task_attempt_cancelled": patch = { status: "blocked" }; break;
     case "task_started": patch = { status: "in_progress", currentAttempt: event.attemptId, startedAt: event.at }; break;
     case "task_progress": patch = { lastNarrationLine: event.note }; break;
     case "task_submitted_for_review": patch = { status: "review" }; break;
