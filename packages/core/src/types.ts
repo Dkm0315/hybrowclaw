@@ -13,7 +13,7 @@ export type TaskKind =
   | "private_analysis"
   | "workflow";
 
-export type ReasoningLevel = "none" | "low" | "medium" | "high";
+export type ReasoningLevel = "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export type ProviderKind =
   | "openai-compatible"

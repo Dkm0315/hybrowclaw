@@ -28,10 +28,10 @@ import {
 } from "@musterhq/core";
 
 const RESET = "\x1b[0m";
-const ACCENT_RGB = "41;211;255";
-const OK_RGB = "104;245;168";
+const ACCENT_RGB = "217;119;87";
+const OK_RGB = "138;154;91";
 const WARN_RGB = "255;196;92";
-const MUTED_RGB = "142;161;181";
+const MUTED_RGB = "148;144;140";
 
 function paint(rgb: string, text: string, bold = false): string {
   if (process.env.NO_COLOR) return text;

@@ -1,0 +1,181 @@
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+export type ModelProvider = "codex" | "claude";
+export type EffortValue = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+
+export interface CatalogModel {
+  readonly provider: ModelProvider;
+  readonly value: string;
+  readonly label: string;
+}
+
+export interface EffortOption {
+  readonly value: EffortValue;
+  readonly label: string;
+  readonly hint?: string;
+}
+
+export interface ComposerCatalog {
+  readonly models: readonly CatalogModel[];
+  readonly efforts: readonly EffortOption[];
+}
+
+export interface ComposerPickerState {
+  readonly catalog: ComposerCatalog;
+  readonly activeModel: string;
+  readonly modelSource: "codex config" | "session" | "app default";
+  readonly effort: EffortValue;
+  readonly effortSource: "codex config" | "session" | "app default";
+  readonly speed: "session" | "fast";
+}
+
+export type ComposerPickerSelection =
+  | { readonly kind: "model"; readonly value: string }
+  | { readonly kind: "effort"; readonly value: EffortValue }
+  | { readonly kind: "speed"; readonly value: "session" | "fast" };
+
+export interface TranscriptMessage {
+  readonly role: string;
+  readonly content: string;
+}
+
+export interface CodexComposerDefaults {
+  readonly model?: string;
+  readonly effort?: EffortValue;
+  readonly modelSource: "codex config" | "app default";
+  readonly effortSource: "codex config" | "app default";
+}
+
+export const CODEX_MODELS: readonly CatalogModel[] = [
+  { provider: "codex", value: "gpt-5.6-sol", label: "5.6 Sol" },
+  { provider: "codex", value: "gpt-5.6-terra", label: "5.6 Terra" },
+  { provider: "codex", value: "gpt-5.6-luna", label: "5.6 Luna" },
+  { provider: "codex", value: "gpt-5.5", label: "5.5" },
+] as const;
+
+export const CLAUDE_MODELS: readonly CatalogModel[] = [
+  { provider: "claude", value: "claude-fable-5", label: "Fable 5" },
+  { provider: "claude", value: "claude-opus-5", label: "Opus 5" },
+  { provider: "claude", value: "claude-sonnet-5", label: "Sonnet 5" },
+  { provider: "claude", value: "claude-haiku-4-5", label: "Haiku 4.5" },
+] as const;
+
+export const EFFORT_OPTIONS: readonly EffortOption[] = [
+  { value: "low", label: "Light" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "Extra High" },
+  { value: "max", label: "Max" },
+  { value: "ultra", label: "Ultra", hint: "Consumes usage limits faster" },
+] as const;
+
+export function buildComposerCatalog(auth: { readonly codex: boolean; readonly claude: boolean }): ComposerCatalog {
+  return {
+    models: [
+      ...(auth.codex ? CODEX_MODELS : []),
+      ...(auth.claude ? CLAUDE_MODELS : []),
+    ],
+    efforts: EFFORT_OPTIONS,
+  };
+}
+
+export function modelProvider(model: string | undefined): ModelProvider | undefined {
+  if (!model) return undefined;
+  if (CLAUDE_MODELS.some((item) => item.value === model) || model.startsWith("claude-")) return "claude";
+  if (CODEX_MODELS.some((item) => item.value === model) || model.startsWith("gpt-")) return "codex";
+  return undefined;
+}
+
+export function modelDisplayLabel(model: string | undefined): string {
+  if (!model) return "model";
+  return [...CODEX_MODELS, ...CLAUDE_MODELS].find((item) => item.value === model)?.label ?? model;
+}
+
+export function effortDisplayLabel(value: EffortValue | undefined): string {
+  return EFFORT_OPTIONS.find((item) => item.value === value)?.label ?? "Medium";
+}
+
+export function parseEffortValue(value: string | undefined): EffortValue | undefined {
+  const normalized = value?.trim().toLowerCase().replace(/[ _-]+/g, " ");
+  return EFFORT_OPTIONS.find((item) => item.value === normalized || item.label.toLowerCase() === normalized)?.value;
+}
+
+/** Exact `-c` value ultimately forwarded by the Codex app-server transport. */
+export function buildReasoningEffortOverride(value: EffortValue): string {
+  return `model_reasoning_effort=${JSON.stringify(value)}`;
+}
+
+export function formatModelStatus(model: string | undefined, effort: EffortValue | undefined): string {
+  const label = modelDisplayLabel(model);
+  return modelProvider(model) === "claude" ? label : `${label} · ${effortDisplayLabel(effort)}`;
+}
+
+export async function readCodexComposerDefaults(path = join(homedir(), ".codex", "config.toml")): Promise<CodexComposerDefaults> {
+  const text = await readFile(path, "utf8").catch(() => "");
+  const model = readTopLevelTomlString(text, "model");
+  const effort = parseEffortValue(readTopLevelTomlString(text, "model_reasoning_effort"));
+  return {
+    model,
+    effort,
+    modelSource: model ? "codex config" : "app default",
+    effortSource: effort ? "codex config" : "app default",
+  };
+}
+
+function readTopLevelTomlString(text: string, key: string): string | undefined {
+  let inTable = false;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/\s+#.*$/, "").trim();
+    if (!line) continue;
+    if (line.startsWith("[")) {
+      inTable = true;
+      continue;
+    }
+    if (inTable) continue;
+    const match = line.match(new RegExp(`^${key}\\s*=\\s*(["'])(.*?)\\1\\s*$`));
+    if (match) return match[2];
+  }
+  return undefined;
+}
+
+/**
+ * Provider-neutral handoff context. The paragraph is deterministic and the
+ * transcript is capped at the 30 most recent stored messages.
+ */
+export function buildContinuityContext(messages: readonly TranscriptMessage[], limit = 30): string {
+  const recent = messages.slice(-Math.max(1, limit));
+  const summary = continuitySummary(recent);
+  const transcript = recent.map((message) => `${normalizeRole(message.role)}: ${cleanMessage(message.content)}`).join("\n");
+  return [
+    "Muster conversation continuity",
+    `Summary: ${summary}`,
+    "Recent transcript (oldest to newest):",
+    transcript || "(no prior messages)",
+    "Continue this same conversation. Do not repeat or describe this handoff unless the user asks.",
+  ].join("\n\n");
+}
+
+function continuitySummary(messages: readonly TranscriptMessage[]): string {
+  if (!messages.length) return "This conversation has no stored messages yet.";
+  const userTurns = messages.filter((message) => normalizeRole(message.role) === "User");
+  const assistantTurns = messages.filter((message) => normalizeRole(message.role) === "Assistant");
+  const latestUser = [...userTurns].reverse().find((message) => cleanMessage(message.content))?.content;
+  const focus = latestUser ? truncate(cleanMessage(latestUser), 220) : "the ongoing task in the transcript below";
+  return `The recent context contains ${userTurns.length} user ${userTurns.length === 1 ? "turn" : "turns"} and ${assistantTurns.length} assistant ${assistantTurns.length === 1 ? "turn" : "turns"}. The latest user focus is: ${focus}`;
+}
+
+function normalizeRole(role: string): string {
+  if (role.toLowerCase() === "assistant") return "Assistant";
+  if (role.toLowerCase() === "user") return "User";
+  return role ? role[0]!.toUpperCase() + role.slice(1).toLowerCase() : "Context";
+}
+
+function cleanMessage(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function truncate(value: string, width: number): string {
+  return value.length <= width ? value : `${value.slice(0, width - 1).trimEnd()}…`;
+}

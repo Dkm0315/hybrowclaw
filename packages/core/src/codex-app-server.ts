@@ -8,7 +8,7 @@ export interface CodexAppServerRunInput {
   readonly prompt: string;
   readonly cwd: string;
   readonly model?: string;
-  readonly reasoning?: "none" | "low" | "medium" | "high";
+  readonly reasoning?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   /** Native app-server developer contract; sent in protocol, never process arguments. */
   readonly developerInstructions?: string;
   /** Fresh host-verified context for this turn; never made sticky on the provider thread. */
@@ -130,6 +130,15 @@ export function clearCodexAppServerSessions(transportOwner?: string): void {
   }
 }
 
+/** Interrupt the active native Codex turn owned by this host, if there is one. */
+export async function interruptActiveCodexTurn(transportOwner?: string): Promise<boolean> {
+  const attempts = [...ACTIVE_CLIENTS]
+    .filter(([, metadata]) => transportOwner === undefined || metadata.transportOwner === transportOwner)
+    .map(([client]) => client.interruptActiveTurn());
+  if (!attempts.length) return false;
+  return (await Promise.allSettled(attempts)).some((result) => result.status === "fulfilled" && result.value);
+}
+
 /** Drop only one conversation's warm process; other chats keep their cache state. */
 export function clearCodexAppServerConversation(conversationKey: string, transportOwner?: string): void {
   for (const [key, session] of SESSION_CACHE) {
@@ -149,6 +158,11 @@ export function clearCodexAppServerConversation(conversationKey: string, transpo
 
 export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<CodexAppServerRunResult> {
   if (!input.prompt.trim()) throw new Error("Codex prompt is required.");
+  if (!(input.configOverrides ?? []).some((value) => /^model_reasoning_summary\s*=/.test(value))) {
+    // Request provider-approved summaries for the transcript without changing
+    // ~/.codex/config.toml. Models that emit no summary remain silent.
+    input = { ...input, configOverrides: [...(input.configOverrides ?? []), 'model_reasoning_summary="auto"'] };
+  }
   const started = Date.now();
   const keepAlive = (input.keepAlive ?? true) && input.cacheKey !== undefined;
   const instructionsHash = await hashInstructions(input.developerInstructions, input.instructionsFile);
@@ -424,7 +438,7 @@ function appServerScopeKey(input: CodexAppServerRunInput, command: string, conve
 
 export function buildCodexAppServerArgs(input: {
   readonly model?: string;
-  readonly reasoning?: "none" | "low" | "medium" | "high";
+  readonly reasoning?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   readonly networkAccess?: boolean;
   readonly configOverrides?: readonly string[];
 }): string[] {
@@ -490,13 +504,14 @@ class CodexAppServerClient {
   private readonly notifications: Record<string, unknown>[] = [];
   private readonly waiters: Array<(message: Record<string, unknown>) => void> = [];
   private readonly stderrLines: string[] = [];
+  private activeTurn?: { readonly threadId: string; readonly turnId: string };
   private closed = false;
 
   constructor(input: {
     readonly command: string;
     readonly cwd: string;
     readonly model?: string;
-    readonly reasoning?: "none" | "low" | "medium" | "high";
+    readonly reasoning?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
     readonly developerInstructions?: string;
     readonly sandbox?: "read-only" | "workspace-write" | "danger-full-access";
     readonly networkAccess?: boolean;
@@ -571,6 +586,13 @@ class CodexAppServerClient {
     return resumedId;
   }
 
+  async interruptActiveTurn(): Promise<boolean> {
+    const active = this.activeTurn;
+    if (!active || !this.isAlive()) return false;
+    await this.request("turn/interrupt", active, 15_000);
+    return true;
+  }
+
   async runTurn(input: {
     readonly threadId: string;
     readonly prompt: string;
@@ -604,6 +626,7 @@ class CodexAppServerClient {
         : {}),
     }, 15_000);
     const turnId = stringValue(asRecord(turnStart.turn).id);
+    if (turnId) this.activeTurn = { threadId: input.threadId, turnId };
     let finalMessage = "";
     let firstDeltaMs: number | undefined;
     let tokenUsage: CodexAppServerRunResult["tokenUsage"] | undefined;
@@ -615,62 +638,66 @@ class CodexAppServerClient {
     // ceiling guards against a notification-spamming runaway turn.
     const absoluteCeilingMs = Math.max(input.timeoutMs * 8, 15 * 60_000);
     let lastNotificationAt = Date.now();
-    while (Date.now() - lastNotificationAt < input.timeoutMs) {
-      if (Date.now() - started >= absoluteCeilingMs) {
-        throw new Error(this.formatError(`codex app-server turn exceeded the absolute ceiling of ${absoluteCeilingMs}ms`));
-      }
-      if (!this.isAlive()) throw new Error(this.formatError("codex app-server exited during turn"));
-      const message = await this.takeNotification(250);
-      if (!message) continue;
-      lastNotificationAt = Date.now();
-      const method = stringValue(message.method) ?? "";
-      const params = asRecord(message.params);
-      if (method.startsWith("item/")) input.onActivity?.();
-      if (method.endsWith("/request")) {
-        this.respond(message.id, { decision: "decline", action: "decline", content: null, _meta: null });
-        continue;
-      }
-      if (method === "item/agentMessage/delta") {
-        const delta = stringValue(params.delta) ?? "";
-        if (delta) {
-          firstDeltaMs ??= Date.now() - started;
-          input.onDelta?.(delta);
+    try {
+      while (Date.now() - lastNotificationAt < input.timeoutMs) {
+        if (Date.now() - started >= absoluteCeilingMs) {
+          throw new Error(this.formatError(`codex app-server turn exceeded the absolute ceiling of ${absoluteCeilingMs}ms`));
         }
-        continue;
-      }
-      if (method === "item/reasoning/summaryTextDelta") {
-        const delta = stringValue(params.delta) ?? "";
-        if (delta) input.onReasoningDelta?.(delta);
-        continue;
-      }
-      if (method === "item/completed") {
-        const item = asRecord(params.item);
-        if (item.type === "agentMessage") {
-          finalMessage = stringValue(item.text) ?? finalMessage;
+        if (!this.isAlive()) throw new Error(this.formatError("codex app-server exited during turn"));
+        const message = await this.takeNotification(250);
+        if (!message) continue;
+        lastNotificationAt = Date.now();
+        const method = stringValue(message.method) ?? "";
+        const params = asRecord(message.params);
+        if (method.startsWith("item/")) input.onActivity?.();
+        if (method.endsWith("/request")) {
+          this.respond(message.id, { decision: "decline", action: "decline", content: null, _meta: null });
+          continue;
         }
-        continue;
-      }
-      if (method === "thread/tokenUsage/updated") {
-        const last = asRecord(asRecord(params.tokenUsage).last);
-        tokenUsage = {
-          inputTokens: numberValue(last.inputTokens),
-          cachedInputTokens: numberValue(last.cachedInputTokens),
-          outputTokens: numberValue(last.outputTokens),
-        };
-        continue;
-      }
-      if (method === "turn/completed") {
-        const turn = asRecord(params.turn);
-        const error = asRecord(turn.error);
-        const status = stringValue(turn.status);
-        if (status && status !== "completed" && status !== "interrupted") {
-          return { finalMessage, firstDeltaMs, errorMessage: stringValue(error.message) ?? `codex turn ended with status ${status}`, tokenUsage };
+        if (method === "item/agentMessage/delta") {
+          const delta = stringValue(params.delta) ?? "";
+          if (delta) {
+            firstDeltaMs ??= Date.now() - started;
+            input.onDelta?.(delta);
+          }
+          continue;
         }
-        if (turnId && stringValue(turn.id) && stringValue(turn.id) !== turnId) continue;
-        return { finalMessage, firstDeltaMs, tokenUsage };
+        if (method === "item/reasoning/summaryTextDelta") {
+          const delta = stringValue(params.delta) ?? "";
+          if (delta) input.onReasoningDelta?.(delta);
+          continue;
+        }
+        if (method === "item/completed") {
+          const item = asRecord(params.item);
+          if (item.type === "agentMessage") {
+            finalMessage = stringValue(item.text) ?? finalMessage;
+          }
+          continue;
+        }
+        if (method === "thread/tokenUsage/updated") {
+          const last = asRecord(asRecord(params.tokenUsage).last);
+          tokenUsage = {
+            inputTokens: numberValue(last.inputTokens),
+            cachedInputTokens: numberValue(last.cachedInputTokens),
+            outputTokens: numberValue(last.outputTokens),
+          };
+          continue;
+        }
+        if (method === "turn/completed") {
+          const turn = asRecord(params.turn);
+          const error = asRecord(turn.error);
+          const status = stringValue(turn.status);
+          if (status && status !== "completed" && status !== "interrupted") {
+            return { finalMessage, firstDeltaMs, errorMessage: stringValue(error.message) ?? `codex turn ended with status ${status}`, tokenUsage };
+          }
+          if (turnId && stringValue(turn.id) && stringValue(turn.id) !== turnId) continue;
+          return { finalMessage, firstDeltaMs, tokenUsage };
+        }
       }
+      throw new Error(this.formatError(`codex app-server turn timed out: silent for ${input.timeoutMs}ms with no notifications`));
+    } finally {
+      if (this.activeTurn?.threadId === input.threadId && this.activeTurn.turnId === turnId) this.activeTurn = undefined;
     }
-    throw new Error(this.formatError(`codex app-server turn timed out: silent for ${input.timeoutMs}ms with no notifications`));
   }
 
   private request(method: string, params: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {

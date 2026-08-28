@@ -449,12 +449,58 @@ test("muster selected completion row keeps readable full-row contrast", async ()
   const selectedLine = rendered.split("\n").find((line) => line.includes("/help"));
 
   assert.ok(selectedLine, "selected /help line should render");
-  const backgroundStart = selectedLine.indexOf("\u001b[48;2;41;211;255m");
+  const backgroundStart = selectedLine.indexOf("\u001b[48;2;217;119;87m");
   const frameReset = selectedLine.lastIndexOf("\u001b[0m");
   const helpText = selectedLine.indexOf("/help");
-  assert.ok(backgroundStart >= 0, "selected row should include cyan background");
+  assert.ok(backgroundStart >= 0, "selected row should include coral background");
   assert.ok(helpText > backgroundStart, "selected text should be inside selected background");
   assert.ok(frameReset > helpText, "selected background should last through row padding before reset");
+});
+
+test("muster transcript starts with resumed history before the first submitted turn", () => {
+  const initialLines = ["── history: work · 2 messages (1 user · 1 assistant) ──", "> earlier", "● answer", "── end history ──"];
+  const harness = createMusterChatHarness({
+    commands,
+    toolsets: ["core"],
+    recentSessions: () => [],
+    agents: async () => [],
+    initialLines,
+  });
+
+  assert.deepEqual(harness.transcript(), initialLines);
+});
+
+test("muster Escape interrupts a running turn and preserves partial transcript", async () => {
+  let finishTurn!: () => void;
+  const running = new Promise<void>((resolve) => { finishTurn = resolve; });
+  let interrupts = 0;
+  const harness = createMusterChatHarness({
+    commands,
+    toolsets: ["core"],
+    recentSessions: () => [],
+    agents: async () => [],
+    onSubmit: async (_text, sink) => {
+      sink.appendLine("● partial");
+      await running;
+      return true;
+    },
+    onInterrupt: () => {
+      interrupts += 1;
+      return true;
+    },
+  });
+
+  harness.type("long turn");
+  const submitted = harness.submit();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  harness.input("\x1b");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  finishTurn();
+  await submitted;
+
+  assert.equal(interrupts, 1);
+  assert.ok(harness.transcript().some((line) => line.includes("● partial")));
+  assert.ok(harness.transcript().some((line) => line.includes("⎋ interrupted")));
 });
 
 test("muster escape handling only clears bare completion triggers", () => {

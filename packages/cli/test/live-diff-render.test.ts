@@ -66,7 +66,7 @@ const MODIFY_DIFF = [
 ].join("\n");
 
 test("a modify card renders header, stat, latency, and colored hunk lines", () => {
-  const card = renderLiveDiffCard(patchEvent({ diff: MODIFY_DIFF }), { elapsedMs: 86 });
+  const card = renderLiveDiffCard(patchEvent({ diff: MODIFY_DIFF }), { color: true, elapsedMs: 86 });
 
   assert.deepEqual(plain(card), [
     "⏺ Edit(src/run.ts)",
@@ -79,10 +79,10 @@ test("a modify card renders header, stat, latency, and colored hunk lines", () =
     "     const after = 4;",
   ]);
 
-  assert.match(card[0], /\x1b\[38;2;41;211;255m⏺/, "modify uses the accent action glyph");
-  assert.match(card[2], /\x1b\[38;2;41;211;255m@@/, "hunk headers use the accent color");
+  assert.match(card[0], /\x1b\[38;2;217;119;87m⏺/, "modify uses the coral action glyph");
+  assert.match(card[2], /\x1b\[38;2;217;119;87m@@/, "hunk headers use the coral accent");
   assert.match(card[4], /\x1b\[38;2;255;107;122m-const removed/, "deletions are red");
-  assert.match(card[5], /\x1b\[38;2;104;245;168m\+const added/, "additions are green");
+  assert.match(card[5], /\x1b\[38;2;138;154;91m\+const added/, "additions use the restrained diff green");
 });
 
 test("cards drop the diff preamble and never leak ANSI when color is off", () => {
@@ -113,7 +113,7 @@ test("an add card marks the file green and counts only real additions", () => {
     "    +first",
     "    +second",
   ]);
-  assert.match(renderLiveDiffCard(patchEvent({ changeKind: "add", diff }), {})[0], /\x1b\[38;2;104;245;168m⏺/);
+  assert.match(renderLiveDiffCard(patchEvent({ changeKind: "add", diff }), { color: true })[0], /\x1b\[38;2;138;154;91m⏺/);
 });
 
 test("renames show old → new even when the diff carries no hunks", () => {

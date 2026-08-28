@@ -42,10 +42,10 @@ import { RESULT_ELBOW, TOOL_BULLET, shortReceipt } from "./chat-tui.js";
 /* ---------- palette (banner.ts / chat-tui.ts, same dark-console values) ---------- */
 
 const RESET = "\x1b[0m";
-const ACCENT_RGB = "41;211;255";
-const ADD_RGB = "104;245;168";
+const ACCENT_RGB = "217;119;87";
+const ADD_RGB = "138;154;91";
 const DEL_RGB = "255;107;122";
-const MUTED_RGB = "142;161;181";
+const MUTED_RGB = "148;144;140";
 
 /** Beyond this many rendered hunk lines a card truncates with "… n more lines". */
 export const LIVE_DIFF_MAX_LINES = 40;

@@ -1,6 +1,8 @@
 import {
   Editor,
   ProcessTerminal,
+  SelectList,
+  SettingsList,
   TUI,
   matchesKey,
   truncateToWidth,
@@ -9,8 +11,12 @@ import {
   type AutocompleteProvider,
   type Component,
   type EditorTheme,
+  type SelectItem,
+  type SelectListTheme,
+  type SettingsListTheme,
 } from "@earendil-works/pi-tui";
 import { createCoalescer } from "@musterhq/core";
+import { effortDisplayLabel, modelDisplayLabel, modelProvider, type ComposerPickerSelection, type ComposerPickerState, type EffortValue } from "./model-catalog.js";
 
 export interface MusterChatCommand {
   readonly name: string;
@@ -56,6 +62,7 @@ export type MusterCompletionKind =
   | "mcp"
   | "integration"
   | "integration-workflow"
+  | "reasoning"
   | "agent";
 
 export interface MusterCompletionRequest {
@@ -82,12 +89,17 @@ export interface MusterChatSink {
   setStatus(status: string): void;
   clearStatus(): void;
   openPicker(command: string): void;
+  selectComposerSetting(state: ComposerPickerState): Promise<ComposerPickerSelection | undefined>;
 }
 
 export interface RunMusterChatTuiOptions extends MusterAutocompleteOptions {
   readonly headerLines?: readonly string[];
+  /** Transcript rows present before the first frame, including resumed history. */
+  readonly initialLines?: readonly string[];
   readonly statusLine: () => string | Promise<string>;
   readonly onSubmit: (text: string, sink: MusterChatSink) => Promise<boolean>;
+  /** Interrupt the provider turn currently owned by onSubmit. */
+  readonly onInterrupt?: () => boolean | Promise<boolean>;
   /** Printed to stdout after teardown when the session exits via /exit. */
   readonly farewell?: string;
 }
@@ -114,11 +126,15 @@ export function formatWorkingIndicator(agentId: string | undefined, frame: numbe
 }
 
 const RESET = "\x1b[0m";
-const ACCENT_RGB = "41;211;255";
-const HIGHLIGHT_RGB = "104;245;168";
-const MUTED_RGB = "142;161;181";
+// Claude Code-calibre restraint: ONE warm coral accent (Anthropic book-cloth
+// tone), warm amber for highlights, warm neutral grays for chrome. The old
+// cyan/lime arcade palette was the reported "old blue" problem — cold colors
+// belong nowhere in the chat surface.
+const ACCENT_RGB = "217;119;87";
+const HIGHLIGHT_RGB = "224;175;104";
+const MUTED_RGB = "148;144;140";
 const RED_RGB = "255;107;122";
-const SELECTION_BG_RGB = "41;211;255";
+const SELECTION_BG_RGB = "217;119;87";
 const ITALIC = "\x1b[3m";
 
 /**
@@ -664,11 +680,11 @@ export interface CompactHeaderInfo {
  * `/header full` restores the full panel.
  */
 export function buildCompactHeaderLines(info: CompactHeaderInfo): string[] {
+  // Two lines. Model/provider/runtime/speed/scopes live in the status row —
+  // repeating them here was the "too much MUSTER" complaint.
   return [
-    `${accent("MUSTER")} ${dim("· agent harness")}`,
-    dim(`session ${info.session} · ${info.cwd} · scopes ${info.scopes}`),
-    dim(`${info.model} · ${info.provider} · ${info.runtime} · speed ${info.speed}${info.backends ? ` · ${info.backends}` : ""}`),
-    dim("/help commands · /header full for the full panel · @agent routes a turn"),
+    `${accent("MUSTER")} ${dim(`· ${info.model} · session ${info.session} · ${info.cwd}`)}`,
+    dim("/help commands · /header full · @agent routes a turn"),
   ];
 }
 
@@ -730,18 +746,21 @@ export function createMusterChatEditor(tui: Pick<TUI, "terminal" | "requestRende
 
 export function createMusterChatHarness(options: MusterAutocompleteOptions & {
   readonly onSubmit?: (text: string, sink: MusterChatSink) => Promise<boolean>;
+  readonly onInterrupt?: () => boolean | Promise<boolean>;
+  readonly initialLines?: readonly string[];
   readonly width?: number;
   readonly rows?: number;
 }): MusterChatHarness {
   const tui = fakeHarnessTui(options.width ?? 120, options.rows ?? 40);
   const editor = createMusterChatEditor(tui);
-  const sink = new HarnessSink(editor, options.onSubmit);
+  const sink = new HarnessSink(editor, options.onSubmit, options.onInterrupt, options.initialLines);
   editor.setAutocompleteProvider(createMusterAutocompleteProvider(options));
   editor.onSubmit = (text) => {
     void sink.submit(text);
   };
   return {
     input(data) {
+      if (data === "\x1b" && sink.interruptTurn()) return;
       if (isClearComposerKey(data)) {
         editor.handleInput("\x1b");
         editor.setText("");
@@ -818,11 +837,63 @@ export function renderMusterComposer(editor: Editor, width: number): string[] {
   return result.map((line) => padAnsi(line, frameWidth));
 }
 
+function composerPickerTheme(): { settings: SettingsListTheme; select: SelectListTheme } {
+  return {
+    settings: {
+      label: (text, selected) => selected ? accent(text) : text,
+      value: (text, selected) => selected ? accent(text) : dim(text),
+      description: dim,
+      cursor: accent("› "),
+      hint: dim,
+    },
+    select: {
+      selectedPrefix: accent,
+      selectedText: (text) => process.env.NO_COLOR ? text : `\x1b[38;2;${ACCENT_RGB}m${text}${RESET}`,
+      description: dim,
+      scrollInfo: dim,
+      noMatch: dim,
+    },
+  };
+}
+
+function groupedModelSubmenu(
+  state: ComposerPickerState,
+  theme: SelectListTheme,
+  onSelect: (value: string) => void,
+  onCancel: () => void,
+): SelectList {
+  let previousProvider: string | undefined;
+  const items: SelectItem[] = state.catalog.models.map((model) => {
+    const startsGroup = model.provider !== previousProvider;
+    previousProvider = model.provider;
+    return {
+      value: model.value,
+      label: `${startsGroup ? model.provider.padEnd(8) : "".padEnd(8)}${model.label}${model.value === state.activeModel ? "  ✓" : ""}`,
+      description: startsGroup ? `${model.provider} models` : undefined,
+    };
+  });
+  return selectSubmenu(items, items.findIndex((item) => item.value === state.activeModel), theme, onSelect, onCancel);
+}
+
+function selectSubmenu(
+  items: SelectItem[],
+  selectedIndex: number,
+  theme: SelectListTheme,
+  onSelect: (value: string) => void,
+  onCancel: () => void,
+): SelectList {
+  const list = new SelectList(items, 12, theme, { minPrimaryColumnWidth: 24, maxPrimaryColumnWidth: 44 });
+  if (selectedIndex >= 0) list.setSelectedIndex(selectedIndex);
+  list.onSelect = (item) => onSelect(item.value);
+  list.onCancel = onCancel;
+  return list;
+}
+
 export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promise<void> {
   const terminal = new ProcessTerminal();
   const tui = new TUI(terminal, true);
   const editor = createMusterChatEditor(tui);
-  const screen = new MusterChatScreen(tui, editor, options.statusLine, options.headerLines ?? []);
+  const screen = new MusterChatScreen(tui, editor, options.statusLine, options.headerLines ?? [], options.initialLines ?? [], options.onInterrupt);
   editor.setAutocompleteProvider(createMusterAutocompleteProvider(options));
   editor.onSubmit = (text) => {
     void screen.submit(text, options.onSubmit);
@@ -834,6 +905,7 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
       screen.stop();
       return { consume: true };
     }
+    if (matchesKey(data, "escape") && screen.interruptTurn()) return { consume: true };
     if (isClearComposerKey(data)) {
       editor.handleInput("\x1b");
       editor.setText("");
@@ -856,6 +928,7 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
   await screen.refreshStatusLine();
   const rawEscapeHandler = (chunk: Buffer | string): void => {
     const data = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+    if (data === "\x1b" && screen.interruptTurn()) return;
     if (data === "\x1b" && isBareCompletionTrigger(editor.getText())) {
       editor.handleInput(data);
       editor.setText("");
@@ -877,9 +950,12 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
 }
 
 class MusterChatScreen implements Component, MusterChatSink {
-  private readonly lines: string[] = [];
+  private readonly lines: string[];
   private status = "";
   private stopped = false;
+  private turnRunning = false;
+  private interruptRequested = false;
+  private pickerOpen = false;
   exited = false;
   onStop?: () => void;
 
@@ -888,7 +964,11 @@ class MusterChatScreen implements Component, MusterChatSink {
     private readonly editor: Editor,
     private readonly statusLine: () => string | Promise<string>,
     private headerLines: readonly string[],
-  ) {}
+    initialLines: readonly string[],
+    private readonly onInterrupt?: () => boolean | Promise<boolean>,
+  ) {
+    this.lines = [...initialLines];
+  }
 
   async refreshStatusLine(): Promise<void> {
     this.status = await this.statusLine();
@@ -937,6 +1017,73 @@ class MusterChatScreen implements Component, MusterChatSink {
     this.tui.requestRender(true);
   }
 
+  selectComposerSetting(state: ComposerPickerState): Promise<ComposerPickerSelection | undefined> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let handle: ReturnType<TUI["showOverlay"]> | undefined;
+      const finish = (selection?: ComposerPickerSelection): void => {
+        if (settled) return;
+        settled = true;
+        this.pickerOpen = false;
+        handle?.hide();
+        this.tui.setFocus(this.editor);
+        this.tui.requestRender(true);
+        resolve(selection);
+      };
+      const pickerTheme = composerPickerTheme();
+      this.pickerOpen = true;
+      const settings = new SettingsList([
+        {
+          id: "model",
+          label: "Model",
+          currentValue: modelDisplayLabel(state.activeModel),
+          description: `Current source: ${state.modelSource}`,
+          submenu: () => groupedModelSubmenu(state, pickerTheme.select, (value) => finish({ kind: "model", value }), () => finish()),
+        },
+        modelProvider(state.activeModel) === "claude"
+          ? {
+              id: "extended-thinking",
+              label: "Effort",
+              currentValue: "Extended thinking — managed by the model",
+              description: "Claude CLI exposes no verified thinking tier flag for these models.",
+            }
+          : {
+              id: "effort",
+              label: "Effort",
+              currentValue: effortDisplayLabel(state.effort),
+              description: `Current source: ${state.effortSource}`,
+              submenu: () => selectSubmenu(
+                state.catalog.efforts.map((option) => ({
+                  value: option.value,
+                  label: `${option.label}${option.value === state.effort ? "  ✓" : ""}`,
+                  description: option.hint,
+                })),
+                state.catalog.efforts.findIndex((option) => option.value === state.effort),
+                pickerTheme.select,
+                (value) => finish({ kind: "effort", value: value as EffortValue }),
+                () => finish(),
+              ),
+            },
+        {
+          id: "speed",
+          label: "Speed",
+          currentValue: state.speed,
+          description: state.speed === "fast" ? "Warm native session with ambient recall off" : "Full memory and skill context",
+          values: state.speed === "fast" ? ["fast", "session"] : ["session", "fast"],
+        },
+      ], 6, pickerTheme.settings, (id, value) => {
+        if (id === "speed") finish({ kind: "speed", value: value as "session" | "fast" });
+      }, () => finish());
+      handle = this.tui.showOverlay(settings, {
+        anchor: "bottom-center",
+        width: 72,
+        maxHeight: 22,
+        margin: { bottom: 5, left: 1, right: 1 },
+      });
+      this.tui.requestRender(true);
+    });
+  }
+
   async submit(text: string, onSubmit: (text: string, sink: MusterChatSink) => Promise<boolean>): Promise<void> {
     const value = text.trim();
     if (!value || this.stopped) return;
@@ -950,6 +1097,8 @@ class MusterChatScreen implements Component, MusterChatSink {
       return;
     }
     this.editor.disableSubmit = true;
+    this.turnRunning = true;
+    this.interruptRequested = false;
     this.editor.addToHistory(value);
     this.appendUser(value);
     try {
@@ -958,9 +1107,20 @@ class MusterChatScreen implements Component, MusterChatSink {
     } catch (error) {
       this.appendLine(red(error instanceof Error ? error.message : String(error)));
     } finally {
+      this.turnRunning = false;
       this.editor.disableSubmit = false;
       this.clearStatus();
     }
+  }
+
+  interruptTurn(): boolean {
+    if (this.pickerOpen || !this.turnRunning || this.interruptRequested || !this.onInterrupt) return false;
+    this.interruptRequested = true;
+    void Promise.resolve(this.onInterrupt()).then((interrupted) => {
+      if (interrupted) this.appendLine(dim("⎋ interrupted"));
+      else this.interruptRequested = false;
+    }).catch(() => { this.interruptRequested = false; });
+    return true;
   }
 
   stop(): void {
@@ -976,18 +1136,19 @@ class MusterChatScreen implements Component, MusterChatSink {
   render(width: number): string[] {
     const frameWidth = Math.max(40, Math.min(width, 240));
     const composer = renderMusterComposer(this.editor, frameWidth);
-    const rows = Math.max(12, this.tui.terminal.rows);
     // The status row arrives pre-styled (formatStatusLine owns spinner + dim);
     // re-wrapping it in dim() would reset the color half-way through the row.
     const status = this.status ? [truncateToWidth(this.status, frameWidth, "")] : [];
     const fittedHeader = fitLines(this.headerLines, frameWidth);
-    const freeRows = Math.max(0, rows - composer.length - status.length - 1);
-    const reserveTranscriptRows = Math.min(6, Math.max(1, Math.floor(freeRows * 0.45)));
-    const headerBudget = Math.max(0, freeRows - reserveTranscriptRows);
-    const header = renderHeaderWindow(fittedHeader, headerBudget);
-    const transcriptBudget = Math.max(1, rows - header.length - composer.length - status.length - 1);
-    const transcript = renderTranscriptWindow(this.lines, frameWidth, transcriptBudget);
-    return [...header, ...transcript, ...status, ...composer].map((line) => padAnsi(line, frameWidth));
+    // FLOW MODE — the Claude Code contract. The full transcript is handed to
+    // pi-tui, whose differ repaints only the visible viewport and lets earlier
+    // lines flow into the terminal's NATIVE scrollback: the user can scroll up
+    // through the whole session. Windowing/truncation here (the old
+    // renderTranscriptWindow budget) is what made running history vanish; it
+    // must never come back. renderTranscriptWindow remains exported for
+    // cramped non-interactive surfaces only.
+    const transcript = this.lines.flatMap((line) => wrapLine(line, frameWidth));
+    return [...fittedHeader, ...transcript, ...status, ...composer].map((line) => padAnsi(line, frameWidth));
   }
 
   handleInput(data: string): void {
@@ -995,7 +1156,9 @@ class MusterChatScreen implements Component, MusterChatSink {
   }
 
   private trimTranscript(): void {
-    if (this.lines.length > 500) this.lines.splice(0, this.lines.length - 500);
+    // Generous: this caps in-process repaint cost, not what the user can read —
+    // everything already flowed into native scrollback stays there regardless.
+    if (this.lines.length > 5000) this.lines.splice(0, this.lines.length - 5000);
   }
 }
 
@@ -1003,11 +1166,17 @@ class HarnessSink implements MusterChatSink {
   readonly transcriptLines: string[] = [];
   exited = false;
   statusRow = "";
+  private turnRunning = false;
+  private interruptRequested = false;
 
   constructor(
     private readonly editor: Editor,
     private readonly onSubmit?: (text: string, sink: MusterChatSink) => Promise<boolean>,
-  ) {}
+    private readonly onInterrupt?: () => boolean | Promise<boolean>,
+    initialLines: readonly string[] = [],
+  ) {
+    this.transcriptLines.push(...initialLines);
+  }
 
   appendLine(line: string): void {
     if (isWorkingStatusLine(line)) {
@@ -1040,6 +1209,10 @@ class HarnessSink implements MusterChatSink {
     for (const char of command) this.editor.handleInput(char);
   }
 
+  async selectComposerSetting(_state: ComposerPickerState): Promise<ComposerPickerSelection | undefined> {
+    return undefined;
+  }
+
   async submit(text: string): Promise<boolean> {
     const value = text.trim();
     if (!value) return true;
@@ -1049,9 +1222,24 @@ class HarnessSink implements MusterChatSink {
       this.exited = true;
       return false;
     }
-    const keepGoing = await (this.onSubmit?.(value, this) ?? Promise.resolve(true));
-    this.clearStatus();
-    return keepGoing;
+    this.turnRunning = true;
+    this.interruptRequested = false;
+    try {
+      return await (this.onSubmit?.(value, this) ?? Promise.resolve(true));
+    } finally {
+      this.turnRunning = false;
+      this.clearStatus();
+    }
+  }
+
+  interruptTurn(): boolean {
+    if (!this.turnRunning || this.interruptRequested || !this.onInterrupt) return false;
+    this.interruptRequested = true;
+    void Promise.resolve(this.onInterrupt()).then((interrupted) => {
+      if (interrupted) this.appendLine(dim("⎋ interrupted"));
+      else this.interruptRequested = false;
+    }).catch(() => { this.interruptRequested = false; });
+    return true;
   }
 }
 
@@ -1183,6 +1371,7 @@ function slashCompletionContext(trimmed: string):
   | { kind: "mcp"; fragment: string; prefix: string }
   | { kind: "integration"; fragment: string; prefix: string }
   | { kind: "integration-workflow"; fragment: string; prefix: string }
+  | { kind: "reasoning"; fragment: string; prefix: string }
   | undefined {
   switch (trimmed.toLowerCase()) {
     case "/tools":
@@ -1213,6 +1402,8 @@ function slashCompletionContext(trimmed: string):
       return { kind: "plugin", fragment: "", prefix: trimmed };
     case "/mcp":
       return { kind: "mcp", fragment: "", prefix: trimmed };
+    case "/reasoning":
+      return { kind: "reasoning", fragment: "", prefix: trimmed };
     case "/integration":
     case "/integrations":
       return { kind: "integration", fragment: "", prefix: trimmed };
@@ -1245,6 +1436,8 @@ function slashCompletionContext(trimmed: string):
   if (cloudMatch) return { kind: "cloud", fragment: cloudMatch[1] ?? "", prefix: trimmed };
   const speedMatch = trimmed.match(/^\/speed\s+([^\s]*)$/i);
   if (speedMatch) return { kind: "speed", fragment: speedMatch[1] ?? "", prefix: trimmed };
+  const reasoningMatch = trimmed.match(/^\/reasoning\s+([^\s]*)$/i);
+  if (reasoningMatch) return { kind: "reasoning", fragment: reasoningMatch[1] ?? "", prefix: trimmed };
   const capabilityMatch = trimmed.match(/^\/(?:capabilities|capability|caps)\s+([^\s]*)$/i);
   if (capabilityMatch) return { kind: "capability", fragment: capabilityMatch[1] ?? "", prefix: trimmed };
   const skillMatch = trimmed.match(/^\/skills?\s+([^\s]*)$/i);
@@ -1320,6 +1513,17 @@ function createCallbackCompletionCatalog(options: MusterAutocompleteOptions): Mu
           return filterPickerOptions(await options.clouds?.() ?? [], request.fragment);
         case "speed":
           return filterPickerOptions(await options.speeds?.() ?? [], request.fragment);
+        case "reasoning":
+          return filterPickerOptions([
+            { value: "low", label: "Light", description: "Codex Effort" },
+            { value: "medium", label: "Medium", description: "Codex Effort" },
+            { value: "high", label: "High", description: "Codex Effort" },
+            { value: "xhigh", label: "Extra High", description: "Codex Effort" },
+            { value: "max", label: "Max", description: "Codex Effort" },
+            { value: "ultra", label: "Ultra", description: "Consumes usage limits faster" },
+            { value: "compact", label: "summaries: brief", description: "one dim line above each answer" },
+            { value: "full", label: "summaries: full", description: "every provider-approved summary line" },
+          ], request.fragment);
         case "capability": {
           const capabilities = await options.capabilities?.();
           return filterPickerOptions(capabilities ?? [

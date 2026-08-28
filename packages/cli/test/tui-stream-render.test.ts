@@ -110,7 +110,7 @@ test("reasoning summaries render dim italic and above the message they explain",
   assert.match(stripAnsi(painted[reasoningIndex]), /^· /);
   if (!process.env.NO_COLOR) {
     assert.ok(painted[reasoningIndex].includes("\x1b[3m"), "reasoning renders italic");
-    assert.ok(formatReasoningLine("x").includes("142;161;181"), "reasoning renders dim");
+    assert.ok(formatReasoningLine("x").includes("148;144;140"), "reasoning renders dim");
   }
 });
 
@@ -241,7 +241,7 @@ test("exit commands are routed by the TUI itself", async () => {
 
 // ── Defect #6: compact launch header ────────────────────────────────────────
 
-test("compact launch header fits in five lines and still names session, model, and help", () => {
+test("compact launch header is two lines and keeps the active model on the wordmark line", () => {
   const lines = buildCompactHeaderLines({
     session: "main",
     cwd: "~/code/muster",
@@ -252,12 +252,14 @@ test("compact launch header fits in five lines and still names session, model, a
     speed: "session",
   });
 
-  assert.ok(lines.length <= 5, `compact header must stay <= 5 lines, saw ${lines.length}`);
+  assert.ok(lines.length <= 2, `compact header must stay <= 2 lines, saw ${lines.length}`);
   const text = plain(lines).join("\n");
   assert.match(text, /MUSTER/);
   assert.match(text, /session main/);
-  assert.match(text, /gpt-5\.6-sol · codex · native · speed session/);
+  assert.match(text, /~\/code\/muster/);
   assert.match(text, /\/header full/);
+  assert.match(text, /MUSTER · gpt-5\.6-sol/);
+  assert.doesNotMatch(text, /codex · native|speed session|scopes/);
   assert.equal(plain(lines).some((line) => line.length === 0), false, "no filler rows");
 });
 

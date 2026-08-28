@@ -179,7 +179,7 @@ test("CLI chat exposes a real named terminal chat surface without hanging in non
   assert.match(help.stdout, /\/agents/);
   assert.match(help.stdout, /\/provider <id> \[model\]/);
   assert.match(help.stdout, /\/cloud \[preset\]/);
-  assert.match(help.stdout, /\/model <name>/);
+  assert.match(help.stdout, /\/model \[name\]/);
   assert.match(help.stdout, /\/runtime \[id\]/);
   assert.match(help.stdout, /\/tokens \[limit\]/);
   assert.match(help.stdout, /\/scope <kind:id/);
@@ -213,7 +213,7 @@ test("CLI chat exposes a real named terminal chat surface without hanging in non
   assert.match(commands.stdout, /\/provider <id> \[model\]/);
   assert.match(commands.stdout, /\/providers/);
   assert.match(commands.stdout, /\/cloud \[preset\]/);
-  assert.match(commands.stdout, /\/model <name>/);
+  assert.match(commands.stdout, /\/model \[name\]/);
   assert.match(commands.stdout, /\/runtime \[id\]/);
   assert.match(commands.stdout, /\/scope <kind:id/);
   assert.match(commands.stdout, /\/tokens \[limit\]/);
@@ -3903,9 +3903,13 @@ process.exit(3);
 }
 
 async function runCli(args: string[], cwd = resolve(import.meta.dirname, "..", "..", ".."), env: Record<string, string> = {}): Promise<{ stdout: string; stderr: string }> {
+  const inheritedEnv = { ...process.env };
+  // Node warns when an agent shell exports both values. Tests request color
+  // explicitly where it matters, so keep subprocess stderr deterministic.
+  delete inheritedEnv.FORCE_COLOR;
   return execFileAsync("tsx", [cliPath, ...args], {
     cwd,
-    env: { ...process.env, MUSTER_ONBOARDING_HOME: join(cwd, ".test-home"), ...env },
+    env: { ...inheritedEnv, MUSTER_ONBOARDING_HOME: join(cwd, ".test-home"), ...env },
     timeout: args.includes("pty_tui") ? 180_000 : 30_000,
     maxBuffer: 1024 * 1024
   });

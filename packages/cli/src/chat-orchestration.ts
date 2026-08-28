@@ -69,11 +69,11 @@ import {
 /* ---------- palette (live-diff.ts / chat-tui.ts, same dark-console values) ---------- */
 
 const RESET = "\x1b[0m";
-const ACCENT_RGB = "41;211;255";
-const OK_RGB = "104;245;168";
+const ACCENT_RGB = "217;119;87";
+const OK_RGB = "138;154;91";
 const WARN_RGB = "247;198;106";
 const BAD_RGB = "255;107;122";
-const MUTED_RGB = "142;161;181";
+const MUTED_RGB = "148;144;140";
 
 function paint(value: string, rgb: string, enabled: boolean): string {
   return enabled ? `\x1b[38;2;${rgb}m${value}${RESET}` : value;

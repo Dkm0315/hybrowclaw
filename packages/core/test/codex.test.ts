@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { buildCodexArgs, parseCodexEvents, runCodex } from "../src/codex.js";
-import { buildCodexAppServerArgs, clearCodexAppServerConversation, clearCodexAppServerSessions, runCodexAppServer } from "../src/codex-app-server.js";
+import { buildCodexAppServerArgs, clearCodexAppServerConversation, clearCodexAppServerSessions, interruptActiveCodexTurn, runCodexAppServer } from "../src/codex-app-server.js";
 import { codexMcpDisableOverrides } from "../src/run.js";
 
 test("runCodex marks an unavailable CLI as safe for governed fallback", async () => {
@@ -204,6 +204,58 @@ rl.on("line", (line) => {
     assert.equal(second.timings?.startupMs, 0);
     assert.equal(second.timings?.threadOpenMs, 0);
     assert.ok((second.timings?.requestToFirstDeltaMs ?? Infinity) < (first.timings?.requestToFirstDeltaMs ?? 0), "warm hit excludes cold startup from request latency");
+  } finally {
+    clearCodexAppServerSessions();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runCodexAppServer: interrupts the active native turn and requests reasoning summaries", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "muster-codex-app-server-interrupt-"));
+  const fake = join(dir, "codex-fake.mjs");
+  const argsLog = join(dir, "args.json");
+  await writeFile(fake, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+import readline from "node:readline";
+writeFileSync(${JSON.stringify(argsLog)}, JSON.stringify(process.argv.slice(2)));
+const rl = readline.createInterface({ input: process.stdin });
+function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ id: msg.id, result: {} });
+  else if (msg.method === "thread/start") send({ id: msg.id, result: { thread: { id: "thread-interrupt" } } });
+  else if (msg.method === "turn/start") {
+    send({ id: msg.id, result: { turn: { id: "turn-interrupt", status: "inProgress" } } });
+    send({ method: "item/agentMessage/delta", params: { delta: "partial" } });
+  } else if (msg.method === "turn/interrupt") {
+    send({ id: msg.id, result: {} });
+    send({ method: "turn/completed", params: { turn: { id: "turn-interrupt", status: "interrupted" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  try {
+    const deltas: string[] = [];
+    let markDispatched!: () => void;
+    const dispatched = new Promise<void>((resolve) => { markDispatched = resolve; });
+    const turn = runCodexAppServer({
+      prompt: "stop me",
+      cwd: dir,
+      command: fake,
+      cacheKey: "interrupt",
+      transportOwner: "test-tui",
+      onDelta: (delta) => {
+        deltas.push(delta);
+        markDispatched();
+      },
+    });
+    await dispatched;
+    assert.equal(await interruptActiveCodexTurn("test-tui"), true);
+    const result = await turn;
+    assert.equal(result.status, "completed");
+    assert.deepEqual(deltas, ["partial"]);
+    const args = JSON.parse(await readFile(argsLog, "utf8")) as string[];
+    assert.ok(args.includes('model_reasoning_summary="auto"'));
   } finally {
     clearCodexAppServerSessions();
     await rm(dir, { recursive: true, force: true });

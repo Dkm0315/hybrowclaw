@@ -235,9 +235,9 @@ async function caseSelectedRowContrast(): Promise<QaPtyTuiCase> {
   const rendered = renderMusterComposer(editor, 90).join("\n");
   const selectedLine = rendered.split("\n").find((line) => line.includes("/help")) ?? "";
   const evidence = {
-    hasBackground: selectedLine.includes("\u001b[48;2;41;211;255m"),
+    hasBackground: selectedLine.includes("\u001b[48;2;217;119;87m"),
     hasReadableForeground: selectedLine.includes("\u001b[38;2;255;255;255m") || selectedLine.includes("\u001b[30;1m"),
-    backgroundBeforeText: selectedLine.indexOf("\u001b[48;2;41;211;255m") >= 0 && selectedLine.indexOf("\u001b[48;2;41;211;255m") < selectedLine.indexOf("/help"),
+    backgroundBeforeText: selectedLine.indexOf("\u001b[48;2;217;119;87m") >= 0 && selectedLine.indexOf("\u001b[48;2;217;119;87m") < selectedLine.indexOf("/help"),
   };
   return makeCase("selected_row_contrast", evidence.hasBackground && evidence.hasReadableForeground && evidence.backgroundBeforeText, "selected completion row has full-row background and readable foreground", stripAnsi(rendered), evidence);
 }
@@ -363,11 +363,12 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
     const overlay = await waitForPtyScreen(session, (screen) => screen.includes("suggestions") && screen.includes("/help"));
     await delay(250);
     const persistentOverlay = await capturePtyScreen(session);
+    const selectedBefore = selectedSuggestion(overlay);
     evidence.stage = "navigate-completion";
     for (let index = 0; index < 5; index += 1) await tmux(["send-keys", "-t", session, "Down"]);
     const navigated = await waitForPtyScreen(session, (screen) => {
       const selected = selectedSuggestion(screen);
-      return Boolean(selected && selected !== "/help");
+      return Boolean(selected && selected !== selectedBefore);
     });
     screens.push(`overlay\n${stripAnsi(overlay)}`, `navigated\n${stripAnsi(navigated)}`);
 
@@ -403,7 +404,7 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
     Object.assign(evidence, {
       overlayCount: count(stripAnsi(persistentOverlay), "suggestions"),
       overlayPersisted: persistentOverlay.includes("suggestions"),
-      selectedBefore: selectedSuggestion(overlay),
+      selectedBefore,
       selectedAfter: selectedSuggestion(navigated),
       escapedComposer: composerValue(escaped),
       historyLatest: composerValue(historyLatest),
@@ -414,9 +415,9 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
     });
     const passed = evidence.overlayCount === 1
       && evidence.overlayPersisted === true
-      && evidence.selectedBefore === "/help"
+      && typeof evidence.selectedBefore === "string"
       && typeof evidence.selectedAfter === "string"
-      && evidence.selectedAfter !== "/help"
+      && evidence.selectedAfter !== evidence.selectedBefore
       && evidence.escapedComposer === ""
       && evidence.historyLatest === "/name pty-two"
       && evidence.historyOlder === "/name pty-one"
@@ -495,7 +496,7 @@ function composerValue(screen: string): string | undefined {
 }
 
 function selectedSuggestion(screen: string): string | undefined {
-  const selected = screen.split("\n").find((line) => line.includes("\u001b[48;2;41;211;255m"));
+  const selected = screen.split("\n").find((line) => line.includes("\u001b[48;2;217;119;87m"));
   return stripAnsi(selected ?? "").match(/→\s+(\/[^\s]+)/)?.[1];
 }
 
