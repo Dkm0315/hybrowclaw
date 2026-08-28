@@ -141,6 +141,8 @@ export interface KanbanTask {
   readonly estimatedContextTokens?: number;
   readonly labels?: readonly string[];
   readonly createdAt: string;
+  /** Commands selected at planning time and run inside the attempt worktree before approval. */
+  readonly acceptanceChecks?: readonly { readonly command: string; readonly expectedExitCode?: number }[];
 }
 
 /** Validate untrusted task JSON without executing or mutating it (agent-graph.ts idiom). */
@@ -176,6 +178,13 @@ export function validateKanbanTask(value: unknown): readonly string[] {
     issues.push("estimatedContextTokens must be a non-negative integer.");
   }
   if (typeof value.createdAt !== "string" || Number.isNaN(Date.parse(value.createdAt))) issues.push("Task createdAt must be an ISO timestamp.");
+  if (value.acceptanceChecks !== undefined) {
+    if (!Array.isArray(value.acceptanceChecks)) issues.push("acceptanceChecks must be an array.");
+    else for (const [index, check] of value.acceptanceChecks.entries()) {
+      if (!isRecord(check) || typeof check.command !== "string" || !check.command.trim()) issues.push(`acceptanceChecks[${index}] requires a command.`);
+      if (isRecord(check) && check.expectedExitCode !== undefined && !Number.isInteger(check.expectedExitCode)) issues.push(`acceptanceChecks[${index}].expectedExitCode must be an integer.`);
+    }
+  }
 
   if (!Array.isArray(value.dependsOn)) issues.push("dependsOn must be an array.");
   else {
@@ -1361,6 +1370,19 @@ export interface KanbanAttemptState {
   readonly costUsd?: number;
   readonly receiptHash?: string;
   readonly error?: string;
+  readonly worktreePath?: string;
+  readonly branchName?: string;
+  readonly lastOutputLine?: string;
+  readonly stalledAt?: string;
+  readonly processOwnerPid?: number;
+}
+
+export interface AcceptanceCheckResult {
+  readonly command: string;
+  readonly expectedExitCode: number;
+  readonly exitCode: number;
+  readonly outputTail: string;
+  readonly passed: boolean;
 }
 
 export type KanbanEventBody =
@@ -1376,14 +1398,23 @@ export type KanbanEventBody =
   | { readonly type: "task_assigned"; readonly taskId: string; readonly assignment: TaskAssignment }
   | { readonly type: "task_unassigned"; readonly taskId: string; readonly reason: string }
   | { readonly type: "task_session_bound"; readonly taskId: string; readonly sessionId: string }
-  | { readonly type: "task_attempt_started"; readonly taskId: string; readonly attemptId: string; readonly agentId: string; readonly turnId?: string; readonly processId?: string }
+  | { readonly type: "task_attempt_started"; readonly taskId: string; readonly attemptId: string; readonly agentId: string; readonly turnId?: string; readonly processId?: string; readonly worktreePath?: string; readonly branchName?: string; readonly idleBudgetMs?: number }
+  | { readonly type: "process_started"; readonly taskId: string; readonly attemptId: string; readonly processId: string; readonly ownerPid?: number }
+  | { readonly type: "process_exited"; readonly taskId: string; readonly attemptId: string; readonly processId: string; readonly exitCode: number }
   | { readonly type: "task_attempt_completed"; readonly taskId: string; readonly attemptId: string; readonly turnId?: string; readonly processId?: string; readonly receiptHash?: string; readonly costUsd?: number }
   | { readonly type: "task_attempt_failed"; readonly taskId: string; readonly attemptId: string; readonly error: string; readonly turnId?: string; readonly processId?: string; readonly costUsd?: number }
   /** Legacy lifecycle fact retained so existing JSONL histories remain replayable. */
   | { readonly type: "task_started"; readonly taskId: string; readonly agentId: string; readonly attemptId: string }
   | { readonly type: "task_progress"; readonly taskId: string; readonly note: string; readonly percentComplete?: number }
+  | { readonly type: "attempt_output"; readonly taskId: string; readonly attemptId: string; readonly line: string }
+  | { readonly type: "attempt_stalled"; readonly taskId: string; readonly attemptId: string; readonly idleBudgetMs: number; readonly lastEvent: string; readonly lastOutputLine: string }
+  | { readonly type: "orphan_process_reaped"; readonly taskId: string; readonly attemptId: string; readonly processId: string; readonly evidence: string }
   | { readonly type: "comment_recorded"; readonly taskId: string; readonly attemptId: string; readonly comment: string; readonly path?: string; readonly line?: number }
+  | { readonly type: "comment_turn_sent"; readonly taskId: string; readonly attemptId: string; readonly sessionId: string; readonly turnId: string; readonly worktreePath: string }
   | { readonly type: "approval_requested"; readonly taskId: string; readonly attemptId: string; readonly reviewerId: string }
+  | { readonly type: "acceptance_checks_completed"; readonly taskId: string; readonly attemptId: string; readonly results: readonly AcceptanceCheckResult[] }
+  | { readonly type: "review_accepted"; readonly taskId: string; readonly attemptId: string; readonly reviewerId: string; readonly acceptanceChecks: readonly AcceptanceCheckResult[]; readonly diffHashes: readonly string[]; readonly mergeCommit?: string }
+  | { readonly type: "merge_conflict"; readonly taskId: string; readonly attemptId: string; readonly detail: string }
   | { readonly type: "task_attempt_cancelled"; readonly taskId: string; readonly attemptId: string; readonly reason: string }
   | { readonly type: "task_submitted_for_review"; readonly taskId: string; readonly artifactDigests?: readonly string[] }
   | { readonly type: "task_review_rejected"; readonly taskId: string; readonly reviewerId: string; readonly reason: string }
@@ -1810,6 +1841,9 @@ export function reduceKanbanEvent(state: KanbanBoardState, event: KanbanEvent): 
       const attemptId = requireText(event.attemptId, "task_attempt_started attemptId");
       if (event.turnId !== undefined) requireText(event.turnId, "task_attempt_started turnId");
       if (event.processId !== undefined) requireText(event.processId, "task_attempt_started processId");
+      if (event.worktreePath !== undefined) requireText(event.worktreePath, "task_attempt_started worktreePath");
+      if (event.branchName !== undefined) requireText(event.branchName, "task_attempt_started branchName");
+      if (event.idleBudgetMs !== undefined && (!Number.isInteger(event.idleBudgetMs) || event.idleBudgetMs < 1)) throw new KanbanEventConflictError("task_attempt_started idleBudgetMs must be a positive integer.");
       if (prior.attemptHistory.has(attemptId)) throw new KanbanEventConflictError(`Attempt "${attemptId}" already exists on task "${event.taskId}".`);
       const attempts = prior.attempts + 1;
       if (attempts > MAX_TASK_ATTEMPTS) throw new KanbanEventConflictError(`Task "${event.taskId}" exhausted ${MAX_TASK_ATTEMPTS} attempts; escalate instead of retrying.`);
@@ -1820,6 +1854,8 @@ export function reduceKanbanEvent(state: KanbanBoardState, event: KanbanEvent): 
         startedAt: event.at,
         ...(event.turnId ? { turnId: event.turnId } : {}),
         ...(event.processId ? { processId: event.processId } : {}),
+        ...(event.worktreePath ? { worktreePath: event.worktreePath } : {}),
+        ...(event.branchName ? { branchName: event.branchName } : {}),
       });
       commit(event.taskId, prior, { status: "in_progress", attemptHistory, currentAttemptId: attemptId, attempts, reason: undefined });
       break;
@@ -1848,6 +1884,22 @@ export function reduceKanbanEvent(state: KanbanBoardState, event: KanbanEvent): 
       });
       commit(event.taskId, prior, { status: "review", attemptHistory, reason: undefined });
       break;
+    }
+    case "process_started": {
+      const prior = requireTask(event.taskId);
+      const attempt = prior.attemptHistory.get(requireText(event.attemptId, "process_started attemptId"));
+      if (!attempt || attempt.status !== "running" || attempt.processId) throw new KanbanEventConflictError(`Attempt "${event.attemptId}" cannot start another process.`);
+      const attemptHistory = new Map(prior.attemptHistory);
+      if (event.ownerPid !== undefined && (!Number.isInteger(event.ownerPid) || event.ownerPid < 1)) throw new KanbanEventConflictError("process_started ownerPid must be positive.");
+      attemptHistory.set(event.attemptId, { ...attempt, processId: requireText(event.processId, "process_started processId"), ...(event.ownerPid ? { processOwnerPid: event.ownerPid } : {}) });
+      commit(event.taskId, prior, { attemptHistory }); break;
+    }
+    case "process_exited": {
+      const prior = requireTask(event.taskId);
+      const attempt = prior.attemptHistory.get(requireText(event.attemptId, "process_exited attemptId"));
+      if (!attempt || attempt.processId !== requireText(event.processId, "process_exited processId")) throw new KanbanEventConflictError(`Process identity does not own attempt "${event.attemptId}".`);
+      if (!Number.isInteger(event.exitCode)) throw new KanbanEventConflictError("process_exited exitCode must be an integer.");
+      commit(event.taskId, prior, {}); break;
     }
     case "task_attempt_failed": {
       const prior = requireTask(event.taskId);
@@ -1911,6 +1963,39 @@ export function reduceKanbanEvent(state: KanbanBoardState, event: KanbanEvent): 
       commit(event.taskId, prior, {});
       break;
     }
+    case "attempt_output": {
+      const prior = requireTask(event.taskId);
+      const attempt = prior.attemptHistory.get(requireText(event.attemptId, "attempt_output attemptId"));
+      if (!attempt || attempt.status !== "running") throw new KanbanEventConflictError(`Attempt "${event.attemptId}" is not running on task "${event.taskId}".`);
+      const attemptHistory = new Map(prior.attemptHistory);
+      attemptHistory.set(event.attemptId, { ...attempt, lastOutputLine: requireText(event.line, "attempt_output line") });
+      commit(event.taskId, prior, { attemptHistory });
+      break;
+    }
+    case "attempt_stalled": {
+      const prior = requireTask(event.taskId);
+      const attempt = prior.attemptHistory.get(requireText(event.attemptId, "attempt_stalled attemptId"));
+      if (!attempt || attempt.status !== "running") throw new KanbanEventConflictError(`Attempt "${event.attemptId}" is not running on task "${event.taskId}".`);
+      if (!Number.isInteger(event.idleBudgetMs) || event.idleBudgetMs < 1) throw new KanbanEventConflictError("attempt_stalled idleBudgetMs must be positive.");
+      const lastEvent = requireText(event.lastEvent, "attempt_stalled lastEvent");
+      const lastOutputLine = requireText(event.lastOutputLine, "attempt_stalled lastOutputLine");
+      const attemptHistory = new Map(prior.attemptHistory);
+      attemptHistory.set(event.attemptId, { ...attempt, stalledAt: event.at, lastOutputLine });
+      commit(event.taskId, prior, { attemptHistory, reason: `stalled after ${event.idleBudgetMs}ms · last event: ${lastEvent} · last output: ${lastOutputLine}` });
+      break;
+    }
+    case "orphan_process_reaped": {
+      const prior = requireTask(event.taskId);
+      const attemptId = requireText(event.attemptId, "orphan_process_reaped attemptId");
+      requireText(event.processId, "orphan_process_reaped processId");
+      const evidence = requireText(event.evidence, "orphan_process_reaped evidence");
+      const attempt = prior.attemptHistory.get(attemptId);
+      if (!attempt || attempt.status !== "running" || attempt.processId !== event.processId) throw new KanbanEventConflictError(`Orphan evidence does not own running attempt "${attemptId}".`);
+      const attemptHistory = new Map(prior.attemptHistory);
+      attemptHistory.set(attemptId, { ...attempt, status: "failed", finishedAt: event.at, error: evidence });
+      commit(event.taskId, prior, { status: "blocked", attemptHistory, reason: evidence });
+      break;
+    }
     case "comment_recorded": {
       const prior = requireTask(event.taskId);
       if (!prior.attemptHistory.has(requireText(event.attemptId, "comment_recorded attemptId"))) throw new KanbanEventConflictError(`Unknown attempt "${event.attemptId}" on task "${event.taskId}".`);
@@ -1920,12 +2005,45 @@ export function reduceKanbanEvent(state: KanbanBoardState, event: KanbanEvent): 
       commit(event.taskId, prior, {});
       break;
     }
+    case "comment_turn_sent": {
+      const prior = requireTask(event.taskId);
+      if (prior.sessionId !== requireText(event.sessionId, "comment_turn_sent sessionId")) throw new KanbanEventConflictError(`Comment turn session does not own task "${event.taskId}".`);
+      const attempt = prior.attemptHistory.get(requireText(event.attemptId, "comment_turn_sent attemptId"));
+      if (!attempt || attempt.worktreePath !== requireText(event.worktreePath, "comment_turn_sent worktreePath")) throw new KanbanEventConflictError(`Comment turn worktree does not own attempt "${event.attemptId}".`);
+      requireText(event.turnId, "comment_turn_sent turnId");
+      commit(event.taskId, prior, {});
+      break;
+    }
     case "approval_requested": {
       const prior = requireTask(event.taskId);
       if (prior.status !== "review") throw new KanbanEventConflictError(`Task "${event.taskId}" must be in review before approval is requested (was ${prior.status}).`);
       if (!prior.attemptHistory.has(requireText(event.attemptId, "approval_requested attemptId"))) throw new KanbanEventConflictError(`Unknown attempt "${event.attemptId}" on task "${event.taskId}".`);
       requireText(event.reviewerId, "approval_requested reviewerId");
+      if (event.actorKind !== "human") throw new KanbanEventConflictError("Approval must be requested by a human actor.");
       commit(event.taskId, prior, {});
+      break;
+    }
+    case "acceptance_checks_completed": {
+      const prior = requireTask(event.taskId);
+      if (prior.status !== "review" || prior.currentAttemptId !== event.attemptId) throw new KanbanEventConflictError(`Acceptance checks require the current review attempt on task "${event.taskId}".`);
+      for (const result of event.results) if (!result.command.trim() || !Number.isInteger(result.exitCode) || !Number.isInteger(result.expectedExitCode)) throw new KanbanEventConflictError("Invalid acceptance check result.");
+      commit(event.taskId, prior, {});
+      break;
+    }
+    case "merge_conflict": {
+      const prior = requireTask(event.taskId);
+      requireText(event.attemptId, "merge_conflict attemptId");
+      commit(event.taskId, prior, { reason: requireText(event.detail, "merge_conflict detail") });
+      break;
+    }
+    case "review_accepted": {
+      const prior = requireTask(event.taskId);
+      if (event.actorKind !== "human") throw new KanbanEventConflictError("review_accepted requires a human actor.");
+      if (prior.status !== "review" || prior.currentAttemptId !== event.attemptId) throw new KanbanEventConflictError(`Task "${event.taskId}" is not at its current review attempt.`);
+      if (event.acceptanceChecks.some((result) => !result.passed)) throw new KanbanEventConflictError("Failed acceptance checks block review acceptance.");
+      requireText(event.reviewerId, "review_accepted reviewerId");
+      for (const hash of event.diffHashes) requireText(hash, "review_accepted diff hash");
+      commit(event.taskId, prior, { status: "done", reason: undefined });
       break;
     }
     case "task_submitted_for_review": {
@@ -2048,6 +2166,9 @@ export interface BoardViewCard {
   readonly lastEventAt: string;
   readonly costUsd?: number;
   readonly lastNarrationLine?: string;
+  readonly stalled?: boolean;
+  readonly stallReason?: string;
+  readonly worktreePath?: string;
 }
 
 export interface BoardView {
@@ -2086,15 +2207,20 @@ function updateProjectedCard(card: BoardViewCard, event: KanbanEvent): BoardView
     case "task_assigned": patch = { status: "assigned", modelId: event.assignment.cardId, score: event.assignment.total }; break;
     case "task_unassigned": patch = { status: "ready", modelId: undefined, score: undefined }; break;
     case "task_session_bound": patch = { sessionId: event.sessionId }; break;
-    case "task_attempt_started": patch = { status: "in_progress", currentAttempt: event.attemptId, startedAt: event.at }; break;
+    case "task_attempt_started": patch = { status: "in_progress", currentAttempt: event.attemptId, startedAt: event.at, ...(event.worktreePath ? { worktreePath: event.worktreePath } : {}) }; break;
     case "task_attempt_completed": patch = { status: "review", costUsd: event.costUsd }; break;
     case "task_attempt_failed": patch = { status: "blocked", costUsd: event.costUsd }; break;
     case "task_attempt_cancelled": patch = { status: "blocked" }; break;
     case "task_started": patch = { status: "in_progress", currentAttempt: event.attemptId, startedAt: event.at }; break;
     case "task_progress": patch = { lastNarrationLine: event.note }; break;
+    case "attempt_output": patch = { lastNarrationLine: event.line }; break;
+    case "attempt_stalled": patch = { stalled: true, stallReason: `last event: ${event.lastEvent} · last output: ${event.lastOutputLine}`, lastNarrationLine: event.lastOutputLine }; break;
+    case "orphan_process_reaped": patch = { status: "blocked", stalled: false, stallReason: event.evidence }; break;
     case "task_submitted_for_review": patch = { status: "review" }; break;
     case "task_review_rejected": patch = { status: "assigned" }; break;
     case "task_completed": patch = { status: "done" }; break;
+    case "review_accepted": patch = { status: "done" }; break;
+    case "merge_conflict": patch = { stallReason: `merge conflict: ${event.detail}` }; break;
     default: break;
   }
   return { ...card, ...patch, lastEventAt: event.at };

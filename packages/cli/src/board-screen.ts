@@ -73,6 +73,8 @@ function modelLabel(card: BoardViewCard): string {
   return `${label}${card.score === undefined ? "" : ` (${card.score})`}`;
 }
 
+const BOARD_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
+
 export function renderBoardLayout(view: BoardView, width: number, height: number, focus: BoardFocus, options: { readonly color?: boolean; readonly nowMs?: number; readonly spinnerFrame?: number } = {}): BoardLayout {
   const color = options.color ?? !process.env.NO_COLOR;
   const nowMs = options.nowMs ?? Date.now();
@@ -97,13 +99,15 @@ export function renderBoardLayout(view: BoardView, width: number, height: number
       const card = view.cards[taskId]!;
       const active = normalized.column === column && normalized.row === row;
       const inner = Math.max(1, columnWidth - 3);
-      const glyph = renderMissionStatusGlyph(card.status);
+      // Stalled beats everything; a running card animates; settled states wear
+      // the spec glyphs (● ◔ ✖) — both lanes' semantics, composed.
+      const glyph = card.stalled ? "!" : card.status === "in_progress" ? BOARD_SPINNER[(options.spinnerFrame ?? 0) % BOARD_SPINNER.length] : renderMissionStatusGlyph(card.status);
       const cost = card.costUsd === undefined ? "cost —" : `$${card.costUsd.toFixed(3)}`;
       const rows = [
         `${glyph} ${clip(card.title, inner)}`,
         `  ${clip(modelLabel(card), inner)}`,
         `  ${elapsed(card, nowMs)} · ${cost}`,
-        `  ${card.status === "in_progress" ? clip(card.lastNarrationLine ?? "working", inner) : clip(card.status.replace("_", " "), inner)}`,
+        `  ${card.stalled ? clip(card.stallReason ?? "stalled · retry/cancel", inner) : card.status === "in_progress" ? clip(card.lastNarrationLine ?? "working", inner) : clip(card.status.replace("_", " "), inner)}`,
         "",
       ].map((line) => pad(active ? paint(line, ACCENT, color) : line, columnWidth));
       cells.push(rows);

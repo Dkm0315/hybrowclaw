@@ -290,7 +290,9 @@ test("the needs-intervention card names the fix, not just the failure", () => {
 test("an empty board says so instead of rendering blank columns", async () => {
   const cwd = await workspace();
   const { deps, lines } = harness(cwd);
+  const startedAt = performance.now();
   const snapshot = await runBoardCommand(deps);
+  assert.ok(performance.now() - startedAt < 150, "board open must stay below the 150ms depth-bar budget");
   assert.equal(snapshot.atSequence, 0);
   assert.deepEqual(lines, [
     "── tasks tasks.main · seq 0 · 0 task(s)",
@@ -300,7 +302,7 @@ test("an empty board says so instead of rendering blank columns", async () => {
 
 /* ------------------------- mission: plan → route → run → narrate ------------------------- */
 
-test("a mission plans, routes per task, streams typed cards, and summarizes", async () => {
+test("a mission stops at review until a human approves, leaving dependents factual", async () => {
   const cwd = await workspace();
   const { deps, lines, executed } = harness(cwd, { plan: async () => TWO_TASK_PLAN });
 
@@ -308,25 +310,23 @@ test("a mission plans, routes per task, streams typed cards, and summarizes", as
 
   assert.ok(outcome);
   assert.deepEqual(outcome.tasks, ["t1", "t2"]);
-  assert.deepEqual(outcome.done, ["t1", "t2"]);
+  assert.deepEqual(outcome.done, []);
   // test_authoring is a claude-only capability on the authenticated seed, so the
   // two tasks must land on different backends — routing, not a default.
-  assert.deepEqual(executed.map((entry) => entry.task.id), ["t1", "t2"]);
-  assert.equal(executed[1]!.cardId, CLAUDE_CARD);
+  assert.deepEqual(executed.map((entry) => entry.task.id), ["t1"]);
 
   const text = lines.join("\n");
   assert.match(text, /^── tasks tasks\.main · codex authenticated · claude on PATH$/m);
   assert.match(text, new RegExp(`^◔ t1 rate-limiter → (${escapeRegExp(CLAUDE_CARD)}|${escapeRegExp(CODEX_CARD)}) \\(\\d+\\)$`, "m"));
   assert.match(text, /^ {2}⎿ t1 editing t1\/limiter\.ts$/m);
-  assert.match(text, /^● t1 done · 14 tests pass · \$0\.04$/m);
-  assert.match(text, new RegExp(`^◔ t2 tests → ${escapeRegExp(CLAUDE_CARD)} \\(\\d+\\)$`, "m"));
-  assert.match(text, /^● t2 done · 14 tests pass · \$0\.04$/m);
+  assert.match(text, /^● t1 done · 14 tests pass · awaiting human review · \$0\.04$/m);
+  assert.doesNotMatch(text, /^◔ t2 tests/m);
   assert.match(text, /^── tasks tasks\.main · harden the ragbot API$/m);
-  assert.match(text, /^ {3}2 task\(s\) · 2 done · 0 stalled · \$0\.08 · 00:00$/m);
-  assert.equal(outcome.costUsd, 0.08);
+  assert.match(text, /^ {3}2 task\(s\) · 0 done · 0 stalled · \$0\.04 · 00:00$/m);
+  assert.equal(outcome.costUsd, 0.04);
 
   // t1 gates t2: the dependent task can only start after the first is done.
-  assert.ok(text.indexOf("● t1 done") < text.indexOf("◔ t2 tests"), "t2 must be routed only after t1 completed");
+  assert.match(text, /t2 not started \(backlog; upstream unfinished\)/);
 });
 
 test("the board renders the columns, model and score the mission recorded", async () => {
@@ -338,10 +338,10 @@ test("the board renders the columns, model and score the mission recorded", asyn
   await runBoardCommand(reader.deps);
   const rendered = reader.lines;
   assert.match(rendered[0]!, /^── tasks tasks\.main · seq \d+ · 2 task\(s\)$/);
-  assert.equal(rendered[1], "   DONE (2)");
+  assert.equal(rendered[1], "   BACKLOG (1)");
   // Columns are fixed-width so the model + score line up down the board.
-  assert.match(rendered[2]!, new RegExp(`^ {5}● t1 {3}rate-limiter {21}high {5}(${escapeRegExp(CLAUDE_CARD)}|${escapeRegExp(CODEX_CARD)}) \\(\\d+\\)$`));
-  assert.match(rendered[3]!, new RegExp(`^ {5}● t2 {3}tests {28}normal {3}${escapeRegExp(CLAUDE_CARD)} \\(\\d+\\)$`));
+  assert.match(rendered.join("\n"), /REVIEW \(1\)/);
+  assert.match(rendered.join("\n"), new RegExp(`rate-limiter.*(${escapeRegExp(CLAUDE_CARD)}|${escapeRegExp(CODEX_CARD)}) \\(\\d+\\)`));
   assert.equal(rendered.at(-1), "   wip idle");
 });
 
@@ -351,7 +351,7 @@ test("one authenticated backend still routes, and /why shows the other one's blo
   const outcome = await runMissionCommand("harden the ragbot API", deps);
 
   assert.ok(outcome);
-  assert.deepEqual(outcome.done, ["t1", "t2"]);
+  assert.deepEqual(outcome.done, []);
   assert.match(lines.join("\n"), /^── tasks tasks\.main · codex unavailable · claude on PATH$/m);
 
   const reader = harness(cwd, {});
@@ -371,7 +371,7 @@ test("one authenticated backend still routes, and /why shows the other one's blo
 
   const view = plain([...renderWhyView(explanation, { color: false })]);
   assert.equal(view[0], "── why t1 · rate-limiter");
-  assert.match(view[1]!, new RegExp(`^ {3}assigned ${escapeRegExp(CLAUDE_CARD)} · total \\d+ · agent muster-subagent · status done$`));
+  assert.match(view[1]!, new RegExp(`^ {3}assigned ${escapeRegExp(CLAUDE_CARD)} · total \\d+ · agent muster-subagent · status review$`));
   assert.match(view[2]!, /^ {3}policy sha256:[0-9a-f]{64}$/);
   assert.equal(view[3], "   gate         status   detail");
   assert.match(view[4]!, /^ {3}retired {6}passed {3}card is active$/);
@@ -565,9 +565,7 @@ test("narration is recorded as throttled task_progress evidence, deduplicated", 
   await runMissionCommand("harden", deps);
   const events = (await readFile(boardEventsPath("main", cwd), "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line) as KanbanEvent);
   const progress = events.filter((event) => event.type === "task_progress");
-  assert.deepEqual(progress.map((event) => (event as { note: string }).note), [
-    "reading api/limiter.ts", "writing api/limiter.ts", "reading api/limiter.ts", "writing api/limiter.ts",
-  ]);
+  assert.deepEqual(progress.map((event) => (event as { note: string }).note), ["reading api/limiter.ts", "writing api/limiter.ts"]);
   assert.ok(progress.every((event) => event.actorKind === "agent"));
 });
 

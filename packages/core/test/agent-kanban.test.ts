@@ -235,6 +235,20 @@ test("session binding is immutable and attempts cannot start before binding", ()
   assert.throws(() => apply(state, { type: "task_session_bound", taskId: "task-1", sessionId: "sess_2" }), /cannot be rebound/);
 });
 
+test("human review acceptance is fenced to the current worktree attempt and passing checks", () => {
+  let state = createReady(openBoard([CARD_A]));
+  state = apply(state, { type: "task_session_bound", taskId: "task-1", sessionId: "sess-1" });
+  state = apply(state, { type: "task_assigned", taskId: "task-1", assignment: assignment(CARD_A.id, "agent-1") });
+  state = apply(state, { type: "task_attempt_started", taskId: "task-1", attemptId: "a1", agentId: "agent-1", worktreePath: "/repo/.muster/worktrees/a1", branchName: "muster/a1", idleBudgetMs: 1000 });
+  state = apply(state, { type: "task_attempt_completed", taskId: "task-1", attemptId: "a1" });
+  const passed = [{ command: "pnpm test", expectedExitCode: 0, exitCode: 0, outputTail: "green", passed: true }];
+  assert.throws(() => apply(state, { type: "review_accepted", taskId: "task-1", attemptId: "a1", reviewerId: "robot", acceptanceChecks: passed, diffHashes: ["sha256:diff"] }), /human actor/);
+  state = apply(state, { type: "approval_requested", taskId: "task-1", attemptId: "a1", reviewerId: "human" }, { actorId: "human", actorKind: "human" });
+  state = apply(state, { type: "acceptance_checks_completed", taskId: "task-1", attemptId: "a1", results: passed }, { actorId: "human", actorKind: "human" });
+  state = apply(state, { type: "review_accepted", taskId: "task-1", attemptId: "a1", reviewerId: "human", acceptanceChecks: passed, diffHashes: ["sha256:diff"] }, { actorId: "human", actorKind: "human" });
+  assert.equal(state.tasks.get("task-1")?.status, "done");
+});
+
 test("facts projection replay equals incremental application", () => {
   const log: KanbanEvent[] = [];
   let state = createReady(openBoard([CARD_A], log), {}, log);

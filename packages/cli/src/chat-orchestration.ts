@@ -35,8 +35,8 @@
  *    reads like the work, not like a report written after it.
  */
 
-import { mkdir, readFile, appendFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
   KANBAN_CAPABILITIES,
@@ -65,6 +65,7 @@ import {
   type SelectionScoreBreakdown,
   type TaskAssignment,
 } from "@musterhq/core";
+import { acquireBoardLease, appendFsync, findRelaunchOrphans, sweepZombieWorktrees } from "./board-runtime.js";
 
 /* ---------- palette (live-diff.ts / chat-tui.ts, same dark-console values) ---------- */
 
@@ -252,7 +253,7 @@ export function buildMissionPlanPrompt(goal: string, cards: readonly ModelCard[]
     "Reply with ONE json object and nothing else, in this exact shape:",
     '{"tasks":[{"title":"short imperative title","goal":"what the agent must do, self-contained",',
     '"requiredCapabilities":["code_edit"],"preferredStrengths":["refactoring"],"dependsOn":[],',
-    '"priority":"normal","estimatedContextTokens":8000}]}',
+    '"priority":"normal","estimatedContextTokens":8000,"acceptanceChecks":[{"command":"pnpm test","expectedExitCode":0}]}]}',
     "",
     `requiredCapabilities MUST come from: ${capabilities.join(", ")}`,
     strengths.length > 0 ? `preferredStrengths SHOULD come from: ${strengths.join(", ")}` : "",
@@ -382,6 +383,11 @@ export function parseMissionPlan(raw: string, options: {
       priority,
       ...(estimatedContextTokens > 0 ? { estimatedContextTokens } : {}),
       createdAt: options.createdAt,
+      acceptanceChecks: Array.isArray(record.acceptanceChecks) ? record.acceptanceChecks.slice(0, 8).flatMap((raw) => {
+        if (!raw || typeof raw !== "object" || typeof (raw as { command?: unknown }).command !== "string" || !(raw as { command: string }).command.trim()) return [];
+        const check = raw as { command: string; expectedExitCode?: unknown };
+        return [{ command: check.command.trim().slice(0, 500), expectedExitCode: Number.isInteger(check.expectedExitCode) ? check.expectedExitCode as number : 0 }];
+      }) : [],
     };
     const problems = validateKanbanTask(task);
     if (problems.length > 0) issues.push(`${id}: dropped (${problems.join("; ")})`);
@@ -434,6 +440,8 @@ export interface BoardStore {
   readonly sessionName: string;
   readonly cwd: string;
   readonly path: string;
+  readonly readOnly: boolean;
+  readonly leaseMessage?: string;
   state(): KanbanBoardState;
   /** Reduce first, append only on acceptance. Throws KanbanEventConflictError otherwise. */
   commit(
@@ -459,6 +467,7 @@ export async function openBoardStore(options: OpenBoardOptions): Promise<BoardSt
   const now = options.now ?? (() => new Date());
   const newId = options.newId ?? (() => `kbe_${randomUUID().slice(0, 12)}`);
   const path = boardEventsPath(options.sessionName, cwd);
+  const lease = await acquireBoardLease(`${path}.lease`);
   const events = await readBoardEvents(options.sessionName, cwd);
   const identity = events[0]
     ? { boardId: events[0].boardId, tenantId: events[0].tenantId, siteId: events[0].siteId }
@@ -478,9 +487,12 @@ export async function openBoardStore(options: OpenBoardOptions): Promise<BoardSt
     sessionName: options.sessionName,
     cwd,
     path,
+    readOnly: !lease.writable,
+    ...(lease.message ? { leaseMessage: lease.message } : {}),
     state: () => state,
     commit(envelope, body) {
       const write = writes.then(async () => {
+      if (!lease.writable) throw new Error(lease.message ?? "tasks board is read-only because another process owns the writer lease");
       // Clock skew must never make the log unreplayable (`assertEnvelope` rejects
       // a timestamp that moves backwards), so time is monotonic per board.
       const wall = now().toISOString();
@@ -495,8 +507,7 @@ export async function openBoardStore(options: OpenBoardOptions): Promise<BoardSt
       if (next === state) {
         throw new Error(`Task event id "${event.id}" is already applied to ${displayTaskSetId(state.boardId)}; event ids must be unique per task set.`);
       }
-      await mkdir(dirname(path), { recursive: true });
-      await appendFile(path, `${JSON.stringify(event)}\n`);
+      await appendFsync(path, JSON.stringify(event));
       state = next;
       return state;
       });
@@ -804,6 +815,9 @@ export interface MissionTaskRunInput {
   readonly cardId: string;
   readonly agentId: string;
   readonly onNarration: (text: string) => void;
+  readonly worktreePath?: string;
+  readonly nextTurn?: string;
+  readonly onProcessStarted?: (processId: string) => void | Promise<void>;
 }
 
 export interface MissionTaskRunResult {
@@ -833,6 +847,8 @@ export interface OrchestrationDeps {
   readonly taskSessionId?: (task: KanbanTask) => Promise<string> | string;
   /** One task execution (spawnSubagent in production). */
   readonly execute: (input: MissionTaskRunInput) => Promise<MissionTaskRunResult>;
+  /** Production creates one isolated git worktree before the durable run-request fact. */
+  readonly prepareAttempt?: (input: { readonly task: KanbanTask; readonly attemptId: string }) => Promise<{ readonly path: string; readonly branchName: string }>;
   /** Minimum gap between durable task_progress events. */
   readonly progressIntervalMs?: number;
 }
@@ -1078,9 +1094,10 @@ async function runMissionWaves(
     // writer, ordered sequence) while the runs themselves overlap.
     const results = await Promise.all(routed.map(async (entry) => {
       const attemptId = `attempt-${entry.taskId}-${store.state().tasks.get(entry.taskId)!.attempts + 1}`;
+      const worktree = await deps.prepareAttempt?.({ task: entry.task, attemptId });
       await store.commit(
         { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `request run ${attemptId}` },
-        { type: "task_attempt_started", taskId: entry.taskId, agentId: MISSION_AGENT_ID, attemptId },
+        { type: "task_attempt_started", taskId: entry.taskId, agentId: MISSION_AGENT_ID, attemptId, ...(worktree ? { worktreePath: worktree.path, branchName: worktree.branchName } : {}), idleBudgetMs: 120_000 },
       );
       const progress = createProgressRecorder(store, entry.taskId, deps);
       let result: MissionTaskRunResult;
@@ -1091,9 +1108,16 @@ async function runMissionWaves(
           sessionId: entry.sessionId,
           cardId: entry.cardId,
           agentId: MISSION_AGENT_ID,
+          ...(worktree ? { worktreePath: worktree.path } : {}),
           onNarration: (text) => {
             deps.emit(renderTaskNarrationLine(entry.taskId, text, options));
             progress.note(text);
+          },
+          onProcessStarted: async (processId) => {
+            await store.commit(
+              { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `process ${processId} started` },
+              { type: "process_started", taskId: entry.taskId, attemptId, processId, ownerPid: process.pid },
+            );
           },
         });
       } catch (error) {
@@ -1104,6 +1128,10 @@ async function runMissionWaves(
 
     for (const entry of results) {
       await entry.progress.flush();
+      if (entry.result.processId) await store.commit(
+        { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `process ${entry.result.processId} exited` },
+        { type: "process_exited", taskId: entry.taskId, attemptId: entry.attemptId, processId: entry.result.processId, exitCode: entry.result.ok ? 0 : 1 },
+      );
       if (!entry.result.ok) {
         await store.commit(
           { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `fail ${entry.attemptId}` },
@@ -1134,19 +1162,10 @@ async function runMissionWaves(
           ...(entry.result.costUsd !== undefined ? { costUsd: entry.result.costUsd } : {}),
         },
       );
-      await store.commit(
-        { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `complete ${entry.taskId}` },
-        {
-          type: "task_completed",
-          taskId: entry.taskId,
-          reviewerId: ORCHESTRATOR_ID,
-          receiptHash: entry.result.receiptHash ?? `run:${entry.result.runId ?? entry.taskId}`,
-        },
-      );
       if (entry.result.costUsd !== undefined) costs.set(entry.taskId, entry.result.costUsd);
       deps.emit(renderTaskDoneCard({
         taskId: entry.taskId,
-        detail: entry.result.summary || "completed",
+        detail: `${entry.result.summary || "completed"} · awaiting human review`,
         ...(entry.result.costUsd !== undefined ? { costUsd: entry.result.costUsd } : {}),
       }, options));
     }
@@ -1208,13 +1227,20 @@ function createProgressRecorder(store: BoardStore, taskId: string, deps: Orchest
 }
 
 export async function runBoardCommand(deps: OrchestrationDeps): Promise<KanbanBoardSnapshot> {
+  const boardCwd = deps.cwd ?? process.cwd();
+  await sweepZombieWorktrees(boardCwd, await readBoardEvents(deps.sessionName, boardCwd)).catch(() => []);
   const store = await openBoardStore({
     sessionName: deps.sessionName,
     ...(deps.cwd ? { cwd: deps.cwd } : {}),
     ...(deps.now ? { now: deps.now } : {}),
     ...(deps.newId ? { newId: deps.newId } : {}),
   });
+  if (!store.readOnly) for (const orphan of findRelaunchOrphans(store.state())) await store.commit(
+    { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `reap orphan ${orphan.processId}` },
+    { type: "orphan_process_reaped", ...orphan },
+  );
   const snapshot = snapshotKanbanBoard(store.state());
+  if (store.readOnly && store.leaseMessage) deps.emit(store.leaseMessage);
   emitAll(deps, renderBoardView(snapshot, renderOptions(deps)));
   return snapshot;
 }

@@ -20,7 +20,7 @@ test("board layout snapshot is stable and contains the five task columns", () =>
   assert.deepEqual(snapshot, [
     "tasks · 5",
     "Backlog 1           Ready 2             Running 1           Review 0            Done 1",
-    "● Write the plan    ◔ Build board       ◔ Wire live updat…                      ● Ship it",
+    "● Write the plan    ◔ Build board       ⠋ Wire live updat…                      ● Ship it",
     "  unassigned          gpt-5.6-sol (91)    gpt-5.6-terra (…                        gpt-5.6-luna (7…",
     "  — · cost —          — · cost —          2m · $0.014                             — · $0.020",
     "  backlog             assigned            Reading the ses…                        done",
@@ -71,4 +71,14 @@ test("SGR reports parse and are stripped before keyboard input", () => {
   assert.deepEqual(parseSgrMouseSequence("\x1b[<0;17;9M"), { button: 0, x: 17, y: 9, release: false });
   assert.equal(stripMouseSequences("a\x1b[<0;17;9M\x1b[<0;17;9mb"), "ab");
   assert.equal(stripMouseSequences("plain"), "plain");
+});
+
+test("stalled card names its last event and output instead of spinning forever", () => {
+  const stalled: BoardView = {
+    columns: { backlog: [], ready: [], running: ["t1"], review: [], done: [] },
+    cards: { t1: { taskId: "t1", title: "Long executor", status: "in_progress", lastEventAt: "2026-08-28T09:00:00.000Z", stalled: true, stallReason: "last event: process.started · last output: compiling worker.ts" } },
+  };
+  const plain = renderBoardLayout(stalled, 100, 10, { column: 2, row: 0 }, { color: false }).lines.join("\n");
+  assert.match(plain, /! Long executor/);
+  assert.match(plain.replace(/\x1b\[[0-9;]*m/g, ""), /last event: pro/);
 });

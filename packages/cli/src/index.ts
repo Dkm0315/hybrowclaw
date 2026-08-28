@@ -258,6 +258,7 @@ import {
   renderSensesPanel,
   resolveAttachableServer,
 } from "./inherited-ecosystem.js";
+import { DurableWorkerStore, approveAttempt, createAttemptWorktree, findRelaunchOrphans, findStalledAttempts, sweepZombieWorktrees } from "./board-runtime.js";
 import {
   approvePairing,
   DEFAULT_GATEWAY_PORT,
@@ -3062,6 +3063,8 @@ function buildOrchestrationDeps(input: {
   readonly provider?: string;
   readonly model?: string;
 }): OrchestrationDeps {
+  const workerStore = new DurableWorkerStore(join(dataDir(input.cwd), "boards", `${input.sessionName.replace(/[^a-zA-Z0-9._-]/g, "_")}.workers.json`));
+  const workerReady = workerStore.restore().then(() => workerStore);
   return {
     sessionName: input.sessionName,
     cwd: input.cwd,
@@ -3105,11 +3108,17 @@ function buildOrchestrationDeps(input: {
         store.close();
       }
     },
+    async prepareAttempt({ task, attemptId }) {
+      return createAttemptWorktree(input.cwd, `board-${input.sessionName}`, task.id, attemptId);
+    },
     async execute(task: MissionTaskRunInput): Promise<MissionTaskRunResult> {
       await ensureDefaultConfig(input.cwd);
       const config = await loadConfig(input.cwd);
       const runtime = runtimeForCardId(task.cardId);
-      const prompt = `${task.task.title}\n\n${task.task.goal}`;
+      const prompt = task.nextTurn ?? `${task.task.title}\n\n${task.task.goal}`;
+      const attemptCwd = task.worktreePath ?? input.cwd;
+      const durableWorker = await workerReady;
+      await durableWorker.setWorker(task.task.id, task.sessionId, "woken");
       const sessionStore = openSessionStore(input.cwd);
       try {
         const prior = sessionStore.loadActiveMessages(task.sessionId);
@@ -3121,7 +3130,7 @@ function buildOrchestrationDeps(input: {
       const accumulator = new LiveFileTurnAccumulator();
       taskDiffTurns.set(task.task.id, accumulator);
       const diffFeed = await startLiveDiffFeed({
-        cwd: input.cwd,
+        cwd: attemptCwd,
         emit: () => {},
         onPatch: (event) => {
           let content = "";
@@ -3130,6 +3139,7 @@ function buildOrchestrationDeps(input: {
         },
       });
       let run: Awaited<Awaited<ReturnType<typeof spawnSubagent>>["done"]>;
+      let executorId: string | undefined;
       try {
         const handle = await spawnSubagent(config, {
           task: prompt,
@@ -3142,11 +3152,17 @@ function buildOrchestrationDeps(input: {
             skipSkillSelection: true,
             skipAgentRules: true,
           },
-        }, input.cwd);
+        }, attemptCwd);
+        // The provider runner is in-process; the owning Muster PID is therefore
+        // the honest OS kill/relaunch identity. The durable worker keeps the
+        // reusable conversation identity separately.
+        executorId = String(process.pid);
+        await task.onProcessStarted?.(executorId);
         run = await handle.done;
       } finally {
         await diffFeed.finish().catch(() => {});
         taskLiveMessages.delete(task.sessionId);
+        await durableWorker.setWorker(task.task.id, task.sessionId, "parked");
       }
       const summary = (run.resultText ?? run.errorMessage ?? "").split("\n").map((line) => line.trim()).find(Boolean) ?? "no output";
       const finalText = run.resultText ?? run.errorMessage ?? summary;
@@ -3158,6 +3174,7 @@ function buildOrchestrationDeps(input: {
         summary,
         ...(costUsd !== undefined ? { costUsd } : {}),
         ...(run.runId ? { runId: run.runId } : {}),
+        ...(executorId ? { processId: executorId } : {}),
       };
     },
   };
@@ -3180,13 +3197,35 @@ const taskLiveMessages = new Map<string, string>();
 function createChatBoardController(state: ChatState): BoardModeController {
   const cwd = chatWorkspaceCwd(state);
   const sessionName = state.sessionName;
+  let hygiene: Promise<unknown> | undefined;
   const withStore = async <T>(fn: (store: Awaited<ReturnType<typeof openBoardStore>>) => Promise<T>): Promise<T> => {
     const store = await openBoardStore({ sessionName, cwd });
     return fn(store);
   };
   return {
     cwd,
-    async loadView() { return projectBoardView(await readBoardEvents(sessionName, cwd)); },
+    async loadView() {
+      let events = await readBoardEvents(sessionName, cwd);
+      hygiene ??= sweepZombieWorktrees(cwd, events).catch(() => []);
+      await hygiene;
+      const recoveryStore = await openBoardStore({ sessionName, cwd });
+      const orphans = findRelaunchOrphans(recoveryStore.state());
+      if (!recoveryStore.readOnly) for (const orphan of orphans) await recoveryStore.commit(
+        { actorId: "orchestrator:recovery", actorKind: "system", summary: `reap orphan ${orphan.processId}` },
+        { type: "orphan_process_reaped", ...orphan },
+      );
+      if (orphans.length) events = await readBoardEvents(sessionName, cwd);
+      const stalls = findStalledAttempts(events);
+      if (stalls.length) {
+        const store = await openBoardStore({ sessionName, cwd });
+        if (!store.readOnly) for (const stall of stalls) await store.commit(
+          { actorId: "orchestrator:recovery", actorKind: "system", summary: `stall detected on ${stall.attemptId}` },
+          { type: "attempt_stalled", ...stall },
+        );
+        events = await readBoardEvents(sessionName, cwd);
+      }
+      return projectBoardView(events);
+    },
     loadMessages(sessionId) {
       const store = openSessionStore(cwd);
       try {
@@ -3198,11 +3237,24 @@ function createChatBoardController(state: ChatState): BoardModeController {
     diff(taskId) { return taskDiffTurns.get(taskId) ?? new LiveFileTurnAccumulator(); },
     comment(taskId, text, anchor) {
       return withStore(async (store) => {
-        const attemptId = store.state().tasks.get(taskId)?.currentAttemptId;
-        if (!attemptId) throw new Error("This task has no attempt to comment on.");
+        const entry = store.state().tasks.get(taskId);
+        const attemptId = entry?.currentAttemptId;
+        const attempt = attemptId ? entry?.attemptHistory.get(attemptId) : undefined;
+        if (!attemptId || !attempt || !entry?.sessionId) throw new Error("This task has no attempt/session to comment on.");
+        if (!attempt.worktreePath) throw new Error("This attempt has no retained worktree; retry it to create an isolated attempt.");
         await store.commit(
           { actorId: "human:cli", actorKind: "human", summary: `record comment on ${taskId}` },
           { type: "comment_recorded", taskId, attemptId, comment: text, ...(anchor ? { path: anchor.path, line: anchor.line } : {}) },
+        );
+        const corrective = `${anchor ? `Review comment at ${anchor.path}:${anchor.line}: ` : "Review comment: "}${text}`;
+        const result = await chatOrchestrationDeps(state).execute({
+          task: entry.task, attemptId, sessionId: entry.sessionId, cardId: entry.assignment?.cardId ?? "", agentId: entry.assignment?.agentId ?? "muster-subagent",
+          worktreePath: attempt.worktreePath, nextTurn: corrective, onNarration: () => {},
+        });
+        if (!result.ok) throw new Error(`comment turn failed: ${result.summary}`);
+        await store.commit(
+          { actorId: "orchestrator:chat", actorKind: "system", summary: `sent comment as next turn on ${taskId}` },
+          { type: "comment_turn_sent", taskId, attemptId, sessionId: entry.sessionId, turnId: result.turnId ?? result.runId ?? `turn-${Date.now()}`, worktreePath: attempt.worktreePath },
         );
       });
     },
@@ -3213,6 +3265,28 @@ function createChatBoardController(state: ChatState): BoardModeController {
         await store.commit(
           { actorId: "human:cli", actorKind: "human", summary: `request approval for ${taskId}` },
           { type: "approval_requested", taskId, attemptId: entry.currentAttemptId, reviewerId: "human:cli" },
+        );
+        const attempt = entry.attemptHistory.get(entry.currentAttemptId);
+        if (!attempt?.worktreePath || !attempt.branchName) throw new Error("This attempt has no retained worktree to approve.");
+        const result = await approveAttempt({
+          projectCwd: cwd,
+          worktree: { path: attempt.worktreePath, branchName: attempt.branchName },
+          checks: entry.task.acceptanceChecks ?? [],
+        });
+        await store.commit(
+          { actorId: "human:cli", actorKind: "human", summary: `acceptance checks for ${taskId}` },
+          { type: "acceptance_checks_completed", taskId, attemptId: entry.currentAttemptId, results: result.checks },
+        );
+        if (!result.accepted) {
+          if (result.conflict) await store.commit(
+            { actorId: "human:cli", actorKind: "human", summary: `merge conflict on ${taskId}` },
+            { type: "merge_conflict", taskId, attemptId: entry.currentAttemptId, detail: result.conflict },
+          );
+          throw new Error(result.conflict ? `merge conflict: ${result.conflict}` : "acceptance checks failed; task remains in Review");
+        }
+        await store.commit(
+          { actorId: "human:cli", actorKind: "human", summary: `accept and merge ${taskId}` },
+          { type: "review_accepted", taskId, attemptId: entry.currentAttemptId, reviewerId: "human:cli", acceptanceChecks: result.checks, diffHashes: result.diffHashes, ...(result.mergeCommit ? { mergeCommit: result.mergeCommit } : {}) },
         );
       });
     },
@@ -3253,9 +3327,10 @@ function createChatBoardController(state: ChatState): BoardModeController {
         entry = store.state().tasks.get(taskId);
         if (entry?.status !== "assigned" || !entry.assignment) throw new Error(`Task is ${entry?.status ?? "missing"}; retry requires review or a stopped attempt.`);
         const attemptId = `attempt-${taskId}-${entry.attempts + 1}`;
+        const worktree = await createAttemptWorktree(cwd, `board-${sessionName}`, taskId, attemptId);
         await store.commit(
           { actorId: "human:cli", actorKind: "human", summary: `start retry ${attemptId}` },
-          { type: "task_attempt_started", taskId, attemptId, agentId: entry.assignment.agentId },
+          { type: "task_attempt_started", taskId, attemptId, agentId: entry.assignment.agentId, worktreePath: worktree.path, branchName: worktree.branchName, idleBudgetMs: 120_000 },
         );
         taskDiffTurns.set(taskId, new LiveFileTurnAccumulator());
         const task = entry.task;
@@ -3264,17 +3339,28 @@ function createChatBoardController(state: ChatState): BoardModeController {
         if (!sessionId) throw new Error("This task has no bound session.");
         const deps = chatOrchestrationDeps(state);
         void deps.execute({
-          task, attemptId, sessionId, cardId, agentId: entry.assignment.agentId,
+          task, attemptId, sessionId, cardId, agentId: entry.assignment.agentId, worktreePath: worktree.path,
           onNarration: (note) => {
             void openBoardStore({ sessionName, cwd }).then((liveStore) => liveStore.commit(
               { actorId: "orchestrator:chat", actorKind: "system", summary: `${taskId} progress` },
               { type: "task_progress", taskId, note: note.slice(0, 240) },
             )).catch(() => {});
           },
+          onProcessStarted: async (processId) => {
+            const liveStore = await openBoardStore({ sessionName, cwd });
+            await liveStore.commit(
+              { actorId: "orchestrator:chat", actorKind: "system", summary: `process ${processId} started` },
+              { type: "process_started", taskId, attemptId, processId, ownerPid: process.pid },
+            );
+          },
         }).then(async (result) => {
           const liveStore = await openBoardStore({ sessionName, cwd });
           const current = liveStore.state().tasks.get(taskId);
           if (current?.status !== "in_progress" || current.currentAttemptId !== attemptId) return;
+          if (result.processId) await liveStore.commit(
+            { actorId: "orchestrator:chat", actorKind: "system", summary: `process ${result.processId} exited` },
+            { type: "process_exited", taskId, attemptId, processId: result.processId, exitCode: result.ok ? 0 : 1 },
+          );
           await liveStore.commit(
             { actorId: "orchestrator:chat", actorKind: "system", summary: `${result.ok ? "complete" : "fail"} ${attemptId}` },
             result.ok

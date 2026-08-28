@@ -137,7 +137,7 @@ export class TaskView implements Component {
       ? `${accent("comment", color)} › ${this.input}_`
       : "c comment · a approve · r retry · x cancel · o open in $EDITOR · tab file · esc back";
     rows.push(pad(truncateToWidth(controls, width, ""), width));
-    rows.push(pad(dim(this.notice || "review actions are recorded; send-to-agent and merge mechanics land in K-C", color), width));
+    rows.push(pad(dim(this.notice || "comments continue this task session · approval checks then merges", color), width));
     return rows.slice(0, height);
   }
   handleInput(data: string): void {
@@ -145,7 +145,7 @@ export class TaskView implements Component {
       if (matchesKey(data, "escape")) { this.input = undefined; this.options.requestRender(); return; }
       if (matchesKey(data, "enter") || matchesKey(data, "return")) {
         const text = this.input.trim(); this.input = undefined;
-        if (text) this.runAction(this.options.comment(text, this.anchor()), "comment recorded · send-to-agent lands in K-C");
+        if (text) this.runAction(this.options.comment(text, this.anchor()), "comment sent as this task's next turn");
         return;
       }
       if (matchesKey(data, "backspace")) this.input = this.input.slice(0, -1);
@@ -154,7 +154,7 @@ export class TaskView implements Component {
     }
     if (matchesKey(data, "escape")) { this.options.close(); return; }
     if (data === "c") { this.input = ""; this.options.requestRender(); return; }
-    if (data === "a") { this.runAction(this.options.approve(), "approval requested · acceptance checks and merge land in K-C"); return; }
+    if (data === "a") { this.runAction(this.options.approve(), "acceptance checks passed · worktree merged"); return; }
     if (data === "r") { this.runAction(this.options.retry(), "new attempt started"); return; }
     if (data === "x") { this.runAction(this.options.cancel(), "attempt cancelled"); return; }
     if (data === "o") { const anchor = this.anchor(); if (anchor) void Promise.resolve(this.options.openEditor?.(anchor.path, anchor.line) ?? openFileWithEditorGuard(anchor.path, { cwd: this.options.cwd, line: anchor.line })).finally(() => this.options.requestRender(true)); return; }
