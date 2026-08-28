@@ -13,10 +13,12 @@ import {
   isSyntheticCodexUserText,
   listCodexRolloutFiles,
   matchCodexThread,
+  orderCodexSessionsByLineage,
   parseCodexSince,
   readCodexRollout,
   readCodexSessionMeta,
   resolveCodexForkChain,
+  summarizeCodexPrompt,
   type CodexSessionSummary,
 } from "../src/codex-sessions.js";
 import { openSessionStore, type SessionStore } from "../src/sessions.js";
@@ -642,4 +644,132 @@ test("importCodexSession never mutates the rollout file", async (t) => {
       assert.equal((await stat(filePath)).mtimeMs, beforeStat.mtimeMs);
     });
   });
+});
+
+/* ---------- last activity: rollout truth over file mtime ---------- */
+
+test("lastActivityAt comes from the rollout, not a re-touched file mtime", async (t) => {
+  await withCodexHome(t, async (home) => {
+    // The live bug: a day-old 45-turn thread listed as seconds old because
+    // something other than Codex touched its rollout file.
+    const now = Date.UTC(2026, 7, 27, 12, 0, 0);
+    await writeRollout(home, "2026-08-26", {
+      threadId: "aaaa1111-2222-3333-4444-555566667777",
+      startedAt: "2026-08-26T10:00:00.000Z",
+      turns: Array.from({ length: 3 }, (_unused, index) => ({ user: `ask ${index}`, assistant: `answer ${index}` })),
+      mtimeMs: now - 1000,
+    });
+
+    const { sessions } = await discoverCodexSessions({ codexHome: home, nowMs: now });
+
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0].lastActivitySource, "rollout");
+    // Fixture turns are stamped 10:0N — a day before the freshened mtime.
+    assert.ok(now - Date.parse(sessions[0].lastActivityAt) > 60 * 60 * 1000,
+      `expected a day-old activity stamp, got ${sessions[0].lastActivityAt}`);
+  });
+});
+
+test("a truncated head-window scan falls back to mtime and says so", async (t) => {
+  await withCodexHome(t, async (home) => {
+    const now = Date.UTC(2026, 7, 27, 12, 0, 0);
+    const filePath = await writeRollout(home, "2026-08-26", {
+      threadId: "bbbb1111-2222-3333-4444-555566667777",
+      turns: Array.from({ length: 6 }, (_unused, index) => ({ user: `ask ${index}`, assistant: `answer ${index}` })),
+      mtimeMs: now - 5000,
+    });
+
+    // A byte budget that clears session_meta but not the tail forces the
+    // truncated path — exactly what a 1 GB rollout does in the wild.
+    const { size } = await (await import("node:fs/promises")).stat(filePath);
+    const { sessions } = await discoverCodexSessions({ codexHome: home, nowMs: now, maxBytes: Math.floor(size / 2) });
+
+    assert.equal(sessions[0].lastActivitySource, "mtime");
+    assert.equal(sessions[0].lastActivityAt, new Date(now - 5000).toISOString());
+  });
+});
+
+/* ---------- prompt preview ---------- */
+
+test("summarizeCodexPrompt strips manifest noise and returns the first human sentence", () => {
+  const raw = [
+    "---",
+    "name: redis-automation",
+    "plugins:",
+    "  - id: shard_tool",
+    "model: gpt-5.6-sol",
+    "---",
+    "",
+    "Double the redis shards for the staging cluster. Then report the new topology.",
+    "```yaml",
+    "cluster: staging",
+    "```",
+  ].join("\n");
+
+  assert.equal(summarizeCodexPrompt(raw), "Double the redis shards for the staging cluster.");
+});
+
+test("summarizeCodexPrompt collapses whitespace, drops tags, and clamps width", () => {
+  assert.equal(summarizeCodexPrompt("  <ide_context></ide_context>\n\n  fix   the\n  auth bug  "), "fix the auth bug");
+  assert.equal(summarizeCodexPrompt(""), "");
+  // Nothing but a config paste: no human sentence exists, so show the paste
+  // rather than pretending the thread had no prompt.
+  assert.equal(summarizeCodexPrompt("---\nname: x\n"), "name: x");
+  assert.equal(summarizeCodexPrompt("can you access [@chrome](plugin://chrome@openai-bundled)"), "can you access chrome");
+  // A short leading fragment is not a "sentence" worth truncating to.
+  assert.equal(summarizeCodexPrompt("hi. now do the real work"), "hi. now do the real work");
+  assert.equal(summarizeCodexPrompt("x".repeat(50), 10), `${"x".repeat(9)}…`);
+});
+
+/* ---------- fork lineage ordering ---------- */
+
+test("orderCodexSessionsByLineage nests forks under the thread they came from", () => {
+  const summary = (threadId: string, forkedFromId?: string): CodexSessionSummary => ({
+    threadId,
+    cwd: "/repo",
+    startedAt: "2026-08-26T10:00:00.000Z",
+    ...(forkedFromId ? { forkedFromId } : {}),
+    filePath: `/tmp/${threadId}.jsonl`,
+    turnCount: 1,
+    turnCountExact: true,
+    messageCount: 2,
+    firstUserMessage: "ask",
+    lastActivityAt: "2026-08-26T10:05:00.000Z",
+    lastActivitySource: "rollout",
+    sizeBytes: 10,
+  });
+  const rows = orderCodexSessionsByLineage([
+    summary("fork-b", "root-a"),
+    summary("root-a"),
+    summary("fork-of-fork", "fork-b"),
+    summary("orphan", "not-listed"),
+  ]);
+
+  assert.deepEqual(rows.map((row) => [row.session.threadId, row.depth]), [
+    ["root-a", 0],
+    ["fork-b", 1],
+    ["fork-of-fork", 2],
+    ["orphan", 0],
+  ]);
+});
+
+test("orderCodexSessionsByLineage survives a fork cycle without hanging or dropping rows", () => {
+  const summary = (threadId: string, forkedFromId: string): CodexSessionSummary => ({
+    threadId,
+    forkedFromId,
+    cwd: "/repo",
+    startedAt: "2026-08-26T10:00:00.000Z",
+    filePath: `/tmp/${threadId}.jsonl`,
+    turnCount: 1,
+    turnCountExact: true,
+    messageCount: 2,
+    firstUserMessage: "ask",
+    lastActivityAt: "2026-08-26T10:05:00.000Z",
+    lastActivitySource: "rollout",
+    sizeBytes: 10,
+  });
+  const rows = orderCodexSessionsByLineage([summary("a", "b"), summary("b", "a")]);
+
+  assert.equal(rows.length, 2);
+  assert.deepEqual([...rows.map((row) => row.session.threadId)].sort(), ["a", "b"]);
 });

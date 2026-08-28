@@ -326,26 +326,29 @@ export const MODEL_CARD_SEED: readonly ModelCard[] = [
     caveats: ["subscription CLI auth; throughput is bounded by the local `claude` login, not by an API quota"],
   },
   {
-    id: "openai/gpt-5.4", provider: "openai", model: "gpt-5.4", deployment: "cloud",
+    id: "openai/gpt-5.6", provider: "openai", model: "gpt-5.6", deployment: "cloud",
     capabilities: ["code_edit", "code_review", "architecture", "structured_output", "tool_use", "vision"],
     strengths: ["structured_output", "architecture", "instruction_following"],
     costTier: "medium", latencyTier: "standard", contextWindow: 400_000,
     evidence: [vendorClaim(22, 400_000)], dataResidency: "any",
   },
   {
-    id: "codex-cli/gpt-5.5", provider: "codex-cli", model: "gpt-5.5", deployment: "cli",
+    id: "codex-cli/gpt-5.6-sol", provider: "codex-cli", model: "gpt-5.6-sol", deployment: "cli",
     capabilities: ["code_edit", "debugging", "tool_use", "local_execution", "agentic_shell"],
     strengths: ["agentic_shell", "repo_navigation", "debugging"],
-    costTier: "medium", latencyTier: "slow", contextWindow: 400_000,
+    costTier: "medium", latencyTier: "slow", contextWindow: 1_000_000,
     evidence: [
       { kind: "live_probe", ref: "docs/STRATEGY_V2.md#2.2", metric: "first_token_ms", value: 6246, observedAt: "2026-08-27" },
       { kind: "integration_test", ref: "packages/core/test/codex.test.ts" },
-      vendorClaim(45, 400_000),
+      // The only source for this model's window is the operator's own codex
+      // config; cite that file, not the preset line, so the claim is checkable.
+      { kind: "vendor_claim", ref: "~/.codex/config.toml (model_context_window)", metric: "context_window", value: 1_000_000, observedAt: "2026-08-27" },
     ],
     dataResidency: "any",
     caveats: [
       "codex app-server emitted zero item/fileChange/patchUpdated events in 3/3 live runs (STRATEGY_V2 §2.2); edits arrive via shell commandExecution, so the workspace observer, not this backend, is the audit source",
-      "first text delta measured 5.3-9.4s",
+      "first text delta measured 5.3-9.4s against the local codex CLI on 2026-08-27",
+      "the context window is read from the operator's ~/.codex/config.toml, not from a published vendor benchmark",
     ],
   },
   {
@@ -474,6 +477,77 @@ export function findModelCard(id: string, cards: readonly ModelCard[] = MODEL_CA
 
 export function listModelCardsByCapability(capability: string, cards: readonly ModelCard[] = MODEL_CARD_SEED): readonly ModelCard[] {
   return cards.filter((card) => !card.retired && card.capabilities.includes(capability));
+}
+
+/** Bounded Levenshtein: returns `limit + 1` as soon as no alignment can fit. */
+function editDistance(left: string, right: string, limit: number): number {
+  if (Math.abs(left.length - right.length) > limit) return limit + 1;
+  let previous = Array.from({ length: right.length + 1 }, (_unused, index) => index);
+  for (let i = 1; i <= left.length; i += 1) {
+    const current = [i];
+    let rowMin = i;
+    for (let j = 1; j <= right.length; j += 1) {
+      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+      const value = Math.min(current[j - 1]! + 1, previous[j]! + 1, previous[j - 1]! + cost);
+      current.push(value);
+      if (value < rowMin) rowMin = value;
+    }
+    if (rowMin > limit) return limit + 1;
+    previous = current;
+  }
+  return previous[right.length]!;
+}
+
+/** Suggestions are capped so a typo never turns an escalation into a dump. */
+const MAX_CAPABILITY_SUGGESTIONS = 3;
+/** Levenshtein ceiling for "did you mean" — 3 covers plural/tense/one-typo slips. */
+export const CAPABILITY_SUGGESTION_MAX_DISTANCE = 3;
+
+/**
+ * Nearest known capabilities to an unrecognized token: edit distance <= 3, or a
+ * substring relation either way (`edit` → `code_edit`).
+ *
+ * Fail-closed stays fail-closed — this only enriches the escalation DETAIL a
+ * human reads, never the gate that produced it. Ordering is distance then
+ * alphabetical, so the same board always escalates with the same bytes.
+ */
+export function suggestCapabilityMatches(
+  unknown: string,
+  known: Iterable<string>,
+  limit = MAX_CAPABILITY_SUGGESTIONS,
+): readonly string[] {
+  const needle = unknown.toLowerCase();
+  const scored: Array<{ readonly value: string; readonly distance: number }> = [];
+  for (const candidate of new Set(known)) {
+    if (candidate === unknown) continue;
+    const value = candidate.toLowerCase();
+    const distance = editDistance(needle, value, CAPABILITY_SUGGESTION_MAX_DISTANCE);
+    const related = value.includes(needle) || needle.includes(value);
+    if (distance <= CAPABILITY_SUGGESTION_MAX_DISTANCE) scored.push({ value: candidate, distance });
+    else if (related) scored.push({ value: candidate, distance: CAPABILITY_SUGGESTION_MAX_DISTANCE + 1 });
+  }
+  return scored
+    .sort((a, b) => a.distance - b.distance || compareStrings(a.value, b.value))
+    .slice(0, Math.max(0, limit))
+    .map((entry) => entry.value);
+}
+
+/**
+ * "no card qualified" is usually a typo, not a missing model. Name the required
+ * capabilities NO card declares at all, with their nearest known neighbours.
+ */
+function capabilitySuggestionHint(task: KanbanTask, cards: readonly ModelCard[]): string {
+  const known = new Set<string>();
+  for (const card of cards) for (const capability of card.capabilities) known.add(capability);
+  const hints: string[] = [];
+  for (const required of task.requiredCapabilities) {
+    if (known.has(required)) continue;
+    const suggestions = suggestCapabilityMatches(required, known);
+    hints.push(suggestions.length
+      ? `no card declares "${required}" — did you mean ${suggestions.join(", ")}?`
+      : `no card declares "${required}"`);
+  }
+  return hints.length ? `; ${hints.join("; ")}` : "";
 }
 
 // ============================================================================
@@ -810,7 +884,7 @@ export function selectModelForTask(task: KanbanTask, cards: readonly ModelCard[]
       ? "no model cards registered"
       : wipBlocked.length > 0
         ? `all otherwise-qualified cards are at WIP capacity [${wipBlocked.join(", ")}]`
-        : `no card qualified for capabilities [${task.requiredCapabilities.join(", ")}]`;
+        : `no card qualified for capabilities [${task.requiredCapabilities.join(", ")}]${capabilitySuggestionHint(task, cards)}`;
     const draft = { outcome: "needs_intervention" as const, reason, detail, candidates };
     return { ...draft, policyDigest, rationale: renderRationale(draft) };
   }

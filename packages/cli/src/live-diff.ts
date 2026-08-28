@@ -28,11 +28,16 @@
 
 import {
   createWorkspaceObserver,
+  matchesIgnore,
   WorkspaceObserverError,
+  type IgnoreMatcher,
   type WorkspaceObserver,
   type WorkspaceObserverOptions,
   type WorkspacePatchEvent,
 } from "@musterhq/core";
+// Glyphs and the receipt shortener are owned by the transcript idiom so a diff
+// card and a tool result can never drift apart (chat-tui.ts, "TRANSCRIPT IDIOM").
+import { RESULT_ELBOW, TOOL_BULLET, shortReceipt } from "./chat-tui.js";
 
 /* ---------- palette (banner.ts / chat-tui.ts, same dark-console values) ---------- */
 
@@ -44,6 +49,22 @@ const MUTED_RGB = "142;161;181";
 
 /** Beyond this many rendered hunk lines a card truncates with "… n more lines". */
 export const LIVE_DIFF_MAX_LINES = 40;
+
+/**
+ * The harness's own bookkeeping is never the turn's work. When the session cwd
+ * contains a project-local `.muster/` data dir, every turn appends run records,
+ * session handles, memory rows and logs under it — live-proven 2026-08-27: the
+ * `.muster/data/tokens.jsonl` card leaked the raw `{"runId"…}` ledger line into
+ * the transcript (re-opening defect #1 through the diff feed) and inflated the
+ * summary to "8 file(s) changed" when the model touched two. Matching uses the
+ * core `matchesIgnore` segment rule, so a nested `.muster` dir is skipped too.
+ */
+export const LIVE_DIFF_INTERNAL_IGNORE: readonly string[] = [".muster"];
+
+/** True when the feed must not render this event (harness-internal path). */
+export function isLiveDiffInternalPath(path: string | null | undefined): boolean {
+  return typeof path === "string" && matchesIgnore(path, LIVE_DIFF_INTERNAL_IGNORE);
+}
 
 export interface LiveDiffStat {
   readonly additions: number;
@@ -89,50 +110,84 @@ export function liveDiffPathLabel(event: Pick<WorkspacePatchEvent, "path" | "pre
 }
 
 /**
- * One diff card: header line, then the hunk body. Header is
- * `● <path>  (+adds −dels)  <latency>ms` — the marker is green for an add, red
- * for a delete, accent otherwise.
+ * One diff card in the transcript's action idiom (chat-tui.ts):
+ *
+ *   ⏺ Edit(src/run.ts)
+ *     ⎿ +2 −1 · 86ms · receipt d3b9c1a2…
+ *       @@ -1,4 +1,5 @@
+ *
+ * The BODY renderer is unchanged — the same hunk lines, the same colors, the
+ * same truncation — only the frame is the shared ⏺/⎿ one, so a diff card and a
+ * tool result read as the same kind of thing.
  */
 export function renderLiveDiffCard(event: WorkspacePatchEvent, options: LiveDiffRenderOptions = {}): readonly string[] {
   const paint = colorEnabled(options.color);
   const maxLines = Math.max(1, options.maxLines ?? LIVE_DIFF_MAX_LINES);
   const stat = countDiffStat(event.diff);
-  const lines = [renderLiveDiffHeader(event, stat, options)];
+  const lines = [renderLiveDiffHeader(event, stat, options), renderLiveDiffResult(event, stat, options)];
 
   if (event.diff === null || event.diff === undefined) {
-    lines.push(tint(`  diff omitted: ${event.diffOmitted ?? "unavailable"}`, MUTED_RGB, paint));
+    lines.push(tint(`    diff omitted: ${event.diffOmitted ?? "unavailable"}`, MUTED_RGB, paint));
     return lines;
   }
 
   const body = diffBodyLines(event.diff);
   if (!body.length) {
-    lines.push(tint(`  ${changeKindNote(event.changeKind)}`, MUTED_RGB, paint));
+    lines.push(tint(`    ${changeKindNote(event.changeKind)}`, MUTED_RGB, paint));
     return lines;
   }
 
-  for (const line of body.slice(0, maxLines)) lines.push(`  ${paintDiffLine(line, paint)}`);
-  if (body.length > maxLines) lines.push(tint(`  … ${body.length - maxLines} more lines`, MUTED_RGB, paint));
+  for (const line of body.slice(0, maxLines)) lines.push(`    ${paintDiffLine(line, paint)}`);
+  if (body.length > maxLines) lines.push(tint(`    … +${body.length - maxLines} lines`, MUTED_RGB, paint));
   return lines;
 }
 
+/** `⏺ Edit(src/run.ts)` — the action headline; the glyph is tinted by kind. */
 export function renderLiveDiffHeader(
   event: Pick<WorkspacePatchEvent, "path" | "previousPath" | "changeKind">,
+  _stat: LiveDiffStat,
+  options: LiveDiffRenderOptions = {},
+): string {
+  const paint = colorEnabled(options.color);
+  const marker = tint(TOOL_BULLET, markerRgb(event.changeKind), paint);
+  return `${marker} ${liveDiffToolName(event.changeKind)}(${liveDiffPathLabel(event)})`;
+}
+
+/** `  ⎿ +2 −1 · 86ms · receipt d3b9c1a2…` — one dim row, every fact kept. */
+export function renderLiveDiffResult(
+  event: Pick<WorkspacePatchEvent, "receiptHash" | "binary">,
   stat: LiveDiffStat,
   options: LiveDiffRenderOptions = {},
 ): string {
   const paint = colorEnabled(options.color);
-  const marker = tint("●", markerRgb(event.changeKind), paint);
-  const segments = [marker, liveDiffPathLabel(event), renderStatSegment(stat, paint)];
+  const segments = [renderStatSegment(stat, paint)];
+  if (event.binary) segments.push(tint("binary", MUTED_RGB, paint));
   if (options.elapsedMs !== undefined && Number.isFinite(options.elapsedMs)) {
     segments.push(tint(`${Math.max(0, Math.round(options.elapsedMs))}ms`, MUTED_RGB, paint));
   }
-  return `${segments[0]} ${segments.slice(1).join("  ")}`;
+  if (event.receiptHash) segments.push(tint(`receipt ${shortReceipt(event.receiptHash)}`, MUTED_RGB, paint));
+  return `  ${tint(RESULT_ELBOW, MUTED_RGB, paint)} ${segments.join(tint(" · ", MUTED_RGB, paint))}`;
 }
 
-/** Turn-end receipt: `2 file(s) changed  (+12 −4)`. */
+/** Turn-end receipt: `▸ 2 files changed · +12 −4` (pinned when the turn overflows). */
 export function renderLiveDiffSummary(totals: LiveDiffTotals, options: { readonly color?: boolean } = {}): string {
   const paint = colorEnabled(options.color);
-  return `${tint(`${totals.files} file(s) changed`, MUTED_RGB, paint)}  ${renderStatSegment(totals, paint)}`;
+  const label = `${totals.files} file${totals.files === 1 ? "" : "s"} changed`;
+  return `${tint(`▸ ${label} · `, MUTED_RGB, paint)}${renderStatSegment(totals, paint)}`;
+}
+
+/** The verb a change kind reads as in the action headline. */
+export function liveDiffToolName(kind: WorkspacePatchEvent["changeKind"]): string {
+  switch (kind) {
+    case "add":
+      return "Create";
+    case "delete":
+      return "Delete";
+    case "rename":
+      return "Rename";
+    default:
+      return "Edit";
+  }
 }
 
 /** The single dim line a degraded feed is allowed to print. */
@@ -216,6 +271,10 @@ export async function startLiveDiffFeed(options: LiveDiffFeedOptions): Promise<L
 
   const onPatch = (event: WorkspacePatchEvent): void => {
     if (finished) return;
+    // Guarded here as well as via the observer's ignore option so the rule
+    // holds even for injected observers (createObserver seam) that never
+    // consult observerOptions.ignore.
+    if (isLiveDiffInternalPath(event.path) || isLiveDiffInternalPath(event.previousPath)) return;
     try {
       const stat = countDiffStat(event.diff);
       touched.add(event.path);
@@ -233,6 +292,7 @@ export async function startLiveDiffFeed(options: LiveDiffFeedOptions): Promise<L
   try {
     observer = (options.createObserver ?? createWorkspaceObserver)({
       ...(options.observerOptions ?? {}),
+      ignore: mergeIgnoreMatchers(LIVE_DIFF_INTERNAL_IGNORE, options.observerOptions?.ignore),
       root: options.cwd,
       onPatch,
     });
@@ -272,6 +332,13 @@ export async function startLiveDiffFeed(options: LiveDiffFeedOptions): Promise<L
 }
 
 /* ---------- internals ---------- */
+
+/** The feed's internal exclusions plus whatever the caller asked to skip. */
+function mergeIgnoreMatchers(base: readonly string[], extra: IgnoreMatcher | undefined): IgnoreMatcher {
+  if (!extra) return base;
+  if (typeof extra === "function") return (relPath) => matchesIgnore(relPath, base) || extra(relPath);
+  return [...base, ...extra];
+}
 
 /**
  * The card's latency is turn-relative: how long after the turn started this
@@ -313,10 +380,11 @@ function paintDiffLine(line: string, paint: boolean): string {
   return line;
 }
 
+/** `+2 −1` — signed counts keep their colors; the frame around them is dim. */
 function renderStatSegment(stat: LiveDiffStat, paint: boolean): string {
   const adds = tint(`+${stat.additions}`, ADD_RGB, paint);
   const dels = tint(`−${stat.deletions}`, DEL_RGB, paint);
-  return `${tint("(", MUTED_RGB, paint)}${adds} ${dels}${tint(")", MUTED_RGB, paint)}`;
+  return `${adds} ${dels}`;
 }
 
 function markerRgb(kind: WorkspacePatchEvent["changeKind"]): string {

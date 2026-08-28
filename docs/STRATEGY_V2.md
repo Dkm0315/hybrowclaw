@@ -194,7 +194,7 @@ satisfy it (§4.1). It just hasn't connected it.
 Execution item #1 was "build the durable event spine." **It is built.**
 `packages/core/src/run-events.ts`:
 
-- 22 typed append-only event types (`:17-38`)
+- 21 typed append-only event types (`:17-38`; recount 2026-08-27 — the union holds 21 members)
 - Monotonic sequence enforcement (`:128`)
 - Fencing tokens with stale-writer rejection (`:146-155`)
 - Idempotency keys with conflicting-receipt detection (`:198-208`)

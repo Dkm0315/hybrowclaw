@@ -335,7 +335,10 @@ function isDefined<T>(value: T | undefined): value is T {
 function indexGrants(grants: readonly ScopedRuntimeGrant[]): Map<string, ScopedRuntimeGrant> {
   const byScope = new Map<string, ScopedRuntimeGrant>();
   for (const grant of grants) {
-    const scope = normalizeScope(grant.scope);
+    if (!isRecord(grant)) {
+      throw new ScopedRuntimeError("invalid_scope_kind", `Runtime grants must be objects with a scope; received ${grant === null ? "null" : typeof grant}.`);
+    }
+    const scope = normalizeScope(grant.scope as MemoryScope);
     const key = formatMemoryScope(scope);
     if (byScope.has(key)) {
       throw new ScopedRuntimeError("duplicate_grant", `Scope ${key} declares more than one runtime grant.`);
@@ -379,6 +382,10 @@ function normalizeScope(scope: MemoryScope): MemoryScope {
 }
 
 function normalizeEnvAllowlist(names: readonly string[]): string[] {
+  if (!Array.isArray(names)) {
+    // A bare string is iterable and would silently decay into per-character "names".
+    throw new ScopedRuntimeError("invalid_env_name", `Environment allowlist must be an array of variable names, received ${names === null ? "null" : typeof names}.`);
+  }
   const normalized = new Set<string>();
   for (const name of names) {
     const trimmed = typeof name === "string" ? name.trim() : "";
@@ -391,6 +398,10 @@ function normalizeEnvAllowlist(names: readonly string[]): string[] {
 }
 
 function normalizeToolPolicy(toolIds: readonly string[]): string[] {
+  if (!Array.isArray(toolIds)) {
+    // A bare string is iterable and would silently decay into per-character "ids".
+    throw new ScopedRuntimeError("invalid_tool_id", `Tool policy must be an array of tool ids, received ${toolIds === null ? "null" : typeof toolIds}.`);
+  }
   const normalized = new Set<string>();
   for (const toolId of toolIds) {
     const trimmed = typeof toolId === "string" ? toolId.trim() : "";

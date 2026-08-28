@@ -365,6 +365,71 @@ rl.on("line", (line) => {
   }
 });
 
+test("managed Codex runtime honors the configured task model", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-run-codex-configured-model-"));
+  const fake = join(cwd, "codex-fake.mjs");
+  await writeFile(fake, `#!/usr/bin/env node
+import readline from "node:readline";
+if (process.argv[2] === "--help") {
+  process.stdout.write("Commands:\\n  app-server\\n");
+  process.exit(0);
+}
+const rl = readline.createInterface({ input: process.stdin });
+const threadId = "thread-configured-model";
+function send(message) { process.stdout.write(JSON.stringify(message) + "\\n"); }
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") send({ id: message.id, result: { userAgent: "fake" } });
+  else if (message.method === "thread/start") send({ id: message.id, result: { thread: { id: threadId } } });
+  else if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
+    send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m", text: "ok" }, threadId, turnId: "turn-1" } });
+    send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  const previousCommand = process.env.MUSTER_CODEX_COMMAND;
+  process.env.MUSTER_CODEX_COMMAND = fake;
+  try {
+    const base = defaultConfig();
+    const config: MusterConfig = {
+      ...base,
+      providers: {
+        ...base.providers,
+        codex: { ...base.providers.codex!, defaultModel: "configured-provider-model" },
+      },
+      runtimes: {
+        ...base.runtimes,
+        native: {
+          ...base.runtimes.native!,
+          routes: {
+            ...base.runtimes.native!.routes,
+            simple_qa: { provider: "codex", model: "configured-route-model", reasoning: "low" },
+          },
+        },
+      },
+    };
+    const outcome = await executeRun(config, {
+      prompt: "hello",
+      cwd,
+      workspaceDir: cwd,
+      runtime: "codex",
+      nativeTransport: "warm",
+      nativeSessionKeepAlive: false,
+      skipRecall: true,
+      skipSkillSelection: true,
+      skipAgentRules: true,
+      skipMemoryWrite: true,
+    });
+    assert.equal(outcome.episode.model, "configured-route-model");
+  } finally {
+    clearCodexAppServerSessions();
+    if (previousCommand === undefined) delete process.env.MUSTER_CODEX_COMMAND;
+    else process.env.MUSTER_CODEX_COMMAND = previousCommand;
+  }
+});
+
 test("executeRun records exact Codex app-server token usage in the ledger", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-run-codex-app-server-tokens-"));
   const fake = join(cwd, "codex-fake.mjs");

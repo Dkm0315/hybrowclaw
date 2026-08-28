@@ -177,13 +177,13 @@ function guidedInteractionPresentation(
   }
   const rows = Object.entries(pending.values)
     .filter(([, value]) => value !== undefined && value !== null && String(value).trim())
-    .filter(([field]) => !supportTicket || ["subject", "customer", "priority"].includes(field))
-    .map(([field, value]) => [humanizeField(field), String(value)]);
+    .filter(([field]) => !supportTicket || ["subject", "customer", "priority", "description"].includes(field))
+    .map(([field, value]) => [supportTicket && field === "description" ? "Evidence preview" : humanizeField(field), String(value)]);
   return {
     kind: "form",
     title: supportTicket ? "Review the support ticket" : "Review your request",
     summary: supportTicket
-      ? "I gathered the affected record, business impact, reproduction steps, versions, and sanitized error evidence. Check the summary below; nothing has been sent yet."
+      ? "Review the ticket summary and evidence preview below. The approval is bound to the complete sanitized ticket payload; nothing has been sent yet."
       : "I have the required information. Review it before anything is saved.",
     ...(rows.length ? { tables: [{ id: "request-preview", columns: ["Field", "Value"], rows }] } : {}),
     actions: [

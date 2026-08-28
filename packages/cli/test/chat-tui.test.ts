@@ -343,7 +343,7 @@ test("muster chat harness keeps submitted prompt visible after output and clears
   const screen = stripAnsi(harness.visible(100).join("\n"));
 
   assert.equal(harness.text(), "");
-  assert.match(screen, /› show status/);
+  assert.match(screen, /> show status/);
   assert.match(screen, /timings total=120ms/);
   assert.match(screen, /memory backend=sqlite-fts5/);
   assert.match(screen, /done/);
@@ -372,7 +372,7 @@ test("muster chat harness shows and navigates @ agent completions", async () => 
 test("muster transcript keeps the latest prompt visible after long output", () => {
   const rendered = renderTranscriptWindow([
     "older setup line",
-    "\x1b[38;2;104;245;168m›\x1b[0m Where do we deploy the Frappe app?",
+    "\x1b[38;2;142;161;181m>\x1b[0m Where do we deploy the Frappe app?",
     "memory backend=sqlite-fts5 recalled=1 candidates=1",
     "This is a deliberately long assistant answer that wraps across several rows and would otherwise push the prompt out of the visible transcript window.",
     "final answer line",
@@ -385,7 +385,7 @@ test("muster transcript keeps the latest prompt visible after long output", () =
 
 test("muster transcript pins timing and retrieval receipts in cramped TUI output", () => {
   const rendered = renderTranscriptWindow([
-    "\x1b[38;2;104;245;168m›\x1b[0m Reply with exactly: ok",
+    "\x1b[38;2;142;161;181m>\x1b[0m Reply with exactly: ok",
     "timings total=8335ms provider=8259ms recall=11ms prompt=5ms persist=56ms planning=2ms",
     "memory backend=sqlite-fts5 recalled=0 candidates=0 scopes=tenant:f2,user:goblin",
     "assistant body line that would otherwise crowd out receipts",

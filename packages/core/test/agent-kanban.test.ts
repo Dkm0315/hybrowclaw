@@ -31,6 +31,7 @@ import {
   resolveContext,
   selectModelForTask,
   snapshotKanbanBoard,
+  suggestCapabilityMatches,
   toContextBundleReceipt,
   validateKanbanTask,
   type ContextRef,
@@ -355,6 +356,39 @@ test("wip_limit_set changes capacity mid-board and replays identically", () => {
 // 10-18. Selection
 // ---------------------------------------------------------------------------
 
+test("a fail-closed escalation names the nearest known capability instead of just refusing", () => {
+  // The gate is unchanged — the DETAIL is what gains the pointer, so an
+  // operator who typed "code_edits" is not left staring at a blank refusal.
+  const selection = selectModelForTask(task({ requiredCapabilities: ["code_edits"] }), MODEL_CARD_SEED);
+
+  assert.equal(selection.outcome, "needs_intervention");
+  if (selection.outcome !== "needs_intervention") return;
+  assert.equal(selection.reason, "no_qualified_model");
+  assert.match(selection.detail, /no card declares "code_edits" — did you mean code_edit\?/);
+  // Deterministic: the same board escalates with the same bytes every time.
+  assert.equal(selectModelForTask(task({ requiredCapabilities: ["code_edits"] }), MODEL_CARD_SEED).detail, selection.detail);
+});
+
+test("a capability every card lacks BUT that some card declares gets no invented suggestion", () => {
+  // "vision" is a real, declared capability; CARD_A/B/C simply do not have it.
+  // That is a capacity/coverage fact, not a typo, so no hint is fabricated.
+  const selection = selectModelForTask(task({ requiredCapabilities: ["code_edit", "vision"] }), [CARD_A, CARD_B, CARD_C]);
+  assert.equal(selection.outcome, "needs_intervention");
+  if (selection.outcome !== "needs_intervention") return;
+  assert.doesNotMatch(selection.detail, /did you mean/);
+});
+
+test("suggestCapabilityMatches ranks by edit distance, then alphabetically, and stays bounded", () => {
+  const known = ["code_edit", "code_review", "classification", "long_context"];
+  assert.deepEqual(suggestCapabilityMatches("code_edits", known), ["code_edit"]);
+  // Substring relation counts even past the distance ceiling.
+  assert.deepEqual(suggestCapabilityMatches("edit", known), ["code_edit"]);
+  assert.deepEqual(suggestCapabilityMatches("code_", known), ["code_edit", "code_review"]);
+  // Nothing close: refuse to guess.
+  assert.deepEqual(suggestCapabilityMatches("quantum_annealing", known), []);
+  assert.equal(suggestCapabilityMatches("code_", known).length <= 3, true);
+});
+
 test("selection fails closed to needs_intervention when no card covers the capabilities", () => {
   const selection = selectModelForTask(task({ requiredCapabilities: ["code_edit", "vision"] }), [CARD_A, CARD_B, CARD_C]);
   assert.equal(selection.outcome, "needs_intervention");
@@ -562,7 +596,7 @@ test("seed catalog is honest and vendor-neutral", () => {
   for (const entry of MODEL_CARD_SEED.filter((candidate) => candidate.deployment === "local")) assert.equal(entry.dataResidency, "on_premise");
 
   // The finding that forced this design: the codex backend is not an audit source (STRATEGY_V2 §2.2).
-  const codex = findModelCard("codex-cli/gpt-5.5")!;
+  const codex = findModelCard("codex-cli/gpt-5.6-sol")!;
   assert.ok(codex.evidence.some((citation) => citation.kind === "live_probe" && citation.value === 6246));
   assert.ok(codex.caveats?.some((caveat) => /zero item\/fileChange\/patchUpdated events/.test(caveat)));
 

@@ -29,15 +29,17 @@ export interface GatewayFrappeAssistantConfig {
 }
 
 /**
- * Deployment-owned support destination. The connection is resolved through
- * the same actor-bound Frappe OAuth vault as every other write; this object
- * never contains a token or expands the source user's permissions.
+ * Deployment-owned support destination. OAuth remains the default. A public
+ * intake endpoint must be opted into explicitly for one exact origin and
+ * record type; this object never contains credentials.
  */
 export interface GatewayFrappeSupportConfig {
   /** Canonical HTTPS origin of the support site. */
   readonly site?: string;
   /** OAuth connection id configured under frappe.oauth.connections. */
   readonly connectionId?: string;
+  /** Authentication contract for ticket creation. Defaults to actor-bound OAuth. */
+  readonly authMode?: "oauth" | "guest";
   /** Support record type exposed by the destination site. */
   readonly doctype?: "HD Ticket" | "Issue";
   /** Optional deployment default, still validated by the live destination. */

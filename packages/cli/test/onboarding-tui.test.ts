@@ -4,9 +4,9 @@ import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { loadConfig } from "@musterhq/core";
+import { addMemory, loadConfig, MemoryPolicyError } from "@musterhq/core";
 import { loadGatewayConfig } from "@musterhq/gateway";
-import { applyOnboardingProfile, globalOnboardingProfilePath, onboardingProfilePath, onboardingStateForSelections, runMusterOnboardingTui } from "../src/onboarding-tui.js";
+import { applyOnboardingProfile, globalOnboardingProfilePath, memoryPolicyForSelections, onboardingProfilePath, onboardingStateForSelections, renderOnboarding, runMusterOnboardingTui } from "../src/onboarding-tui.js";
 
 function fakeTtyInput(): PassThrough & NodeJS.ReadStream {
   const input = new PassThrough() as PassThrough & NodeJS.ReadStream & { isRaw: boolean };
@@ -113,4 +113,81 @@ test("interactive onboarding redraws in one live screen and ignores normal chara
   assert.match(raw, /\x1b\[\?1049h/, "onboarding should enter the alternate screen to avoid scrollback panes");
   assert.match(raw, /\x1b\[\?1049l/, "onboarding should leave the alternate screen on cleanup");
   assert.equal((raw.match(/Muster onboarding/g) ?? []).length, 2, "initial render plus Down update only; ordinary character keys should not append duplicate frames");
+});
+
+test("every step carries a running summary of the steps before it", async () => {
+  const state = onboardingStateForSelections({
+    purpose: ["code", "memory"],
+    style: [],
+    provider: ["codex", "claude"],
+  });
+
+  // Step 4 (integrations): the rail must carry purpose, style, and provider.
+  state.stepIndex = 3;
+  const screen = renderOnboarding(state, 120, false);
+  assert.match(screen, /So far:/);
+  assert.match(screen, /01 \/ shape/);
+  assert.match(screen, /Build with code/);
+  assert.match(screen, /Personal memory/);
+  assert.match(screen, /02 \/ priorities/);
+  assert.match(screen, /— skipped/, "a step left empty is stated as skipped, not hidden");
+  assert.match(screen, /03 \/ model/);
+  assert.match(screen, /Claude Code/);
+  assert.doesNotMatch(screen, /04 \/ senses\s+\n?.*So far/, "the rail lists prior steps, not the current one");
+
+  // First step: the rail exists and says so, rather than showing an empty column.
+  const emptyState = onboardingStateForSelections({});
+  emptyState.stepIndex = 0;
+  const first = renderOnboarding(emptyState, 120, false);
+  assert.match(first, /So far:/);
+  assert.match(first, /Nothing chosen yet/);
+
+  // Narrow terminals keep the summary; they stack it instead of dropping it.
+  const narrow = renderOnboarding(state, 76, false);
+  assert.match(narrow, /So far:/);
+  assert.match(narrow, /Build with code/);
+
+  // Every step, not just some: walk all of them.
+  for (let index = 0; index < 6; index += 1) {
+    state.stepIndex = index;
+    assert.match(renderOnboarding(state, 120, false), /So far:/, `step ${index} lost the summary rail`);
+    assert.match(renderOnboarding(state, 120, false), /every step optional — s starts coding now/, `step ${index} lost the optional hint`);
+  }
+});
+
+test("the setup surface names runnable commands and never fakes an input field", async () => {
+  const state = onboardingStateForSelections({ channels: ["slack", "whatsapp"] });
+  state.stepIndex = 4;
+  const screen = renderOnboarding(state, 130, false);
+  assert.match(screen, /configure later: muster channels setup slack --bot-token-env/);
+  assert.match(screen, /SLACK_BOT_TOKEN/);
+  assert.match(screen, /WHATSAPP_ACCESS_TOKEN/);
+  assert.doesNotMatch(screen, /Bot token\/env:/, "credential fields that could not be typed into are gone");
+  assert.doesNotMatch(screen, /Access token\/env:/);
+});
+
+test("the memory step writes an ENFORCED policy, not only persona prose", async () => {
+  for (const [selection, expected] of [[["never"], "never"], [["ask"], "ask"], [["project"], "auto"], [["ask", "never"], "never"]] as const) {
+    const cwd = await mkdtemp(join(tmpdir(), "muster-onboarding-memory-"));
+    const home = await mkdtemp(join(tmpdir(), "muster-onboarding-memory-home-"));
+    const state = onboardingStateForSelections({ memory: [...selection] });
+    assert.equal(memoryPolicyForSelections(state), expected);
+
+    const applied = await applyOnboardingProfile(state, cwd, home);
+    const config = await loadConfig(cwd);
+    assert.equal(config.memory?.policy, expected, `memory:${selection.join("+")} must persist policy ${expected}`);
+    assert.ok(applied.configured.includes(`memory:policy=${expected}`));
+
+    // The policy is not advice: the write path enforces it.
+    if (expected === "auto") {
+      const written = await addMemory({ summary: "auto policy fact", provenance: ["onboarding:test"], scopes: [{ kind: "user", id: "me" }] }, cwd);
+      assert.ok(written.id.startsWith("mem_"));
+      continue;
+    }
+    await assert.rejects(
+      () => addMemory({ summary: "policy fact", provenance: ["onboarding:test"], scopes: [{ kind: "user", id: "me" }] }, cwd),
+      (error: unknown) => error instanceof MemoryPolicyError && error.policy === expected,
+      `memory:${selection.join("+")} must block an unconsented durable write`,
+    );
+  }
 });

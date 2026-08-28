@@ -1,7 +1,18 @@
 #!/usr/bin/env node
 import { printBanner, renderBanner } from "./banner.js";
-import { createMusterAutocompleteProvider, formatWorkingIndicator, runMusterChatTui, type MusterChatSink, type MusterCompletionCatalog, type PickerOption } from "./chat-tui.js";
+import { buildCompactHeaderLines, createMusterAutocompleteProvider, createNarrationPainter, formatAssistantBlock, formatCostChip, formatStatusLine, formatToolLine, formatUserLine, formatWorkingIndicator, routeEngineLine, runMusterChatTui, type MusterChatSink, type MusterCompletionCatalog, type PickerOption, type ReasoningMode } from "./chat-tui.js";
 import { startLiveDiffFeed } from "./live-diff.js";
+import {
+  BACKEND_CARD_PROVIDERS,
+  parseBoardCliCommand,
+  parseOrchestrationInvocation,
+  runOrchestrationCommand,
+  type BackendAuth,
+  type MissionTaskRunInput,
+  type MissionTaskRunResult,
+  type OrchestrationDeps,
+} from "./chat-orchestration.js";
+import { commandUsageLines, trimDanglingCodeFence } from "./output.js";
 import { hasCompletedMusterOnboarding, runMusterOnboardingTui } from "./onboarding-tui.js";
 import { runFrappe2RealPromptsQa } from "./qa-frappe2.js";
 import { runFrappeConnectCommand } from "./frappe-connect-command.js";
@@ -20,6 +31,7 @@ import {
   resumePulse,
   listSubRuns,
   reapOrphans,
+  spawnSubagent,
   runWasteBenchmark,
   renderWasteReport,
   adjudicateFeedback,
@@ -30,6 +42,7 @@ import {
   appendFeedback,
   addOpenAICompatibleProvider,
   addCodexCliProvider,
+  DEFAULT_CODEX_MODEL,
   enableBuiltinPlugin,
   enableBuiltinSkill,
   disableBuiltinPlugin,
@@ -189,7 +202,9 @@ import {
   discoverCodexSessions,
   importCodexSession,
   matchCodexThread,
+  orderCodexSessionsByLineage,
   resolveCodexForkChain,
+  summarizeCodexPrompt,
   type CodexSessionSummary,
   artifact_goal_passes,
   artifact_structural_verify,
@@ -199,8 +214,20 @@ import {
   office_tool_integrations,
   pdf_document,
   pptx_presentation,
-  xlsx_workbook
+  xlsx_workbook,
+  attachableInheritedServers,
+  formatReasoningDecision,
+  parseReasoningPreference,
+  withReasoningEconomy,
+  type ReasoningPreference
 } from "@musterhq/core";
+import {
+  inheritedEcosystem,
+  renderInheritedIntegrationsTable,
+  renderInheritedToolsSection,
+  renderSensesPanel,
+  resolveAttachableServer,
+} from "./inherited-ecosystem.js";
 import {
   approvePairing,
   DEFAULT_GATEWAY_PORT,
@@ -224,7 +251,7 @@ import {
   telegramUpdateToSurfaceMessage,
   whatsAppWebhookToSurfaceMessages
 } from "@musterhq/gateway";
-import { closeSync, existsSync, openSync, readFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { access, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -266,6 +293,12 @@ function readCliPackageVersion(): string {
 async function main(): Promise<void> {
   if (command === "--skip-onboarding" || command === "--no-onboarding") {
     await chat([command, ...args]);
+    return;
+  }
+  // Help is answered BEFORE dispatch: no command may see a `--help` argument,
+  // because at least one of them (run) would have spent money on it.
+  if (command && !SELF_HELP_COMMANDS.has(command) && wantsHelp(args)) {
+    printCommandUsage(command);
     return;
   }
   switch (command) {
@@ -383,6 +416,9 @@ async function main(): Promise<void> {
     case "subagents":
       await subagentsCommand(args);
       return;
+    case "board":
+      await boardCommand(args);
+      return;
     case "demo":
       await demoCommand(args);
       return;
@@ -433,8 +469,46 @@ async function main(): Promise<void> {
   }
 }
 
-function printHelp(): void {
-  console.log(`Muster v0
+/**
+ * Does this invocation ask for help rather than work?
+ *
+ * `muster run --help` EXECUTED A PAID MODEL TURN: `--help` survived flag
+ * stripping and became the prompt. A flag-shaped argument must never be
+ * mistaken for user content, so `--help`/`-h` count ANYWHERE in the argv, while
+ * bare `help` counts only in the first position — "explain the help text" is a
+ * legitimate prompt, `--help` never is.
+ */
+function wantsHelp(args: readonly string[]): boolean {
+  return args.some((arg) => arg === "--help" || arg === "-h") || args[0] === "help";
+}
+
+/**
+ * Commands that render their own richer help and must keep doing so
+ * (`muster chat --help` lists slash commands; `eval retrieval --help` explains
+ * seeding). Everything else is answered from the master usage table.
+ */
+const SELF_HELP_COMMANDS = new Set(["chat", "eval"]);
+
+/**
+ * Usage lines for one command, lifted from the single master help text so the
+ * two can never drift. Falls back to full help for a command with no entry.
+ */
+function printCommandUsage(name: string): void {
+  if (name === "codex") {
+    printCodexHelp();
+    return;
+  }
+  const lines = commandUsageLines(HELP_TEXT, name);
+  if (!lines.length) {
+    printHelp();
+    return;
+  }
+  console.log(`muster ${name}\n\nUsage:`);
+  for (const line of lines) console.log(line);
+  console.log("\nFull command list: muster --help");
+}
+
+const HELP_TEXT = `Muster v0
 
 Usage:
   muster                                    # first run: onboarding; after setup: interactive chat
@@ -485,6 +559,7 @@ Usage:
   muster dashboard status | start [--port 7461] [--host 127.0.0.1]
   muster channels list | status [channel] | plan <channel> | simulate <channel> [--message TEXT] | doctor <channel> [--live] | setup|connect|ready <channel> [--mode socket|http] [--public-url URL] [secret flags]
   muster integrations [list|guide|status|workflow <id>|setup <id>|verify <id>|enable <id>|sample <id>]  # guided setup for channels, plugins, and MCPs
+  muster integrations inherited [--refresh]                      # read-only inventory of the MCP servers and plugins codex/claude already give this machine
   muster context graph [episode-id] [--scope tenant:hybrow] [--latest]
   muster latency "prompt" [--runs 3] [--runtime codex] [--provider X] [--model Y] [--scope user:me] [--timeout-ms 30000]
   muster qa scorecard [--codex-command path] [--latest-version x.y.z] [--evidence path] [--strict-release]
@@ -522,6 +597,7 @@ Usage:
   muster skills list | catalog | enable <id> | disable <id> | view <name> | index | curate
   muster pulse add "<cron>" [--kind heartbeat|task] [--prompt "..."] | list | resume <id> | run-due
   muster subagents list | reap [--ttl-min N]
+  muster board list | why <taskId> | assign <taskId> <cardId> [--session <chat>]   # the kanban board /mission builds, outside chat
   muster demo                         # provision a throwaway workspace + stub model, show the full pipeline
   muster benchmark                    # Token Waste Index — prove the ledger savings (deterministic, no model)
   muster run "prompt" [--runtime pi] [--provider anthropic] [--model claude-sonnet-4-5] [--session memory|create|continue] [--scope user:me] [--task-kind coding] [--sensitive]
@@ -550,7 +626,10 @@ Usage:
 
 Design rule:
   One active runtime per run. Providers/models can route dynamically by task.
-`);
+`;
+
+function printHelp(): void {
+  console.log(HELP_TEXT);
 }
 
 async function frappeCommand(args: string[]): Promise<void> {
@@ -771,6 +850,121 @@ function updateCommandForManager(manager: UpdateManager, target: string): { read
   return { command: "npm", args: ["install", "-g", spec] };
 }
 
+/* ---------- workspace bootstrap + backend detection ---------- */
+
+interface ProbeResult {
+  readonly ok: boolean;
+  readonly output: string;
+}
+
+/** Run a short probe command. A missing binary is an answer, never a crash. */
+async function probeCommand(command: string, commandArgs: readonly string[], timeoutMs = 6000): Promise<ProbeResult> {
+  return new Promise<ProbeResult>((resolveProbe) => {
+    let output = "";
+    let settled = false;
+    const finish = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveProbe({ ok, output: output.trim() });
+    };
+    const child = spawn(command, [...commandArgs], { stdio: ["ignore", "pipe", "pipe"] });
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(false);
+    }, timeoutMs);
+    child.stdout?.on("data", (chunk: Buffer) => { output += chunk.toString("utf8"); });
+    child.stderr?.on("data", (chunk: Buffer) => { output += chunk.toString("utf8"); });
+    child.on("error", () => finish(false));
+    child.on("exit", (code) => finish(code === 0));
+  });
+}
+
+/** PATH lookup without spawning `which` — cheaper, and identical in outcome. */
+function findOnPath(binary: string): string | undefined {
+  for (const entry of (process.env.PATH ?? "").split(":")) {
+    if (!entry) continue;
+    const candidate = join(entry, binary);
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+interface BackendDetection {
+  readonly codex: "authenticated" | "installed_logged_out" | "missing";
+  readonly claude: "installed" | "missing";
+}
+
+async function detectBackends(): Promise<BackendDetection> {
+  const codexPath = findOnPath("codex");
+  const codex = !codexPath
+    ? "missing" as const
+    : (await probeCommand("codex", ["login", "status"])).ok ? "authenticated" as const : "installed_logged_out" as const;
+  return { codex, claude: findOnPath("claude") ? "installed" : "missing" };
+}
+
+function describeBackends(detection: BackendDetection): string {
+  const codex = detection.codex === "authenticated" ? "codex: logged in"
+    : detection.codex === "installed_logged_out" ? "codex: installed, logged out (codex login)"
+      : "codex: not installed";
+  return `${codex} · claude: ${detection.claude === "installed" ? "CLI on PATH" : "CLI not on PATH"}`;
+}
+
+/** Single keypress, raw mode, restored no matter how the read ends. */
+async function readSingleKey(): Promise<string> {
+  if (!input.isTTY) return "";
+  const wasRaw = input.isRaw === true;
+  input.setRawMode(true);
+  input.resume();
+  try {
+    return await new Promise<string>((resolveKey) => {
+      const onData = (chunk: Buffer): void => {
+        input.off("data", onData);
+        resolveKey(chunk.toString("utf8"));
+      };
+      input.on("data", onData);
+    });
+  } finally {
+    input.setRawMode(wasRaw);
+    input.pause();
+  }
+}
+
+/**
+ * Guard every command that needs a configured workspace.
+ *
+ * `muster run` in a fresh directory used to surface a raw ENOENT for
+ * `.muster/config.json` — a stack trace where a decision belongs. Interactively
+ * the user is offered the two real choices (init here, or use the global
+ * workspace) and the ORIGINAL command then continues. Non-interactively there is
+ * nobody to ask, so it fails closed with the exact fix.
+ */
+async function requireWorkspace(): Promise<void> {
+  if (existsSync(configPath())) return;
+  if (!input.isTTY || !output.isTTY) {
+    throw new Error("No muster workspace. Fix: muster init");
+  }
+  const detection = await detectBackends();
+  console.log(color(`No muster workspace here (${configPath()} is missing).`, "yellow"));
+  console.log(color(`detected backends: ${describeBackends(detection)}`, "dim"));
+  console.log("[enter] init here with detected backends · [g] global · [esc] cancel");
+  const key = await readSingleKey();
+  if (key === "\r" || key === "\n") {
+    const target = await ensureDefaultConfig(process.cwd());
+    console.log(color(`workspace=${target} backends=${describeBackends(detection)}`, "green"));
+    return;
+  }
+  if (key === "g" || key === "G") {
+    const target = await ensureDefaultConfig(homedir());
+    // "Global" means the command runs against the home workspace, so the cwd
+    // moves with it — otherwise the next config read would miss it again.
+    process.chdir(homedir());
+    console.log(color(`workspace=${target} (global; running from ${homedir()})`, "green"));
+    return;
+  }
+  throw new Error("No muster workspace. Fix: muster init");
+}
+
 async function runUpdateCommand(commandName: string, commandArgs: readonly string[]): Promise<void> {
   await new Promise<void>((resolveRun, rejectRun) => {
     const child = spawn(commandName, [...commandArgs], { stdio: "inherit" });
@@ -830,6 +1024,112 @@ async function doctor(commandArgs: string[] = []): Promise<void> {
   for (const [name, ok, detail] of checks) {
     console.log(`${ok ? "ok " : "err"} ${name.padEnd(28)} ${detail}`);
   }
+
+  for (const check of await runEnvironmentDoctorChecks()) {
+    console.log(`${check.status.padEnd(4)} ${check.id.padEnd(28)} ${check.detail}`);
+    if (check.fix && check.status !== "pass") console.log(`fix  ${check.id.padEnd(28)} ${check.fix}`);
+  }
+}
+
+interface EnvironmentCheck {
+  readonly id: string;
+  readonly status: "pass" | "warn" | "fail";
+  readonly detail: string;
+  readonly fix?: string;
+}
+
+/** Repo root when running from a checkout; undefined for an installed package. */
+function workspaceRepoRoot(): string | undefined {
+  const packageRoot = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
+  const root = resolve(packageRoot, "..", "..");
+  return existsSync(join(root, "pnpm-workspace.yaml")) ? root : undefined;
+}
+
+/** Newest mtime under `dir`, or undefined when the directory has no files. */
+async function newestMtimeMs(dir: string): Promise<number | undefined> {
+  let entries: Array<import("node:fs").Dirent<string>>;
+  try {
+    entries = await readdir(dir, { recursive: true, withFileTypes: true, encoding: "utf8" });
+  } catch {
+    return undefined;
+  }
+  let newest: number | undefined;
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    try {
+      const info = await stat(join(entry.parentPath, entry.name));
+      if (newest === undefined || info.mtimeMs > newest) newest = info.mtimeMs;
+    } catch {
+      // Vanished mid-walk; it cannot be the newest thing that matters.
+    }
+  }
+  return newest;
+}
+
+/**
+ * The four things that have actually broken a session on this machine and that
+ * `doctor` was silent about: a stale dist, a logged-out backend, a daemon that
+ * is not running, and a `muster` on PATH pointing somewhere unexpected.
+ *
+ * Every check reports pass/warn/fail with ONE line of fix. Nothing here mutates
+ * anything — doctor diagnoses; `--fix` and the named commands repair.
+ */
+async function runEnvironmentDoctorChecks(): Promise<readonly EnvironmentCheck[]> {
+  const checks: EnvironmentCheck[] = [];
+
+  // 1. dist freshness — stale dist has silently shipped old behaviour twice.
+  const repoRoot = workspaceRepoRoot();
+  if (!repoRoot) {
+    checks.push({ id: "dist-freshness", status: "pass", detail: "installed package (no source tree to compare)" });
+  } else {
+    for (const pkg of ["core", "gateway", "cli"]) {
+      const packageDir = join(repoRoot, "packages", pkg);
+      if (!existsSync(packageDir)) continue;
+      const srcAt = await newestMtimeMs(join(packageDir, "src"));
+      const distAt = await newestMtimeMs(join(packageDir, "dist"));
+      const rebuild = `pnpm --filter @musterhq/${pkg} build`;
+      if (srcAt === undefined) continue;
+      if (distAt === undefined) {
+        checks.push({ id: `dist:${pkg}`, status: "fail", detail: `${packageDir}/dist is missing`, fix: rebuild });
+      } else if (srcAt > distAt) {
+        const behindMin = Math.max(1, Math.round((srcAt - distAt) / 60_000));
+        checks.push({ id: `dist:${pkg}`, status: "warn", detail: `src is ${behindMin}m newer than dist`, fix: rebuild });
+      } else {
+        checks.push({ id: `dist:${pkg}`, status: "pass", detail: "dist newer than src" });
+      }
+    }
+  }
+
+  // 2. backend auth — a run that will fail at the provider should fail here first.
+  const backends = await detectBackends();
+  checks.push(backends.codex === "authenticated"
+    ? { id: "backend:codex", status: "pass", detail: "codex login status: logged in" }
+    : backends.codex === "installed_logged_out"
+      ? { id: "backend:codex", status: "fail", detail: "codex CLI present but not logged in", fix: "codex login" }
+      : { id: "backend:codex", status: "warn", detail: "codex CLI not on PATH", fix: "npm i -g @openai/codex" });
+  checks.push(backends.claude === "installed"
+    ? { id: "backend:claude", status: "pass", detail: "claude CLI on PATH" }
+    : { id: "backend:claude", status: "warn", detail: "claude CLI not on PATH", fix: "install Claude Code, then: claude login" });
+
+  // 3. gateway daemon — pid file AND health, because either alone can lie.
+  const gatewayPort = await loadGatewayConfig().then((config) => config.port ?? DEFAULT_GATEWAY_PORT, () => DEFAULT_GATEWAY_PORT);
+  const daemon = await inspectGatewayDaemon(gatewayPort);
+  checks.push(!daemon.running
+    ? { id: "gateway-daemon", status: "warn", detail: "not running", fix: `muster gateway daemon start --port ${gatewayPort}` }
+    : daemon.healthy
+      ? { id: "gateway-daemon", status: "pass", detail: `pid ${daemon.pid} healthy on :${gatewayPort}` }
+      : { id: "gateway-daemon", status: "fail", detail: `pid ${daemon.pid} alive but /v1/health unreachable on :${gatewayPort}`, fix: "muster gateway daemon restart" });
+
+  // 4. PATH shim — the binary the user's terminal actually resolves.
+  const shimPath = join(homedir(), ".local", "bin", "muster");
+  const resolved = findOnPath("muster");
+  checks.push(!existsSync(shimPath)
+    ? { id: "path-shim", status: "warn", detail: `${shimPath} is missing`, fix: "npm i -g @musterhq/cli (or symlink the shim into ~/.local/bin)" }
+    : resolved === shimPath
+      ? { id: "path-shim", status: "pass", detail: shimPath }
+      : { id: "path-shim", status: "warn", detail: `PATH resolves muster to ${resolved ?? "nothing"}, not ${shimPath}`, fix: "put ~/.local/bin ahead of the other entry in PATH" });
+
+  return checks;
 }
 
 async function printCodexDoctor(commandArgs: string[]): Promise<void> {
@@ -863,6 +1163,8 @@ interface ChatState {
   pendingMenu?: ChatMenu;
   pendingSuggestion?: ChatSelectedSuggestion;
   statusSink?: MusterChatSink;
+  /** Launch header density. Compact (4 lines) is the default; /header full restores the panel. */
+  headerMode?: "compact" | "full";
   /** undefined ⇒ follow the environment default; see liveDiffEnabled. */
   liveDiff?: boolean;
   /**
@@ -877,6 +1179,30 @@ interface ChatState {
    * this is cleared once used (see resumeCodexThread).
    */
   resumeThreadId?: string;
+  /**
+   * Reasoning summary density. Compact (one dim row per summary) is the
+   * default; `/reasoning full` paints every line the provider approved.
+   */
+  reasoningMode?: ReasoningMode;
+  /**
+   * Reasoning SPEND tier for this chat. `auto` (the default) lets the prompt
+   * heuristic pick, and may only lower the tier below what config would spend;
+   * an explicit tier is sticky until changed. See reasoning-economy.ts.
+   */
+  reasoningTier?: ReasoningPreference;
+  /** Tier the last turn actually ran at — rendered in the status line. */
+  lastReasoning?: string;
+  /** Session running totals — the bottom status row's tokens and cost. */
+  usage?: ChatSessionUsage;
+  /** Wall clock the session started at; the status row's idle elapsed. */
+  startedAt?: number;
+}
+
+interface ChatSessionUsage {
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  turns: number;
 }
 
 const DEFAULT_CHAT_SESSION = "main";
@@ -912,8 +1238,15 @@ const CHAT_COMMANDS: readonly ChatCommandDef[] = [
   { name: "runtime", usage: "/runtime [id]", description: "list or switch active runtime" },
   { name: "speed", usage: "/speed [session|fast]", description: "choose full memory mode or low-latency warm native mode" },
   { name: "live-diff", usage: "/live-diff [on|off]", description: "show inline file diffs live while a turn edits files", aliases: ["livediff", "diffs"] },
+  { name: "mission", usage: "/mission \"<goal>\"", description: "plan a goal into board tasks, route each to a model, run them here" },
+  { name: "board", usage: "/board", description: "show this chat's kanban board with model and score per task", aliases: ["kanban"] },
+  { name: "why", usage: "/why <taskId>", description: "show the 9-gate selection table behind one assignment" },
+  { name: "assign", usage: "/assign <taskId> <cardId>", description: "override the routed model; recorded as a user-override event" },
+  { name: "reasoning", usage: "/reasoning [auto|low|medium|high|compact|full]", description: "set the reasoning spend tier, or the summary density", aliases: ["think"] },
+  { name: "senses", usage: "/senses", description: "show codex-native computer-use, browser, and local endpoint status" },
   { name: "sessions", usage: "/sessions [limit]", description: "list recent named chats", aliases: ["ls"] },
   { name: "resume", usage: "/resume <name|id>", description: "switch to a prior named chat or session id", aliases: ["use"] },
+  { name: "codex", usage: "/codex sessions [limit] | /codex resume <id-prefix>", description: "list or continue your native Codex threads without leaving this chat" },
   { name: "name", usage: "/name <name>", description: "switch current reference name" },
   { name: "history", usage: "/history [limit]", description: "show current chat history" },
   { name: "memory", usage: "/memory <query>", description: "search scoped memory" },
@@ -938,6 +1271,7 @@ const CHAT_COMMANDS: readonly ChatCommandDef[] = [
   { name: "receipt", usage: "/receipt [limit]", description: "show recent retrieval receipts and memory write decisions" },
   { name: "new", usage: "/new [name]", description: "start/switch to a fresh named chat and clear provider handles" },
   { name: "reset", usage: "/reset", description: "clear provider handles for this named chat" },
+  { name: "header", usage: "/header [compact|full]", description: "switch the launch header between the compact 4-line and full panel" },
   { name: "clear", usage: "/clear", description: "clear the terminal screen", aliases: ["cls"] },
   { name: "exit", usage: "/exit", description: "leave chat", aliases: ["quit", "q"] },
 ] as const;
@@ -979,6 +1313,7 @@ const CHAT_MCP_OPTIONS = listBuiltinMcpServers().map((server) => ({
   description: `${server.category} · ${server.source} · risk ${server.risk}`,
 }));
 const CHAT_MCP_ACTION_OPTIONS: readonly PickerOption[] = [
+  { value: "attach", label: "attach", description: "let muster own an inherited codex/claude server that is reachable on localhost" },
   { value: "add-http", label: "add-http", description: "add a custom Streamable HTTP MCP server" },
   { value: "add-stdio", label: "add-stdio", description: "add a custom stdio MCP server" },
   { value: "status", label: "status", description: "show configured MCP auth and transport status" },
@@ -1015,6 +1350,7 @@ async function chat(commandArgs: string[]): Promise<void> {
     scopes: readFlags(commandArgs, "--scope").map(parseMemoryScope),
     recallLimit: readNumberFlag(commandArgs, "--recall-limit"),
     liveDiff: readLiveDiffFlag(commandArgs),
+    startedAt: Date.now(),
     // First turn only: after it lands, executeRun stores a session handle for
     // this conversation and later turns resume the thread without the flag.
     resumeThreadId: readFlag(commandArgs, "--codex-thread"),
@@ -1286,18 +1622,57 @@ async function printChatHeader(state: ChatState): Promise<void> {
   console.log("");
 }
 
+/**
+ * The single bottom row: `<model> · <session> · <tokens in/out> · $cost ·
+ * <elapsed>`, plus the scopes/speed context the compact header no longer
+ * repeats. While a turn runs the same row grows a spinner at its left edge
+ * (startTuiWorkingStatus) — chrome lives in ONE place now.
+ */
 async function chatStatusLine(state: ChatState): Promise<string> {
+  return formatStatusLine(await chatStatusInfo(state));
+}
+
+async function chatStatusInfo(state: ChatState): Promise<Parameters<typeof formatStatusLine>[0]> {
   const config = await loadConfig().catch(() => undefined);
   const runtimeId = state.runtime ?? config?.routing.defaultRuntime ?? "native";
   const runtime = runtimeId ? config?.runtimes[runtimeId] : undefined;
   const providerId = state.provider ?? runtime?.provider ?? "provider";
   const provider = providerId ? config?.providers[providerId] : undefined;
   const model = state.model ?? firstRuntimeModel(runtime) ?? provider?.defaultModel ?? "model";
-  const skills = await listSkills().catch(() => []);
-  const pluginPolicy = config?.plugins;
-  const pluginCount = (pluginPolicy?.allow?.length ?? 0) + Object.keys(pluginPolicy?.entries ?? {}).length;
-  const mcpCount = Object.keys(config?.tools?.mcp?.servers ?? {}).length;
-  return `${model} · ${providerId} · ${runtimeId} · speed ${state.speedMode ?? "fast"} · scopes ${formatChatScopes(activeChatScopes(state))} · ${formatCompactNumber(8)} tool groups · ${formatCompactNumber(skills.length)} skills · ${formatCompactNumber(pluginCount)} plugins · ${formatCompactNumber(mcpCount)} mcp · /help`;
+  const usage = state.usage;
+  return {
+    model,
+    session: state.sessionName,
+    inputTokens: usage?.inputTokens,
+    outputTokens: usage?.outputTokens,
+    costUsd: usage?.costUsd,
+    elapsedMs: state.startedAt ? Date.now() - state.startedAt : undefined,
+    // The active reasoning tier is spend the user is paying for, so it belongs
+    // on the always-visible row, not behind a command.
+    extra: [`${providerId}/${runtimeId}`, `speed ${state.speedMode ?? "fast"}`, `reasoning ${chatReasoningTierLabel(state)}`, `scopes ${formatChatScopes(activeChatScopes(state))}`, "/help"],
+  };
+}
+
+/**
+ * `auto→low` after a turn, `auto` before the first one, `high` when pinned.
+ * The arrow form is the honest one: `auto` is a policy, the tier after it is
+ * what the last turn actually spent.
+ */
+function chatReasoningTierLabel(state: ChatState): string {
+  const preference = state.reasoningTier ?? "auto";
+  const last = state.lastReasoning?.split(" · ")[0];
+  if (preference !== "auto") return preference;
+  return last ? `auto→${last}` : "auto";
+}
+
+/** Every completed turn folds into the session totals the status row shows. */
+function recordChatUsage(state: ChatState, tokens: { inputTokens?: number; outputTokens?: number; costUsd?: number }): void {
+  const usage = state.usage ?? { inputTokens: 0, outputTokens: 0, costUsd: 0, turns: 0 };
+  usage.inputTokens += tokens.inputTokens ?? 0;
+  usage.outputTokens += tokens.outputTokens ?? 0;
+  usage.costUsd += tokens.costUsd ?? 0;
+  usage.turns += 1;
+  state.usage = usage;
 }
 
 async function captureConsoleToSink<T>(fn: () => Promise<T>, sink: MusterChatSink): Promise<T> {
@@ -1306,8 +1681,7 @@ async function captureConsoleToSink<T>(fn: () => Promise<T>, sink: MusterChatSin
   const originalError = console.error;
   const originalClear = console.clear;
   const write = (...values: unknown[]): void => {
-    const line = values.map(formatConsoleValue).join(" ");
-    sink.appendLine(line);
+    emitEngineOutput(values.map(formatConsoleValue).join(" "), sink);
   };
   console.log = write;
   console.warn = write;
@@ -1320,6 +1694,41 @@ async function captureConsoleToSink<T>(fn: () => Promise<T>, sink: MusterChatSin
     console.warn = originalWarn;
     console.error = originalError;
     console.clear = originalClear;
+  }
+}
+
+/**
+ * The one gate between engine stdout and the TUI transcript (defects #1, #2,
+ * #4). A TTY session renders typed events only: run records become a cost
+ * chip, recall/timing debug becomes a chip plus a log line, spinner frames go
+ * to the status row. Non-TTY output never passes through here, so scripts keep
+ * parsing the raw JSON and `memory backend=` lines they always have.
+ */
+/** Guards against printing two cost chips for one run (proactive + engine echo). */
+let lastCostChipRunId: string | undefined;
+
+function emitEngineOutput(text: string, sink: MusterChatSink): void {
+  for (const line of String(text).split(/\r?\n/)) {
+    const route = routeEngineLine(line);
+    switch (route.kind) {
+      case "transcript":
+        sink.appendLine(route.line);
+        break;
+      case "status":
+        sink.setStatus(route.line);
+        break;
+      case "cost":
+        appendChatDiagnostic(route.log);
+        // One chip per run, whoever gets there first.
+        if (route.runId && route.runId === lastCostChipRunId) break;
+        lastCostChipRunId = route.runId;
+        sink.appendLine(route.chip);
+        break;
+      case "diagnostic":
+        appendChatDiagnostic(route.log);
+        if (route.chip) sink.appendLine(route.chip);
+        break;
+    }
   }
 }
 
@@ -1337,11 +1746,62 @@ async function collectConsoleLines(fn: () => Promise<void> | void): Promise<stri
   return lines.flatMap((line) => line.split(/\r?\n/));
 }
 
+/**
+ * Defect #6: the launch header defaults to four lines. The ~20-line panel is
+ * still one command away (`/header full`) — it is a reference table, not
+ * something worth spending half the viewport on every session.
+ */
 async function buildChatHeaderLines(state: ChatState): Promise<string[]> {
+  if ((state.headerMode ?? "compact") === "compact") return buildCompactChatHeaderLines(state);
   return [
     ...renderBanner().split(/\r?\n/).filter((line) => line.length > 0),
     ...(await collectConsoleLines(() => printChatHeader(state))).filter((line) => line.length > 0),
   ];
+}
+
+async function buildCompactChatHeaderLines(state: ChatState): Promise<string[]> {
+  const config = await loadConfig().catch(() => undefined);
+  const runtimeId = state.runtime ?? config?.routing.defaultRuntime ?? "native";
+  const runtime = runtimeId ? config?.runtimes[runtimeId] : undefined;
+  const providerId = state.provider ?? runtime?.provider ?? "provider";
+  const provider = providerId ? config?.providers[providerId] : undefined;
+  return buildCompactHeaderLines({
+    session: state.sessionName,
+    cwd: process.cwd().replace(process.env.HOME ?? "", "~"),
+    scopes: formatChatScopes(activeChatScopes(state)),
+    model: state.model ?? firstRuntimeModel(runtime) ?? provider?.defaultModel ?? "model",
+    provider: providerId,
+    runtime: runtimeId,
+    speed: state.speedMode ?? "fast",
+  });
+}
+
+function switchChatHeaderMode(args: string, state: ChatState): void {
+  const mode = args.trim().toLowerCase();
+  if (!mode) {
+    console.log(color(`header=${state.headerMode ?? "compact"} — use /header full for the full panel, /header compact for four lines`, "dim"));
+    return;
+  }
+  if (mode !== "full" && mode !== "compact") {
+    console.log(color("Usage: /header compact or /header full", "yellow"));
+    return;
+  }
+  state.headerMode = mode;
+  console.log(color(`header=${mode}`, "green"));
+}
+
+/**
+ * Diagnostics belong in a file, not mid-conversation (defect #2). Best effort:
+ * a chat turn must never fail because a log line could not be written.
+ */
+function appendChatDiagnostic(line: string): void {
+  try {
+    const dir = join(dataDir(), "logs");
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(join(dir, `chat-${new Date().toISOString().slice(0, 10)}.log`), `${new Date().toISOString()} ${line}\n`);
+  } catch {
+    // A missing/read-only data dir must not break the session.
+  }
 }
 
 async function refreshChatTuiHeader(state: ChatState): Promise<void> {
@@ -1512,6 +1972,27 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
     case "live-diff":
       toggleChatLiveDiff(args, state);
       return true;
+    case "mission":
+    case "board":
+    case "kanban":
+    case "why":
+    case "assign": {
+      // The kanban engine's only user surface: orchestration is invoked from the
+      // conversation, and every card it prints comes back out of the event log.
+      const parsed = parseOrchestrationInvocation(name === "kanban" ? "board" : name, args);
+      if (parsed) await runOrchestrationCommand(parsed, chatOrchestrationDeps(state));
+      return true;
+    }
+    case "reasoning":
+      switchChatReasoningMode(args, state);
+      return true;
+    case "senses":
+      await printChatSenses();
+      return true;
+    case "header":
+      switchChatHeaderMode(args, state);
+      await refreshChatTuiHeader(state);
+      return true;
     case "sessions":
     case "resume-list":
       printChatSessions(args ? Number(args) || 15 : 15);
@@ -1524,6 +2005,31 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
       state.sessionName = safeChatSessionName(resolveChatSessionName(args));
       console.log(color(`session=${state.sessionName}`, "green"));
       return true;
+    case "codex": {
+      const [sub, ...restArgs] = args.split(/\s+/).filter(Boolean);
+      if (sub === "sessions" || sub === "list") {
+        await codexSessionsCommand(restArgs.length ? ["--limit", restArgs[0]] : []);
+        return true;
+      }
+      if (sub === "resume" && restArgs[0]) {
+        try {
+          const { session, imported } = await importCodexThreadByPrefix(restArgs[0], []);
+          state.sessionName = safeChatSessionName(`codex-${session.threadId.slice(0, 8)}`);
+          state.resumeThreadId = session.threadId;
+          const workspace = codexResumeWorkspace(session, []);
+          if (workspace) state.workspaceCwd = workspace;
+          ensureNamedChatSession(state.sessionName);
+          console.log(color(`codex thread ${session.threadId} → session ${state.sessionName}${workspace ? ` · workspace ${workspace}` : ""}`, "green"));
+          console.log(color(`imported ${imported.appended} new message(s); your next message continues the native thread`, "dim"));
+          printImportedHistory(imported.sessionId, `codex ${session.threadId.slice(0, 8)}`);
+        } catch (error) {
+          console.log(color(error instanceof Error ? error.message : String(error), "yellow"));
+        }
+        return true;
+      }
+      console.log(color("Usage: /codex sessions [limit]  or  /codex resume <thread-id-prefix>", "yellow"));
+      return true;
+    }
     case "name":
       if (!args) {
         console.log(color("Usage: /name <reference-name>", "yellow"));
@@ -1546,7 +2052,7 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
       printChatScopes(state);
       return true;
     case "tools":
-      printChatTools(args);
+      await printChatTools(args);
       return true;
     case "whoami":
       printChatControlView("Identity", [
@@ -1998,7 +2504,18 @@ async function runChatTurn(text: string, state: ChatState, options: { timeoutMs?
   const routed = parseAgentMention(text);
   const prompt = routed ? routed.prompt : text;
   const agentId = routed?.agentId;
-  const config = await loadConfig();
+  const loadedConfig = await loadConfig();
+  // Reasoning economy: `executeRun` takes the config BY VALUE, so this turn runs
+  // against a per-turn copy whose route for the classified task kind carries the
+  // decided tier. Nothing is written back — `/reasoning` is a session control,
+  // not a config edit. See core/src/reasoning-economy.ts for the direction rule.
+  const reasoning = withReasoningEconomy(loadedConfig, {
+    prompt,
+    runtimeId: state.runtime,
+    preference: state.reasoningTier ?? "auto",
+  });
+  const config = reasoning.config;
+  state.lastReasoning = formatReasoningDecision(reasoning.decision);
   const mentionedCapabilities = await printMentionedCapabilityChecks(prompt, config, { interactive: Boolean(state.statusSink) });
   // The turn SHOWS its own edits: every observed workspace patch becomes a diff
   // card in the transcript while the run streams (docs/STRATEGY_V2.md §9).
@@ -2012,10 +2529,23 @@ async function runChatTurn(text: string, state: ChatState, options: { timeoutMs?
   // session handle for the conversation and every later turn resumes from that.
   const resumeThreadId = state.resumeThreadId;
   state.resumeThreadId = undefined;
-  const stopWorking = state.statusSink ? startTuiWorkingStatus(state.statusSink, agentId) : startWorkingStatus(agentId);
+  const stopWorking = state.statusSink
+    ? startTuiWorkingStatus(state.statusSink, { ...(await chatStatusInfo(state)), agentId })
+    : startWorkingStatus(agentId);
+  // Defect #3: the parent model's narration streams into the transcript while
+  // the turn runs. onDelta/onReasoningDelta already arrive in-process; the
+  // painter coalesces them fence-aware so a code block never splits mid-fence.
+  const painter = state.statusSink
+    ? createNarrationPainter({
+        emit: (line) => emitChatLine(state, line),
+        reasoningMode: state.reasoningMode ?? "compact",
+      })
+    : undefined;
   let outcome: RunOutcome;
   try {
     outcome = await executeRun(config, {
+      onDelta: painter ? (chunk) => painter.delta(chunk) : undefined,
+      onReasoningDelta: painter ? (chunk) => painter.reasoning(chunk) : undefined,
       prompt: agentId ? `Agent route: ${agentId}\n\n${prompt}` : prompt,
       runtime: state.runtime,
       provider: state.provider,
@@ -2036,11 +2566,15 @@ async function runChatTurn(text: string, state: ChatState, options: { timeoutMs?
       ...(resumeThreadId ? { sessionId: resumeThreadId, resume: true } : {}),
     });
   } finally {
+    painter?.finish();
     stopWorking();
     await liveDiff.finish().catch(() => {});
   }
   persistChatTranscriptIfMissing(state.sessionName, prompt, outcome);
-  printAssistantResponse(outcome);
+  recordChatUsage(state, outcome.tokens);
+  // Already painted delta-by-delta — reprinting the body would double it.
+  printAssistantResponse(outcome, { streamed: (painter?.painted ?? 0) > 0, bullet: Boolean(state.statusSink) });
+  emitTurnCostChip(state, outcome);
   openMentionedCapabilityPicker(state, mentionedCapabilities, config);
 }
 
@@ -2083,6 +2617,51 @@ function emitChatLine(state: ChatState, line: string): void {
   console.log(line);
 }
 
+/**
+ * Defect #1: a TTY session closes a turn with one formatted chip built from
+ * the run's own token record. Scripts (no statusSink) keep the raw JSON line
+ * the engine writes, so nothing that parses stdout changes.
+ */
+function emitTurnCostChip(state: ChatState, outcome: RunOutcome): void {
+  if (!state.statusSink) return;
+  const tokens = outcome.tokens;
+  if (tokens.runId && tokens.runId === lastCostChipRunId) return;
+  lastCostChipRunId = tokens.runId;
+  state.statusSink.appendLine(formatCostChip(tokens));
+}
+
+/**
+ * One `/reasoning` command, two knobs the user thinks of as one thing:
+ *
+ * - SPEND: `auto|low|medium|high`. `auto` runs the prompt heuristic and may only
+ *   LOWER the tier below what config would spend, so a two-line question never
+ *   burns a high-reasoning budget out of a 5-hour window. An explicit tier is
+ *   sticky for the chat.
+ * - DENSITY: `compact|full`. Compact keeps the provider-approved summary to one
+ *   dim row above the answer it explains; full paints every line. Raw hidden
+ *   chain-of-thought is never available to either mode (codex-app-server.ts:34).
+ */
+function switchChatReasoningMode(args: string, state: ChatState): void {
+  const mode = args.trim().toLowerCase();
+  if (!mode) {
+    console.log(color(`reasoning=${state.reasoningTier ?? "auto"} density=${state.reasoningMode ?? "compact"}${state.lastReasoning ? ` last_turn=${state.lastReasoning}` : ""}`, "dim"));
+    console.log(color("/reasoning auto|low|medium|high sets spend; /reasoning compact|full sets summary density.", "dim"));
+    return;
+  }
+  const tier = parseReasoningPreference(mode);
+  if (tier) {
+    state.reasoningTier = tier;
+    console.log(color(`reasoning=${tier}${tier === "auto" ? " — the prompt heuristic picks the tier and never raises it above your config" : " — sticky until you change it"}`, "green"));
+    return;
+  }
+  if (mode !== "full" && mode !== "compact") {
+    console.log(color("Usage: /reasoning auto|low|medium|high (spend) or /reasoning compact|full (summary density)", "yellow"));
+    return;
+  }
+  state.reasoningMode = mode;
+  console.log(color(`reasoning_density=${mode}`, "green"));
+}
+
 function toggleChatLiveDiff(args: string, state: ChatState): void {
   const mode = args.trim().toLowerCase();
   if (!mode) {
@@ -2097,10 +2676,143 @@ function toggleChatLiveDiff(args: string, state: ChatState): void {
   console.log(color(`live-diff=${mode}`, "green"));
 }
 
-function startTuiWorkingStatus(sink: MusterChatSink, agentId: string | undefined): () => void {
+/* ---------- chat-embedded orchestration (/mission /board /why /assign) ---------- */
+
+/**
+ * A board card names a BACKEND, so the run is routed by runtime id. The card's
+ * own model string is deliberately NOT forced onto the runtime: the codex CLI
+ * serves whatever `~/.codex/config.toml` is configured with, and pinning a model
+ * the CLI does not offer fails the turn (see DEFAULT_CODEX_MODEL's note in
+ * packages/core/src/config.ts). The board records the card that was chosen; the
+ * runtime records the model that actually ran.
+ */
+function runtimeForCardId(cardId: string): string | undefined {
+  if (cardId.startsWith(`${BACKEND_CARD_PROVIDERS.claude}/`)) return "claude-code";
+  if (cardId.startsWith(`${BACKEND_CARD_PROVIDERS.codex}/`)) return "codex";
+  return undefined;
+}
+
+/** Deltas arrive token-shaped; the board narration line wants sentences. */
+function createNarrationChunker(emit: (text: string) => void): (chunk: string) => void {
+  let buffer = "";
+  return (chunk: string) => {
+    buffer += chunk;
+    let cut = Math.max(buffer.lastIndexOf("\n"), buffer.lastIndexOf(". "));
+    if (cut < 0 && buffer.length > 160) cut = buffer.length - 1;
+    if (cut < 0) return;
+    const ready = buffer.slice(0, cut + 1).trim();
+    buffer = buffer.slice(cut + 1);
+    if (ready) emit(ready.split("\n").filter(Boolean).at(-1) ?? ready);
+  };
+}
+
+/** Sum the ledger rows this run actually wrote; unpriced stays unpriced. */
+async function costForRunId(runId: string | undefined, cwd: string): Promise<number | undefined> {
+  if (!runId) return undefined;
+  const records = await listTokenRecords(cwd).catch(() => []);
+  const priced = records.filter((record) => record.runId === runId && record.costUsd !== undefined);
+  return priced.length > 0 ? priced.reduce((sum, record) => sum + (record.costUsd ?? 0), 0) : undefined;
+}
+
+function buildOrchestrationDeps(input: {
+  readonly sessionName: string;
+  readonly cwd: string;
+  readonly emit: (line: string) => void;
+  readonly runtime?: string;
+  readonly provider?: string;
+  readonly model?: string;
+}): OrchestrationDeps {
+  return {
+    sessionName: input.sessionName,
+    cwd: input.cwd,
+    emit: input.emit,
+    width: process.stdout.columns || 100,
+    async detectAuth(): Promise<BackendAuth> {
+      const backends = await detectBackends();
+      return { codex: backends.codex === "authenticated", claude: backends.claude === "installed" };
+    },
+    async plan(prompt: string): Promise<string> {
+      await ensureDefaultConfig(input.cwd);
+      const config = await loadConfig(input.cwd);
+      const outcome = await executeRun(config, {
+        prompt,
+        cwd: input.cwd,
+        runtime: input.runtime,
+        provider: input.provider,
+        model: input.model,
+        surfaceId: "cli-chat-mission",
+        skipRecall: true,
+        skipSkillSelection: true,
+        skipMemoryWrite: true,
+        skipAgentRules: true,
+      });
+      return outcome.episode.responseText ?? "";
+    },
+    async execute(task: MissionTaskRunInput): Promise<MissionTaskRunResult> {
+      await ensureDefaultConfig(input.cwd);
+      const config = await loadConfig(input.cwd);
+      const runtime = runtimeForCardId(task.cardId);
+      const onDelta = createNarrationChunker(task.onNarration);
+      const handle = await spawnSubagent(config, {
+        task: `${task.task.title}\n\n${task.task.goal}`,
+        parentKey: `mission:${input.sessionName}`,
+        runOptions: {
+          ...(runtime ? { runtime } : {}),
+          onDelta,
+          surfaceId: `mission:${input.sessionName}:${task.task.id}`,
+          skipRecall: true,
+          skipSkillSelection: true,
+          skipAgentRules: true,
+        },
+      }, input.cwd);
+      const run = await handle.done;
+      const summary = (run.resultText ?? run.errorMessage ?? "").split("\n").map((line) => line.trim()).find(Boolean) ?? "no output";
+      const costUsd = await costForRunId(run.runId, input.cwd);
+      return {
+        ok: run.status === "completed",
+        summary,
+        ...(costUsd !== undefined ? { costUsd } : {}),
+        ...(run.runId ? { runId: run.runId } : {}),
+      };
+    },
+  };
+}
+
+function chatOrchestrationDeps(state: ChatState): OrchestrationDeps {
+  return buildOrchestrationDeps({
+    sessionName: state.sessionName,
+    cwd: chatWorkspaceCwd(state),
+    emit: (line) => emitChatLine(state, line),
+    ...(state.runtime ? { runtime: state.runtime } : {}),
+    ...(state.provider ? { provider: state.provider } : {}),
+    ...(state.model ? { model: state.model } : {}),
+  });
+}
+
+/** The non-chat door onto the same board: `muster board list|why|assign`. */
+async function boardCommand(commandArgs: string[]): Promise<void> {
+  const sessionName = readFlag(commandArgs, "--session") ?? DEFAULT_CHAT_SESSION;
+  const parsed = parseBoardCliCommand(commandArgs.filter((entry, index, all) => {
+    if (entry === "--session") return false;
+    return all[index - 1] !== "--session";
+  }));
+  await runOrchestrationCommand(parsed, buildOrchestrationDeps({
+    sessionName,
+    cwd: process.cwd(),
+    emit: (line) => console.log(line),
+  }));
+}
+
+/**
+ * The spinner NEVER enters the transcript (defect #4) and no longer owns a row
+ * of its own: it paints at the left edge of the one status line, whose elapsed
+ * segment counts THIS turn while the turn runs.
+ */
+function startTuiWorkingStatus(sink: MusterChatSink, info: Parameters<typeof formatStatusLine>[0]): () => void {
   let frame = 0;
+  const startedAt = Date.now();
   const render = (): void => {
-    sink.setStatus(formatWorkingIndicator(agentId, frame));
+    sink.setStatus(formatStatusLine({ ...info, frame, elapsedMs: Date.now() - startedAt }));
     frame += 1;
   };
   render();
@@ -2229,7 +2941,7 @@ async function formatMentionedCapabilityCheck(
   return `${color(label, "accent")} ${status} risk=${mention.risk}${missing.length ? ` missing=${missing.join(",")}` : ""} next="/mcp ${configured ? `test ${mention.id}` : mention.id}"`;
 }
 
-function printAssistantResponse(outcome: RunOutcome): void {
+function printAssistantResponse(outcome: RunOutcome, options: { readonly streamed?: boolean; readonly bullet?: boolean } = {}): void {
   const status = outcome.episode.outcome?.kind ?? "unknown";
   if (process.env.MUSTER_TIMINGS === "1" && outcome.timings) {
     console.log(color(formatTimingLine(outcome.timings), "dim"));
@@ -2253,7 +2965,11 @@ function printAssistantResponse(outcome: RunOutcome): void {
     }
   }
   if (outcome.fallbackUsed) console.log(color(`fallback=${outcome.fallbackUsed}`, "yellow"));
-  for (const line of wrapPreserveLines(outcome.episode.responseText || "(empty response)", Math.min(process.stdout.columns || 100, 120) - 2)) {
+  if (options.streamed) return;
+  const body = wrapPreserveLines(outcome.episode.responseText || "(empty response)", Math.min(process.stdout.columns || 100, 120) - 2);
+  // In the TUI an un-streamed answer is still ONE message block, so it wears
+  // the same `●` gutter a streamed one does. Scripts keep the bare lines.
+  for (const line of options.bullet ? formatAssistantBlock(body.join("\n")) : body) {
     console.log(line);
   }
 }
@@ -2536,7 +3252,7 @@ async function switchChatRuntime(args: string, state: ChatState): Promise<void> 
       }),
       "",
       `${color("claude-code".padEnd(18), "accent")} Claude Code local login · no API key · model default sonnet`,
-      `${color("codex".padEnd(18), "accent")} Codex CLI local login · model default gpt-5.5`,
+      `${color("codex".padEnd(18), "accent")} Codex CLI local login · model default ${DEFAULT_CODEX_MODEL}`,
       `${color("pi".padEnd(18), "accent")} Pi managed provider runtime`,
     ]);
     console.log(color("Use /runtime claude-code, /runtime codex, /runtime pi, or /provider <id> [model].", "dim"));
@@ -2557,7 +3273,7 @@ async function switchChatRuntime(args: string, state: ChatState): Promise<void> 
   if (runtimeId === "codex") {
     state.runtime = "codex";
     state.provider = "codex";
-    state.model = "gpt-5.5";
+    state.model = DEFAULT_CODEX_MODEL;
     await refreshChatTuiHeader(state);
     const cleared = await clearConversationSessionHandles(chatConversationKey(state.sessionName));
     console.log(color(`runtime=codex provider=codex model=${state.model} provider_handles_cleared=${cleared}`, "green"));
@@ -2687,7 +3403,15 @@ async function updateChatScopes(args: string, state: ChatState): Promise<void> {
   }
 }
 
-function printChatTools(toolset?: string): void {
+/**
+ * Muster's own toolsets, plus what the turn INHERITS.
+ *
+ * A codex turn under muster boots the user's own MCP servers and keeps their
+ * codex plugin skills active — verified live. Listing only muster's built-ins
+ * made the harness look emptier than the session actually is, so the inherited
+ * inventory is rendered underneath (read-only discovery, never a config edit).
+ */
+async function printChatTools(toolset?: string): Promise<void> {
   const registry = createToolRegistry();
   registerBuiltinTools(registry);
   const entries = registry.list(toolset || undefined);
@@ -2699,10 +3423,18 @@ function printChatTools(toolset?: string): void {
   for (const entry of entries) {
     grouped.set(entry.toolset, [...(grouped.get(entry.toolset) ?? []), entry]);
   }
+  // A narrowed `/tools <toolset>` is a lookup, not an inventory: no discovery.
+  const ecosystem = toolset ? undefined : await inheritedEcosystem();
   printChatPanel("Tools", [
     ...[...grouped].map(([name, items]) => `${color(`${name}:`, "accent")} ${items.map((item) => item.name).join(", ")}`),
     color("Use /tools <toolset> to narrow the list.", "dim"),
+    ...(ecosystem ? renderInheritedToolsSection(ecosystem) : []),
   ]);
+}
+
+/** `/senses` — codex-native perception, surfaced and verified, never simulated. */
+async function printChatSenses(): Promise<void> {
+  printChatPanel("Senses", renderSensesPanel(await inheritedEcosystem()));
 }
 
 async function printChatCapabilities(query: string | undefined, state: ChatState): Promise<void> {
@@ -2922,6 +3654,10 @@ async function printChatMcp(selection: string | undefined, state: ChatState): Pr
       existed ? `${color("removed", "green")} ${key}` : `${color("not found", "yellow")} ${key}`,
       "Provider-hosted credentials, OAuth tokens, and external app auth were not changed.",
     ]);
+    return;
+  }
+  if (selected === "attach") {
+    await chatAttachInheritedMcp(parsed.rest[0], state);
     return;
   }
   if (selected === "add-http") {
@@ -3214,6 +3950,44 @@ function integrationWorkflowNextAction(fields: ReadonlyMap<string, readonly stri
 
 function formatWorkflowField(fields: ReadonlyMap<string, readonly string[]>, key: string, label: string): string[] {
   return (fields.get(key) ?? []).map((value) => `${color(label, "accent")} ${value}`);
+}
+
+/**
+ * Take native ownership of a server muster only INHERITED until now.
+ *
+ * Policy gate, deliberately narrow: loopback HTTP only, active only, and never
+ * an account-bound claude.ai connector. Inheriting a server through a codex
+ * turn is the backend's trust decision; connecting to it directly is muster's,
+ * so it takes an explicit keypress and reuses the same `mcp add-http` config
+ * path as any hand-added server. No credential is copied from either backend.
+ */
+async function chatAttachInheritedMcp(target: string | undefined, state: ChatState): Promise<void> {
+  const ecosystem = await inheritedEcosystem();
+  if (!target) {
+    const attachable = attachableInheritedServers(ecosystem);
+    printChatPanel("MCP", attachable.length
+      ? [
+        color("Attachable inherited servers (reachable on localhost):", "accent"),
+        ...attachable.map((server) => `${color(server.name, "highlight")} ${server.url}`),
+        color("Submit /mcp attach <name> to let muster own one directly.", "dim"),
+      ]
+      : [
+        color("No inherited MCP server is directly attachable right now.", "yellow"),
+        "Remote and stdio servers stay owned by codex/claude; muster inherits them on that backend's turns.",
+        color("See the full inventory: muster integrations inherited", "dim"),
+      ]);
+    return;
+  }
+  const resolved = resolveAttachableServer(ecosystem, target);
+  if ("error" in resolved) {
+    printChatPanel("MCP", [color(resolved.error, "yellow")]);
+    return;
+  }
+  await chatAddHttpMcp([resolved.server.name, resolved.server.url!], state);
+  printChatPanel("MCP", [
+    `${color("attached", "green")} ${resolved.server.name} — inherited from ${resolved.server.backend}, now also owned by muster config.`,
+    color("The backend's own copy is untouched; nothing was written to codex or claude config.", "dim"),
+  ]);
 }
 
 async function chatAddHttpMcp(args: string[], state: ChatState): Promise<void> {
@@ -3929,9 +4703,14 @@ function pickerMatchRank(option: PickerOption, lowerFragment: string): number {
 }
 
 function modelHintsForProvider(providerId: string | undefined, kind: string | undefined): string[] {
-  if (providerId === "codex" || providerId === "codex-cli" || kind === "codex-cli") return ["gpt-5.5", "gpt-5.4", "o4-mini", "o3", "gpt-4.1"];
+  // gpt-5.6-sol leads because it is what defaultConfig seeds and what the local
+  // codex CLI runs; gpt-5.5 stays offered because profiles created before the
+  // bump keep it in their config and packages/core/src/run.ts still names it as
+  // the managed-codex fallback model — a model the config can hold must be a
+  // model this list can offer.
+  if (providerId === "codex" || providerId === "codex-cli" || kind === "codex-cli") return ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "o4-mini", "o3", "gpt-4.1"];
   if (providerId === "anthropic") return ["claude-fable-5", "claude-sonnet-4.6", "claude-opus-4.5", "sonnet"];
-  if (providerId === "openai") return ["gpt-5.4", "gpt-5.5", "gpt-4.1", "o4-mini"];
+  if (providerId === "openai") return ["gpt-5.6", "gpt-5.5", "gpt-5.4", "gpt-4.1", "o4-mini"];
   if (providerId === "openrouter") return ["anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-2.5-pro"];
   if (providerId === "groq") return ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"];
   if (providerId === "gemini") return ["gemini-2.5-pro", "gemini-2.5-flash"];
@@ -3965,16 +4744,20 @@ async function printChatAgents(options: { numbered?: boolean } = {}): Promise<vo
   ]);
 }
 
+/**
+ * A command's answer is an ACTION RESULT, not a window: `⏺ Status` on its own
+ * line with the body indented beneath it. The full-width ╭─╮ frames are gone
+ * from the chat surface — the composer is the only box left, because it is a
+ * control rather than content.
+ */
 function printChatPanel(title: string, lines: readonly string[]): void {
   const width = Math.min(Math.max((process.stdout.columns || 100) - 4, 72), 140);
-  console.log(color(`╭─ ${title} ${"─".repeat(Math.max(1, width - title.length - 5))}╮`, "accent"));
+  console.log(formatToolLine(title));
   for (const line of lines) {
-    const wrapped = wrapPreserveLines(line || " ", width - 4);
-    for (const part of wrapped) {
-      console.log(color("│ ", "accent") + visiblePadEnd(part, width - 4) + color(" │", "accent"));
+    for (const part of wrapPreserveLines(line || "", width - 4)) {
+      console.log(part ? `  ${part}` : "");
     }
   }
-  console.log(color(`╰${"─".repeat(width - 2)}╯`, "accent"));
 }
 
 function summarizeCatalog<T>(
@@ -7208,7 +7991,12 @@ async function memory(args: string[]): Promise<void> {
       confidence: confidenceRaw ? Number(confidenceRaw) : undefined,
       provenance,
       scopes,
-      redactionState: readRedactionState(readFlag(args, "--redaction"))
+      redactionState: readRedactionState(readFlag(args, "--redaction")),
+      // Typing `muster memory add` IS the explicit request config.memory.policy
+      // asks for, so this write survives an "ask"/"never" profile while the
+      // agent's own auto-promotion does not. Never set this flag on a write the
+      // user did not ask for by name.
+      explicitUserRequest: true
     });
     printMemoryObject(object);
     return;
@@ -7802,14 +8590,23 @@ async function codexSessionsCommand(args: string[]): Promise<void> {
     if (result.subagentsHidden) console.log(`${result.subagentsHidden} subagent thread(s) hidden — pass --all to include them.`);
     return;
   }
-  console.log(color("id        project                age     turns  first message", "cyan"));
-  for (const session of result.sessions) {
+  // Two clocks, because one was read as the other: `age` is how old the THREAD
+  // is (a month-old redis session), `active` is how long since its last turn.
+  // A single "age" column made a long-lived thread that was touched minutes ago
+  // read as one second old.
+  console.log(color("id        project                age  active  turns  first message", "cyan"));
+  for (const row of orderCodexSessionsByLineage(result.sessions)) {
+    const session = row.session;
+    // A fork is the same conversation continued: nest it under its root with ↳
+    // instead of listing it as an unrelated (and confusingly adjacent) thread.
+    const marker = row.depth > 0 ? `${"  ".repeat(row.depth - 1)}↳ ` : "";
     console.log([
       session.threadId.slice(0, 8),
-      codexProjectLabel(session).padEnd(21).slice(0, 21),
+      `${marker}${codexProjectLabel(session)}`.padEnd(21).slice(0, 21),
+      formatCodexAge(session.startedAt).padStart(4),
       formatCodexAge(session.lastActivityAt).padStart(6),
       `${session.turnCount}${session.turnCountExact ? "" : "+"}`.padStart(6),
-      trimToWidth(session.firstUserMessage, 60),
+      trimToWidth(summarizeCodexPrompt(session.firstUserMessage, 60), 60),
     ].join(" "));
   }
   const notes = [
@@ -7843,10 +8640,39 @@ function formatCodexAge(iso: string, nowMs = Date.now()): string {
   return `${Math.round(seconds / 86_400)}d`;
 }
 
-async function codexResumeCommand(args: string[]): Promise<void> {
-  const prefix = stripFlags(args, ["--limit", "--since", "--codex-home", "--session"])
-    .filter((arg) => !arg.startsWith("--"))[0];
-  if (!prefix) throw new Error("Usage: muster codex resume <thread-id-prefix> [--session name]");
+/**
+ * Replay a stored session's transcript into the terminal before the chat takes
+ * over — a resumed thread must LOOK resumed, not empty. The provider already
+ * has the context; this paints it for the human.
+ */
+function printImportedHistory(storeSessionId: string, title: string): void {
+  const store = openSessionStore();
+  try {
+    const result = store.search({ sessionId: storeSessionId });
+    if (result.shape !== "read") return;
+    const rows = [...result.head, ...result.tail];
+    if (!rows.length) return;
+    const omittedNote = result.omitted > 0 ? ` · ${result.omitted} older message(s) omitted — /history for more` : "";
+    console.log(color(`── history: ${title} (${rows.length} shown${omittedNote}) ──`, "dim"));
+    for (const row of rows) {
+      const text = row.content.length > 400 ? `${row.content.slice(0, 400)}…` : row.content;
+      if (row.role === "user") console.log(formatUserLine(text.split("\n")[0].slice(0, 160)));
+      else for (const line of formatAssistantBlock(text).slice(0, 4)) console.log(line);
+    }
+    console.log(color("── end of imported history ──", "dim"));
+  } catch {
+    // History is best-effort decoration; a store hiccup must never block the chat.
+  } finally {
+    store.close();
+  }
+}
+
+/** Discovery + import shared by the CLI command and the in-chat /codex command. */
+async function importCodexThreadByPrefix(prefix: string, args: string[]): Promise<{
+  session: CodexSessionSummary;
+  imported: Awaited<ReturnType<typeof importCodexSession>>;
+  chain: readonly CodexSessionSummary[];
+}> {
   // A resume is deliberate, so scan wider than the listing default and include
   // subagents: the user may well want to continue a specific delegated thread.
   const flags = readCodexScanFlags(args, 200);
@@ -7860,16 +8686,20 @@ async function codexResumeCommand(args: string[]): Promise<void> {
     throw new Error(`"${prefix}" matches ${match.candidates.length} Codex sessions:\n${ids}\nUse more characters.`);
   }
   const session = match.session;
-
   const store = openSessionStore();
-  let imported: Awaited<ReturnType<typeof importCodexSession>>;
   try {
-    imported = await importCodexSession(session, store);
+    const imported = await importCodexSession(session, store);
+    return { session, imported, chain: resolveCodexForkChain(result.sessions, session.threadId) };
   } finally {
     store.close();
   }
+}
 
-  const chain = resolveCodexForkChain(result.sessions, session.threadId);
+async function codexResumeCommand(args: string[]): Promise<void> {
+  const prefix = stripFlags(args, ["--limit", "--since", "--codex-home", "--session"])
+    .filter((arg) => !arg.startsWith("--"))[0];
+  if (!prefix) throw new Error("Usage: muster codex resume <thread-id-prefix> [--session name]");
+  const { session, imported, chain } = await importCodexThreadByPrefix(prefix, args);
   console.log(color(`codex thread ${session.threadId}`, "cyan"));
   console.log(`workspace   ${session.cwd || "(unknown)"}`);
   console.log(`model       ${session.model ?? "(unknown)"}`);
@@ -7893,11 +8723,13 @@ async function codexResumeCommand(args: string[]): Promise<void> {
     sessionName: safeChatSessionName(readFlag(args, "--session") ?? `codex-${session.threadId.slice(0, 8)}`),
     scopes: [],
     speedMode: "session",
+    startedAt: Date.now(),
     resumeThreadId: session.threadId,
     ...(codexResumeWorkspace(session, args) ? { workspaceCwd: codexResumeWorkspace(session, args) } : {}),
   };
   ensureNamedChatSession(state.sessionName);
   console.log(`chat        ${state.sessionName} (next turn continues the native Codex thread)`);
+  printImportedHistory(imported.sessionId, `codex ${session.threadId.slice(0, 8)}`);
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     const prefix = state.workspaceCwd ? `cd ${state.workspaceCwd} && ` : "";
     console.log(color("No TTY. Continue this thread with:", "dim"));
@@ -8817,6 +9649,7 @@ async function runCommand(commandArgs: string[]): Promise<void> {
   const flagNames = ["--runtime", "--provider", "--model", "--thinking", "--session", "--session-dir", "--scope", "--task-kind", "--timeout-ms", "--recall-limit", "--transport"];
   const prompt = stripFlags(commandArgs, flagNames).filter((value) => value !== "--sensitive").join(" ").trim();
   if (!prompt) throw new Error('Usage: muster run "prompt" [--runtime pi] [--provider X] [--model Y] [--transport auto|warm|exec] [--session memory|create|continue] [--scope user:me]');
+  await requireWorkspace();
   const config = await loadConfig();
   const scopeFlags = commandArgs.flatMap((value, index) => (value === "--scope" && commandArgs[index + 1] ? [commandArgs[index + 1]] : []));
   const outcome = await executeRun(config, {
@@ -8860,7 +9693,7 @@ async function runCommand(commandArgs: string[]): Promise<void> {
   if (outcome.episode.outcome?.kind === "failed") {
     throw new Error(outcome.episode.outcome.detail ?? "Run failed");
   }
-  console.log("\n" + outcome.episode.responseText + "\n");
+  console.log("\n" + trimDanglingCodeFence(outcome.episode.responseText) + "\n");
 }
 
 interface LatencySample {
@@ -9496,14 +10329,22 @@ async function gatewayCommand(commandArgs: string[]): Promise<void> {
     const readyChannels = gateway.initialized
       ? CHANNEL_SETUP_SPECS.filter((spec) => channelReady(spec.id, gateway.config)).length
       : 0;
-    const next = gateway.initialized
-      ? `muster gateway daemon start --port ${gateway.config.port ?? DEFAULT_GATEWAY_PORT}`
-      : "muster gateway init";
+    const port = gateway.config.port ?? DEFAULT_GATEWAY_PORT;
+    // The hint has to read the world before advising it. Telling a user to
+    // start a daemon that is already serving requests trains them to ignore
+    // every next= line the CLI prints.
+    const daemon = await inspectGatewayDaemon(port);
+    const next = !gateway.initialized
+      ? "muster gateway init"
+      : daemon.running
+        ? "muster gateway daemon status"
+        : `muster gateway daemon start --port ${port}`;
     console.log(`gateway_status=${gateway.initialized ? "configured" : "missing"}`);
     console.log(`gateway_config=${gatewayConfigPath()}`);
     console.log(`token=${gateway.initialized && gateway.config.token ? "configured" : "missing"}`);
-    console.log(`port=${gateway.config.port ?? DEFAULT_GATEWAY_PORT}`);
+    console.log(`port=${port}`);
     console.log(`channels_ready=${readyChannels}/${CHANNEL_SETUP_SPECS.length}`);
+    console.log(`daemon=${daemon.running ? "running" : "stopped"}${daemon.pid ? ` pid=${daemon.pid}` : ""} health=${daemon.healthy ? "ok" : daemon.running ? "unreachable" : "n/a"}`);
     console.log(`next=${JSON.stringify(next)}`);
     return;
   }
@@ -9631,6 +10472,30 @@ async function readGatewayPid(cwd = process.cwd()): Promise<number | undefined> 
   const raw = await readFile(gatewayPidPath(cwd), "utf8").catch(() => "");
   const pid = Number(raw.trim());
   return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+interface GatewayDaemonState {
+  readonly pid?: number;
+  /** Pid file present AND that process alive. */
+  readonly running: boolean;
+  /** `/v1/health` answered ok. Only probed when a live pid says it should. */
+  readonly healthy: boolean;
+}
+
+/** Two independent facts — a live pid and a healthy port — never one guessed from the other. */
+async function inspectGatewayDaemon(port: number, cwd = process.cwd()): Promise<GatewayDaemonState> {
+  const pid = await readGatewayPid(cwd);
+  const running = pid !== undefined && processIsAlive(pid);
+  if (!running) return { running: false, healthy: false };
+  let healthy = false;
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/health`, { signal: AbortSignal.timeout(750) });
+    const body = await response.json().catch(() => undefined) as { ok?: boolean } | undefined;
+    healthy = response.ok && body?.ok === true;
+  } catch {
+    healthy = false;
+  }
+  return { ...(pid === undefined ? {} : { pid }), running, healthy };
 }
 
 async function gatewayDaemonCommand(args: string[]): Promise<void> {
@@ -10735,8 +11600,15 @@ async function printIntegrationReadiness(): Promise<void> {
 
 async function integrationsCommand(args: string[]): Promise<void> {
   const action = args[0] ?? "list";
-  if (action !== "list" && action !== "guide" && action !== "status" && action !== "workflow" && action !== "setup" && action !== "verify" && action !== "enable" && action !== "sample") {
-    throw new Error("Usage: muster integrations [list|guide|status|workflow|setup|verify|enable|sample <plugin|mcp|channel>]");
+  if (action !== "list" && action !== "guide" && action !== "status" && action !== "workflow" && action !== "setup" && action !== "verify" && action !== "enable" && action !== "sample" && action !== "inherited") {
+    throw new Error("Usage: muster integrations [list|inherited|guide|status|workflow|setup|verify|enable|sample <plugin|mcp|channel>]");
+  }
+  if (action === "inherited") {
+    // Read-only inventory of what codex/claude already give this machine, with
+    // the exact enable/auth line for each entry. Muster prints; the human runs.
+    const ecosystem = await inheritedEcosystem({ refresh: args.includes("--refresh") });
+    for (const line of renderInheritedIntegrationsTable(ecosystem)) console.log(line);
+    return;
   }
   if (action === "status") {
     await printIntegrationReadiness();
@@ -11418,7 +12290,10 @@ async function demoCommand(_commandArgs: string[]): Promise<void> {
     const live = await loadConfig(cwd);
 
     console.log("muster demo — provisioned an isolated workspace and a live stub model service.\n");
-    await addMemory({ summary: "Muster deploys to uat-erp.example.com", provenance: ["demo"], scopes: [{ kind: "user", id: "demo" }] }, cwd);
+    // The demo's seeded fact exists because the operator ran `muster demo`; it
+    // is written into the demo's own throwaway workspace, so it is an explicit
+    // request rather than an inference the memory policy should block.
+    await addMemory({ summary: "Muster deploys to uat-erp.example.com", provenance: ["demo"], scopes: [{ kind: "user", id: "demo" }], explicitUserRequest: true }, cwd);
 
     for (const prompt of ["Where do we deploy?", "Summarize the day's work."]) {
       const outcome = await executeRun(live, { prompt, cwd, scopes: [{ kind: "user", id: "demo" }] });

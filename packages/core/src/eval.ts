@@ -1,8 +1,20 @@
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { dataDir, findEpisode } from "./store.js";
-import { addMemory, inspectMemoryStore, parseMemoryScope, searchMemoryWithReceipts, type MemoryStoreInspection } from "./memory.js";
-import type { EpisodeRecord, MemoryScope, TaskKind } from "./types.js";
+import { addMemory, inspectMemoryStore, parseMemoryScope, searchMemoryWithReceipts, type AddMemoryInput, type MemoryStoreInspection } from "./memory.js";
+import type { ContextObject, EpisodeRecord, MemoryScope, TaskKind } from "./types.js";
+
+/**
+ * Eval-pack fixtures are written because the operator ran a seed command, not
+ * because the harness inferred a fact worth keeping — so they carry
+ * `explicitUserRequest`, the one thing `config.memory.policy` treats as the
+ * user's own decision (packages/core/src/memory.ts). Without it a profile on
+ * the "ask"/"never" policy could not seed an eval pack at all: the retrieval
+ * evals would fail for a reason that has nothing to do with retrieval.
+ */
+function seedMemory(input: Omit<AddMemoryInput, "explicitUserRequest">, cwd: string): Promise<ContextObject> {
+  return addMemory({ ...input, explicitUserRequest: true }, cwd);
+}
 
 export interface EvalCase {
   readonly schemaVersion: 1;
@@ -211,28 +223,28 @@ export async function seedRepresentativeRetrievalEvalPack(
   const scopeStrings = scopes.map((scope) => `${scope.kind}:${scope.id}`);
   const otherScopes = [parseMemoryScope(`tenant:${tenant}`), parseMemoryScope(`user:${otherUser}`)];
   const provenance = `retrieval-pack:${id}`;
-  const exact = await addMemory({
+  const exact = await seedMemory({
     summary: `Frappe ${id} exact deployment target is uat-erp.example.com and belongs to ${user}.`,
     provenance: [provenance, "case:exact"],
     scopes,
     observedAt: "2026-06-20T00:00:00.000Z",
     confidence: 0.95,
   }, cwd);
-  const stale = await addMemory({
+  const stale = await seedMemory({
     summary: `Frappe ${id} payroll destination is the retired legacy finance bench.`,
     provenance: [provenance, "case:stale"],
     scopes,
     observedAt: "2025-01-01T00:00:00.000Z",
     confidence: 0.9,
   }, cwd);
-  const fresh = await addMemory({
+  const fresh = await seedMemory({
     summary: `Frappe ${id} payroll destination is the current finance bench.`,
     provenance: [provenance, "case:fresh"],
     scopes,
     observedAt: "2026-06-20T00:00:00.000Z",
     confidence: 0.95,
   }, cwd);
-  const forbidden = await addMemory({
+  const forbidden = await seedMemory({
     summary: `Frappe ${id} private forbiddenneedle${otherUser} secret belongs only to ${otherUser}.`,
     provenance: [provenance, "case:forbidden"],
     scopes: otherScopes,
@@ -241,7 +253,7 @@ export async function seedRepresentativeRetrievalEvalPack(
   }, cwd);
   const distractors = [];
   for (let index = 0; index < distractorCount; index += 1) {
-    const memory = await addMemory({
+    const memory = await seedMemory({
       summary: `Frappe ${id} distractor ${index} about plugins, sessions, benches, workflows, and non-target notes.`,
       provenance: [provenance, `case:distractor:${index}`],
       scopes,
@@ -335,7 +347,7 @@ export async function seedFrappeGraphRetrievalEvalPack(
   const otherScopes = [parseMemoryScope(`tenant:${tenant}`), parseMemoryScope(`user:${otherUser}`)];
   const provenance = `frappe-graph-pack:${id}`;
 
-  const child = await addMemory({
+  const child = await seedMemory({
     kind: "frappe_child_table",
     summary: `${module} child table DocType ${childDoctype} stores row_type Select and amount Currency rows for ${doctype} structured details.`,
     provenance: [provenance, "node:child-table"],
@@ -343,7 +355,7 @@ export async function seedFrappeGraphRetrievalEvalPack(
     observedAt: "2026-06-20T00:00:00.000Z",
     confidence: 0.96,
   }, cwd);
-  const customField = await addMemory({
+  const customField = await seedMemory({
     kind: "frappe_custom_field",
     summary: `${module} Custom Field ${doctype}.external_reference_id is fieldtype Data and is owned by app ${app}.`,
     provenance: [provenance, "node:custom-field"],
@@ -351,7 +363,7 @@ export async function seedFrappeGraphRetrievalEvalPack(
     observedAt: "2026-06-20T00:00:00.000Z",
     confidence: 0.95,
   }, cwd);
-  const workflow = await addMemory({
+  const workflow = await seedMemory({
     kind: "frappe_workflow",
     summary: `${module} workflow ${doctype} Onboarding uses states Draft, Verified, and Active for ${doctype}.`,
     provenance: [provenance, "node:workflow"],
@@ -359,7 +371,7 @@ export async function seedFrappeGraphRetrievalEvalPack(
     observedAt: "2026-06-20T00:00:00.000Z",
     confidence: 0.95,
   }, cwd);
-  const permission = await addMemory({
+  const permission = await seedMemory({
     kind: "frappe_permission",
     summary: `${module} permissions allow HR Manager to read and write ${doctype}; Employee Self Service can read only owned records.`,
     provenance: [provenance, "node:permission"],
@@ -367,7 +379,7 @@ export async function seedFrappeGraphRetrievalEvalPack(
     observedAt: "2026-06-20T00:00:00.000Z",
     confidence: 0.95,
   }, cwd);
-  const stale = await addMemory({
+  const stale = await seedMemory({
     kind: "frappe_docfield",
     summary: `${module} retired ${doctype} field legacy_grade was replaced before 2026 and should not be used for salary classification.`,
     provenance: [provenance, "node:stale-field"],
@@ -375,7 +387,7 @@ export async function seedFrappeGraphRetrievalEvalPack(
     observedAt: "2025-01-01T00:00:00.000Z",
     confidence: 0.9,
   }, cwd);
-  const fresh = await addMemory({
+  const fresh = await seedMemory({
     kind: "frappe_docfield",
     summary: `${module} current ${doctype} field salary_band is fieldtype Link to Salary Band for salary classification.`,
     provenance: [provenance, "node:fresh-field"],
@@ -383,7 +395,7 @@ export async function seedFrappeGraphRetrievalEvalPack(
     observedAt: "2026-06-20T00:00:00.000Z",
     confidence: 0.96,
   }, cwd);
-  const doctypeNode = await addMemory({
+  const doctypeNode = await seedMemory({
     kind: "frappe_doctype",
     summary: `${module} DocType ${doctype} belongs to app ${app}, module ${module}, and maps to MariaDB table ${table}. It has Link fields to related masters and stores structured details through child table ${childDoctype}.`,
     provenance: [provenance, "node:doctype"],
@@ -392,7 +404,7 @@ export async function seedFrappeGraphRetrievalEvalPack(
     confidence: 0.97,
     links: [child.id, customField.id, workflow.id, permission.id, fresh.id],
   }, cwd);
-  const forbidden = await addMemory({
+  const forbidden = await seedMemory({
     kind: "frappe_private_metadata",
     summary: `${module} private forbiddenneedle${otherUser} schema token belongs only to ${otherUser}.`,
     provenance: [provenance, "node:forbidden"],
@@ -402,7 +414,7 @@ export async function seedFrappeGraphRetrievalEvalPack(
   }, cwd);
   const distractors = [];
   for (let index = 0; index < distractorCount; index += 1) {
-    const memory = await addMemory({
+    const memory = await seedMemory({
       kind: "frappe_distractor",
       summary: `${module} distractor ${index} covers ERPNext forms, MariaDB tables, workflow state, DocFields, permissions, and unrelated app notes.`,
       provenance: [provenance, `node:distractor:${index}`],

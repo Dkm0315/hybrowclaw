@@ -83,7 +83,7 @@
         <p>The practical consequence for resumed sessions is that a fifty-turn thread stays workable. The ledger shows what each continuation actually cost, and flags the runs where replay overhead dominated, so an expensive session is visible before the invoice rather than after it.</p>
 
         <h3>Codex is a runtime, not the product</h3>
-        <p>Muster treats Codex as one adapter behind its own contract, alongside a native runtime, Claude Code, Cursor SDK, OpenHands and Pi. Sessions, memory scoping, the token ledger, and the observed file-change stream sit above the runtime boundary, so switching backends mid-project does not throw away the record. <code>muster runtime doctor</code> checks that the Codex CLI is reachable and correctly configured before you depend on it.</p>
+        <p>Muster treats Codex as one adapter behind its own contract, alongside a native runtime, Claude Code and Pi. Sessions, memory scoping, the token ledger, and the observed file-change stream sit above the runtime boundary, so switching backends mid-project does not throw away the record. <code>muster runtime doctor</code> checks that the Codex CLI is reachable and correctly configured before you depend on it.</p>
         <p>This also means the audit story does not change when the backend does. Whichever runtime executed the turn, the file-change evidence came from watching the workspace, and the receipt for it reproduces byte-identically on a different machine.</p>
         <p class="proof-link"><a href="/live-inline-diff.html">How observed file changes work →</a> <a href="/docs.html">Read the docs →</a></p>
       </div>

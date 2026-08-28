@@ -5,7 +5,8 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { dataDir } from "./store.js";
-import type { ContextObject, MemoryScope, MemoryScopeKind } from "./types.js";
+import { configPath } from "./config.js";
+import type { ContextObject, MemoryScope, MemoryScopeKind, MemoryWritePolicy } from "./types.js";
 
 export interface AddMemoryInput {
   readonly kind?: string;
@@ -18,6 +19,33 @@ export interface AddMemoryInput {
   readonly scopes: MemoryScope[];
   readonly redactionState?: ContextObject["redactionState"];
   readonly links?: string[];
+  /**
+   * True only when the human in the loop asked for this fact to be remembered
+   * ("remember that…", `muster memory add`). The one thing that satisfies a
+   * `never` policy — never set it from a heuristic.
+   */
+  readonly explicitUserRequest?: boolean;
+  /**
+   * Proof that consent was obtained for this write under an `ask` policy: the
+   * id//description of the confirmation the user answered. Free-form so callers
+   * can cite an approval id, a turn id, or a CLI flag.
+   */
+  readonly consentReceipt?: string;
+}
+
+/**
+ * Thrown when config.memory.policy forbids a durable write. Enforcement lives in
+ * `addMemory` itself, so no caller — including the goal loop in run.ts — can
+ * route around it: the policy holds by construction, not by prompt string.
+ */
+export class MemoryPolicyError extends Error {
+  readonly policy: MemoryWritePolicy;
+
+  constructor(policy: MemoryWritePolicy, message: string) {
+    super(message);
+    this.name = "MemoryPolicyError";
+    this.policy = policy;
+  }
 }
 
 export interface SearchMemoryInput {
@@ -142,8 +170,65 @@ export function memoryDbPath(cwd = process.cwd()): string {
   return join(dataDir(cwd), "memory.db");
 }
 
+/**
+ * The configured durable-write policy for `cwd`, defaulting to "auto".
+ *
+ * Reads the profile config directly rather than through `loadConfig` so a
+ * missing, unreadable, or older config degrades to today's behaviour instead of
+ * failing a write, and an unknown policy string is treated as the strictest
+ * thing it can safely mean: nothing (auto) is never inferred from garbage —
+ * garbage is rejected loudly at write time.
+ */
+export async function memoryWritePolicy(cwd = process.cwd()): Promise<MemoryWritePolicy> {
+  let raw: string;
+  try {
+    raw = await readFile(configPath(cwd), "utf8");
+  } catch {
+    return "auto";
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return "auto";
+  }
+  const policy = (parsed as { memory?: { policy?: unknown } } | null)?.memory?.policy;
+  if (policy === undefined || policy === null) return "auto";
+  if (policy === "auto" || policy === "ask" || policy === "never") return policy;
+  throw new MemoryPolicyError(
+    "never",
+    `Unknown config.memory.policy: ${JSON.stringify(policy)}. Set it to "auto", "ask", or "never" — durable writes stay blocked until it is a policy Muster can enforce.`,
+  );
+}
+
+/**
+ * Enforce config.memory.policy for one write. Exported so callers that want to
+ * check before doing expensive work can, but `addMemory` calls it itself: the
+ * gate is not optional.
+ */
+export async function assertMemoryWriteAllowed(input: AddMemoryInput, cwd = process.cwd()): Promise<MemoryWritePolicy> {
+  const policy = await memoryWritePolicy(cwd);
+  if (policy === "never" && input.explicitUserRequest !== true) {
+    throw new MemoryPolicyError(
+      "never",
+      "config.memory.policy is \"never\": Muster does not write durable memory on its own. Only a write the user explicitly asked for is allowed — pass explicitUserRequest: true for that case. To change the policy, re-run `muster onboard` and pick a different memory option, or set memory.policy in .muster/config.json.",
+    );
+  }
+  if (policy === "ask" && input.explicitUserRequest !== true) {
+    const receipt = typeof input.consentReceipt === "string" ? input.consentReceipt.trim() : "";
+    if (!receipt) {
+      throw new MemoryPolicyError(
+        "ask",
+        "config.memory.policy is \"ask\": obtain the user's confirmation for this memory before writing it, then pass consentReceipt with the id of that confirmation (an approval id, turn id, or the flag the user answered). Writes without a consent receipt are refused.",
+      );
+    }
+  }
+  return policy;
+}
+
 export async function addMemory(input: AddMemoryInput, cwd = process.cwd()): Promise<ContextObject> {
   const validated = validateMemoryInput(input);
+  await assertMemoryWriteAllowed(input, cwd);
   const previousStats = await memorySourceStats(cwd);
   const object: ContextObject = {
     id: `mem_${randomUUID()}`,
@@ -911,7 +996,10 @@ function compareReceipts(a: MemoryReceipt, b: MemoryReceipt): number {
 }
 
 function escapeLike(value: string): string {
-  return value.replace(/[%_]/g, (match) => `\\${match}`);
+  // The escape character itself must be escaped first; otherwise a literal `\`
+  // in the query consumes the next pattern character (querying `a\b` would
+  // match "ab", and a trailing `\` would turn `%` into a literal-percent match).
+  return value.replace(/[\\%_]/g, (match) => `\\${match}`);
 }
 
 /**

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { defaultConfig, profileWorkspaceDir } from "@musterhq/core";
 import type { MusterConfig } from "@musterhq/core";
-import { createFrappeRunCsrfProof, frappeChannelSystemContext, frappeChannelTurnContext, initGatewayConfig, resolvePairing, startGatewayServer, trustedFrappeProviderBoundary, trustedFrappeSystemContext, trustedFrappeTurnContext, TRUSTED_FRAPPE_ASYNC_PATH } from "../src/index.js";
+import { createFrappeRunCsrfProof, frappeChannelSystemContext, frappeChannelTurnContext, initGatewayConfig, parseTrustedFrappeIngress, resolvePairing, startGatewayServer, trustedFrappeProviderBoundary, trustedFrappeSystemContext, trustedFrappeTurnContext, TRUSTED_FRAPPE_ASYNC_PATH } from "../src/index.js";
 
 function config(baseUrl: string): MusterConfig {
   const base = defaultConfig();
@@ -113,6 +113,38 @@ test("trusted Desk Ask is offline, read-only, skill-disabled, and denies every c
   });
   assert.equal(Object.isFrozen(boundary), true);
   assert.equal(Object.isFrozen(boundary.inheritedToolDeny), true);
+});
+
+test("trusted Frappe ingress accepts bounded structured support evidence and rejects undeclared fields", () => {
+  const supportEvidence = {
+    expected: "The migrated report opens against the v16 schema.",
+    observed: "The report still resolves a removed v15 field.",
+    businessImpact: "Production review is blocked.",
+    likelyLocations: ["Custom report query", "Migration patch"],
+    affectedRecords: [{ label: "Readiness report", doctype: "Report", name: "MUSTER-DEMO-V16-READINESS" }],
+    appVersions: { frappe: "16.27.1", vinman_app: "2026.08.15" },
+    reproduction: ["Open the readiness report after migration."],
+    validation: ["Restored baseline reproduced the failure."],
+    errorEvidence: ["report_builder.missing_field"],
+    evidenceIds: ["migration:baseline-1"],
+  };
+  const parsed = parseTrustedFrappeIngress(ingress({
+    context: {
+      route: "/app/query-report/MUSTER-DEMO-V16-READINESS",
+      doctype: "Report",
+      docname: "MUSTER-DEMO-V16-READINESS",
+      summary: "Permission-filtered migration diagnostic.",
+      supportEvidence,
+      ask: { schemaVersion: 1, requestId: "ask-migration-1", requestedOutcomes: ["answer"] },
+    },
+  }));
+  assert.deepEqual(parsed.context.supportEvidence, supportEvidence);
+  assert.throws(() => parseTrustedFrappeIngress(ingress({
+    context: { supportEvidence: { ...supportEvidence, rawSecretBundle: "not permitted" } },
+  })), /unknown field/i);
+  assert.throws(() => parseTrustedFrappeIngress(ingress({
+    context: { supportEvidence: { ...supportEvidence, affectedRecords: Array.from({ length: 101 }, () => supportEvidence.affectedRecords[0]) } },
+  })), /exceeds 100 items/i);
 });
 
 test("channel Frappe context keeps provider power but forbids generic host disclosure", () => {
@@ -404,7 +436,10 @@ test("trusted Frappe deterministic reply bypasses the provider and spoofed sende
   const baseUrl = `http://127.0.0.1:${running.port}`;
   const headers = trustedHeaders(initialized.config.token);
   try {
-    const fast = ingress({ context: { fastReply: { text: "You are signed in as Asha (EMP-0042)." } } });
+    const fast = ingress({ context: {
+      fastReply: { text: "You are signed in as Asha (EMP-0042)." },
+      ask: { schemaVersion: 1, requestId: "repair-1", requestedOutcomes: ["answer", "customization_repair"] },
+    } });
     const accepted = await fetch(`${baseUrl}${TRUSTED_FRAPPE_ASYNC_PATH}`, { method: "POST", headers, body: JSON.stringify(fast) });
     const start = await accepted.json() as { pollUrl: string };
     const completed = await fetch(`${baseUrl}${start.pollUrl}?waitMs=5000`, { headers });

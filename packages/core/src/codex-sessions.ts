@@ -167,6 +167,12 @@ export interface CodexRollout {
   /** Most recent model observed in `turn_context` / `world_state`. */
   readonly model?: string;
   readonly messages: readonly CodexTranscriptMessage[];
+  /**
+   * Latest `timestamp` seen on ANY scanned line. Only meaningful when the scan
+   * reached EOF (`stats.truncated === false`); a head-window read stops long
+   * before the newest line of a big rollout.
+   */
+  readonly lastEventAt?: string;
   readonly stats: CodexRolloutStats;
 }
 
@@ -179,8 +185,16 @@ export interface CodexSessionSummary extends CodexSessionMeta {
   readonly turnCountExact: boolean;
   readonly messageCount: number;
   readonly firstUserMessage: string;
-  /** File mtime: an append-only log's last write IS its last activity. */
+  /**
+   * When the thread was last worked on. Prefers the newest rollout line
+   * timestamp when the scan reached EOF, and only falls back to file mtime when
+   * it did not — mtime is a fact about the FILE, and anything that rewrites or
+   * touches rollouts (backup agents, sync clients, an index rebuild) makes a
+   * day-old thread read as seconds old. See `lastActivitySource`.
+   */
   readonly lastActivityAt: string;
+  /** Which fact `lastActivityAt` came from — reported, never guessed at. */
+  readonly lastActivitySource: "rollout" | "mtime";
   readonly sizeBytes: number;
 }
 
@@ -463,6 +477,8 @@ export async function readCodexRollout(filePath: string, limits: CodexReadLimits
 
   let meta: CodexSessionMeta | undefined;
   let model: string | undefined;
+  let lastEventAt: string | undefined;
+  let lastEventMs = Number.NEGATIVE_INFINITY;
   let malformedLines = 0;
   let droppedMessages = 0;
   const messages: CodexTranscriptMessage[] = [];
@@ -497,6 +513,15 @@ export async function readCodexRollout(filePath: string, limits: CodexReadLimits
       const payload = parsed.payload;
       if (!isRecord(payload)) return;
       const lineAt = stringValue(parsed.timestamp);
+      if (lineAt) {
+        // Every line type counts: the newest write is the newest write, whether
+        // it was a message, a turn_context, or a compaction marker.
+        const at = Date.parse(lineAt);
+        if (Number.isFinite(at) && at > lastEventMs) {
+          lastEventMs = at;
+          lastEventAt = lineAt;
+        }
+      }
       switch (stringValue(parsed.type)) {
         case "session_meta":
           meta ??= readMeta(payload, lineAt);
@@ -540,6 +565,7 @@ export async function readCodexRollout(filePath: string, limits: CodexReadLimits
     meta: CodexSessionMeta;
     model?: string;
     messages: readonly CodexTranscriptMessage[];
+    lastEventAt?: string;
     stats: CodexRolloutStats;
   } = {
     filePath,
@@ -554,6 +580,7 @@ export async function readCodexRollout(filePath: string, limits: CodexReadLimits
     },
   };
   if (model) rollout.model = model;
+  if (lastEventAt) rollout.lastEventAt = lastEventAt;
   return rollout;
 }
 
@@ -605,6 +632,27 @@ export async function listCodexRolloutFiles(codexHome?: string): Promise<readonl
   return files.sort((left, right) => right.mtimeMs - left.mtimeMs);
 }
 
+/**
+ * When the thread was actually last worked on.
+ *
+ * mtime is only a proxy, and a lying one whenever something other than Codex
+ * writes the file: a day-old thread rendered "1s" old in `muster codex sessions`
+ * because its rollout had been re-touched. The rollout's own newest line
+ * timestamp is the truth — but only when the scan reached EOF, because a head
+ * window stops long before the newest line of a large rollout. So: rollout
+ * timestamp on a complete scan, mtime otherwise, and say which one was used.
+ */
+export function resolveCodexLastActivity(
+  rollout: Pick<CodexRollout, "lastEventAt" | "stats">,
+  mtimeMs: number,
+): { readonly lastActivityAt: string; readonly lastActivitySource: "rollout" | "mtime" } {
+  const at = rollout.lastEventAt ? Date.parse(rollout.lastEventAt) : Number.NaN;
+  if (!rollout.stats.truncated && Number.isFinite(at)) {
+    return { lastActivityAt: new Date(at).toISOString(), lastActivitySource: "rollout" };
+  }
+  return { lastActivityAt: new Date(mtimeMs).toISOString(), lastActivitySource: "mtime" };
+}
+
 function summarize(rollout: CodexRollout, file: CodexRolloutFile): CodexSessionSummary {
   const userMessages = rollout.messages.filter((message) => message.role === "user");
   const summary: CodexSessionSummary = {
@@ -614,10 +662,119 @@ function summarize(rollout: CodexRollout, file: CodexRolloutFile): CodexSessionS
     turnCountExact: !rollout.stats.truncated,
     messageCount: rollout.messages.length,
     firstUserMessage: userMessages[0]?.text ?? "",
-    lastActivityAt: new Date(file.mtimeMs).toISOString(),
+    ...resolveCodexLastActivity(rollout, file.mtimeMs),
     sizeBytes: file.sizeBytes,
   };
   return rollout.model ? { ...summary, model: rollout.model } : summary;
+}
+
+/* ---------- prompt preview ---------- */
+
+/**
+ * Lines that are scaffolding rather than something a human said: YAML front
+ * matter and its scalar keys, plugin/skill manifest references, fence markers,
+ * and bullet lists that only ever precede the real ask. Matched conservatively
+ * — a key must be a bare lower_snake token with a single-token value, so
+ * "Fix: rebuild the dist first" (multi-word value) survives as prose.
+ */
+const PROMPT_NOISE_LINE = [
+  /^-{3,}$/,
+  /^`{3,}/,
+  /^#/,
+  /^[a-z][a-z0-9_.-]*\s*:\s*\S*$/,
+  /^[-*]\s+[a-z][a-z0-9_.-]*\s*:\s*\S*$/,
+  /^[-*]\s*$/,
+  /^(?:plugin|skill|tool|mcp)s?\s*:/i,
+] as const;
+
+/** Structural markers that are never worth showing, even in the fallback. */
+const PROMPT_STRUCTURAL_LINE = /^(?:-{3,}|`{3,}.*)$/;
+
+function isPromptNoiseLine(line: string): boolean {
+  return PROMPT_NOISE_LINE.some((pattern) => pattern.test(line));
+}
+
+/**
+ * Render a rollout's opening prompt as one readable line.
+ *
+ * `firstUserMessage` keeps full fidelity for import and search; a table column
+ * cannot. Markup is dropped, fenced blocks are dropped whole, leading manifest
+ * noise is skipped, and what is returned is the first sentence a HUMAN wrote.
+ * Returns "" when there is nothing but scaffolding — the caller decides how to
+ * say "no user message" rather than being handed an invented one.
+ */
+export function summarizeCodexPrompt(text: string, maxChars = 200): string {
+  const withoutFences = text.replace(/```[\s\S]*?(?:```|$)/g, " ");
+  // `[@chrome](plugin://chrome@openai-bundled)` is a plugin reference the TUI
+  // renders as a chip; in a table it is 30 characters of URL for one word.
+  const withoutRefs = withoutFences.replace(/\[@?([^\]]*)\]\((?:plugin|https?|file|mcp):\/\/[^)]*\)/g, "$1");
+  const withoutTags = withoutRefs.replace(/<\/?[a-z][a-z0-9_:.-]*(?:\s[^>]*)?>/gi, " ");
+  const lines = withoutTags.split(/\r?\n/).map((line) => line.trim());
+  const prose: string[] = [];
+  for (const line of lines) {
+    if (!line) continue;
+    // Skip scaffolding only while it LEADS the message; once prose starts, the
+    // rest of the paragraph belongs to the human.
+    if (!prose.length && isPromptNoiseLine(line)) continue;
+    prose.push(line);
+  }
+  // A prompt that is ONLY a config paste has no human sentence to prefer. Show
+  // it, minus the structural markers — an honest ugly preview beats claiming
+  // there was no message at all.
+  const shown = prose.length ? prose : lines.filter((line) => line && !PROMPT_STRUCTURAL_LINE.test(line));
+  const collapsed = shown.join(" ").replace(/\s+/g, " ").trim();
+  if (!collapsed) return "";
+  const sentence = /^(.+?[.!?])(?:\s|$)/.exec(collapsed)?.[1];
+  const preview = sentence && sentence.length >= 12 ? sentence : collapsed;
+  return preview.length <= maxChars ? preview : `${preview.slice(0, maxChars - 1)}…`;
+}
+
+/* ---------- fork lineage ---------- */
+
+export interface CodexSessionLineageRow {
+  readonly session: CodexSessionSummary;
+  /** 0 for a root thread; 1+ for a fork whose ancestor is also in the listing. */
+  readonly depth: number;
+}
+
+/**
+ * Order a listing so forks sit under the thread they were forked from.
+ *
+ * A fork is the SAME conversation continued, so listing it as an unrelated row
+ * (usually adjacent, since it shares recent activity) reads as duplicate work.
+ * Roots keep the caller's order; each fork follows its parent, depth+1, forks of
+ * forks nested further. A thread whose parent is not in this listing is a root
+ * here — the parent may be older than `--limit` or filtered out entirely.
+ */
+export function orderCodexSessionsByLineage(
+  sessions: readonly CodexSessionSummary[],
+): readonly CodexSessionLineageRow[] {
+  const present = new Set(sessions.map((session) => session.threadId));
+  const children = new Map<string, CodexSessionSummary[]>();
+  const roots: CodexSessionSummary[] = [];
+  for (const session of sessions) {
+    const parent = session.forkedFromId;
+    if (parent && parent !== session.threadId && present.has(parent)) {
+      const bucket = children.get(parent);
+      if (bucket) bucket.push(session);
+      else children.set(parent, [session]);
+    } else {
+      roots.push(session);
+    }
+  }
+  const rows: CodexSessionLineageRow[] = [];
+  // Visited guard: a malformed fork cycle must not hang or duplicate a row.
+  const visited = new Set<string>();
+  const walk = (session: CodexSessionSummary, depth: number): void => {
+    if (visited.has(session.threadId)) return;
+    visited.add(session.threadId);
+    rows.push({ session, depth });
+    for (const child of children.get(session.threadId) ?? []) walk(child, depth + 1);
+  };
+  for (const root of roots) walk(root, 0);
+  // Any thread stranded by a cycle still gets listed; nothing silently vanishes.
+  for (const session of sessions) if (!visited.has(session.threadId)) walk(session, 0);
+  return rows;
 }
 
 /**

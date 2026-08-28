@@ -19,7 +19,7 @@ export interface ProviderPreset {
  */
 export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
   // Cloud, native protocols
-  { id: "openai", label: "OpenAI", kind: "openai", baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY", defaultModel: "gpt-5.4", category: "cloud" },
+  { id: "openai", label: "OpenAI", kind: "openai", baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY", defaultModel: "gpt-5.6", category: "cloud" },
   { id: "anthropic", label: "Anthropic Claude (API)", kind: "anthropic", baseUrl: "https://api.anthropic.com", apiKeyEnv: "ANTHROPIC_API_KEY", defaultModel: "claude-fable-5", category: "cloud", notes: "Fable 5: 1M context, adaptive thinking via effort param." },
   // Cloud, OpenAI-compatible
   { id: "xai", label: "xAI Grok", kind: "openai-compatible", baseUrl: "https://api.x.ai/v1", apiKeyEnv: "XAI_API_KEY", defaultModel: "grok-4", category: "cloud" },
@@ -42,7 +42,7 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
   { id: "vllm", label: "vLLM (self-hosted)", kind: "openai-compatible", baseUrl: "http://localhost:8000/v1", defaultModel: "served-model", category: "local", notes: "Point --base-url at your vLLM server." },
   { id: "sglang", label: "SGLang (self-hosted)", kind: "openai-compatible", baseUrl: "http://localhost:30000/v1", defaultModel: "served-model", category: "local", notes: "Point --base-url at your SGLang server." },
   // CLI-auth runtimes (subscription auth, no raw API key needed)
-  { id: "codex-cli", label: "OpenAI Codex CLI (subscription auth)", kind: "codex-cli", defaultModel: "gpt-5.5", category: "cli", notes: "Uses your local `codex` login." },
+  { id: "codex-cli", label: "OpenAI Codex CLI (subscription auth)", kind: "codex-cli", defaultModel: "gpt-5.6-sol", category: "cli", notes: "Uses your local `codex` login; gpt-5.5 remains selectable for profiles pinned to it." },
 ];
 
 export function findProviderPreset(id: string): ProviderPreset | undefined {

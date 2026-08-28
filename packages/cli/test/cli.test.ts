@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
-import { openSessionStore } from "@musterhq/core";
+import { DEFAULT_CODEX_MODEL, openSessionStore } from "@musterhq/core";
 
 const execFileAsync = promisify(execFile);
 const cliPath = resolve(import.meta.dirname, "..", "src", "index.ts");
@@ -108,31 +108,58 @@ test("gateway init redacts bearer token unless explicitly requested", async () =
   assert.match(daemonStatus.stdout, /next=muster gateway daemon start/);
 });
 
+/**
+ * The onboarding body is a wrapped column beside the "So far:" summary rail, so
+ * a sentence the screen shows can legitimately span two rows. Flatten the box
+ * (drop the rail, drop the borders, collapse whitespace) before asserting on
+ * prose; the assertions stay about what the user can READ, not about where the
+ * renderer happened to break a line.
+ */
+function onboardingBodyText(stdout: string): string {
+  // Strip ANSI first: an inherited FORCE_COLOR (e.g. from a CI or agent shell)
+  // legitimately colors the preview, and border parsing must survive that.
+  return stdout
+    .replace(/\x1b\[[0-9;]*m/g, "")
+    .split("\n")
+    .map((line) => line.replace(/^\s*[╭╰].*$/, "").replace(/^│/, "").replace(/│.*$/, ""))
+    .join(" ")
+    .replace(/\s+/g, " ");
+}
+
 test("CLI onboarding preview exposes setup controls, impacts, and separate channel credentials", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-cli-onboarding-"));
 
-  const purpose = await runCli(["onboard", "--preview", "--step", "purpose"], cwd);
-  assert.match(purpose.stdout, /Welcome to Muster/);
-  assert.match(purpose.stdout, /Set up Frappe \/ ERPNext/);
-  assert.match(purpose.stdout, /Frappe answers will prefer module, DocType, field, and workflow context/);
+  const purposeRaw = await runCli(["onboard", "--preview", "--step", "purpose"], cwd);
+  const purpose = onboardingBodyText(purposeRaw.stdout);
+  assert.match(purpose, /Welcome to Muster/);
+  assert.match(purpose, /Set up Frappe \/ ERPNext/);
+  assert.match(purpose, /Frappe answers will prefer module, DocType, field, and workflow context/);
+  assert.match(purpose, /every step optional — s starts coding now/, "every step must say it is skippable");
+  assert.match(purposeRaw.stdout, /So far:/, "the running summary rail is present on every step");
 
-  const integrations = await runCli(["onboard", "--preview", "--step", "integrations"], cwd);
-  assert.match(integrations.stdout, /Choose your assistant's senses/);
-  assert.match(integrations.stdout, /Frappe \/ ERPNext/);
-  assert.match(integrations.stdout, /Deep graph indexing improves module\/field accuracy/);
-  assert.doesNotMatch(integrations.stdout, /Slack/);
+  const integrationsRaw = await runCli(["onboard", "--preview", "--step", "integrations"], cwd);
+  const integrations = onboardingBodyText(integrationsRaw.stdout);
+  assert.match(integrations, /Choose your assistant's senses/);
+  assert.match(integrations, /Frappe \/ ERPNext/);
+  assert.match(integrations, /Deep graph indexing improves module\/field accuracy/);
+  assert.doesNotMatch(integrationsRaw.stdout, /Slack/);
 
-  const channels = await runCli(["onboard", "--preview", "--step", "channels"], cwd);
-  assert.match(channels.stdout, /Where should your assistant talk/);
-  assert.match(channels.stdout, /Slack/);
-  assert.match(channels.stdout, /WhatsApp/);
-  assert.match(channels.stdout, /SLACK_BOT_TOKEN/);
-  assert.match(channels.stdout, /WHATSAPP_ACCESS_TOKEN/);
-  assert.match(channels.stdout, /Draft-first keeps humans in control/);
+  const channelsRaw = await runCli(["onboard", "--preview", "--step", "channels"], cwd);
+  const channels = onboardingBodyText(channelsRaw.stdout);
+  assert.match(channels, /Where should your assistant talk/);
+  assert.match(channels, /Slack/);
+  assert.match(channels, /WhatsApp/);
+  assert.match(channels, /SLACK_BOT_TOKEN/);
+  assert.match(channels, /WHATSAPP_ACCESS_TOKEN/);
+  assert.match(channels, /Draft-first keeps humans in control/);
+  // Honest fields: every credential is named inside a runnable command, never
+  // as a field that looks typeable on a screen with no text input.
+  assert.match(channels, /configure later: muster channels setup slack --bot-token-env SLACK_BOT_TOKEN/);
+  assert.doesNotMatch(channels, /Bot token\/env:/, "the fake enterable field must be gone");
 
-  const memory = await runCli(["onboarding", "--preview", "--step", "memory"], cwd);
-  assert.match(memory.stdout, /Recall strictness/);
-  assert.match(memory.stdout, /Maximum privacy/);
+  const memory = onboardingBodyText((await runCli(["onboarding", "--preview", "--step", "memory"], cwd)).stdout);
+  assert.match(memory, /Recall strictness/);
+  assert.match(memory, /Maximum privacy/);
 
   const colored = await runCli(["onboard", "--preview", "--step", "channels", "--color=always"], cwd);
   assert.match(colored.stdout, /\x1b\[/);
@@ -3513,7 +3540,9 @@ test("CLI codex doctor and QA scorecard expose runtime maturity without false po
   assert.match(scorecard.stdout, /release_ready=unknown mode=advisory reason=run_with_--strict-release_before_release_claims/);
   assert.match(scorecard.stdout, /required_suites=pty_tui,provider_latency,mcp_auth_failure,memory_retrieval_speed,channel_plugin_setup,frappe2_real_prompts,pack_readiness/);
   assert.match(scorecard.stdout, /providers:/);
-  assert.match(scorecard.stdout, /passed\s+codex\s+codex-cli model=gpt-5\.5/);
+  // Pinned to the seeded default so a model bump that forgets the scorecard is
+  // caught here rather than shipping a doctor that names a model nothing seeds.
+  assert.match(scorecard.stdout, new RegExp(`passed\\s+codex\\s+codex-cli model=${DEFAULT_CODEX_MODEL.replace(/\./g, "\\.")}`));
 
   const suites = await runCli(["qa", "suites"], cwd);
   assert.match(suites.stdout, /suite=pty_tui/);

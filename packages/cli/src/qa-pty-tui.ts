@@ -7,6 +7,7 @@ import {
   createMusterAutocompleteProvider,
   createMusterChatEditor,
   createMusterChatHarness,
+  formatUserLine,
   isBareCompletionTrigger,
   isClearComposerKey,
   renderMusterComposer,
@@ -69,7 +70,7 @@ const CATALOG: MusterAutocompleteOptions = {
   ],
   models: ({ providerId }) => providerId === "groq"
     ? [{ value: "llama-3.3-70b-versatile", description: "fast cloud route" }]
-    : [{ value: "gpt-5.5", description: "selected" }, { value: "gpt-5.5-medium", description: "deeper" }],
+    : [{ value: "gpt-5.6-sol", description: "selected" }, { value: "gpt-5.6-sol-medium", description: "deeper" }],
   runtimes: () => [{ value: "native" }, { value: "claude-code" }, { value: "codex" }],
   clouds: () => [{ value: "openrouter" }, { value: "anthropic" }, { value: "groq" }],
   speeds: () => [{ value: "fast" }, { value: "session" }, { value: "deep" }],
@@ -187,7 +188,10 @@ async function casePromptVisibleAfterOutput(): Promise<QaPtyTuiCase> {
   const screen = stripAnsi(harness.visible(100).join("\n"));
   const evidence = {
     composerText: harness.text(),
-    promptVisible: screen.includes("› show status"),
+    // Derived from the renderer's own gutter (formatUserLine), never a literal
+    // glyph: the wave-2 transcript restyle moved the user turn from "›" to "> "
+    // and a hard-coded fixture reported that restyle as a product failure.
+    promptVisible: screen.includes(stripAnsi(formatUserLine("show status"))),
     timingsVisible: screen.includes("timings total=120ms"),
     memoryVisible: screen.includes("memory backend=sqlite-fts5"),
     doneVisible: screen.includes("done"),
@@ -261,8 +265,8 @@ async function caseProviderModelSpeedWorkflow(): Promise<QaPtyTuiCase> {
   const evidence = {
     providerOverlay: providerScreen.includes("codex") && providerScreen.includes("groq") && count(providerScreen, "suggestions") === 1,
     providerApplied: providerText === "/provider groq",
-    modelOverlay: modelScreen.includes("gpt-5.5") && count(modelScreen, "suggestions") === 1,
-    modelApplied: modelText === "/model gpt-5.5",
+    modelOverlay: modelScreen.includes("gpt-5.6-sol") && count(modelScreen, "suggestions") === 1,
+    modelApplied: modelText === "/model gpt-5.6-sol",
     speedApplied: speedText === "/speed session",
   };
   return makeCase(
@@ -276,7 +280,9 @@ async function caseProviderModelSpeedWorkflow(): Promise<QaPtyTuiCase> {
 
 function caseCrampedTranscriptReceipts(): QaPtyTuiCase {
   const rendered = renderTranscriptWindow([
-    "\x1b[38;2;104;245;168m›\x1b[0m Reply with exactly: ok",
+    // The real user row, produced by the renderer, so the pin logic is tested
+    // against the shipped gutter rather than a copy of it.
+    formatUserLine("Reply with exactly: ok"),
     "timings total=8335ms provider=8259ms recall=11ms prompt=5ms persist=56ms planning=2ms",
     "memory backend=sqlite-fts5 recalled=0 candidates=0 scopes=tenant:f2,user:goblin",
     "assistant body line that would otherwise crowd out receipts",

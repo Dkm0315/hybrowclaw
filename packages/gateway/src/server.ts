@@ -28,7 +28,15 @@ import {
 import { FRAPPE_TELEGRAM_LINK_PATH, FrappeTelegramLinkCoordinator, openSqliteFrappeTelegramLinkCoordinator } from "./frappe-telegram-link.js";
 import type { FrappeTelegramAuthority, TelegramChatType } from "./frappe-telegram-link.js";
 import { frappeChannelQuickReply, frappeEvidenceQuickReply, frappePermissionContextForTurn, frappeTaskKindForIntent, isFrappeBusinessIntent } from "./frappe-channel.js";
-import { createFrappeSupportDraft, isFrappeIssueReportRequest, resolveFrappeSupportDestination } from "./frappe-support.js";
+import {
+  createFrappeSupportDraft,
+  createGuestFrappeSupportTicket,
+  isFrappeIssueReportRequest,
+  reconcileGuestFrappeSupportTicket,
+  resolveFrappeSupportDestination,
+  type FrappeSupportDestination,
+  type FrappeSupportInvestigationEvidence,
+} from "./frappe-support.js";
 import { googleChatAudienceIsValid, type GatewayConfig, type GatewayGovernanceAssignment } from "./gateway-config.js";
 import {
   classifyGatewayRequest,
@@ -269,16 +277,43 @@ function frappeDeskLink(site: string, doctype: string, name: string): string {
 async function acceptPendingFrappeCreation(input: {
   readonly pending?: PendingFrappeInteraction;
   readonly authorization?: FrappeOAuthAuthorization;
+  readonly guestSupportDestination?: FrappeSupportDestination;
   readonly registry?: FlowToolRegistry;
   readonly signingKey?: string;
+  readonly fetcher?: typeof fetch;
   readonly clear: () => void;
+  readonly update: (pending: PendingFrappeInteraction) => void;
+  readonly claim: (pending: PendingFrappeInteraction, attemptId: string, nowMs: number) => PendingFrappeInteraction | undefined;
 }): Promise<SurfaceReply> {
   if (!input.pending) return { text: "There is no request waiting for approval." };
+  if (matchesGuestSupportDestination(input.pending, input.guestSupportDestination)) {
+    return acceptPendingGuestSupportCreation({
+      pending: input.pending,
+      destination: input.guestSupportDestination!,
+      fetcher: input.fetcher,
+      clear: input.clear,
+      update: input.update,
+      claim: input.claim,
+    });
+  }
+  if (!input.authorization) return { text: "Your Frappe authorization is unavailable. Reconnect with /pair, then review the request again." };
+  if (input.authorization.site !== input.pending.site
+      || input.authorization.identity.user.trim().toLowerCase() !== input.pending.principal.trim().toLowerCase()
+      || (input.pending.connectionId && input.authorization.connectionId !== input.pending.connectionId)) {
+    return { text: "The active Frappe authorization does not match the reviewed request. Nothing was sent; reconnect the exact destination and review it again." };
+  }
+  if (input.pending.phase === "executing" || input.pending.phase === "uncertain") {
+    const reconciled = await reconcilePendingFrappeCreation(input.pending, input.authorization, input.fetcher);
+    if (reconciled) {
+      input.clear();
+      return createdFrappeRecordReply(input.pending, reconciled);
+    }
+    return { text: "This request was already admitted for execution, but the destination has not returned a unique matching record yet. I will not send it again because that could create a duplicate." };
+  }
   if (input.pending.operation !== "create") return { text: "This approval action currently supports new records only. Nothing was changed." };
   if (input.pending.phase !== "review" || input.pending.requiredFields.length) {
     return { text: "This request still needs information before it can be created." };
   }
-  if (!input.authorization) return { text: "Your Frappe authorization is unavailable. Reconnect with /pair, then review the request again." };
   if (!input.signingKey?.trim()) return { text: "Creation approval is not configured for this deployment. Nothing was changed." };
   const safeWrite = input.registry?.[FRAPPE_SAFE_WRITE_TOOL];
   if (!safeWrite) return { text: "The governed Frappe write tool is unavailable. Nothing was changed." };
@@ -296,33 +331,267 @@ async function acceptPendingFrappeCreation(input: {
   if (dryRun?.error || dryRun?.status !== "approval_required" || !proposal) {
     return { text: typeof dryRun?.error === "string" ? dryRun.error : "The request could not be verified for creation. Nothing was changed." };
   }
+  if (proposal.site !== input.pending.site
+      || proposal.principal.trim().toLowerCase() !== input.pending.principal.trim().toLowerCase()
+      || proposal.operation !== "create"
+      || proposal.doctype !== input.pending.doctype) {
+    return { text: "The governed write proposal did not match the request you reviewed. Nothing was sent." };
+  }
   const approvalReceipt = signFrappeWriteProposal(proposal, input.pending.principal, input.signingKey.trim());
-  const executed = objectRecord(await safeWrite({
-    ...args,
-    permissionEpoch: proposal.permissionEpoch,
-    schemaRevision: proposal.schemaRevision,
-    dataRevision: proposal.dataRevision,
-    approvalReceipt,
-    approvalNote: "Approved from the governed channel review.",
-  }));
+  const admittedAt = Date.now();
+  const claimed = input.claim(input.pending, proposal.proposalId, admittedAt);
+  if (!claimed) return { text: "This approval is already being processed. I will not start a second write." };
+  let executed: Record<string, unknown> | undefined;
+  try {
+    executed = objectRecord(await safeWrite({
+      ...args,
+      permissionEpoch: proposal.permissionEpoch,
+      schemaRevision: proposal.schemaRevision,
+      dataRevision: proposal.dataRevision,
+      approvalReceipt,
+      approvalNote: "Approved from the governed channel review.",
+    }));
+  } catch {
+    input.update({
+      ...claimed,
+      phase: "uncertain",
+      attemptId: proposal.proposalId,
+      updatedAtMs: Date.now(),
+      expiresAtMs: Math.max(claimed.expiresAtMs, Date.now() + 30 * 24 * 60 * 60_000),
+    });
+    return { text: "The destination did not confirm the final result. I will not send the request again because that could create a duplicate; the existing attempt must be reconciled first." };
+  }
   const verification = objectRecord(executed?.verification);
   if (executed?.status !== "executed" || verification?.verified !== true) {
+    input.update({
+      ...claimed,
+      phase: "uncertain",
+      attemptId: proposal.proposalId,
+      updatedAtMs: Date.now(),
+      expiresAtMs: Math.max(claimed.expiresAtMs, Date.now() + 30 * 24 * 60 * 60_000),
+    });
     return { text: typeof executed?.error === "string" ? executed.error : "Frappe did not verify the saved record, so I cannot report this request as created." };
   }
-  const fetched = objectRecord(verification.fetched);
+  const writeVerified = objectRecord(verification.fetched);
   const result = objectRecord(executed.result);
   const created = objectRecord(result?.created);
-  const name = typeof fetched?.name === "string" ? fetched.name : typeof created?.name === "string" ? created.name : undefined;
-  if (!name) return { text: "Frappe saved the request but did not return a verifiable record reference." };
+  const name = typeof writeVerified?.name === "string" ? writeVerified.name : typeof created?.name === "string" ? created.name : undefined;
+  const supportHandoff = isSupportHandoff(input.pending);
+  const fetched = name && input.fetcher
+    ? await readFrappeRecordByName(input.pending, input.authorization, name, input.fetcher)
+    : supportHandoff ? undefined : writeVerified;
+  const fetchedDoctype = typeof fetched?.doctype === "string" ? fetched.doctype : undefined;
+  if (!name || (fetchedDoctype && fetchedDoctype !== input.pending.doctype) || !approvedValuesMatch(input.pending.values, fetched)) {
+    input.update({
+      ...claimed,
+      phase: "uncertain",
+      attemptId: proposal.proposalId,
+      updatedAtMs: Date.now(),
+      expiresAtMs: Math.max(claimed.expiresAtMs, Date.now() + 30 * 24 * 60 * 60_000),
+    });
+    return { text: "Frappe returned a result that does not match the approved request. I will not retry or report success until the destination is reconciled." };
+  }
   input.clear();
-  const link = frappeDeskLink(input.pending.site, input.pending.doctype, name);
+  return createdFrappeRecordReply(input.pending, name);
+}
+
+async function acceptPendingGuestSupportCreation(input: {
+  readonly pending: PendingFrappeInteraction;
+  readonly destination: FrappeSupportDestination;
+  readonly fetcher?: typeof fetch;
+  readonly clear: () => void;
+  readonly update: (pending: PendingFrappeInteraction) => void;
+  readonly claim: (pending: PendingFrappeInteraction, attemptId: string, nowMs: number) => PendingFrappeInteraction | undefined;
+}): Promise<SurfaceReply> {
+  if (input.pending.operation !== "create" || input.pending.requiredFields.length) {
+    return { text: "This support request is not ready for approval. Nothing was sent." };
+  }
+  if (input.pending.phase === "executing" || input.pending.phase === "uncertain") {
+    const reconciled = await reconcileGuestFrappeSupportTicket({ destination: input.destination, values: input.pending.values, fetcher: input.fetcher });
+    if (reconciled.state === "verified") {
+      input.clear();
+      return createdFrappeRecordReply(input.pending, reconciled.name);
+    }
+    return { text: `${reconciled.reason} I will not send the ticket again because that could create a duplicate.` };
+  }
+  if (input.pending.phase !== "review") return { text: "This support request is not ready for approval. Nothing was sent." };
+  const reference = supportRequestReference(input.pending);
+  if (!reference) return { text: "The reviewed support request has no idempotency reference. Nothing was sent." };
+  const claimed = input.claim(input.pending, reference, Date.now());
+  if (!claimed) return { text: "This approval is already being processed. I will not start a second ticket submission." };
+  const result = await createGuestFrappeSupportTicket({ destination: input.destination, values: input.pending.values, fetcher: input.fetcher });
+  if (result.state === "verified") {
+    input.clear();
+    return createdFrappeRecordReply(input.pending, result.name);
+  }
+  if (result.state === "rejected") {
+    input.clear();
+    return { text: `${result.reason} No ticket was reported as created.` };
+  }
+  input.update({
+    ...claimed,
+    phase: "uncertain",
+    attemptId: reference,
+    updatedAtMs: Date.now(),
+    expiresAtMs: Math.max(claimed.expiresAtMs, Date.now() + 30 * 24 * 60 * 60_000),
+  });
+  return { text: `${result.reason} I will not send the ticket again because that could create a duplicate; use /accept to reconcile this attempt.` };
+}
+
+function createdFrappeRecordReply(pending: PendingFrappeInteraction, name: string): SurfaceReply {
+  const link = frappeDeskLink(pending.site, pending.doctype, name);
+  const supportTicket = isSupportHandoff(pending);
   const presentation: SurfacePresentation = {
     kind: "status",
-    title: "Created",
-    summary: `Your ${input.pending.doctype.toLowerCase()} was created successfully.`,
-    tables: [{ id: "created-record", columns: ["Reference", "Open"], rows: [[name, link]] }],
+    title: supportTicket ? "Sent to support" : "Created",
+    summary: supportTicket
+      ? "The support destination created the ticket, reread it, and confirmed the approved evidence was saved."
+      : `Your ${pending.doctype.toLowerCase()} was created successfully.`,
+    tables: [{ id: "created-record", columns: [supportTicket ? "Ticket" : "Reference", "Open"], rows: [[name, link]] }],
   };
   return { text: renderPresentationText(presentation), presentation };
+}
+
+function isSupportHandoff(pending: PendingFrappeInteraction | undefined): boolean {
+  if (!pending || (pending.doctype !== "HD Ticket" && pending.doctype !== "Issue")) return false;
+  return typeof pending.values.description === "string" && /\bMUSTER-[0-9a-f-]{36}\b/i.test(pending.values.description);
+}
+
+function supportRequestReference(pending: PendingFrappeInteraction): string | undefined {
+  const description = typeof pending.values.description === "string" ? pending.values.description : "";
+  return description.match(/\bMUSTER-[0-9a-f-]{36}\b/i)?.[0];
+}
+
+function matchesGuestSupportDestination(
+  pending: PendingFrappeInteraction,
+  destination: FrappeSupportDestination | undefined,
+): boolean {
+  return Boolean(destination?.authMode === "guest"
+    && isSupportHandoff(pending)
+    && pending.site === destination.site
+    && pending.doctype === destination.doctype
+    && !pending.connectionId);
+}
+
+function supportReviewReply(values: Readonly<Record<string, unknown>>): SurfaceReply {
+  const rows = Object.entries(values)
+    .filter(([field, value]) => ["subject", "customer", "priority", "description"].includes(field) && value !== undefined && value !== null && String(value).trim())
+    .map(([field, value]) => [field === "description" ? "Evidence preview" : field[0]!.toUpperCase() + field.slice(1), String(value)]);
+  const presentation: SurfacePresentation = {
+    kind: "form",
+    title: "Review the support ticket",
+    summary: "Review the ticket summary and evidence preview below. Approval is bound to this complete sanitized payload; nothing has been sent yet.",
+    ...(rows.length ? { tables: [{ id: "request-preview", columns: ["Field", "Value"], rows }] } : {}),
+    actions: [
+      { id: "accept", label: "Approve & send to support", command: "/accept", style: "primary", kind: "confirm" },
+      { id: "cancel", label: "Cancel ticket", command: "/cancel" },
+    ],
+  };
+  return { text: renderPresentationText(presentation), presentation };
+}
+
+async function reconcilePendingFrappeCreation(
+  pending: PendingFrappeInteraction,
+  authorization: FrappeOAuthAuthorization | undefined,
+  fetcher: typeof fetch | undefined,
+): Promise<string | undefined> {
+  if (!authorization || !fetcher || authorization.site !== pending.site) return undefined;
+  const description = typeof pending.values.description === "string" ? pending.values.description : "";
+  const reference = description.match(/\bMUSTER-[0-9a-f-]{36}\b/i)?.[0];
+  if (!reference) return undefined;
+  const url = new URL(`/api/resource/${encodeURIComponent(pending.doctype)}`, authorization.site);
+  url.searchParams.set("fields", JSON.stringify(["name", "doctype", ...Object.keys(pending.values)]));
+  url.searchParams.set("filters", JSON.stringify([[pending.doctype, "description", "like", `%${reference}%`]]));
+  url.searchParams.set("limit_page_length", "2");
+  let response: Response;
+  try {
+    response = await fetcher(url, {
+      method: "GET",
+      headers: { authorization: authorization.header, accept: "application/json" },
+      redirect: "error",
+      signal: AbortSignal.timeout(8_000),
+    });
+  } catch {
+    return undefined;
+  }
+  if (!response.ok) return undefined;
+  const payload = objectRecord(await response.json().catch(() => undefined));
+  const rows = Array.isArray(payload?.data) ? payload.data.map(objectRecord).filter((row): row is Record<string, unknown> => Boolean(row)) : [];
+  if (rows.length !== 1 || !approvedValuesMatch(pending.values, rows[0])) return undefined;
+  return typeof rows[0].name === "string" && rows[0].name.trim() ? rows[0].name : undefined;
+}
+
+async function readFrappeRecordByName(
+  pending: PendingFrappeInteraction,
+  authorization: FrappeOAuthAuthorization,
+  name: string,
+  fetcher: typeof fetch,
+): Promise<Record<string, unknown> | undefined> {
+  const url = new URL(`/api/resource/${encodeURIComponent(pending.doctype)}/${encodeURIComponent(name)}`, authorization.site);
+  let response: Response;
+  try {
+    response = await fetcher(url, {
+      method: "GET",
+      headers: { authorization: authorization.header, accept: "application/json" },
+      redirect: "error",
+      signal: AbortSignal.timeout(8_000),
+    });
+  } catch {
+    return undefined;
+  }
+  if (!response.ok) return undefined;
+  const payload = objectRecord(await response.json().catch(() => undefined));
+  return objectRecord(payload?.data);
+}
+
+function approvedValuesMatch(expected: Readonly<Record<string, unknown>>, fetched: Readonly<Record<string, unknown>> | undefined): boolean {
+  if (!fetched) return false;
+  return Object.entries(expected).every(([key, value]) => approvedValueMatches(value, fetched[key]));
+}
+
+function approvedValueMatches(expected: unknown, actual: unknown): boolean {
+  if (Array.isArray(expected)) {
+    return Array.isArray(actual)
+      && expected.length === actual.length
+      && expected.every((value, index) => approvedValueMatches(value, actual[index]));
+  }
+  const expectedRecord = objectRecord(expected);
+  if (expectedRecord) {
+    const actualRecord = objectRecord(actual);
+    return Boolean(actualRecord)
+      && Object.entries(expectedRecord).every(([key, value]) => approvedValueMatches(value, actualRecord?.[key]));
+  }
+  return canonicalJson(actual) === canonicalJson(expected);
+}
+
+function supportInvestigationFromTrustedContext(context: TrustedFrappeContext | undefined): FrappeSupportInvestigationEvidence | undefined {
+  if (!context) return undefined;
+  const supplied = context.supportEvidence;
+  const selectedRecord = context.doctype && context.docname
+    ? { label: context.pageName?.trim() || context.docname, doctype: context.doctype, name: context.docname }
+    : undefined;
+  const affectedRecords = [...(supplied?.affectedRecords ?? [])];
+  if (selectedRecord && !affectedRecords.some((record) => record.doctype === selectedRecord.doctype && record.name === selectedRecord.name)) {
+    affectedRecords.unshift(selectedRecord);
+  }
+  const evidenceIds = [...(supplied?.evidenceIds ?? [])];
+  if (context.ask?.requestId) evidenceIds.push(`frappe-ask:${context.ask.requestId}`);
+  return {
+    ...(supplied ?? {}),
+    ...(supplied?.observed?.trim() ? {} : context.summary?.trim() ? { observed: context.summary.trim() } : {}),
+    ...(affectedRecords.length ? { affectedRecords } : {}),
+    reproduction: supplied?.reproduction?.length ? supplied.reproduction : [
+      context.route?.trim()
+        ? `Open the affected page at ${context.route.trim()} under the reporter's own Frappe permissions.`
+        : "Open the affected record under the reporter's own Frappe permissions.",
+      "Repeat the reported workflow and compare the observed result with the approved business state.",
+    ],
+    validation: [
+      ...(supplied?.validation ?? []),
+      "Frappe supplied this context after applying the reporter's live identity and permissions.",
+    ],
+    ...(evidenceIds.length ? { evidenceIds: [...new Set(evidenceIds)] } : {}),
+  };
 }
 
 /** Per-profile workspace dirs already ensured this process — skip the mkdir syscall on the hot path. */
@@ -1116,7 +1385,7 @@ function pairedIdentityFromAuthorization(authorization: FrappeOAuthAuthorization
 
 export async function handleSurfaceMessage(
   message: SurfaceMessage,
-  options: Pick<GatewayServerOptions, "config" | "cwd" | "nativeTransportOwner" | "frappeOAuth"> & {
+  options: Pick<GatewayServerOptions, "config" | "cwd" | "nativeTransportOwner" | "frappeOAuth" | "fetcher"> & {
     readonly gateway?: GatewayConfig;
     readonly enterprise?: GatewayEnterpriseRuntime;
     readonly approvalStore?: SqliteApprovalActionStore;
@@ -1169,8 +1438,22 @@ export async function handleSurfaceMessage(
     ? pendingFrappeInteractionKey(message, paired.identity.site, paired.identity.user)
     : undefined;
   if (frappeInteractionKey && parsedCommand?.name === "cancel") {
+    const pending = options.enterprise?.frappeInteractionStore.read(frappeInteractionKey);
+    if (pending?.phase === "executing" || pending?.phase === "uncertain") {
+      return {
+        text: "This request was already admitted for execution, so it cannot be discarded safely. Use /accept to check the destination without sending it again.",
+      };
+    }
     options.enterprise?.frappeInteractionStore.clear(frappeInteractionKey);
-    return { text: "Request cancelled. Nothing was created or changed." };
+    const supportHandoff = isSupportHandoff(pending);
+    const presentation: SurfacePresentation = {
+      kind: "status",
+      title: supportHandoff ? "Ticket cancelled" : "Request cancelled",
+      summary: supportHandoff
+        ? "Nothing was sent to support and no record was created or changed."
+        : "Nothing was created or changed.",
+    };
+    return { text: renderPresentationText(presentation), presentation };
   }
   const pendingApproval = pendingApprovalFromRaw(message.raw);
   if (pendingApproval) {
@@ -1293,13 +1576,25 @@ export async function handleSurfaceMessage(
   }
   if (frappeInteractionKey && parsedCommand && ["accept", "create"].includes(parsedCommand.name)) {
     const pendingInteraction = options.enterprise?.frappeInteractionStore.read(frappeInteractionKey);
-    if (pendingInteraction && options.frappeOAuth) {
+    let guestSupportDestination: FrappeSupportDestination | undefined;
+    if (options.gateway?.frappe?.support) {
       try {
-        frappeAuthorization = await options.frappeOAuth.authorizationForActor({
+        const configured = resolveFrappeSupportDestination(options.gateway.frappe.support);
+        if (configured.authMode === "guest") guestSupportDestination = configured;
+      } catch {
+        guestSupportDestination = undefined;
+      }
+    }
+    if (pendingInteraction && options.frappeOAuth && !matchesGuestSupportDestination(pendingInteraction, guestSupportDestination)) {
+      try {
+        const actor = {
           surfaceId: message.surfaceId,
           senderId: message.senderId,
           pairingId: paired.pairingId,
-        }, pendingInteraction.site);
+        };
+        frappeAuthorization = pendingInteraction.connectionId
+          ? await options.frappeOAuth.authorization(pendingInteraction.connectionId, actor)
+          : await options.frappeOAuth.authorizationForActor(actor, pendingInteraction.site);
       } catch {
         frappeAuthorization = undefined;
       }
@@ -1307,9 +1602,18 @@ export async function handleSurfaceMessage(
     return acceptPendingFrappeCreation({
       pending: pendingInteraction,
       authorization: frappeAuthorization,
+      guestSupportDestination,
       registry: options.registry,
       signingKey: options.gateway?.frappe?.approvalSigningKey,
+      fetcher: options.fetcher,
       clear: () => options.enterprise?.frappeInteractionStore.clear(frappeInteractionKey),
+      update: (pending) => options.enterprise?.frappeInteractionStore.put(pending),
+      claim: (pending, attemptId, nowMs) => options.enterprise?.frappeInteractionStore.claimExecution(
+        pending.key,
+        pending.updatedAtMs,
+        attemptId,
+        nowMs,
+      ),
     });
   }
   const storedFrappeInteraction = frappeInteractionKey && !parsedCommand
@@ -1340,21 +1644,49 @@ export async function handleSurfaceMessage(
     options.onStatus?.(frappeContinuation ? "Checking the next required detail" : "Checking your current access");
   }
   const supportDraft = paired.identity?.provider === "frappe" && isFrappeIssueReportRequest(message.text)
-    ? createFrappeSupportDraft({
+      ? createFrappeSupportDraft({
         prompt: message.text,
         identity: paired.identity,
         context: options.trustedFrappe,
         config: options.gateway?.frappe?.support,
+        investigation: supportInvestigationFromTrustedContext(options.trustedFrappe),
       })
     : undefined;
+  if (supportDraft?.destination.authMode === "guest") {
+    if (!frappeInteractionKey || !options.enterprise) {
+      return { text: "Public support intake is configured, but durable approval state is unavailable. Nothing was sent." };
+    }
+    const nowMs = Date.now();
+    options.enterprise.frappeInteractionStore.put({
+      key: frappeInteractionKey,
+      site: supportDraft.destination.site,
+      principal: paired.identity!.user,
+      surfaceId: message.surfaceId,
+      conversationId: message.conversationId,
+      senderId: message.senderId,
+      doctype: supportDraft.destination.doctype,
+      operation: "create",
+      values: supportDraft.values,
+      requiredFields: [],
+      phase: "review",
+      createdAtMs: nowMs,
+      updatedAtMs: nowMs,
+      expiresAtMs: nowMs + 15 * 60_000,
+    });
+    return supportReviewReply(supportDraft.values);
+  }
   if (supportDraft && options.frappeOAuth
-      && frappeAuthorization?.site !== supportDraft.destination.site) {
+      && (frappeAuthorization?.site !== supportDraft.destination.site
+        || (supportDraft.destination.connectionId && frappeAuthorization.connectionId !== supportDraft.destination.connectionId))) {
     try {
-      frappeAuthorization = await options.frappeOAuth.authorizationForActor({
+      const actor = {
         surfaceId: message.surfaceId,
         senderId: message.senderId,
         pairingId: paired.pairingId,
-      }, supportDraft.destination.site);
+      };
+      frappeAuthorization = supportDraft.destination.connectionId
+        ? await options.frappeOAuth.authorization(supportDraft.destination.connectionId, actor)
+        : await options.frappeOAuth.authorizationForActor(actor, supportDraft.destination.site);
     } catch {
       frappeAuthorization = undefined;
     }
@@ -1396,6 +1728,7 @@ export async function handleSurfaceMessage(
       surfaceId: message.surfaceId,
       conversationId: message.conversationId,
       senderId: message.senderId,
+      ...(supportDraft?.destination.connectionId ? { connectionId: supportDraft.destination.connectionId } : {}),
       doctype: frappeTurnContext.pendingInteraction.doctype,
       operation: frappeTurnContext.pendingInteraction.operation,
       values: frappeTurnContext.pendingInteraction.values,
@@ -1487,8 +1820,11 @@ export async function handleSurfaceMessage(
       workspaceDir,
       skipRecall: !shouldRecallForChannel(message.text),
       conversationKey: sessionKey,
-      nativeTransport: "warm",
-      nativeSessionKeepAlive: true,
+      // Trusted Frappe turns already carry fresh, permission-filtered context.
+      // One-shot transport avoids a stale/hung provider thread retaining an
+      // earlier permission epoch and has materially lower tail latency here.
+      nativeTransport: options.trustedFrappe ? "exec" : "warm",
+      nativeSessionKeepAlive: !options.trustedFrappe,
       nativeSessionMaxTurns: NATIVE_SESSION_MAX_TURNS,
       nativeSessionMaxAgeMs: NATIVE_SESSION_MAX_AGE_MS,
       nativeTransportOwner: options.nativeTransportOwner,
@@ -4435,7 +4771,7 @@ async function route(
       sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
       return;
     }
-    const reply = await handleSurfaceMessage(message, { config: options.config, gateway: options.gateway, enterprise: options.enterprise, approvalStore: options.approvalStore, cwd, registry: options.registry, frappeOAuth: options.frappeOAuth });
+    const reply = await handleSurfaceMessage(message, { config: options.config, gateway: options.gateway, enterprise: options.enterprise, approvalStore: options.approvalStore, cwd, registry: options.registry, frappeOAuth: options.frappeOAuth, fetcher: options.fetcher });
     sendJson(response, 200, reply);
     return;
   }
@@ -4510,6 +4846,8 @@ async function route(
           approvalStore: options.approvalStore,
           cwd,
           registry: options.registry,
+          frappeOAuth: options.frappeOAuth,
+          fetcher: options.fetcher,
           trustedFrappe: ingress.context,
           allowArtifacts: false,
           onDelta: stream.onDelta,
@@ -4602,6 +4940,7 @@ async function route(
       cwd,
       registry: options.registry,
       frappeOAuth: options.frappeOAuth,
+      fetcher: options.fetcher,
       onDelta: stream.onDelta,
       onReasoningDelta: stream.onReasoningDelta,
     }));
@@ -4813,6 +5152,7 @@ export function startGatewayServer(options: GatewayServerOptions, port = 0): Pro
     ?? (ownsFrappeTelegramLinks ? openSqliteFrappeTelegramLinkCoordinator(join(dataDir(cwd), "frappe-telegram-links.db")) : undefined);
   const effectiveOptions: GatewayServerOptions = {
     ...options,
+    fetcher: options.fetcher ?? fetch,
     enterprise,
     gchatVerifier,
     ingress,
@@ -4974,7 +5314,7 @@ export function gatewayStartupErrors(gateway: GatewayConfig): readonly string[] 
   if (gateway.frappe?.support) {
     try {
       const support = resolveFrappeSupportDestination(gateway.frappe.support);
-      if (support.connectionId && !gateway.frappe.oauth?.connections.some((connection) => connection.id === support.connectionId)) {
+      if (support.authMode === "oauth" && support.connectionId && !gateway.frappe.oauth?.connections.some((connection) => connection.id === support.connectionId)) {
         errors.push(`Frappe support connection ${support.connectionId} is not configured under frappe.oauth.connections`);
       }
     } catch {

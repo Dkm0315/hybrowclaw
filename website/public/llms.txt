@@ -43,14 +43,14 @@ each Codex release rather than assumed permanent.
 ## Core capabilities
 
 - Observed file-change truth with deterministic, reproducible receipts
-- Append-only event spine: 22 typed events, monotonic sequences, fencing tokens,
+- Append-only event spine: 21 typed events, monotonic sequences, fencing tokens,
   idempotency keys, and a reducer invariant rejecting secrets or chain-of-thought
 - Scoped memory lanes: tenant, workspace, user, role, session — with leakage tests
 - Local token ledger with replay-waste flags; `muster benchmark` measures 875.8k
   naive tokens vs 355.2k (59.4% reduction) across 5 scenarios / 170 turns,
   deterministically and with no model calls
 - Eval-gated learning: feedback becomes a test fixture before behaviour changes
-- Pluggable runtimes: native, Codex, Claude Code, Cursor SDK, OpenHands, Pi
+- Pluggable runtimes: native, Codex, Claude Code, Pi (Cursor SDK and OpenHands are declared kinds, adapters not yet shipped)
 - MCP capability policy: include/exclude, OAuth setup, result caps, circuit breakers
 - Channel gateway: terminal, web, Telegram, Slack, Google Chat, Teams, Discord, WhatsApp
 - ERPNext / Frappe context packs: DocTypes, fields, workflows, reports, scripts,

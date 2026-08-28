@@ -10,6 +10,7 @@ import {
   type Component,
   type EditorTheme,
 } from "@earendil-works/pi-tui";
+import { createCoalescer } from "@musterhq/core";
 
 export interface MusterChatCommand {
   readonly name: string;
@@ -87,6 +88,8 @@ export interface RunMusterChatTuiOptions extends MusterAutocompleteOptions {
   readonly headerLines?: readonly string[];
   readonly statusLine: () => string | Promise<string>;
   readonly onSubmit: (text: string, sink: MusterChatSink) => Promise<boolean>;
+  /** Printed to stdout after teardown when the session exits via /exit. */
+  readonly farewell?: string;
 }
 
 export interface MusterChatHarness {
@@ -97,6 +100,10 @@ export interface MusterChatHarness {
   text(): string;
   transcript(): readonly string[];
   openPicker(command: string): void;
+  /** True once an exit command (/exit, /quit, /q) has been routed. */
+  exited(): boolean;
+  /** The single status row the spinner owns; never part of the transcript. */
+  status(): string;
 }
 
 const WORKING_FRAMES = ["|", "/", "-", "\\"] as const;
@@ -112,6 +119,558 @@ const HIGHLIGHT_RGB = "104;245;168";
 const MUTED_RGB = "142;161;181";
 const RED_RGB = "255;107;122";
 const SELECTION_BG_RGB = "41;211;255";
+const ITALIC = "\x1b[3m";
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * TUI render model (docs/PRODUCT_MODES.md, "Parent-model streaming").
+ *
+ * The transcript renders TYPED EVENTS only. Anything the engine happens to
+ * print — a run-record JSON line, a memory-recall diagnostic, a spinner
+ * repaint — is classified before it can reach the screen: chips go to the
+ * transcript, raw diagnostics go to a session log, spinner frames go to the
+ * single status row. `routeEngineLine` is the one gate, so a new print site
+ * anywhere in the engine cannot re-open defect #1 or #2.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+/** The subset of a `TokenRecord` (core `tokens.ts`) the cost chip renders. */
+export interface CostChipRecord {
+  readonly runId?: string;
+  readonly provider?: string;
+  readonly model?: string;
+  readonly inputTokens?: number;
+  readonly cachedInputTokens?: number;
+  readonly outputTokens?: number;
+  readonly estimated?: boolean;
+  readonly costUsd?: number;
+  readonly durationMs?: number;
+}
+
+export type EngineLineRoute =
+  /** Model/tool content: paint it. */
+  | { readonly kind: "transcript"; readonly line: string }
+  /** A spinner frame: it belongs to the status row, never to scrollback. */
+  | { readonly kind: "status"; readonly line: string }
+  /** A run record: transcript gets `chip`, the log file gets `log`. */
+  | { readonly kind: "cost"; readonly chip: string; readonly log: string; readonly runId?: string }
+  /** Debug output: `chip` (when present) is the only thing a human sees. */
+  | { readonly kind: "diagnostic"; readonly chip?: string; readonly log: string };
+
+/**
+ * Classify one engine-emitted line for a TTY session. Non-TTY callers must NOT
+ * use this: scripts keep the raw JSON/diagnostic lines they parse today.
+ */
+export function routeEngineLine(line: string): EngineLineRoute {
+  const clean = stripAnsi(line);
+  const trimmed = clean.trim();
+  if (isWorkingStatusLine(trimmed)) return { kind: "status", line: trimmed };
+  const record = parseRunRecordLine(trimmed);
+  if (record) return { kind: "cost", chip: formatCostChip(record), log: trimmed, runId: record.runId };
+  if (trimmed.startsWith("memory backend=")) {
+    return { kind: "diagnostic", chip: formatRecallChip(trimmed), log: trimmed };
+  }
+  if (trimmed.startsWith("timings total=")) {
+    return { kind: "diagnostic", chip: formatTimingsChip(trimmed), log: trimmed };
+  }
+  if (isRecallReceiptDetailLine(trimmed)) return { kind: "diagnostic", log: trimmed };
+  return { kind: "transcript", line };
+}
+
+/** A spinner frame — `⟨frame⟩ working` / `⟨frame⟩ @agent working`. */
+export function isWorkingStatusLine(line: string): boolean {
+  return /^[|/\\-]\s+(?:@[A-Za-z0-9_.:-]+\s+)?working$/.test(stripAnsi(line).trim());
+}
+
+function isRecallReceiptDetailLine(line: string): boolean {
+  return /^\S+\s+score=\d+(?:\.\d+)?\s+\S/.test(line);
+}
+
+/**
+ * Parse a raw run-record JSON line. Deliberately strict: a line only counts as
+ * a run record when it carries a runId AND both token counts, so a model that
+ * legitimately answers with JSON is never swallowed.
+ */
+export function parseRunRecordLine(line: string): CostChipRecord | undefined {
+  const trimmed = stripAnsi(line).trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.runId !== "string") return undefined;
+  if (typeof record.inputTokens !== "number" || typeof record.outputTokens !== "number") return undefined;
+  return record as CostChipRecord;
+}
+
+/** `▸ gpt-5.6 · 25.1k in · 3.0k cached · 512 out · $0.0337 · 12.4s` */
+export function formatCostChip(record: CostChipRecord): string {
+  const estimated = record.estimated ? "~" : "";
+  const parts: string[] = [record.model ?? record.provider ?? "model"];
+  if (typeof record.inputTokens === "number") parts.push(`${compactCount(record.inputTokens)}${estimated} in`);
+  if (typeof record.cachedInputTokens === "number" && record.cachedInputTokens > 0) {
+    parts.push(`${compactCount(record.cachedInputTokens)} cached`);
+  }
+  if (typeof record.outputTokens === "number") parts.push(`${compactCount(record.outputTokens)}${estimated} out`);
+  if (typeof record.costUsd === "number") parts.push(`$${record.costUsd.toFixed(4)}`);
+  if (typeof record.durationMs === "number") parts.push(formatDuration(record.durationMs));
+  return dim(`▸ ${parts.join(" · ")}`);
+}
+
+/** `memory backend=… recalled=2 …` → `▸ recalled 2 memories`; nothing when 0. */
+export function formatRecallChip(line: string): string | undefined {
+  const recalled = Number(stripAnsi(line).match(/\brecalled=(\d+)/)?.[1] ?? Number.NaN);
+  if (!Number.isFinite(recalled) || recalled <= 0) return undefined;
+  return dim(`▸ recalled ${recalled} ${recalled === 1 ? "memory" : "memories"}`);
+}
+
+/** `timings total=8335ms provider=8259ms …` → `▸ 8.3s total · 8.3s provider`. */
+export function formatTimingsChip(line: string): string | undefined {
+  const clean = stripAnsi(line);
+  const total = Number(clean.match(/\btotal=(\d+)ms/)?.[1] ?? Number.NaN);
+  if (!Number.isFinite(total)) return undefined;
+  const parts = [`${formatDuration(total)} total`];
+  const provider = Number(clean.match(/\bprovider=(\d+)ms/)?.[1] ?? Number.NaN);
+  if (Number.isFinite(provider)) parts.push(`${formatDuration(provider)} provider`);
+  const firstToken = Number(clean.match(/\bfirst_token_ms=(\d+)/)?.[1] ?? Number.NaN);
+  if (Number.isFinite(firstToken)) parts.push(`first token ${formatDuration(firstToken)}`);
+  return dim(`▸ ${parts.join(" · ")}`);
+}
+
+export function compactCount(value: number): string {
+  if (!Number.isFinite(value)) return "0";
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (abs >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return String(Math.round(value));
+}
+
+export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "0ms";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const minutes = Math.floor(ms / 60_000);
+  const seconds = Math.round((ms % 60_000) / 1000);
+  return `${minutes}m ${seconds}s`;
+}
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * TRANSCRIPT IDIOM (owner verdict 2026-08-27: "functional but noisy").
+ *
+ * The transcript is styling and hierarchy ONLY — every fact that reached the
+ * screen before still reaches it. What changes is the frame:
+ *
+ *   > restyle the transcript                     ← user turn, dim "> " gutter
+ *
+ *   ● Reading the gateway config to find where   ← assistant prose, one bullet
+ *     the ingress spool is flushed.                per block, continuations
+ *                                                  align under the bullet
+ *   ⏺ Edit(server.js)                            ← an action is a headline
+ *     ⎿ +12 −2 · 86ms · receipt d3b9c1a2…        ← its result is a dim elbow
+ *       @@ -1,4 +1,5 @@                            with the detail indented
+ *       … +7 lines
+ *
+ * No box frames: whitespace and gutters do the separating. The only remaining
+ * ╭─╮ in the chat surface is the composer, which is a control, not content.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+/** The dim gutter a user turn wears in scrollback (the composer keeps "›"). */
+export const USER_PREFIX = "> ";
+/** One bullet per assistant message block; continuations align beneath it. */
+export const ASSISTANT_BULLET = "●";
+/** An action headline: `⏺ Edit(server.js)`. */
+export const TOOL_BULLET = "⏺";
+/** The result elbow hanging under an action. */
+export const RESULT_ELBOW = "⎿";
+/** Result detail beyond this many rows collapses to a "… +n lines" count. */
+export const TOOL_RESULT_MAX_LINES = 6;
+/** Spinner frames for the single status row (never the transcript). */
+export const STATUS_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
+
+/** `> deploy the limiter` — the gutter is dim, the user's own words are not. */
+export function formatUserLine(text: string): string {
+  return `${dim(">")} ${text}`;
+}
+
+/**
+ * True for a user turn in scrollback. Assistant prose can legitimately contain
+ * a markdown blockquote, so the test is anchored at column 0 — every assistant
+ * row carries a "● "/"  " gutter and therefore can never be mistaken for one.
+ */
+export function isUserTranscriptLine(line: string): boolean {
+  return stripAnsi(line).startsWith(USER_PREFIX);
+}
+
+/**
+ * One assistant message block: `● first line`, continuations indented two so
+ * the prose reads as a single column. `continued` keeps a streaming block open
+ * — deltas paint into the SAME bullet instead of sprouting one per chunk.
+ */
+export function formatAssistantBlock(text: string, options: { readonly continued?: boolean } = {}): string[] {
+  const rows = String(text).split(/\r?\n/);
+  while (rows.length && !rows[0]!.trim()) rows.shift();
+  while (rows.length && !rows[rows.length - 1]!.trim()) rows.pop();
+  if (!rows.length) return [];
+  return rows.map((row, index) => (index === 0 && !options.continued ? `${accent(ASSISTANT_BULLET)} ${row}` : `  ${row}`));
+}
+
+/** `⏺ Edit(server.js)` — the action, on its own line, above its result. */
+export function formatToolLine(name: string, target?: string): string {
+  const label = target ? `${name}(${target})` : name;
+  return `${accent(TOOL_BULLET)} ${label}`;
+}
+
+export interface ToolResultOptions {
+  /** Raw result rows (diff hunks, stdout, table rows). Never reordered. */
+  readonly detail?: readonly string[];
+  /** Rows shown before collapsing. Default TOOL_RESULT_MAX_LINES. */
+  readonly maxLines?: number;
+  /**
+   * Hint appended to the collapse counter, e.g. "ctrl+o expands". Set it ONLY
+   * where an expand hook actually exists: the chat screen has none today, so a
+   * long result truncates with an honest count instead of promising a keypress
+   * that does nothing.
+   */
+  readonly expandHint?: string;
+}
+
+/**
+ * `  ⎿ +12 −2 · 86ms` plus indented detail, collapsed past `maxLines`. Returns
+ * lines, never prints — same purity rule as live-diff.ts.
+ */
+export function formatToolResultLines(summary: string, options: ToolResultOptions = {}): string[] {
+  const lines = [`  ${dim(`${RESULT_ELBOW} ${summary}`)}`];
+  const detail = options.detail ?? [];
+  const maxLines = Math.max(1, options.maxLines ?? TOOL_RESULT_MAX_LINES);
+  for (const row of detail.slice(0, maxLines)) lines.push(`    ${row}`);
+  const hidden = detail.length - Math.min(detail.length, maxLines);
+  if (hidden > 0) lines.push(`    ${dim(`… +${hidden} lines${options.expandHint ? ` (${options.expandHint})` : ""}`)}`);
+  return lines;
+}
+
+export interface ToolBlockOptions extends ToolResultOptions {
+  readonly name: string;
+  readonly target?: string;
+  readonly summary: string;
+}
+
+/** The whole ⏺/⎿ frame for one action. */
+export function renderToolBlock(options: ToolBlockOptions): string[] {
+  return [formatToolLine(options.name, options.target), ...formatToolResultLines(options.summary, options)];
+}
+
+export interface ToolSummaryParts {
+  readonly additions?: number;
+  readonly deletions?: number;
+  readonly durationMs?: number;
+  /** Content-addressed receipt; rendered short (`d3b9c1a2…`), never dropped. */
+  readonly receipt?: string;
+  /** Anything else worth one segment (e.g. "binary", "3 matches"). */
+  readonly extra?: readonly string[];
+}
+
+/** `+12 −2 · 86ms · receipt d3b9c1a2…` — the dim one-liner under an action. */
+export function formatToolSummary(parts: ToolSummaryParts): string {
+  const segments: string[] = [];
+  if (parts.additions !== undefined || parts.deletions !== undefined) {
+    segments.push(`+${parts.additions ?? 0} −${parts.deletions ?? 0}`);
+  }
+  for (const extra of parts.extra ?? []) segments.push(extra);
+  if (parts.durationMs !== undefined && Number.isFinite(parts.durationMs)) {
+    segments.push(formatDuration(Math.max(0, parts.durationMs)));
+  }
+  if (parts.receipt) segments.push(`receipt ${shortReceipt(parts.receipt)}`);
+  return segments.join(" · ");
+}
+
+/** `sha256:d3b9c1a2f0…` → `d3b9c1a2…`; anything shorter passes through. */
+export function shortReceipt(receipt: string): string {
+  const value = receipt.includes(":") ? receipt.slice(receipt.lastIndexOf(":") + 1) : receipt;
+  return value.length > 8 ? `${value.slice(0, 8)}…` : value;
+}
+
+export interface StatusLineInfo {
+  readonly model: string;
+  readonly session: string;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly costUsd?: number;
+  readonly elapsedMs?: number;
+  /** Routed turn: `@review` rides at the left with the spinner. */
+  readonly agentId?: string;
+  /** Present ⇒ working; the spinner paints at the left edge of THIS row. */
+  readonly frame?: number;
+  /** Extra trailing segments (scopes, tool counts) the header no longer shows. */
+  readonly extra?: readonly string[];
+}
+
+/**
+ * The single bottom row that replaces the scattered chrome:
+ * `⠙ @review · gpt-5.6-sol · main · 25.1k in / 512 out · $0.0337 · 12.4s`.
+ * The spinner lives HERE and only here — a frame in the transcript is defect #4.
+ */
+export function formatStatusLine(info: StatusLineInfo): string {
+  const segments: string[] = [];
+  if (info.agentId) segments.push(`@${info.agentId}`);
+  segments.push(info.model);
+  segments.push(info.session);
+  if (info.inputTokens !== undefined || info.outputTokens !== undefined) {
+    segments.push(`${compactCount(info.inputTokens ?? 0)} in / ${compactCount(info.outputTokens ?? 0)} out`);
+  }
+  if (info.costUsd !== undefined && Number.isFinite(info.costUsd)) segments.push(`$${info.costUsd.toFixed(4)}`);
+  if (info.elapsedMs !== undefined && Number.isFinite(info.elapsedMs)) segments.push(formatDuration(Math.max(0, info.elapsedMs)));
+  for (const extra of info.extra ?? []) segments.push(extra);
+  const body = segments.join(" · ");
+  if (info.frame === undefined) return dim(body);
+  const spinner = STATUS_SPINNER_FRAMES[Math.abs(Math.trunc(info.frame)) % STATUS_SPINNER_FRAMES.length]!;
+  return `${accent(spinner)} ${dim(body)}`;
+}
+
+/** Kanban/mission statuses collapse to three glyphs: pending, live, ended. */
+export function missionStatusGlyph(status: string): string {
+  switch (status) {
+    case "in_progress":
+    case "running":
+    case "assigned":
+    case "review":
+      return "◔";
+    case "done":
+    case "completed":
+      return "●";
+    case "blocked":
+    case "failed":
+    case "needs_intervention":
+    case "cancelled":
+      return "✖";
+    default:
+      return "○";
+  }
+}
+
+export interface MissionCardRow {
+  readonly id: string;
+  readonly title: string;
+  readonly status: string;
+  /** Model or agent driving the task. */
+  readonly agent?: string;
+  /** The task's own latest narration line (already truncated by the caller). */
+  readonly detail?: string;
+  readonly tokens?: number;
+  readonly elapsedMs?: number;
+}
+
+export interface MissionCard {
+  readonly title: string;
+  readonly rows: readonly MissionCardRow[];
+  readonly costUsd?: number;
+  readonly agents?: number;
+}
+
+/**
+ * Board/mission cards wear the same ⏺/⎿ frame as any other action, with the
+ * task columns aligned so a three-agent mission reads as a table, not a list.
+ */
+export function renderMissionCard(card: MissionCard): string[] {
+  const summary: string[] = [`${card.rows.length} task${card.rows.length === 1 ? "" : "s"}`];
+  if (card.agents !== undefined) summary.push(`${card.agents} agent${card.agents === 1 ? "" : "s"}`);
+  const live = card.rows.filter((row) => missionStatusGlyph(row.status) === "◔").length;
+  if (live > 0) summary.push(`${live} running`);
+  if (card.costUsd !== undefined && Number.isFinite(card.costUsd)) summary.push(`$${card.costUsd.toFixed(2)}`);
+
+  const columns = card.rows.map((row) => [
+    row.id,
+    row.title,
+    row.agent ?? "—",
+    row.detail ?? "—",
+    missionRowMetrics(row),
+  ]);
+  const widths = [0, 1, 2, 3].map((index) => Math.max(...columns.map((cells) => visibleWidth(cells[index] ?? "")), 0));
+  const detail = columns.map((cells, index) => {
+    const glyph = missionStatusGlyph(card.rows[index]!.status);
+    const body = cells.slice(0, 4).map((cell, column) => padPlain(cell ?? "", widths[column] ?? 0)).join("  ");
+    const metrics = cells[4] ?? "";
+    // Trim BEFORE tinting: padding hidden inside an escape sequence would
+    // stretch every short row to the width of the longest one.
+    return metrics ? `${glyph} ${body}  ${dim(metrics)}` : `${glyph} ${body}`.trimEnd();
+  });
+  return renderToolBlock({
+    name: "Mission",
+    target: card.title,
+    summary: summary.join(" · "),
+    detail,
+    maxLines: Math.max(TOOL_RESULT_MAX_LINES, detail.length),
+  });
+}
+
+function missionRowMetrics(row: MissionCardRow): string {
+  const parts: string[] = [];
+  if (row.elapsedMs !== undefined && Number.isFinite(row.elapsedMs)) parts.push(formatDuration(Math.max(0, row.elapsedMs)));
+  if (row.tokens !== undefined && Number.isFinite(row.tokens)) parts.push(`${compactCount(row.tokens)} tok`);
+  return parts.join(" · ");
+}
+
+function padPlain(value: string, width: number): string {
+  return value + " ".repeat(Math.max(0, width - visibleWidth(value)));
+}
+
+/**
+ * Streamed narration painter — the fix for the 66s silent spinner.
+ *
+ * Deltas from `onDelta`/`onReasoningDelta` are coalesced by the core
+ * fence-aware Coalescer (`stream.ts`), so a markdown code block never splits
+ * mid-fence, and each emitted block is painted into the transcript the moment
+ * it lands. Reasoning summaries use their own buffer and are flushed BEFORE
+ * the next message block so they always render above the message they explain.
+ */
+export type ReasoningMode = "compact" | "full";
+
+export interface NarrationPainterOptions {
+  readonly emit: (line: string) => void;
+  /** Do not paint a block below this size unless flushed. Default 48. */
+  readonly minChars?: number;
+  /** Force a (fence-aware) split above this size. Default 320. */
+  readonly maxChars?: number;
+  readonly now?: () => number;
+  /**
+   * false ⇒ emit raw text (non-TTY / plain streaming). Default true: deltas
+   * paint into ONE `●` block per message instead of one bullet per chunk.
+   */
+  readonly bullets?: boolean;
+  /** "compact" (default) collapses each reasoning summary to a single row. */
+  readonly reasoningMode?: ReasoningMode;
+}
+
+export interface NarrationPainter {
+  /** Feed an assistant-message delta. */
+  delta(text: string): void;
+  /** Feed a provider-approved reasoning summary delta. */
+  reasoning(text: string): void;
+  /** Flush both buffers at end of turn. */
+  finish(): void;
+  /** Characters of assistant narration painted so far. */
+  readonly painted: number;
+}
+
+export function createNarrationPainter(options: NarrationPainterOptions): NarrationPainter {
+  const minChars = options.minChars ?? 48;
+  const maxChars = Math.max(options.maxChars ?? 320, minChars);
+  const bullets = options.bullets ?? true;
+  const reasoningMode = options.reasoningMode ?? "compact";
+  const message = createCoalescer({ minChars, maxChars, breakPreference: "newline", now: options.now });
+  const reasoning = createCoalescer({ minChars, maxChars, breakPreference: "newline", now: options.now });
+  let painted = 0;
+  /** True while a `●` block is open, so the next delta continues it. */
+  let blockOpen = false;
+
+  const paintMessage = (text: string): void => {
+    if (!text.trim()) return;
+    painted += text.length;
+    if (!bullets) {
+      options.emit(text);
+      return;
+    }
+    const lines = formatAssistantBlock(text, { continued: blockOpen });
+    if (!lines.length) return;
+    for (const line of lines) options.emit(line);
+    blockOpen = true;
+  };
+  const paintReasoning = (text: string): void => {
+    if (!text.trim()) return;
+    // Reasoning explains the block BELOW it, so a summary always closes the
+    // open bullet: the next message delta starts its own `●`.
+    blockOpen = false;
+    if (reasoningMode === "full") {
+      for (const part of text.split(/\r?\n/)) {
+        if (part.trim()) options.emit(formatReasoningLine(part));
+      }
+      return;
+    }
+    options.emit(formatReasoningLine(collapseToOneLine(text)));
+  };
+  const drainReasoning = (): void => {
+    for (const event of reasoning.flush("message_end")) {
+      if (event.type === "block") paintReasoning(event.text);
+    }
+  };
+
+  return {
+    delta(text) {
+      if (!text) return;
+      if (reasoning.pending) drainReasoning();
+      for (const event of message.push(text)) {
+        if (event.type === "block") paintMessage(event.text);
+      }
+    },
+    reasoning(text) {
+      if (!text) return;
+      for (const event of reasoning.push(text)) {
+        if (event.type === "block") paintReasoning(event.text);
+      }
+    },
+    finish() {
+      drainReasoning();
+      for (const event of message.flush("message_end")) {
+        if (event.type === "block") paintMessage(event.text);
+      }
+      blockOpen = false;
+    },
+    get painted() {
+      return painted;
+    },
+  };
+}
+
+/** Reasoning summaries render dim + italic so they never read as the answer. */
+export function formatReasoningLine(text: string): string {
+  const body = `· ${text.trim()}`;
+  if (process.env.NO_COLOR) return body;
+  return `${ITALIC}\x1b[38;2;${MUTED_RGB}m${body}${RESET}`;
+}
+
+/** Longest single-row reasoning summary before "…" (compact mode). */
+export const REASONING_COMPACT_WIDTH = 96;
+
+/**
+ * Compact reasoning: the whole summary block on ONE dim row. The full text is
+ * one `/reasoning full` away — the default must not out-shout the answer.
+ */
+export function collapseToOneLine(text: string, width = REASONING_COMPACT_WIDTH): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (flat.length <= width) return flat;
+  const cut = flat.slice(0, width);
+  const space = cut.lastIndexOf(" ");
+  return `${(space > width * 0.6 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+
+export interface CompactHeaderInfo {
+  readonly session: string;
+  readonly cwd: string;
+  readonly scopes: string;
+  readonly model: string;
+  readonly provider: string;
+  readonly runtime: string;
+  readonly speed: string;
+  readonly backends?: string;
+}
+
+/**
+ * Compact launch header (defect #6): four lines instead of a ~20-line table.
+ * `/header full` restores the full panel.
+ */
+export function buildCompactHeaderLines(info: CompactHeaderInfo): string[] {
+  return [
+    `${accent("MUSTER")} ${dim("· agent harness")}`,
+    dim(`session ${info.session} · ${info.cwd} · scopes ${info.scopes}`),
+    dim(`${info.model} · ${info.provider} · ${info.runtime} · speed ${info.speed}${info.backends ? ` · ${info.backends}` : ""}`),
+    dim("/help commands · /header full for the full panel · @agent routes a turn"),
+  ];
+}
 
 export function createMusterAutocompleteProvider(options: MusterAutocompleteOptions): AutocompleteProvider {
   const catalog = options.catalog ?? createCallbackCompletionCatalog(options);
@@ -215,6 +774,12 @@ export function createMusterChatHarness(options: MusterAutocompleteOptions & {
     openPicker(command) {
       sink.openPicker(command);
     },
+    exited() {
+      return sink.exited;
+    },
+    status() {
+      return sink.statusRow;
+    },
   };
 }
 
@@ -306,12 +871,16 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
   process.stdin.off("data", rawEscapeHandler);
   tui.stop();
   await terminal.drainInput(150, 25).catch(() => {});
+  // Printed AFTER the TUI tears down: anything written into the transcript at
+  // exit time is erased with the alternate screen.
+  if (screen.exited) process.stdout.write(`${dim(options.farewell ?? "bye")}\n`);
 }
 
 class MusterChatScreen implements Component, MusterChatSink {
   private readonly lines: string[] = [];
   private status = "";
   private stopped = false;
+  exited = false;
   onStop?: () => void;
 
   constructor(
@@ -326,6 +895,12 @@ class MusterChatScreen implements Component, MusterChatSink {
   }
 
   appendLine(line: string): void {
+    // Defect #4: a spinner frame owns the status row and nothing else. Even if
+    // one reaches a transcript sink it is redirected, never appended.
+    if (isWorkingStatusLine(line)) {
+      this.setStatus(line);
+      return;
+    }
     for (const part of String(line).split(/\r?\n/)) {
       this.lines.push(part);
     }
@@ -334,7 +909,7 @@ class MusterChatScreen implements Component, MusterChatSink {
   }
 
   appendUser(text: string): void {
-    this.appendLine(`${highlight("›")} ${text}`);
+    this.appendLine(formatUserLine(text));
   }
 
   clearTranscript(): void {
@@ -365,6 +940,15 @@ class MusterChatScreen implements Component, MusterChatSink {
   async submit(text: string, onSubmit: (text: string, sink: MusterChatSink) => Promise<boolean>): Promise<void> {
     const value = text.trim();
     if (!value || this.stopped) return;
+    // Defect #5: /exit is routed by the TUI itself. Routing it through the
+    // command handler worked only in the plain REPL — in TUI mode the farewell
+    // landed in a transcript that the teardown then erased.
+    if (isExitCommand(value)) {
+      this.appendUser(value);
+      this.exited = true;
+      this.stop();
+      return;
+    }
     this.editor.disableSubmit = true;
     this.editor.addToHistory(value);
     this.appendUser(value);
@@ -393,7 +977,9 @@ class MusterChatScreen implements Component, MusterChatSink {
     const frameWidth = Math.max(40, Math.min(width, 240));
     const composer = renderMusterComposer(this.editor, frameWidth);
     const rows = Math.max(12, this.tui.terminal.rows);
-    const status = this.status ? [dim(truncateToWidth(this.status, frameWidth, ""))] : [];
+    // The status row arrives pre-styled (formatStatusLine owns spinner + dim);
+    // re-wrapping it in dim() would reset the color half-way through the row.
+    const status = this.status ? [truncateToWidth(this.status, frameWidth, "")] : [];
     const fittedHeader = fitLines(this.headerLines, frameWidth);
     const freeRows = Math.max(0, rows - composer.length - status.length - 1);
     const reserveTranscriptRows = Math.min(6, Math.max(1, Math.floor(freeRows * 0.45)));
@@ -415,7 +1001,8 @@ class MusterChatScreen implements Component, MusterChatSink {
 
 class HarnessSink implements MusterChatSink {
   readonly transcriptLines: string[] = [];
-  private status = "";
+  exited = false;
+  statusRow = "";
 
   constructor(
     private readonly editor: Editor,
@@ -423,11 +1010,15 @@ class HarnessSink implements MusterChatSink {
   ) {}
 
   appendLine(line: string): void {
+    if (isWorkingStatusLine(line)) {
+      this.setStatus(line);
+      return;
+    }
     for (const part of String(line).split(/\r?\n/)) this.transcriptLines.push(part);
   }
 
   appendUser(text: string): void {
-    this.appendLine(`${highlight("›")} ${text}`);
+    this.appendLine(formatUserLine(text));
   }
 
   clearTranscript(): void {
@@ -437,11 +1028,11 @@ class HarnessSink implements MusterChatSink {
   setHeaderLines(_lines: readonly string[]): void {}
 
   setStatus(status: string): void {
-    this.status = status;
+    this.statusRow = status;
   }
 
   clearStatus(): void {
-    this.status = "";
+    this.statusRow = "";
   }
 
   openPicker(command: string): void {
@@ -454,9 +1045,12 @@ class HarnessSink implements MusterChatSink {
     if (!value) return true;
     this.editor.addToHistory(value);
     this.appendUser(value);
+    if (isExitCommand(value)) {
+      this.exited = true;
+      return false;
+    }
     const keepGoing = await (this.onSubmit?.(value, this) ?? Promise.resolve(true));
     this.clearStatus();
-    void this.status;
     return keepGoing;
   }
 }
@@ -481,11 +1075,17 @@ export function renderTranscriptWindow(lines: readonly string[], width: number, 
 
   const userLine = turn[0] ?? wrapLine(lines[latestUserIndex] ?? "", width)[0] ?? "";
   if (budget === 1) return [userLine];
-  const pinned = turn.slice(1).filter(isPinnedReceiptLine);
-  if (budget >= 3 && pinned.length) {
-    const pinnedBudget = Math.min(pinned.length, budget - 2);
-    const tailBudget = budget - 1 - pinnedBudget;
-    return [userLine, ...pinned.slice(0, pinnedBudget), ...turn.slice(-tailBudget)].slice(0, budget);
+  const groups = pinnedGroups(turn);
+  if (budget >= 3 && groups.length) {
+    // Two passes: the first sizes the tail, the second drops any group the tail
+    // already shows, so a squeezed turn never prints the same receipt twice.
+    const firstPass = takePinnedGroups(groups, budget - 2);
+    const visibleFrom = turn.length - (budget - 1 - firstPass.length);
+    const pinned = takePinnedGroups(groups.filter((group) => group.lastIndex < visibleFrom), budget - 2);
+    if (pinned.length) {
+      const tailBudget = budget - 1 - pinned.length;
+      return [userLine, ...pinned, ...turn.slice(-tailBudget)].slice(0, budget);
+    }
   }
   return [userLine, ...turn.slice(-(budget - 1))].slice(0, budget);
 }
@@ -496,7 +1096,52 @@ export function isClearComposerKey(data: string): boolean {
 
 function isPinnedReceiptLine(line: string): boolean {
   const clean = stripAnsi(line).trimStart();
-  return clean.startsWith("memory backend=") || clean.startsWith("timings total=");
+  // Raw receipts (non-TTY shape), their TTY chips, and the dim `⎿` result rows
+  // under an action all stay visible when a long turn overflows the budget.
+  return clean.startsWith("memory backend=")
+    || clean.startsWith("timings total=")
+    || clean.startsWith("▸ ")
+    || clean.startsWith(`${RESULT_ELBOW} `);
+}
+
+/** `⏺ Edit(server.js)` — the headline an indented result hangs beneath. */
+function isActionHeadline(line: string): boolean {
+  return stripAnsi(line).startsWith(`${TOOL_BULLET} `);
+}
+
+interface PinnedGroup {
+  /** The rows this pin occupies, headline first when it has one. */
+  readonly lines: readonly string[];
+  /** Index of the last row in the turn, used to detect tail overlap. */
+  readonly lastIndex: number;
+}
+
+/**
+ * Receipts worth pinning when a turn overflows, each carried WITH the action
+ * that owns it. Pinning a bare `⎿ +12 −2 · receipt d3b9…` was a quiet data
+ * loss: the numbers survived but the file they belonged to did not, so the row
+ * read as an orphan. A result and its `⏺` headline are one unit or neither.
+ */
+function pinnedGroups(turn: readonly string[]): PinnedGroup[] {
+  const groups: PinnedGroup[] = [];
+  for (let index = 1; index < turn.length; index += 1) {
+    const line = turn[index] ?? "";
+    if (!isPinnedReceiptLine(line)) continue;
+    const owner = turn[index - 1] ?? "";
+    const withOwner = index - 1 >= 1 && isActionHeadline(owner);
+    groups.push({ lines: withOwner ? [owner, line] : [line], lastIndex: index });
+  }
+  return groups;
+}
+
+/** Whole groups only, in order, until the next one would not fit. */
+function takePinnedGroups(groups: readonly PinnedGroup[], budget: number): string[] {
+  const rows: string[] = [];
+  for (const group of groups) {
+    if (rows.length + group.lines.length > budget) break;
+    rows.push(...group.lines);
+  }
+  return rows;
 }
 
 export function renderHeaderWindow(lines: readonly string[], budget: number): string[] {
@@ -516,7 +1161,7 @@ export function renderHeaderWindow(lines: readonly string[], budget: number): st
 
 function findLatestUserLine(lines: readonly string[]): number {
   for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (stripAnsi(lines[index] ?? "").trimStart().startsWith("› ")) return index;
+    if (isUserTranscriptLine(lines[index] ?? "")) return index;
   }
   return -1;
 }
@@ -788,7 +1433,7 @@ export function isBareCompletionTrigger(text: string): boolean {
   return trimmed === "/" || trimmed === "@";
 }
 
-function isExitCommand(text: string): boolean {
+export function isExitCommand(text: string): boolean {
   return /^\/(?:exit|quit|q)\s*$/i.test(text.trim());
 }
 
@@ -810,19 +1455,55 @@ function frameLine(content: string, innerWidth: number): string {
   return `${accent("│ ")}${padded}${RESET}${accent(" │")}`;
 }
 
+/**
+ * Wrap one transcript row losslessly. `truncateToWidth` appends a reset
+ * sequence, so slicing the remainder by the returned string's RAW length used
+ * to eat four characters per wrap — a streamed sentence silently lost a word
+ * every 78 columns. The chunk is stripped before it is used as a cursor, and
+ * every character of the input ends up in exactly one chunk.
+ */
 function wrapLine(line: string, width: number): string[] {
   const cleanWidth = Math.max(10, width - 2);
   if (visibleWidth(line) <= cleanWidth) return [line];
+  const indent = hangingIndent(stripAnsi(line), cleanWidth);
   const chunks: string[] = [];
-  const plain = stripAnsi(line);
-  let rest = plain;
-  while (visibleWidth(rest) > cleanWidth) {
-    const chunk = truncateToWidth(rest, cleanWidth, "");
-    chunks.push(chunk);
-    rest = rest.slice(chunk.length);
+  let rest = stripAnsi(line);
+  for (;;) {
+    // Continuations keep the row's own gutter column, so a wrapped `●` block
+    // still reads as ONE block instead of restarting at column zero.
+    const prefix = chunks.length ? indent : "";
+    const limit = Math.max(1, cleanWidth - prefix.length);
+    if (visibleWidth(rest) <= limit) {
+      if (rest) chunks.push(prefix + rest);
+      break;
+    }
+    const fitted = stripAnsi(truncateToWidth(rest, limit, ""));
+    // A zero-width fit would loop forever; take one character and move on.
+    const take = fitted.length > 0 ? wrapBreakPoint(rest, fitted.length) : 1;
+    chunks.push(prefix + rest.slice(0, take));
+    rest = rest.slice(take);
   }
-  if (rest) chunks.push(rest);
-  return chunks;
+  return chunks.length ? chunks : [line];
+}
+
+/**
+ * The column a wrapped row resumes at: its own leading whitespace plus the
+ * width of a gutter glyph (`●`, `⏺`, `⎿`, `>`, `·`) when it wears one. Clamped
+ * so a deeply indented row can never wrap itself down to a one-character
+ * column.
+ */
+function hangingIndent(clean: string, cleanWidth: number): string {
+  const match = clean.match(/^( *)(?:([●⏺⎿>·]) )?/u);
+  const leading = match?.[1]?.length ?? 0;
+  const glyph = match?.[2] ? 2 : 0;
+  return " ".repeat(Math.max(0, Math.min(leading + glyph, cleanWidth - 10)));
+}
+
+/** Prefer the last space in the final quarter of the chunk so prose breaks between words. */
+function wrapBreakPoint(text: string, limit: number): number {
+  if (limit >= text.length) return limit;
+  const space = text.lastIndexOf(" ", limit);
+  return space > limit * 0.75 ? space + 1 : limit;
 }
 
 function fitLines(lines: readonly string[], width: number): string[] {

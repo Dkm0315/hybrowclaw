@@ -55,7 +55,7 @@ Full methodology and re-measured numbers: [docs/STRATEGY_V2.md §2.2 and §9](do
 
 ## Agent Kanban: explainable, provider-neutral orchestration
 
-`packages/core/src/agent-kanban.ts` (2085 lines) is an event-sourced board. Board state is a fold over an append-only event log — every transition, assignment, and escalation is replayable, and illegal transitions are rejected by the reducer rather than by convention.
+`packages/core/src/agent-kanban.ts` (2156 lines) is an event-sourced board. Board state is a fold over an append-only event log — every transition, assignment, and escalation is replayable, and illegal transitions are rejected by the reducer rather than by convention.
 
 Model selection is the part worth reading. Each candidate model passes through **nine ordered gates** — `retired → capability → provider → residency → cost → latency → context → evidence → wip` — and every gate records why it passed or failed. `renderSelectionRationale()` prints that audit for a human. Model cards carry an explicit evidence kind (`live_probe`, `internal_eval`, `benchmark`, `integration_test`, `vendor_claim`) so a vendor's marketing claim never outranks a measurement you took.
 
@@ -65,8 +65,10 @@ Adversarial verification found and fixed 8 real bugs before this shipped, includ
 
 ## Also shipped in this release train
 
+- **Live inline diff in the chat turn.** Every `WorkspacePatchEvent` the observer detects becomes a diff card appended to the live transcript *while* the turn streams — not a summary printed after it (`packages/cli/src/live-diff.ts`). Rendering is pure and snapshot-tested, the feed never fails a turn (a non-git cwd or missing git binary degrades to one dim notice line), and Muster's own `.muster/` bookkeeping is ignored so the harness never reports its own writes as the model's work.
+- **Streamed narration on the wire.** The parent model's narration now streams to every surface, not just the in-process TUI: `RpcEvent` carries `message.delta` and `reasoning.delta` frames (coalesced readable blocks, one shared monotonic `seq` per stream turn), while `message.stop` remains the sole authoritative carrier of the final text — a surface that drops every delta still renders a correct turn. Reasoning deltas can only originate from provider-approved summaries; raw hidden chain-of-thought is never forwarded.
 - **Resume Codex sessions from Muster chat.** `/resume <name|id>` reopens a prior named chat, and for Codex-backed runtimes it reopens the persisted provider thread (`threadOpenState: resumed`) instead of paying to replay context into a cold one. Warm app-server processes are cached per conversation, so switching chats does not tear down another chat's runtime.
-- **Adopt the Codex threads you already have.** `muster codex sessions` reads `CODEX_HOME` and lists your real threads; `muster codex resume <id-prefix>` imports the transcript into Muster's session store (so search, memory, and the token ledger cover it) and hands the next turn the native thread id, so Codex continues with its own context. Verified live: 438 rollouts scanned in 154 ms, 316 multi-agent subagent threads hidden by default, and a resumed thread answered a question about a turn taken before Muster was involved with `recalled=0` from Muster memory. Rollouts here reach 3 GB with 3 MB lines, so every read is a bounded stream and CODEX_HOME is strictly read-only.
+- **Adopt the Codex threads you already have.** `muster codex sessions` reads `CODEX_HOME` and lists your real threads; `muster codex resume <id-prefix>` imports the transcript into Muster's session store (so search, memory, and the token ledger cover it) and hands the next turn the native thread id, so Codex continues with its own context. Verified live on the development machine (re-measured 2026-08-27): a 440+ rollout CODEX_HOME scans in well under half a second, multi-agent subagent threads are hidden by default, and a resumed thread answered a question about a turn taken before Muster was involved with `recalled=0` from Muster memory — the answer came from Codex's own server-side context, not a replay. Rollouts here reach 3 GB, so every read is a bounded stream and CODEX_HOME is strictly read-only.
 - **Scoped runtime v1.** The active runtime + provider + model bind to a scope rather than to one global default, so changing provider in one chat cannot silently re-route another tenant's or another session's work.
 - **AI agent memory: stemming fix.** Scoped memory search now matches morphological variants — a query for `deploy` finds `deployed` and `deployment` — instead of missing recall that the FTS index physically contained. Recall you cannot reach is worse than no recall, because it looks like an answer.
 
@@ -90,6 +92,7 @@ Today you can run the same path locally — this is the actual output of `muster
 muster demo — provisioned an isolated workspace and a live stub model service.
 
 > Where do we deploy?
+  (recalled 1 scoped memory)
   Muster deploys to uat-erp.example.com (recalled from scoped memory).
 
 > Summarize the day's work.
@@ -97,10 +100,17 @@ muster demo — provisioned an isolated workspace and a live stub model service.
 
 run            model                        in       out      est  cost$    waste   session
 ----------------------------------------------------------------------------------------------
-1008a8b1-35a9- demo/demo-model              5        17       ~    -        -       -
-9b5da9f2-944b- demo/demo-model              7        18       ~    -        -       -
+981ac134-709e- demo/demo-model              38       17       ~    -        -       -
+9c210b2c-9626- demo/demo-model              7        18       ~    -        -       -
 
-integrity check at 2026-08-27: OK
+totals by model              runs   in         out        cost$      waste-runs
+--------------------------------------------------------------------------------
+demo/demo-model              2      45         35         ?          0
+
+note: 2 run(s) ran on models with no price match — cost totals above are a LOWER BOUND
+(those runs counted as $0). "+" marks a model whose total excludes unpriced runs.
+
+integrity check at 2026-08-27T17:22:20.920Z: OK
 
 store      lines    corrupt
 ---------- -------- --------
@@ -108,6 +118,8 @@ episodes   2        0
 feedback   0        0
 memory     3        0
 tokens     2        0
+
+That was a real run loop: scoped memory recall, token ledger, integrity verification — on a throwaway workspace.
 ```
 
 ## Evidence, not claims
@@ -125,7 +137,7 @@ Every number in this README is reproducible from a script in this repository. Wh
 
 Two of these are honest about their limits. `workspace-observer-live.mjs` needs an authenticated Codex CLI, so it is a manual evidence job rather than unattended CI; it exits `2` with a "skipped" status and the exact error rather than fabricating a number. The video evidence index refuses to count a scenario as proven until a real recording and its supporting files exist.
 
-Suite state at the time of writing, re-measured in a fresh session: `@musterhq/core` **607/607 pass**, `@musterhq/gateway` **421/421 pass**, evidence tooling **35/35 pass**.
+Suite state at the time of writing, re-measured in a fresh session (2026-08-27): `@musterhq/core` **682/682 pass**, `@musterhq/gateway` **429/429 pass**, `@musterhq/cli` **132/132 pass**, evidence tooling **35/35 pass**.
 
 ## Proof: Token Waste Index
 
@@ -199,6 +211,21 @@ pnpm install
 pnpm build
 pnpm hc demo
 ```
+
+### Install a daily-driver `muster` command
+
+For day-to-day use from any directory, put a small shim on your `PATH` that runs the built CLI (rebuilds are picked up automatically because the shim points at `dist`):
+
+```bash
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/muster <<'EOF'
+#!/bin/sh
+exec node --disable-warning=ExperimentalWarning "/absolute/path/to/muster/packages/cli/dist/index.js" "$@"
+EOF
+chmod +x ~/.local/bin/muster
+```
+
+Ensure `~/.local/bin` is on your `PATH`, then `muster version` from anywhere confirms the shim works. After editing `packages/cli/src` or `packages/core/src`, run `pnpm build` so `dist` is current.
 
 ### Start a workspace
 
@@ -324,8 +351,8 @@ Muster is pre-1.0. Core governance paths are implemented and tested; public APIs
 |---|---|
 | Workspace observer | Implemented and live-proven twice against `codex app-server`. Deterministic receipts, git-apply-verified diff chains, 320-file stress coverage. Diff redaction before broadcast is the tracked open item. |
 | Agent kanban | Implemented. Event-sourced board, legal-transition reducer, nine-gate explainable selection, fail-closed escalation, dependency-cycle detection, WIP limits. |
-| Event spine | `run-events.ts` implements 22 typed append-only event types with fencing, idempotency, and a reducer-enforced no-secrets/no-chain-of-thought invariant. Adopted on the Frappe mission path and the gateway; adoption in the universal `run.ts` loop is the next item on the board. |
-| RPC contract | One newline-delimited JSON-RPC 2.0 protocol over stdio, HTTP, and NDJSON. `RpcEvent` now carries 6 variants including `workspace.patch`, `task.transition`, and `task.assigned`. Growing this vocabulary is what unlocks richer surfaces. |
+| Event spine | `run-events.ts` implements 21 typed append-only event types with fencing, idempotency, and a reducer-enforced no-secrets/no-chain-of-thought invariant. Adopted on the Frappe mission path and the gateway; adoption in the universal `run.ts` loop is the next item on the board. |
+| RPC contract | One newline-delimited JSON-RPC 2.0 protocol over stdio, HTTP, and NDJSON. `RpcEvent` now carries 8 variants including `message.delta`, `reasoning.delta`, `workspace.patch`, `task.transition`, and `task.assigned`. Growing this vocabulary is what unlocks richer surfaces. |
 | CLI/TUI | Implemented. `muster` opens the chat UI after onboarding with slash-command completion, `@agent` completion, history, named sessions, Codex session resume, provider/model/runtime pickers, and token/plugin/skill/MCP/memory commands. |
 | Provider/runtime path | Implemented for direct APIs, OpenAI-compatible providers, aggregators, local/self-hosted servers, Pi, Codex CLI, and Claude Code CLI. Presets include OpenAI, Anthropic, Gemini, xAI, Kimi, DeepSeek, Mistral, Qwen, Zhipu, Perplexity, Groq, Cerebras, OpenRouter, Together, Fireworks, LM Studio, vLLM, and SGLang. |
 | Memory | Implemented. Scoped memory uses SQLite/FTS with stemmed matching, receipt reporting, graph-linked expansion, latency probes, rebuild/doctor commands, and leakage tests. No delete, supersede, expire, revoke, or grant primitives yet — that is Wave 2, and it is a real gap. |

@@ -608,10 +608,21 @@ class CodexAppServerClient {
     let firstDeltaMs: number | undefined;
     let tokenUsage: CodexAppServerRunResult["tokenUsage"] | undefined;
 
-    while (Date.now() - started < input.timeoutMs) {
+    // timeoutMs is an IDLE budget, not a wall-clock one: a turn that is still
+    // sending notifications must never be killed mid-stream (a 7-word prompt
+    // over a 45-turn resumed thread legitimately outlives a "simple" budget).
+    // A hung provider still dies after timeoutMs of silence, and an absolute
+    // ceiling guards against a notification-spamming runaway turn.
+    const absoluteCeilingMs = Math.max(input.timeoutMs * 8, 15 * 60_000);
+    let lastNotificationAt = Date.now();
+    while (Date.now() - lastNotificationAt < input.timeoutMs) {
+      if (Date.now() - started >= absoluteCeilingMs) {
+        throw new Error(this.formatError(`codex app-server turn exceeded the absolute ceiling of ${absoluteCeilingMs}ms`));
+      }
       if (!this.isAlive()) throw new Error(this.formatError("codex app-server exited during turn"));
       const message = await this.takeNotification(250);
       if (!message) continue;
+      lastNotificationAt = Date.now();
       const method = stringValue(message.method) ?? "";
       const params = asRecord(message.params);
       if (method.startsWith("item/")) input.onActivity?.();
@@ -659,7 +670,7 @@ class CodexAppServerClient {
         return { finalMessage, firstDeltaMs, tokenUsage };
       }
     }
-    throw new Error(this.formatError(`codex app-server turn timed out after ${input.timeoutMs}ms`));
+    throw new Error(this.formatError(`codex app-server turn timed out: silent for ${input.timeoutMs}ms with no notifications`));
   }
 
   private request(method: string, params: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {

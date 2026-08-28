@@ -56,7 +56,10 @@ test("contract handshake, session lifecycle, prompt round-trip with ledger.tick"
     const reply = await core.handle({ jsonrpc: "2.0", id: 3, method: "prompt.submit", params: { sessionId, prompt: "hello" } });
     assert.equal((reply.result as { text: string }).text, "rpc reply");
     assert.equal("timings" in (reply.result as object), false, "normal clients do not receive operational diagnostics");
-    assert.deepEqual(events, ["session.created", "message.stop", "ledger.tick"]);
+    // Narration now streams before the authoritative final (docs/PRODUCT_MODES.md
+    // "Parent-model streaming"); the terminal pair is unchanged.
+    assert.deepEqual(events.filter((type) => type !== "message.delta"), ["session.created", "message.stop", "ledger.tick"]);
+    assert.ok(events.indexOf("message.delta") > -1 && events.indexOf("message.delta") < events.indexOf("message.stop"));
 
     const ledger = await core.handle({ jsonrpc: "2.0", id: 4, method: "ledger.recent" });
     assert.equal((ledger.result as { records: unknown[] }).records.length, 1);
