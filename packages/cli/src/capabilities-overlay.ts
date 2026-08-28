@@ -18,6 +18,7 @@ export interface CapabilityOverlayOption {
 export interface CapabilityOverlayBuildOptions {
   readonly toolsets: readonly string[];
   readonly skills: readonly { readonly value: string; readonly label?: string; readonly description?: string }[];
+  readonly all?: boolean;
 }
 
 const PLUGIN_ORDER = ["documents", "pdf", "spreadsheets", "presentations", "computer-use"] as const;
@@ -30,26 +31,47 @@ export function buildCapabilityOverlayOptions(
   ecosystem: BackendEcosystem,
   options: CapabilityOverlayBuildOptions,
 ): CapabilityOverlayOption[] {
+  const plugins = orderedPlugins(ecosystem);
+  const visiblePlugins = options.all ? plugins : plugins.filter((plugin) => plugin.status !== "unreachable");
+  const servers = [...ecosystem.codex.mcpServers, ...ecosystem.claude.mcpServers];
+  const visibleServers = options.all ? servers : servers.filter((server) => server.status !== "unreachable");
+  const hiddenNotInstalled = plugins.length - visiblePlugins.length;
+  // The working set is a daily-use picker, not another catalog. Keep enough
+  // room for every category on plugin-heavy machines; `/tools all` retains
+  // every omitted installed entry as well as the not-installed catalog.
+  const shownPlugins = options.all ? visiblePlugins : visiblePlugins.slice(0, 8);
+  const shownServers = options.all ? visibleServers : visibleServers.slice(0, 5);
+  const shownSkills = options.all ? options.skills : options.skills.slice(0, 2);
+  const hiddenAvailable = options.all
+    ? 0
+    : (visiblePlugins.length - shownPlugins.length) + (visibleServers.length - shownServers.length) + (options.skills.length - shownSkills.length);
   return [
-    ...orderedPlugins(ecosystem).map((plugin) => pluginOption(plugin, ecosystem)),
-    ...ecosystem.codex.mcpServers.map(serverOption),
-    ...ecosystem.claude.mcpServers.map(serverOption),
+    ...shownPlugins.map((plugin) => pluginOption(plugin, ecosystem)),
+    ...shownServers.map(serverOption),
     ...options.toolsets.map((toolset): CapabilityOverlayOption => ({
       id: `toolset:${toolset}`,
       label: toolset,
-      description: "native toolset · available · enter inserts a ready prompt",
+      description: `Use ${toolset} tools`,
       group: "toolset",
       status: "native",
       action: { kind: "insert-prompt", text: `use the ${toolset} toolset to ` },
     })),
-    ...options.skills.map((skill): CapabilityOverlayOption => ({
+    ...shownSkills.map((skill): CapabilityOverlayOption => ({
       id: `skill:${skill.value}`,
       label: skill.label ?? skill.value,
-      description: `skill · available · ${skill.description ?? "enter inserts a ready prompt"}`,
+      description: skill.description ?? `Use the ${skill.value} skill`,
       group: "skill",
       status: "available",
       action: { kind: "insert-prompt", text: `use the ${skill.value} skill to ` },
     })),
+    ...(hiddenNotInstalled > 0 || hiddenAvailable > 0 ? [{
+      id: "catalog:all",
+      label: hiddenNotInstalled > 0 ? `…${hiddenNotInstalled} more not installed` : `…${hiddenAvailable} more available`,
+      description: `${hiddenAvailable > 0 ? `+${hiddenAvailable} more available · ` : ""}/tools all`,
+      group: "plugin" as const,
+      status: "available" as const,
+      action: { kind: "insert-prompt" as const, text: "/tools all" },
+    }] : []),
   ];
 }
 
@@ -68,6 +90,7 @@ function pluginRank(id: string): number {
 
 function pluginOption(plugin: InheritedPlugin, ecosystem: BackendEcosystem): CapabilityOverlayOption {
   const name = shortPluginId(plugin.id);
+  const displayName = plugin.displayName ?? name;
   const computerUse = name === "computer-use" ? ecosystem.codex.computerUse : undefined;
   const status: InheritedStatus = computerUse
     ? computerUse.enabled ? "active" : computerUse.installed ? "disabled" : "unreachable"
@@ -75,16 +98,16 @@ function pluginOption(plugin: InheritedPlugin, ecosystem: BackendEcosystem): Cap
   const guidance = computerUse?.guidance ?? plugin.guidance;
   return {
     id: `plugin:codex:${plugin.id}`,
-    label: name,
-    description: `plugin/codex · ${status} · ${computerUse?.detail ?? plugin.detail ?? "inherited on codex turns"}`,
+    label: displayName,
+    description: plugin.shortDescription ?? (status === "active" ? `Use the ${displayName} plugin` : `${status} · ${computerUse?.detail ?? plugin.detail ?? guidance ?? "setup available"}`),
     group: "plugin",
     status,
-    action: actionForPlugin(name, status, guidance),
+    action: actionForPlugin(name, status, guidance, displayName),
   };
 }
 
-function actionForPlugin(name: string, status: InheritedStatus, guidance?: string): CapabilityOverlayAction {
-  if (status === "active") return { kind: "insert-prompt", text: `use the ${name} plugin to ` };
+function actionForPlugin(name: string, status: InheritedStatus, guidance?: string, promptName = name): CapabilityOverlayAction {
+  if (status === "active") return { kind: "insert-prompt", text: `use the ${promptName} plugin to ` };
   if (status === "disabled") {
     if (name === "computer-use") return { kind: "confirm-command", command: "codex", args: ["mcp", "enable", "computer-use"] };
     const command = parseGuardedCommand(guidance);
@@ -99,7 +122,7 @@ function serverOption(server: InheritedMcpServer): CapabilityOverlayOption {
   return {
     id: `mcp:${server.backend}:${server.name}`,
     label: server.name,
-    description: `mcp/${server.backend} · ${status} · ${server.detail ?? server.url ?? server.command ?? "inherited server"}`,
+    description: `${server.backend} MCP · ${status}${server.detail ? ` · ${server.detail}` : ""}`,
     group: "mcp",
     status,
     action: actionForServer(server, reachable),

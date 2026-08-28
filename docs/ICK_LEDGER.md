@@ -9,24 +9,19 @@ fixed in a live session. Severity: ☠ breaks trust/flow · ● daily irritation
 
 | # | Sev | Ick (human words) | Fix |
 |---|---|---|---|
-| 1 | ☠ | `/modle` (typo) does NOTHING — silent swallow, no "did you mean /model?" | Unknown slash → one dim line with nearest-command suggestion |
-| 2 | ☠ | `/tools` overlay = **271 rows**, full of "unreachable · not installed" catalog entries and `installed, enabled` filler text | Default = YOUR working set (active/installed, actionable) ≈ 20 rows; catalog behind `/tools all` or a filter toggle; use manifest displayName + shortDescription (already in core since today) instead of status filler |
-| 3 | ● | Idle session elapsed ticks forever in the status row (21.7s → 23.7s on an untouched chat) | Show elapsed only during a running turn; idle shows nothing |
-| 4 | ● | Wordmark path is raw + edge-truncated for non-home dirs (`/private/tmp/…-Documents`) | Middle-ellipsis to fit; ~ for home; always show the LAST path segment |
-| 5 | ● | `--help` opens with a 6-line ASCII banner; "Muster v0" though the version is 0.1.11 | Banner only on interactive launch; help prints instantly; real version |
-| 6 | ● | `/status` prints the session id twice + "fallbacks none configured" jargon | One id line; human phrasing; drop machine hints into `muster sessions show` |
-| 7 | ● | Shell `muster modle` → "Unknown command: modle", no suggestion, no help pointer | Same did-you-mean treatment as in-chat |
-| 8 | ● | `muster status` speaks machine: ISO header, dashed ruler, raw run UUID | Human summary ("8 runs, last 34m ago · $0.02 today"); ids on demand |
 | 9 | ● | Streamed sentences concatenate ("suite now.Tests pass") — item boundaries lost | Paragraph break on provider item boundary/heuristic in the painter |
-| 10 | ● | Reasoning lines show raw `**markdown**` asterisks | Strip emphasis markers in formatReasoningLine |
-| 11 | ○ | Mid-word wrap ("wri/te") in flow-mode transcript | Word-aware wrapLine; hard-break only over-width words |
-| 12 | ● | Thread-conflict error card suggests `--fork` even for native (non-imported) sessions where the cure is `/reset` | Card distinguishes imported vs native session and names the right cure |
-| 13 | ● | Session-thread conflicts caused by muster's own long-lived gateway daemon holding warm threads | Daemon warm-session TTL + doctor check "gateway holds N warm threads" |
 | 14 | ○ | Composer picker anchoring on very tall terminals (fix landed; re-verify feel) | Re-drive after next build |
-| 15 | ● | 44-row `/` popup: dailies-first landed, but descriptions still muster-jargon ("read-model indexing controls", "eval gates") | Rewrite every description as what YOU get; plugins by name |
-| 16 | ● | Plugins still not directly invocable (`/pdf`, `/documents` absent from popup) — manifest identity landed in core, cli wiring pending | Dynamic slash entries per inherited plugin (displayName + shortDescription), `/pdf <ask>` runs engaged turn |
+| 17 | ● | `/sessions` prints a raw TSV dump — literal tabs, ISO timestamp, `in=74586 out=140` — while `/codex sessions` has a proper human table | One table style for both: name · when (relative) · messages · cost |
+| 18 | ○ | Orphaned `(1 here · 2 total)` fragment floats above the /sessions table | Fold into the table header line |
+| 19 | ● | Memory receipt in transcript: `score=0.211 reason=matched and scopes=user:dhairya` — mangled grammar, machine format | Chip form: `▸ recalled 1 memory (deploy target)`; detail to session log |
+| 20 | ○ | Invalid picker selection message renders one frame late | Flush render after menu rejection |
+| 21 | ○ | A pure-number chat message gets eaten by a stale picker menu (menu never expires) | Menu expires after one invalid entry or any non-selection input |
 
 ## Fixed (kept for honesty — each was live-felt, then live-re-felt)
+
+- #4 Wordmark path is raw + edge-truncated for non-home dirs (`/private/tmp/…-Documents`) → ~-shortened middle-ellipsis paths
+- #10 Reasoning lines show raw `**markdown**` asterisks → markdown stripped from reasoning lines
+- #11 Mid-word wrap ("wri/te") in flow-mode transcript → word-aware wrap (40% threshold)
 
 - History invisible on resume (console.log swallowed) → sink-appended initialLines
 - Running history vanishing (windowed transcript) → flow mode into native scrollback
@@ -39,3 +34,13 @@ fixed in a live session. Severity: ☠ breaks trust/flow · ● daily irritation
 - Raw run-record JSON / memory diagnostics in transcript → chips + session log
 - `run --help` executing a paid turn → global help interception
 - Cold cyan/lime palette → warm coral/gray per UX contract
+- Unknown slash and shell commands → one-line edit-distance suggestion, with `/help` fallback
+- `/tools` → compact working set with manifest names/descriptions; full catalog at `/tools all`
+- Idle status row stays hidden until a turn is running
+- `--help`/`-h` → banner-free package-version help; banner remains on interactive launch
+- `/status` → one conversation id path and no empty fallbacks row
+- `muster status` → human summary; timestamps and run ids require `--verbose`
+- Thread-conflict cards → `/reset` for native chats, `--fork` only for imported Codex threads
+- Gateway Codex threads → 5m env-tunable idle TTL and a counted `muster doctor` check
+- Slash descriptions → concise user outcomes with an automated jargon guard
+- Active inherited plugins → direct cached slash commands with manifest descriptions and prompt engagement

@@ -175,7 +175,7 @@ test("CLI chat exposes a real named terminal chat surface without hanging in non
   const help = await runCli(["chat", "--help"], cwd);
   assert.match(help.stdout, /muster chat/);
   assert.match(help.stdout, /\/resume <name\|id>/);
-  assert.match(help.stdout, /\/tools \[toolset\]/);
+  assert.match(help.stdout, /\/tools \[all\|toolset\]/);
   assert.match(help.stdout, /\/agents/);
   assert.match(help.stdout, /\/provider <id> \[model\]/);
   assert.match(help.stdout, /\/cloud \[preset\]/);
@@ -194,7 +194,7 @@ test("CLI chat exposes a real named terminal chat surface without hanging in non
 
   const status = await runCli(["chat", "--session", "release-audit", "/status"], cwd);
   assert.match(status.stdout, /Status/);
-  assert.match(status.stdout, /session\s+release-audit/);
+  assert.match(status.stdout, /conversation\s+release-audit/);
   assert.match(status.stdout, /resume\s+\/resume release-audit/);
   assert.match(status.stdout, /history\s+\/history 10/);
   assert.match(status.stdout, /inspect\s+muster sessions show sess_/);
@@ -3515,8 +3515,8 @@ test("CLI doctor --fix bootstraps a fresh workspace and status renders mission c
 
   // status must never crash on an empty workspace
   const fresh = await runCli(["status"], cwd);
-  assert.match(fresh.stdout, /muster status —/);
-  assert.match(fresh.stdout, /providers\s+no config \(run: muster doctor --fix\)/);
+  assert.match(fresh.stdout, /0 runs today, no previous runs/);
+  assert.match(fresh.stdout, /no config \(run: muster doctor --fix\)/);
 
   const fixed = await runCli(["doctor", "--fix"], cwd);
   assert.match(fixed.stdout, /fix config/);
@@ -3526,13 +3526,12 @@ test("CLI doctor --fix bootstraps a fresh workspace and status renders mission c
   await runCli(["schedule", "add", "* * * * *", "daily digest"], cwd);
 
   const { stdout } = await runCli(["status"], cwd);
-  assert.match(stdout, /profile\s+default/);
-  assert.match(stdout, /providers\s+1 configured \(codex\)/);
-  assert.match(stdout, /episodes\s+0 recorded/);
-  assert.match(stdout, /tokens today\s+0 across 0 runs/);
-  assert.match(stdout, /schedules\s+1 total, 1 due now/);
-  assert.match(stdout, /flows pending gate\s+none/);
-  assert.match(stdout, /verify\s+OK/);
+  assert.match(stdout, /Profile default/);
+  assert.match(stdout, /1 configured \(codex\)/);
+  assert.match(stdout, /0 runs today/);
+  assert.match(stdout, /1 schedules, 1 due/);
+  assert.match(stdout, /0 flows waiting for approval/);
+  assert.match(stdout, /verify OK/);
 });
 
 test("CLI codex doctor and QA scorecard expose runtime maturity without false positives", async () => {

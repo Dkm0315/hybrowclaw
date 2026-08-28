@@ -46,14 +46,15 @@ test("/tools overlay builds ordered actionable rows and maps every inherited sta
     skills: [{ value: "release-check", description: "release safety" }],
   });
 
-  assert.deepEqual(rows.slice(0, 5).map((row) => row.label), ["documents", "pdf", "spreadsheets", "presentations", "computer-use"]);
-  assert.deepEqual(rows.slice(5, 11).map((row) => row.label), ["docs", "pycharm", "cloud", "screen", "ide-down", "gmail"]);
-  assert.deepEqual(rows.slice(11).map((row) => row.group), ["toolset", "toolset", "skill"]);
+  assert.deepEqual(rows.slice(0, 4).map((row) => row.label), ["documents", "pdf", "spreadsheets", "computer-use"]);
+  assert.deepEqual(rows.slice(4, 9).map((row) => row.label), ["docs", "pycharm", "cloud", "screen", "gmail"]);
+  assert.deepEqual(rows.slice(9, 12).map((row) => row.group), ["toolset", "toolset", "skill"]);
+  assert.equal(rows.at(-1)?.label, "…1 more not installed");
 
   assert.equal(rows.find((row) => row.label === "documents")?.action.kind, "insert-prompt");
   assert.equal(rows.find((row) => row.label === "pdf")?.action.kind, "show-guidance");
   assert.equal(rows.find((row) => row.label === "spreadsheets")?.action.kind, "confirm-command");
-  assert.equal(rows.find((row) => row.label === "presentations")?.action.kind, "show-guidance");
+  assert.equal(rows.find((row) => row.label === "presentations"), undefined);
   assert.equal(rows.find((row) => row.label === "computer-use")?.status, "disabled", "computer-use must use its real resolved enable state");
   assert.deepEqual(rows.find((row) => row.label === "computer-use")?.action, { kind: "confirm-command", command: "codex", args: ["mcp", "enable", "computer-use"] });
 
@@ -61,7 +62,7 @@ test("/tools overlay builds ordered actionable rows and maps every inherited sta
   assert.deepEqual(rows.find((row) => row.label === "pycharm")?.action, { kind: "attach-mcp", command: "/mcp attach pycharm" });
   assert.equal(rows.find((row) => row.label === "cloud")?.action.kind, "show-guidance");
   assert.equal(rows.find((row) => row.label === "screen")?.action.kind, "confirm-command");
-  assert.equal(rows.find((row) => row.label === "ide-down")?.action.kind, "show-guidance");
+  assert.equal(rows.find((row) => row.label === "ide-down"), undefined);
   assert.equal(rows.find((row) => row.label === "gmail")?.action.kind, "show-guidance");
 });
 

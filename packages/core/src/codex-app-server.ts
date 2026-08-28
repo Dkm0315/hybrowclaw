@@ -1,8 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
+import { tmpdir } from "node:os";
 
 export interface CodexAppServerRunInput {
   readonly prompt: string;
@@ -84,6 +85,7 @@ interface CachedSession {
   lastUsedAt: number;
   pendingRuns: number;
   queue: Promise<void>;
+  idleTimer?: NodeJS.Timeout;
 }
 
 interface CreatedSession {
@@ -117,10 +119,37 @@ const SESSION_CREATIONS = new Map<string, SessionCreation>();
 const ACTIVE_CLIENTS = new Map<CodexAppServerClient, ClientMetadata>();
 const DEFAULT_SESSION_CACHE_SIZE = 8;
 const DEFAULT_SESSION_IDLE_MS = 30 * 60_000;
+const DEFAULT_GATEWAY_SESSION_IDLE_MS = 5 * 60_000;
+
+export function gatewayCodexWarmThreadStatePath(pid: number): string {
+  return pathJoin(tmpdir(), `muster-gateway-codex-${pid}.json`);
+}
+
+export function readGatewayCodexWarmThreadCount(pid: number): number {
+  try {
+    const parsed = JSON.parse(readFileSync(gatewayCodexWarmThreadStatePath(pid), "utf8")) as { pid?: unknown; count?: unknown };
+    return parsed.pid === pid && Number.isSafeInteger(parsed.count) && Number(parsed.count) >= 0 ? Number(parsed.count) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function recordGatewayWarmThreadCount(): void {
+  const count = [...SESSION_CACHE.values()].filter((session) => session.transportOwner?.startsWith("gateway:")).length;
+  const path = gatewayCodexWarmThreadStatePath(process.pid);
+  if (count === 0) {
+    try { unlinkSync(path); } catch { /* already absent */ }
+    return;
+  }
+  writeFileSync(path, `${JSON.stringify({ pid: process.pid, count, updatedAt: new Date().toISOString() })}\n`, { mode: 0o600 });
+}
 
 export function clearCodexAppServerSessions(transportOwner?: string): void {
   for (const [key, session] of SESSION_CACHE) {
-    if (transportOwner === undefined || session.transportOwner === transportOwner) SESSION_CACHE.delete(key);
+    if (transportOwner === undefined || session.transportOwner === transportOwner) {
+      if (session.idleTimer) clearTimeout(session.idleTimer);
+      SESSION_CACHE.delete(key);
+    }
   }
   for (const [key, creation] of SESSION_CREATIONS) {
     if (transportOwner === undefined || creation.transportOwner === transportOwner) SESSION_CREATIONS.delete(key);
@@ -128,6 +157,7 @@ export function clearCodexAppServerSessions(transportOwner?: string): void {
   for (const [client, metadata] of ACTIVE_CLIENTS) {
     if (transportOwner === undefined || metadata.transportOwner === transportOwner) client.close();
   }
+  recordGatewayWarmThreadCount();
 }
 
 /** Interrupt the active native Codex turn owned by this host, if there is one. */
@@ -143,6 +173,7 @@ export async function interruptActiveCodexTurn(transportOwner?: string): Promise
 export function clearCodexAppServerConversation(conversationKey: string, transportOwner?: string): void {
   for (const [key, session] of SESSION_CACHE) {
     if (session.conversationKey !== conversationKey || (transportOwner !== undefined && session.transportOwner !== transportOwner)) continue;
+    if (session.idleTimer) clearTimeout(session.idleTimer);
     SESSION_CACHE.delete(key);
   }
   for (const [key, creation] of SESSION_CREATIONS) {
@@ -154,6 +185,7 @@ export function clearCodexAppServerConversation(conversationKey: string, transpo
     if (metadata.conversationKey !== conversationKey || (transportOwner !== undefined && metadata.transportOwner !== transportOwner)) continue;
     if (!metadata.session || metadata.session.pendingRuns === 0) client.close();
   }
+  recordGatewayWarmThreadCount();
 }
 
 export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<CodexAppServerRunResult> {
@@ -305,6 +337,8 @@ async function acquireSession(input: {
   pruneSessionCache(Date.now(), key);
   const cached = keepAlive ? SESSION_CACHE.get(key) : undefined;
   if (cached?.client.isAlive() && (!input.input.threadId || cached.threadId === input.input.threadId)) {
+    if (cached.idleTimer) clearTimeout(cached.idleTimer);
+    cached.idleTimer = undefined;
     cached.pendingRuns += 1;
     cached.lastUsedAt = Date.now();
     SESSION_CACHE.delete(key);
@@ -360,7 +394,15 @@ async function createSession(
     configOverrides: input.input.configOverrides,
     sandbox: input.input.sandbox,
     env: input.input.env,
-    onClose: () => ACTIVE_CLIENTS.delete(client),
+    onClose: () => {
+      const metadata = ACTIVE_CLIENTS.get(client);
+      if (metadata?.session && SESSION_CACHE.get(metadata.session.cacheKey) === metadata.session) {
+        if (metadata.session.idleTimer) clearTimeout(metadata.session.idleTimer);
+        SESSION_CACHE.delete(metadata.session.cacheKey);
+      }
+      ACTIVE_CLIENTS.delete(client);
+      recordGatewayWarmThreadCount();
+    },
   });
   creation.client = client;
   const metadata: ClientMetadata = { conversationKey: input.input.cacheKey, transportOwner: input.input.transportOwner };
@@ -389,7 +431,10 @@ async function createSession(
       queue: Promise.resolve(),
     };
     metadata.session = session;
-    if (input.keepAlive && makeSessionCacheRoom(input.key)) SESSION_CACHE.set(input.key, session);
+    if (input.keepAlive && makeSessionCacheRoom(input.key)) {
+      SESSION_CACHE.set(input.key, session);
+      recordGatewayWarmThreadCount();
+    }
     return { session, startupMs, threadOpenMs, threadOpenState: input.input.threadId ? "resumed" : "started" };
   } catch (error) {
     client.close();
@@ -412,6 +457,7 @@ async function runExclusive<T>(session: CachedSession, task: (queueMs: number) =
     session.lastUsedAt = Date.now();
     release();
     if (session.pendingRuns === 0 && SESSION_CACHE.get(session.cacheKey) !== session) session.client.close();
+    else if (session.pendingRuns === 0) scheduleIdleClose(session);
   }
 }
 
@@ -452,13 +498,34 @@ export function buildCodexAppServerArgs(input: {
 
 function closeCachedSession(key: string, session: CachedSession): void {
   if (session.pendingRuns > 0) return;
+  if (session.idleTimer) clearTimeout(session.idleTimer);
   SESSION_CACHE.delete(key);
   session.client.close();
+  recordGatewayWarmThreadCount();
 }
 
 function invalidateCachedSession(key: string, session: CachedSession): void {
+  if (session.idleTimer) clearTimeout(session.idleTimer);
   SESSION_CACHE.delete(key);
   if (session.pendingRuns === 0) session.client.close();
+  recordGatewayWarmThreadCount();
+}
+
+function sessionIdleMs(session: Pick<CachedSession, "transportOwner">): number {
+  return session.transportOwner?.startsWith("gateway:")
+    ? positiveIntegerEnv("MUSTER_GATEWAY_CODEX_IDLE_MS", DEFAULT_GATEWAY_SESSION_IDLE_MS, 1_000, 24 * 60 * 60_000)
+    : positiveIntegerEnv("MUSTER_NATIVE_SESSION_IDLE_MS", DEFAULT_SESSION_IDLE_MS, 1_000, 24 * 60 * 60_000);
+}
+
+function scheduleIdleClose(session: CachedSession): void {
+  if (session.idleTimer) clearTimeout(session.idleTimer);
+  const idleMs = sessionIdleMs(session);
+  session.idleTimer = setTimeout(() => {
+    if (session.pendingRuns === 0 && Date.now() - session.lastUsedAt >= idleMs && SESSION_CACHE.get(session.cacheKey) === session) {
+      closeCachedSession(session.cacheKey, session);
+    }
+  }, idleMs);
+  session.idleTimer.unref?.();
 }
 
 function closeSupersededSessions(scopeKey: string, protectedKey: string): void {
@@ -478,11 +545,10 @@ function makeSessionCacheRoom(protectedKey: string): boolean {
 }
 
 function pruneSessionCache(now: number, protectedKey: string): void {
-  const idleMs = positiveIntegerEnv("MUSTER_NATIVE_SESSION_IDLE_MS", DEFAULT_SESSION_IDLE_MS, 1_000, 24 * 60 * 60_000);
   for (const [key, session] of SESSION_CACHE) {
     if (key === protectedKey) continue;
     if (!session.client.isAlive()) invalidateCachedSession(key, session);
-    else if (now - session.lastUsedAt >= idleMs) closeCachedSession(key, session);
+    else if (now - session.lastUsedAt >= sessionIdleMs(session)) closeCachedSession(key, session);
   }
   makeSessionCacheRoom(protectedKey);
 }

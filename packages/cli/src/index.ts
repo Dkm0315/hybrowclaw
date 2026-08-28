@@ -24,6 +24,9 @@ import { hasCompletedMusterOnboarding, runMusterOnboardingTui } from "./onboardi
 import { formatWorkspaceMismatchBanner, isParallelWorkPrompt, parallelTaskChoiceForKey, workspaceMismatchChoiceForKey, workspaceOverrideForMismatchChoice } from "./directory-awareness.js";
 import { runFrappe2RealPromptsQa } from "./qa-frappe2.js";
 import { runFrappeConnectCommand } from "./frappe-connect-command.js";
+import { CHAT_COMMANDS, directPluginCommand, dynamicPluginCommands, type ChatCommandDef } from "./chat-command-catalog.js";
+import { unknownShellCommandMessage, unknownSlashCommandMessage } from "./command-suggestion.js";
+import { threadConflictCure } from "./thread-conflict.js";
 import { runPtyTuiQa } from "./qa-pty-tui.js";
 import {
   buildComposerCatalog,
@@ -219,6 +222,8 @@ import {
   renderIntegrityReport,
   connectMcpServers,
   clearCodexAppServerSessions,
+  clearCodexAppServerConversation,
+  readGatewayCodexWarmThreadCount,
   interruptActiveCodexTurn,
   discoverCodexSessions,
   importCodexSession,
@@ -245,7 +250,6 @@ import {
 import {
   inheritedEcosystem,
   renderInheritedIntegrationsTable,
-  renderInheritedToolsSection,
   renderSensesPanel,
   resolveAttachableServer,
 } from "./inherited-ecosystem.js";
@@ -285,7 +289,7 @@ const execFileAsync = promisify(execFile);
 import { createServer } from "node:http";
 import { createInterface, emitKeypressEvents, type Interface } from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
-import type { CapabilityPluginPolicy, ChatMessage, EvidenceRecord, FeedbackValue, FlowRunEvent, FlowRunState, FlowToolRegistry, McpServerConfig, MemoryScope, MessageRow, MigrationSource, RunOutcome, SessionRow } from "@musterhq/core";
+import type { BackendEcosystem, CapabilityPluginPolicy, ChatMessage, EvidenceRecord, FeedbackValue, FlowRunEvent, FlowRunState, FlowToolRegistry, McpServerConfig, MemoryScope, MessageRow, MigrationSource, RunOutcome, SessionRow } from "@musterhq/core";
 import type { GatewayConfig, PairedIdentity } from "@musterhq/gateway";
 
 const originalEmitWarning = process.emitWarning.bind(process);
@@ -304,6 +308,13 @@ process.on("warning", (warning) => {
 const [, , command, ...args] = process.argv;
 const CLI_MUSTER_VERSION = readCliPackageVersion();
 const CLI_PACKAGE_NAME = "@musterhq/cli";
+const SHELL_COMMANDS = [
+  "help", "version", "update", "init", "onboard", "onboarding", "doctor", "status", "chat", "model", "claude", "codex",
+  "episodes", "feedback", "candidates", "eval", "capability", "roster", "artifacts", "plugins", "mcp", "dashboard",
+  "context", "latency", "memory", "goal", "tui", "provider", "runtime", "qa", "pi", "state", "migrate", "sessions",
+  "skills", "pulse", "subagents", "tasks", "board", "demo", "benchmark", "run", "tokens", "traces", "profile",
+  "schedule", "evolve", "flow", "verify", "gateway", "channels", "integrations", "pairing", "frappe",
+] as const;
 
 function readCliPackageVersion(): string {
   const packagePath = fileURLToPath(new URL("../package.json", import.meta.url));
@@ -332,7 +343,6 @@ async function main(): Promise<void> {
     case "help":
     case "--help":
     case "-h":
-      printBanner();
       printHelp();
       return;
     case "version":
@@ -354,10 +364,13 @@ async function main(): Promise<void> {
       await doctor(args);
       return;
     case "status":
-      await statusCommand();
+      await statusCommand(args);
       return;
     case "chat":
       await chat(args);
+      return;
+    case "model":
+      await chat([`/model${args.length ? ` ${args.join(" ")}` : ""}`]);
       return;
     case "claude":
       await claude(args);
@@ -490,7 +503,7 @@ async function main(): Promise<void> {
       await frappeCommand(args);
       return;
     default:
-      throw new Error(`Unknown command: ${command}`);
+      throw new Error(unknownShellCommandMessage(command, SHELL_COMMANDS));
   }
 }
 
@@ -533,7 +546,7 @@ function printCommandUsage(name: string): void {
   console.log("\nFull command list: muster --help");
 }
 
-const HELP_TEXT = `Muster v0
+const HELP_TEXT = `Muster v${CLI_MUSTER_VERSION}
 
 Usage:
   muster                                    # first run: onboarding; after setup: interactive chat
@@ -549,6 +562,7 @@ Usage:
   muster chat "your prompt"
   muster chat --session work "your prompt"
   muster chat --session work --history
+  muster model [name]                       # choose the chat model
   muster claude inspect
   muster claude ask "prompt" [--model sonnet] [--effort low] [--timeout-ms 30000]
   muster codex sessions [--limit 20] [--since 7d] [--here] [--all] [--json]
@@ -1144,6 +1158,13 @@ async function runEnvironmentDoctorChecks(): Promise<readonly EnvironmentCheck[]
     : daemon.healthy
       ? { id: "gateway-daemon", status: "pass", detail: `pid ${daemon.pid} healthy on :${gatewayPort}` }
       : { id: "gateway-daemon", status: "fail", detail: `pid ${daemon.pid} alive but /v1/health unreachable on :${gatewayPort}`, fix: "muster gateway daemon restart" });
+  const warmGatewayThreads = daemon.running && daemon.pid ? readGatewayCodexWarmThreadCount(daemon.pid) : 0;
+  checks.push({
+    id: "gateway-codex-threads",
+    status: warmGatewayThreads > 0 ? "warn" : "pass",
+    detail: `gateway holds ${warmGatewayThreads} warm codex threads`,
+    ...(warmGatewayThreads > 0 ? { fix: "muster gateway daemon restart" } : {}),
+  });
 
   // 4. PATH shim — the binary the user's terminal actually resolves.
   const shimPath = join(homedir(), ".local", "bin", "muster");
@@ -1239,6 +1260,11 @@ interface ChatState {
   interactive?: boolean;
   /** Observer-derived cumulative full-file model for the most recent turn. */
   liveFileTurn?: LiveFileTurnAccumulator;
+  /** Active inherited plugins discovered once when chat starts. */
+  dynamicCommands?: readonly ChatCommandDef[];
+  inheritedTools?: BackendEcosystem;
+  /** Conflict recovery differs for a Codex import and a native chat. */
+  importedFromCodex?: boolean;
 }
 
 interface ChatSessionUsage {
@@ -1263,59 +1289,6 @@ interface ChatSelectedSuggestion {
   readonly value: string;
   readonly kind: ChatSuggestion["kind"];
 }
-interface ChatCommandDef {
-  readonly name: string;
-  readonly usage: string;
-  readonly description: string;
-  readonly aliases?: readonly string[];
-}
-const CHAT_COMMANDS: readonly ChatCommandDef[] = [
-  { name: "help", usage: "/help", description: "show full chat help", aliases: ["?"] },
-  { name: "commands", usage: "/commands", description: "show compact command catalog", aliases: ["cmds"] },
-  { name: "shortcuts", usage: "/shortcuts", description: "show keyboard and routing shortcuts", aliases: ["keys"] },
-  { name: "status", usage: "/status", description: "show runtime, model, session, token usage" },
-  { name: "providers", usage: "/providers", description: "list configured providers and models", aliases: ["provider-list"] },
-  { name: "provider", usage: "/provider <id> [model]", description: "switch active provider for this chat/runtime", aliases: ["use-provider"] },
-  { name: "cloud", usage: "/cloud [preset]", description: "browse or add cloud provider presets" },
-  { name: "model", usage: "/model [name]", description: "open the Model · Effort · Speed picker or select a catalog model" },
-  { name: "runtime", usage: "/runtime [id]", description: "list or switch active runtime" },
-  { name: "speed", usage: "/speed [session|fast]", description: "choose full memory mode or low-latency warm native mode" },
-  { name: "live-diff", usage: "/live-diff [on|off]", description: "show inline file diffs live while a turn edits files", aliases: ["livediff", "diffs"] },
-  { name: "diff", usage: "/diff", description: "toggle the current turn's full-file live view" },
-  { name: "tasks", usage: "/tasks [\"<goal>\" | why <taskId> | assign <taskId> <cardId>]", description: "plan, inspect, explain, or assign parallel tasks and agents" },
-  { name: "reasoning", usage: "/reasoning [auto|low|medium|high|compact|full]", description: "set the reasoning spend tier, or the summary density", aliases: ["think"] },
-  { name: "senses", usage: "/senses", description: "show codex-native computer-use, browser, and local endpoint status" },
-  { name: "sessions", usage: "/sessions [limit]", description: "list recent named chats", aliases: ["ls"] },
-  { name: "resume", usage: "/resume <name|id>", description: "switch to a prior named chat or session id", aliases: ["use"] },
-  { name: "codex", usage: "/codex sessions [limit] | /codex resume <id-prefix>", description: "list or continue your native Codex threads without leaving this chat" },
-  { name: "name", usage: "/name <name>", description: "switch current reference name" },
-  { name: "history", usage: "/history [limit]", description: "show current chat history" },
-  { name: "memory", usage: "/memory <query>", description: "search scoped memory" },
-  { name: "scope", usage: "/scope <kind:id...|add kind:id|clear>", description: "set or inspect memory recall scopes" },
-  { name: "scopes", usage: "/scopes", description: "show active memory recall scopes" },
-  { name: "tools", usage: "/tools [toolset]", description: "list built-in toolsets and tools" },
-  { name: "whoami", usage: "/whoami", description: "show current local and connected identity context" },
-  { name: "reports", usage: "/reports", description: "show report, table, filter, and export workflows" },
-  { name: "capabilities", usage: "/capabilities [query]", description: "find matching skills, plugins, and MCPs", aliases: ["capability", "caps"] },
-  { name: "skills", usage: "/skills [id]", description: "show or enable built-in skills", aliases: ["skill"] },
-  { name: "plugins", usage: "/plugins [id|reuse provider]", description: "show, enable, or reuse provider-authenticated plugins", aliases: ["plugin"] },
-  { name: "mcp", usage: "/mcp [id]", description: "show configured and suggested MCP servers" },
-  { name: "integrations", usage: "/integrations [id]", description: "guided channel/plugin/MCP setup workflow", aliases: ["integration"] },
-  { name: "agents", usage: "/agents", description: "list configured runtimes and @agent ids" },
-  { name: "tokens", usage: "/tokens [limit]", description: "show token ledger", aliases: ["usage", "ledger"] },
-  { name: "limits", usage: "/limits", description: "show rate-limit and token-budget control surfaces" },
-  { name: "security", usage: "/security", description: "show permission, approval, and audit controls" },
-  { name: "evals", usage: "/evals", description: "show eval gates for agents, tools, reports, and writes" },
-  { name: "index", usage: "/index", description: "show Frappe/read-model indexing controls" },
-  { name: "settings", usage: "/settings", description: "show response-style and assistant behavior controls" },
-  { name: "goal", usage: "/goal [status]", description: "show active goal-loop retrieval and memory ledger" },
-  { name: "receipt", usage: "/receipt [limit]", description: "show recent retrieval receipts and memory write decisions" },
-  { name: "new", usage: "/new [name]", description: "start/switch to a fresh named chat and clear provider handles" },
-  { name: "reset", usage: "/reset", description: "clear provider handles for this named chat" },
-  { name: "header", usage: "/header [compact|full]", description: "switch the launch header between the compact 4-line and full panel" },
-  { name: "clear", usage: "/clear", description: "clear the terminal screen", aliases: ["cls"] },
-  { name: "exit", usage: "/exit", description: "leave chat", aliases: ["quit", "q"] },
-] as const;
 const CHAT_COMMAND_NAMES = CHAT_COMMANDS.flatMap((command) => [command.name, ...(command.aliases ?? [])]);
 const CHAT_COMMAND_ALIASES = new Map(CHAT_COMMANDS.flatMap((command) => (command.aliases ?? []).map((alias) => [alias, command.name] as const)));
 const CHAT_TOOLSETS = ["core", "full", "files", "web", "memory", "sessions", "shell", "results", "discovery"];
@@ -1394,6 +1367,7 @@ async function chat(commandArgs: string[]): Promise<void> {
     // First turn only: after it lands, executeRun stores a session handle for
     // this conversation and later turns resume the thread without the flag.
     resumeThreadId: readFlag(commandArgs, "--codex-thread"),
+    importedFromCodex: Boolean(readFlag(commandArgs, "--codex-thread")),
   };
   const prompt = stripFlags(commandArgs, ["--session", "--name", "--runtime", "--provider", "--model", "--scope", "--recall-limit", "--timeout-ms", "--continue", "--tools", "--complete", "--limit", "--codex-thread"]).filter((arg) => !["--commands", "--shortcuts", "--list", "--sessions", "--history", "--fast", "--session-speed", "--skip-onboarding", "--no-onboarding", "--live-diff", "--no-live-diff"].includes(arg)).join(" ").trim();
   if (commandArgs.includes("--list") || commandArgs.includes("--sessions")) {
@@ -1440,6 +1414,7 @@ async function chat(commandArgs: string[]): Promise<void> {
   if (prompt) {
     if (prompt.startsWith("/")) {
       await ensureDefaultConfig();
+      await initializeChatComposerState(state);
       await handleChatCommand(prompt, state);
       return;
     }
@@ -1504,7 +1479,7 @@ async function interactiveChat(state: ChatState): Promise<void> {
     await runMusterChatTui({
       headerLines,
       initialLines,
-      commands: chatCommandsDailyFirst(),
+      commands: chatCommandsDailyFirst(state),
       toolsets: CHAT_TOOLSETS,
       recentSessions: recentChatSessionNames,
       catalog: createChatCompletionCatalog(state),
@@ -1609,7 +1584,9 @@ function chatPrompt(_state: ChatState): string {
 
 async function initializeChatComposerState(state: ChatState): Promise<void> {
   if (state.composerInitialized) return;
-  const [config, codexDefaults] = await Promise.all([loadConfig(), readCodexComposerDefaults()]);
+  const [config, codexDefaults, ecosystem] = await Promise.all([loadConfig(), readCodexComposerDefaults(), inheritedEcosystem()]);
+  state.inheritedTools = ecosystem;
+  state.dynamicCommands = dynamicPluginCommands(ecosystem.codex.plugins);
   const runtimeId = state.runtime ?? config.routing.defaultRuntime;
   const runtime = config.runtimes[runtimeId];
   const configuredProviderId = state.provider ?? runtime?.provider;
@@ -1631,6 +1608,10 @@ async function initializeChatComposerState(state: ChatState): Promise<void> {
   state.configuredEffortSource = codexDefaults.effortSource;
   state.effortSource = codexDefaults.effortSource;
   state.composerInitialized = true;
+}
+
+function chatCommands(state?: ChatState): readonly ChatCommandDef[] {
+  return [...CHAT_COMMANDS, ...(state?.dynamicCommands ?? [])];
 }
 
 function activeChatProvider(state: ChatState): ModelProvider {
@@ -2063,9 +2044,9 @@ async function handleChatInput(text: string, state: ChatState): Promise<boolean>
   state.pendingSuggestion = undefined;
   if (text === "/" || text === "@") {
     state.pendingMenu = text === "/"
-      ? { kind: "commands", options: CHAT_COMMANDS.map((command) => command.name) }
+      ? { kind: "commands", options: chatCommands(state).map((command) => command.name) }
       : { kind: "agents", options: await chatAgentOptions() };
-    if (text === "/") printChatCommandCatalog({ numbered: true });
+    if (text === "/") printChatCommandCatalog({ numbered: true }, state);
     else await printChatAgents({ numbered: true });
     return true;
   }
@@ -2124,11 +2105,11 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
       console.log(color("bye", "dim"));
       return false;
     case "help":
-      printChatCommandCatalog({ all: args.trim().toLowerCase() === "all" });
+      printChatCommandCatalog({ all: args.trim().toLowerCase() === "all" }, state);
       if (args.trim().toLowerCase() === "all") printChatShortcuts();
       return true;
     case "commands":
-      printChatCommandCatalog({ all: true });
+      printChatCommandCatalog({ all: true }, state);
       return true;
     case "shortcuts":
       printChatShortcuts();
@@ -2228,6 +2209,7 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
           const { session, imported } = await importCodexThreadByPrefix(restArgs[0], restArgs.slice(1));
           state.sessionName = safeChatSessionName(`codex-${session.threadId.slice(0, 8)}`);
           state.resumeThreadId = forked ? undefined : session.threadId;
+          state.importedFromCodex = true;
           state.sessionWorkspaceCwd = session.cwd || process.cwd();
           const workspace = session.cwd && session.cwd !== process.cwd() ? session.cwd : undefined;
           ensureNamedChatSession(state.sessionName, workspace ?? process.cwd());
@@ -2273,7 +2255,7 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
         state.statusSink.openPicker("/tools ");
         return true;
       }
-      await printChatTools(args);
+      await printChatTools(args, args.trim().toLowerCase() === "all");
       return true;
     case "whoami":
       printChatControlView("Identity", [
@@ -2377,6 +2359,7 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
     }
     case "reset": {
       const removed = await clearConversationSessionHandles(chatConversationKey(state.sessionName));
+      clearCodexAppServerConversation(chatConversationKey(state.sessionName), "cli-chat");
       console.log(color(`provider_handles_cleared=${removed}`, "green"));
       return true;
     }
@@ -2384,7 +2367,20 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
       console.clear();
       return true;
     default:
-      console.log(color(`Unknown command /${rawName}. Type /commands.`, "yellow"));
+      {
+        const plugin = directPluginCommand(name, args, state.dynamicCommands ?? []);
+        if (plugin?.kind === "insert") {
+          if (state.statusSink) state.statusSink.openPicker(plugin.text);
+          else console.log(plugin.text);
+          return true;
+        }
+        if (plugin?.kind === "prompt") {
+          await runChatTurn(plugin.text, state);
+          return true;
+        }
+        const names = chatCommands(state).flatMap((entry) => [entry.name, ...(entry.aliases ?? [])]);
+        console.log(color(unknownSlashCommandMessage(rawName, names), "dim"));
+      }
       return true;
   }
 }
@@ -2393,16 +2389,18 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
 const CHAT_DAILY_COMMANDS = ["mission", "board", "codex", "tools", "mcp", "plugins", "model", "reasoning", "sessions", "resume", "memory", "diff", "live-diff", "exit"] as const;
 
 /** Same catalog, dailies first — the ordering every completion surface uses. */
-function chatCommandsDailyFirst(): typeof CHAT_COMMANDS {
-  const daily = CHAT_COMMANDS.filter((command) => (CHAT_DAILY_COMMANDS as readonly string[]).includes(command.name));
-  const rest = CHAT_COMMANDS.filter((command) => !(CHAT_DAILY_COMMANDS as readonly string[]).includes(command.name));
+function chatCommandsDailyFirst(state?: ChatState): readonly ChatCommandDef[] {
+  const commands = chatCommands(state);
+  const daily = commands.filter((command) => (CHAT_DAILY_COMMANDS as readonly string[]).includes(command.name) || command.plugin);
+  const rest = commands.filter((command) => !(CHAT_DAILY_COMMANDS as readonly string[]).includes(command.name) && !command.plugin);
   return [...daily, ...rest];
 }
 
-function printChatCommandCatalog(options: { numbered?: boolean; all?: boolean } = {}): void {
-  const daily = CHAT_COMMANDS.filter((command) => (CHAT_DAILY_COMMANDS as readonly string[]).includes(command.name));
-  const rest = CHAT_COMMANDS.filter((command) => !(CHAT_DAILY_COMMANDS as readonly string[]).includes(command.name));
-  const list = options.all || options.numbered ? CHAT_COMMANDS : daily;
+function printChatCommandCatalog(options: { numbered?: boolean; all?: boolean } = {}, state?: ChatState): void {
+  const commands = chatCommands(state);
+  const daily = commands.filter((command) => (CHAT_DAILY_COMMANDS as readonly string[]).includes(command.name) || command.plugin);
+  const rest = commands.filter((command) => !(CHAT_DAILY_COMMANDS as readonly string[]).includes(command.name) && !command.plugin);
+  const list = options.all || options.numbered ? commands : daily;
   printChatPanel("Commands", list.map((command, index) => {
     const aliases = command.aliases?.length ? ` (${command.aliases.map((alias) => `/${alias}`).join(", ")})` : "";
     const prefix = options.numbered ? `${color(`${String(index + 1).padStart(2)}.`, "accent")} ` : "";
@@ -2486,11 +2484,12 @@ function chatCompletions(line: string): string[] {
 
 async function chatTuiCompletions(line: string, state: ChatState): Promise<string[]> {
   await ensureDefaultConfig();
+  await initializeChatComposerState(state);
   // `--complete` is a script surface. Keep its historical plain toolset values;
   // encoded interactive actions belong only inside the pi-tui editor.
   if (/^\/tools(?:\s+\S*)?$/i.test(line.trimStart())) return chatCompletions(line);
   const provider = createMusterAutocompleteProvider({
-    commands: chatCommandsDailyFirst(),
+    commands: chatCommandsDailyFirst(state),
     toolsets: CHAT_TOOLSETS,
     recentSessions: recentChatSessionNames,
     catalog: createChatCompletionCatalog(state),
@@ -2556,7 +2555,7 @@ async function liveSuggestions(line: string, state: ChatState): Promise<ChatSugg
   const trimmed = line.trimStart();
   if (trimmed === "/" || (/^\/[a-z-]*$/i.test(trimmed) && !isBareContextualPickerCommand(trimmed))) {
     const fragment = trimmed.slice(1).toLowerCase();
-    return CHAT_COMMANDS
+    return chatCommands(state)
       .filter((command) => command.name.startsWith(fragment) || command.aliases?.some((alias) => alias.startsWith(fragment)))
       .map((command) => ({
         label: `${color(command.usage.padEnd(20), "highlight")} ${command.description}`,
@@ -2834,7 +2833,7 @@ async function runChatTurn(text: string, state: ChatState, options: { timeoutMs?
   state.pendingContinuityContext = undefined;
   recordChatUsage(state, outcome.tokens);
   // Already painted delta-by-delta — reprinting the body would double it.
-  printAssistantResponse(outcome, { streamed: (painter?.painted ?? 0) > 0, bullet: Boolean(state.statusSink) });
+  printAssistantResponse(outcome, { streamed: (painter?.painted ?? 0) > 0, bullet: Boolean(state.statusSink), importedFromCodex: state.importedFromCodex });
   emitTurnCostChip(state, outcome);
   openMentionedCapabilityPicker(state, mentionedCapabilities, config);
 }
@@ -3286,7 +3285,7 @@ async function formatMentionedCapabilityCheck(
   return `${color(label, "accent")} ${status} risk=${mention.risk}${missing.length ? ` missing=${missing.join(",")}` : ""} next="/mcp ${configured ? `test ${mention.id}` : mention.id}"`;
 }
 
-function printAssistantResponse(outcome: RunOutcome, options: { readonly streamed?: boolean; readonly bullet?: boolean } = {}): void {
+function printAssistantResponse(outcome: RunOutcome, options: { readonly streamed?: boolean; readonly bullet?: boolean; readonly importedFromCodex?: boolean } = {}): void {
   const status = outcome.episode.outcome?.kind ?? "unknown";
   if (process.env.MUSTER_TIMINGS === "1" && outcome.timings) {
     console.log(color(formatTimingLine(outcome.timings), "dim"));
@@ -3299,7 +3298,7 @@ function printAssistantResponse(outcome: RunOutcome, options: { readonly streame
     console.log(color(`✖ ${cause.slice(0, 160)}`, "red"));
     if (detail?.includes("already has an active writer")) {
       console.log(color("  This Codex thread is open in another app (Codex desktop or CLI).", "yellow"));
-      console.log(color("  Close that conversation there and retry — or /codex resume <id> --fork to continue as a copy.", "yellow"));
+      console.log(color(`  ${threadConflictCure(options.importedFromCodex === true)}`, "yellow"));
     } else {
       console.log(color(`  run ${outcome.plan.runId.slice(0, 8)} · ${outcome.episode.providerId}/${outcome.episode.model} · fix: muster doctor or /status`, "dim"));
     }
@@ -3451,8 +3450,9 @@ async function printChatStatus(state: ChatState): Promise<void> {
   try {
     const session = store.findOrCreateSession({ channel: "cli-chat", peer: state.sessionName, title: state.sessionName, workspaceCwd: chatSessionWorkspaceCwd(state) });
     const messages = store.loadActiveMessages(session.id).length;
+    const fallbacks = config.routing.fallbacks ?? [];
     printChatPanel("Status", [
-      `${color("session".padEnd(12), "accent")} ${state.sessionName}`,
+      `${color("conversation".padEnd(12), "accent")} ${state.sessionName}`,
       `${color("runtime".padEnd(12), "accent")} ${runtime}`,
       `${color("provider".padEnd(12), "accent")} ${provider?.id ?? providerId ?? "-"}`,
       `${color("model".padEnd(12), "accent")} ${model ?? "-"}`,
@@ -3461,11 +3461,10 @@ async function printChatStatus(state: ChatState): Promise<void> {
       `${color("recall".padEnd(12), "accent")} limit ${state.recallLimit ?? 5}`,
       `${color("messages".padEnd(12), "accent")} ${messages}`,
       `${color("tokens".padEnd(12), "accent")} in ${session.tokensIn} / out ${session.tokensOut}`,
-      `${color("fallbacks".padEnd(12), "accent")} ${formatFallbackRoutes(config)}`,
+      ...(fallbacks.length ? [`${color("fallbacks".padEnd(12), "accent")} ${formatFallbackRoutes(config)}`] : []),
       `${color("resume".padEnd(12), "accent")} /resume ${state.sessionName}`,
       `${color("history".padEnd(12), "accent")} /history ${Math.min(Math.max(messages, 10), 40)}`,
       `${color("inspect".padEnd(12), "accent")} muster sessions show ${session.id}`,
-      color(`id ${session.id}`, "dim"),
     ]);
   } finally {
     store.close();
@@ -3818,7 +3817,13 @@ async function updateChatScopes(args: string, state: ChatState): Promise<void> {
  * made the harness look emptier than the session actually is, so the inherited
  * inventory is rendered underneath (read-only discovery, never a config edit).
  */
-async function printChatTools(toolset?: string): Promise<void> {
+async function printChatTools(toolset?: string, all = false): Promise<void> {
+  if (all || !toolset) {
+    const rows = await chatToolsOverlayRows(all);
+    printChatPanel(all ? "All tools" : "Tools", rows.map((row) =>
+      `${color(row.label.padEnd(24), row.id === "catalog:all" ? "dim" : "accent")} ${color(row.description, row.id === "catalog:all" ? "dim" : "highlight")}`));
+    return;
+  }
   const registry = createToolRegistry();
   registerBuiltinTools(registry);
   const entries = registry.list(toolset || undefined);
@@ -3830,12 +3835,9 @@ async function printChatTools(toolset?: string): Promise<void> {
   for (const entry of entries) {
     grouped.set(entry.toolset, [...(grouped.get(entry.toolset) ?? []), entry]);
   }
-  // A narrowed `/tools <toolset>` is a lookup, not an inventory: no discovery.
-  const ecosystem = toolset ? undefined : await inheritedEcosystem();
   printChatPanel("Tools", [
     ...[...grouped].map(([name, items]) => `${color(`${name}:`, "accent")} ${items.map((item) => item.name).join(", ")}`),
     color("Use /tools <toolset> to narrow the list.", "dim"),
-    ...(ecosystem ? renderInheritedToolsSection(ecosystem) : []),
   ]);
 }
 
@@ -4533,7 +4535,7 @@ function createChatCompletionCatalog(state: ChatState): MusterCompletionCatalog 
           const fragment = request.fragment.toLowerCase();
           // Daily-driver commands surface first; the long tail stays reachable
           // by typing. 47 undifferentiated rows was the reported noise.
-          return chatCommandsDailyFirst()
+          return chatCommandsDailyFirst(state)
             .filter((command) => command.name.startsWith(fragment) || command.aliases?.some((alias) => alias.startsWith(fragment)))
             .map((command) => ({ value: `/${command.name}`, label: command.usage, description: command.description }));
         }
@@ -4713,9 +4715,19 @@ async function chatMcpOptions(): Promise<PickerOption[]> {
   return [...servers, ...CHAT_MCP_ACTION_OPTIONS];
 }
 
-async function chatToolsOverlayOptions(): Promise<PickerOption[]> {
+async function chatToolsOverlayRows(all = false) {
   const ecosystem = await inheritedEcosystem();
-  return buildCapabilityOverlayOptions(ecosystem, { toolsets: CHAT_TOOLSETS, skills: chatSkillOptions() })
+  const skills = all
+    ? chatSkillOptions()
+    : await listSkills().then((installed) => {
+        const active = new Set(installed.filter((skill) => skill.status === "active").map((skill) => skill.name));
+        return chatSkillOptions().filter((skill) => active.has(skill.value));
+      }).catch(() => [] as PickerOption[]);
+  return buildCapabilityOverlayOptions(ecosystem, { toolsets: CHAT_TOOLSETS, skills, all });
+}
+
+async function chatToolsOverlayOptions(): Promise<PickerOption[]> {
+  return (await chatToolsOverlayRows(false))
     .map((option) => ({
       value: encodeCapabilitySelection(composerTextForCapabilityAction(option.action)),
       label: option.label,
@@ -9287,6 +9299,7 @@ async function codexResumeCommand(args: string[]): Promise<void> {
     // --fork: keep the imported history but start a FRESH provider thread — the
     // path out of a thread-store writer conflict with another Codex client.
     ...(args.includes("--fork") ? {} : { resumeThreadId: session.threadId }),
+    importedFromCodex: true,
     sessionWorkspaceCwd: session.cwd || process.cwd(),
     // Run in the thread's original workspace when it still exists — its context
     // is full of paths from that repo. A vanished dir falls back to cwd.
@@ -10797,7 +10810,7 @@ async function flowCommand(commandArgs: string[]): Promise<void> {
  * active profile, providers, episodes, tokens spent today, schedules due,
  * flows pending approval gates, and store integrity. All local reads.
  */
-async function statusCommand(): Promise<void> {
+async function statusCommand(commandArgs: readonly string[] = []): Promise<void> {
   const now = new Date();
   const today = now.toISOString().slice(0, 10);
 
@@ -10814,6 +10827,7 @@ async function statusCommand(): Promise<void> {
 
   const episodes = await listEpisodes();
   const lastEpisode = episodes.at(-1);
+  const todayEpisodes = episodes.filter((episode) => episode.createdAt.startsWith(today));
 
   const tokenRecords = await listTokenRecords();
   const todayRecords = tokenRecords.filter((record) => record.createdAt.startsWith(today));
@@ -10834,29 +10848,30 @@ async function statusCommand(): Promise<void> {
 
   const integrity = await verifyIntegrity();
 
-  const rows: Array<[string, string]> = [
-    ["profile", activeProfile()],
-    ["providers", providersLine],
-    ["default runtime", runtimeLine],
-    ["episodes", `${episodes.length} recorded${lastEpisode ? ` (last: ${lastEpisode.id} ${lastEpisode.createdAt})` : ""}`],
-    ["tokens today", `${tokensToday} across ${todayRecords.length} runs${costToday ? ` (~$${costToday.toFixed(4)})` : ""}`],
-    ["schedules", `${schedules.length} total, ${dueSchedules.length} due now`],
-    ["flows pending gate", pendingGates.length ? pendingGates.map((run) => run.runId).join(", ") : "none"],
-    ["verify", integrity.ok ? "OK" : `${integrity.issues.length} issue(s) — run: muster verify`],
-  ];
+  const runPhrase = `${todayEpisodes.length} ${todayEpisodes.length === 1 ? "run" : "runs"} today`;
+  const lastPhrase = lastEpisode ? `last ${formatHumanAge(lastEpisode.createdAt, now)} ago` : "no previous runs";
+  console.log(`${runPhrase}, ${lastPhrase} · $${costToday.toFixed(2)} · verify ${integrity.ok ? "OK" : `${integrity.issues.length} issues`}`);
+  console.log(`Profile ${activeProfile()} · ${providersLine} · runtime ${runtimeLine}`);
+  console.log(`${schedules.length} schedules, ${dueSchedules.length} due · ${pendingGates.length} flows waiting for approval`);
 
-  const labelWidth = Math.max(...rows.map(([label]) => label.length)) + 2;
-  console.log(`muster status — ${now.toISOString()}`);
-  console.log("-".repeat(64));
-  for (const [label, value] of rows) {
-    console.log(`${padCell(label, labelWidth)} ${value}`);
-  }
-  if (pendingGates.length) {
-    console.log("-".repeat(64));
+  if (commandArgs.includes("--verbose")) {
+    console.log(`as of ${now.toISOString()}`);
+    console.log(`tokens today ${tokensToday} across ${todayRecords.length} token records`);
+    if (lastEpisode) console.log(`last run ${lastEpisode.id} at ${lastEpisode.createdAt}`);
     for (const run of pendingGates) {
-      console.log(`approve: muster flow approve ${run.runId}   reject: muster flow reject ${run.runId}`);
+      console.log(`approve muster flow approve ${run.runId} · reject muster flow reject ${run.runId}`);
     }
   }
+}
+
+function formatHumanAge(value: string, now = new Date()): string {
+  const elapsedMs = Math.max(0, now.getTime() - new Date(value).getTime());
+  const minutes = Math.floor(elapsedMs / 60_000);
+  if (minutes < 1) return "<1m";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
 }
 
 async function verifyCommand(): Promise<void> {

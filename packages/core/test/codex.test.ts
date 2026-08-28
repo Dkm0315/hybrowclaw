@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { buildCodexArgs, parseCodexEvents, runCodex } from "../src/codex.js";
-import { buildCodexAppServerArgs, clearCodexAppServerConversation, clearCodexAppServerSessions, interruptActiveCodexTurn, runCodexAppServer } from "../src/codex-app-server.js";
+import { buildCodexAppServerArgs, clearCodexAppServerConversation, clearCodexAppServerSessions, interruptActiveCodexTurn, readGatewayCodexWarmThreadCount, runCodexAppServer } from "../src/codex-app-server.js";
 import { codexMcpDisableOverrides } from "../src/run.js";
 
 test("runCodex marks an unavailable CLI as safe for governed fallback", async () => {
@@ -700,6 +700,7 @@ rl.on("line", (line) => {
     send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed" } } });
   }
 });
+
 `, "utf8");
   await chmod(fake, 0o755);
   try {
@@ -710,6 +711,43 @@ rl.on("line", (line) => {
     assert.equal(second.status, "completed");
     assert.notEqual(second.threadId, first.threadId);
   } finally {
+    clearCodexAppServerSessions();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runCodexAppServer: gateway sessions report their count and expire on the shorter TTL", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "muster-codex-gateway-ttl-"));
+  const fake = join(dir, "codex-fake.mjs");
+  await writeFile(fake, `#!/usr/bin/env node
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+const threadId = "thread-" + process.pid;
+function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ id: msg.id, result: { userAgent: "fake" } });
+  else if (msg.method === "thread/start") send({ id: msg.id, result: { thread: { id: threadId } } });
+  else if (msg.method === "turn/start") {
+    send({ id: msg.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
+    send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m", text: "ok" }, threadId, turnId: "turn-1" } });
+    send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  const previous = process.env.MUSTER_GATEWAY_CODEX_IDLE_MS;
+  process.env.MUSTER_GATEWAY_CODEX_IDLE_MS = "1000";
+  try {
+    clearCodexAppServerSessions();
+    const result = await runCodexAppServer({ prompt: "one", cwd: dir, command: fake, cacheKey: "gateway-chat", transportOwner: "gateway:test" });
+    assert.equal(result.status, "completed");
+    assert.equal(readGatewayCodexWarmThreadCount(process.pid), 1);
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_150));
+    assert.equal(readGatewayCodexWarmThreadCount(process.pid), 0);
+  } finally {
+    if (previous === undefined) delete process.env.MUSTER_GATEWAY_CODEX_IDLE_MS;
+    else process.env.MUSTER_GATEWAY_CODEX_IDLE_MS = previous;
     clearCodexAppServerSessions();
     await rm(dir, { recursive: true, force: true });
   }
