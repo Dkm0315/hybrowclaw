@@ -146,7 +146,7 @@ async function caseEscapeClosesOverlay(): Promise<QaPtyTuiCase> {
   await settleAutocomplete();
   harness.input("\x1b");
   const screen = stripAnsi(harness.visible(100).join("\n"));
-  const evidence = { text: harness.text(), suggestionsCount: count(screen, "suggestions"), hasRails: /╭─ chat/.test(screen) && /╰─+╯/.test(screen) };
+  const evidence = { text: harness.text(), suggestionsCount: count(screen, "suggestions"), hasRails: /╭─+╮/.test(screen) && /╰─+╯/.test(screen) };
   return makeCase("escape_closes_bare_completion", evidence.text === "" && evidence.suggestionsCount === 0 && evidence.hasRails, "Escape closes bare slash overlay and returns to an empty composer", screen, evidence);
 }
 
@@ -320,7 +320,7 @@ async function caseResponsiveWidths(): Promise<QaPtyTuiCase> {
     const lines = stripAnsi(harness.visible(width).join("\n")).split("\n");
     checks.push({
       width,
-      hasTopRail: lines.some((line) => line.startsWith("╭─ chat")),
+      hasTopRail: lines.some((line) => /^╭─+╮/.test(line)),
       hasBottomRail: lines.some((line) => /^╰─+╯$/.test(line)),
       hasSuggestions: lines.some((line) => line.includes("suggestions")),
       maxLineWidth: Math.max(...lines.map((line) => line.length)),
@@ -354,7 +354,7 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
     evidence.stage = "wait-baseline";
     const baseline = await waitForPtyScreen(session, (screen) => {
       const visible = stripAnsi(screen);
-      return visible.includes("╭─ chat") && visible.includes("│ ›");
+      return /╭─+╮/.test(visible) && visible.includes("│ ›");
     });
     screens.push(`baseline\n${stripAnsi(baseline)}`);
 

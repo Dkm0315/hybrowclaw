@@ -196,6 +196,14 @@ test("escape cancels a staged /tools state-changing command", () => {
   assert.equal(harness.text(), "");
 });
 
+test("Ctrl+D is reserved for the live file view and leaves the composer intact", () => {
+  const harness = createMusterChatHarness({ commands, toolsets: [], recentSessions: () => [], agents: async () => [] });
+  harness.type("draft");
+  harness.input("\x04");
+  assert.equal(harness.text(), "draft");
+  assert.match(harness.transcript().at(-1) ?? "", /no files edited this turn/);
+});
+
 test("/tools disabled row needs a selection Enter and a separate submit Enter", async () => {
   const confirmation = capabilityConfirmationText("codex", ["mcp", "enable", "computer-use"]);
   const submitted: string[] = [];
@@ -249,7 +257,7 @@ test("muster composer render encloses the actual editor and grows for multiline 
   editor.setText("first line\nsecond line");
   const lines = renderMusterComposer(editor, 80);
 
-  assert.match(stripAnsi(lines[0]), /^╭─ chat/);
+  assert.match(stripAnsi(lines[0]), /^╭─+╮$/);
   assert.match(stripAnsi(lines.at(-1) ?? ""), /^╰/);
   assert.ok(lines.some((line) => stripAnsi(line).includes("first line")));
   assert.ok(lines.some((line) => stripAnsi(line).includes("second line")));
@@ -356,7 +364,7 @@ test("muster chat harness escape closes bare completion and restores normal prom
 
   assert.equal(harness.text(), "");
   assert.doesNotMatch(screen, /suggestions/);
-  assert.match(screen, /╭─ chat/);
+  assert.match(screen, /╭─+╮/);
   assert.match(screen, /╰─+/);
 });
 

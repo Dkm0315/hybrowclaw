@@ -13,6 +13,7 @@ import {
   SELECTION_GATE_ORDER,
   SELECTION_PRIORITY_WEIGHTS,
   assignWithConsultation,
+  applyEventToBoardView,
   computeReadyTasks,
   createDeterministicConsultStrategy,
   createKanbanBoardState,
@@ -23,6 +24,7 @@ import {
   nextKanbanEvent,
   parseKanbanTask,
   planKanbanAssignments,
+  projectBoardView,
   reduceKanbanEvent,
   renderContextBundle,
   renderKanbanBoard,
@@ -179,6 +181,81 @@ test("envelope invariants: sequence, scope, timestamps, duplicate delivery", () 
   assert.equal(afterDuplicate, state, "duplicate transport delivery must be a no-op returning the same state");
   assert.equal(state.nextSequence, created.sequence + 1);
   assert.equal(state.tasks.get("task-1")?.status, "backlog");
+});
+
+test("attempt lifecycle retains failed retries and completes the current attempt with all five identities", () => {
+  const log: KanbanEvent[] = [];
+  let state = createReady(openBoard([CARD_A], log), {}, log);
+  state = apply(state, { type: "task_session_bound", taskId: "task-1", sessionId: "sess_task_1" }, {}, log);
+  state = apply(state, { type: "task_assigned", taskId: "task-1", assignment: assignment(CARD_A.id, "agent-1") }, {}, log);
+  state = apply(state, {
+    type: "task_attempt_started", taskId: "task-1", attemptId: "attempt-1", agentId: "agent-1",
+    turnId: "turn-1", processId: "process-1",
+  }, { actorId: "agent-1", actorKind: "agent" }, log);
+  assert.throws(() => apply(state, {
+    type: "task_attempt_completed", taskId: "task-1", attemptId: "attempt-1", turnId: "different-turn",
+  }), /conflicting turn identity/);
+  state = apply(state, {
+    type: "task_attempt_failed", taskId: "task-1", attemptId: "attempt-1", error: "provider exited 2",
+    turnId: "turn-1", processId: "process-1", costUsd: 0.02,
+  }, {}, log);
+  assert.equal(state.tasks.get("task-1")?.status, "blocked");
+
+  state = apply(state, { type: "task_ready", taskId: "task-1", satisfiedDependencies: [] }, {}, log);
+  state = apply(state, { type: "task_assigned", taskId: "task-1", assignment: assignment(CARD_A.id, "agent-1") }, {}, log);
+  state = apply(state, {
+    type: "task_attempt_started", taskId: "task-1", attemptId: "attempt-2", agentId: "agent-1",
+    turnId: "turn-2", processId: "process-2",
+  }, { actorId: "agent-1", actorKind: "agent" }, log);
+  state = apply(state, {
+    type: "task_attempt_completed", taskId: "task-1", attemptId: "attempt-2", turnId: "turn-2",
+    processId: "process-2", receiptHash: "sha256:attempt-2", costUsd: 0.03,
+  }, {}, log);
+
+  const taskState = state.tasks.get("task-1")!;
+  assert.equal(taskState.attempts, 2);
+  assert.equal(taskState.currentAttemptId, "attempt-2");
+  assert.equal(taskState.attemptHistory.get("attempt-1")?.status, "failed");
+  assert.equal(taskState.attemptHistory.get("attempt-1")?.error, "provider exited 2");
+  assert.equal(taskState.attemptHistory.get("attempt-2")?.status, "completed");
+  assert.equal(taskState.attemptHistory.get("attempt-2")?.turnId, "turn-2");
+  assert.equal(taskState.sessionId, "sess_task_1");
+  assert.equal(taskState.status, "review");
+  assert.deepStrictEqual(replayKanbanEvents(createKanbanBoardState(identity), log), state);
+});
+
+test("session binding is immutable and attempts cannot start before binding", () => {
+  let state = createReady(openBoard([CARD_A]));
+  state = apply(state, { type: "task_assigned", taskId: "task-1", assignment: assignment(CARD_A.id, "agent-1") });
+  assert.throws(() => apply(state, {
+    type: "task_attempt_started", taskId: "task-1", attemptId: "attempt-1", agentId: "agent-1",
+  }), /must bind a session/);
+  state = apply(state, { type: "task_session_bound", taskId: "task-1", sessionId: "sess_1" });
+  state = apply(state, { type: "task_session_bound", taskId: "task-1", sessionId: "sess_1" });
+  assert.throws(() => apply(state, { type: "task_session_bound", taskId: "task-1", sessionId: "sess_2" }), /cannot be rebound/);
+});
+
+test("facts projection replay equals incremental application", () => {
+  const log: KanbanEvent[] = [];
+  let state = createReady(openBoard([CARD_A], log), {}, log);
+  state = apply(state, { type: "task_session_bound", taskId: "task-1", sessionId: "sess_1" }, {}, log);
+  state = apply(state, { type: "task_assigned", taskId: "task-1", assignment: assignment(CARD_A.id, "agent-1") }, {}, log);
+  state = apply(state, { type: "task_attempt_started", taskId: "task-1", attemptId: "attempt-1", agentId: "agent-1" }, {}, log);
+  state = apply(state, { type: "task_progress", taskId: "task-1", note: "editing importer.ts" }, {}, log);
+  state = apply(state, { type: "task_attempt_completed", taskId: "task-1", attemptId: "attempt-1", costUsd: 0.05 }, {}, log);
+
+  let incremental = projectBoardView([]);
+  for (const event of log) incremental = applyEventToBoardView(incremental, event);
+  const replayed = projectBoardView(log);
+  assert.deepStrictEqual(incremental, replayed);
+  assert.deepEqual(replayed.columns.review, ["task-1"]);
+  assert.deepEqual(replayed.cards["task-1"], {
+    taskId: "task-1", title: "Fix the failing importer", currentAttempt: "attempt-1", sessionId: "sess_1",
+    modelId: CARD_A.id, score: assignment(CARD_A.id, "agent-1").total, status: "review",
+    startedAt: log.find((event) => event.type === "task_attempt_started")!.at,
+    lastEventAt: log.at(-1)!.at, costUsd: 0.05, lastNarrationLine: "editing importer.ts",
+  });
+  assert.equal(applyEventToBoardView(replayed, log.at(-1)!), replayed, "duplicate event delivery is inert");
 });
 
 test("forbidden payload keys and secret-looking values are rejected", () => {

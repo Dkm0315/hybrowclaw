@@ -161,7 +161,7 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
   if (!(input.configOverrides ?? []).some((value) => /^model_reasoning_summary\s*=/.test(value))) {
     // Request provider-approved summaries for the transcript without changing
     // ~/.codex/config.toml. Models that emit no summary remain silent.
-    input = { ...input, configOverrides: [...(input.configOverrides ?? []), 'model_reasoning_summary="auto"'] };
+    input = { ...input, configOverrides: [...(input.configOverrides ?? []), 'model_reasoning_summary="detailed"'] };
   }
   const started = Date.now();
   const keepAlive = (input.keepAlive ?? true) && input.cacheKey !== undefined;

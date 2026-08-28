@@ -11,6 +11,7 @@ import {
   type AutocompleteProvider,
   type Component,
   type EditorTheme,
+  type OverlayHandle,
   type SelectItem,
   type SelectListTheme,
   type SettingsListTheme,
@@ -18,6 +19,7 @@ import {
 import { createCoalescer } from "@musterhq/core";
 import { effortDisplayLabel, modelDisplayLabel, modelProvider, type ComposerPickerSelection, type ComposerPickerState, type EffortValue } from "./model-catalog.js";
 import { decodeCapabilitySelection, isCapabilityConfirmationText } from "./capabilities-overlay.js";
+import { LiveFileOverlay, LiveFileTurnAccumulator, renderLiveFilePlain } from "./live-file-view.js";
 
 export interface MusterChatCommand {
   readonly name: string;
@@ -91,6 +93,12 @@ export interface MusterChatSink {
   clearStatus(): void;
   openPicker(command: string): void;
   selectComposerSetting(state: ComposerPickerState): Promise<ComposerPickerSelection | undefined>;
+  /** Replace the Canvas data source at the start of a model turn. */
+  setLiveDiffTurn(turn: LiveFileTurnAccumulator): void;
+  /** Repaint an open Canvas after an observer patch. */
+  updateLiveDiff(turn: LiveFileTurnAccumulator): void;
+  /** Ctrl+D and /diff share this exact toggle. */
+  toggleLiveDiff(): void;
 }
 
 export interface RunMusterChatTuiOptions extends MusterAutocompleteOptions {
@@ -193,6 +201,12 @@ export function routeEngineLine(line: string): EngineLineRoute {
     return { kind: "diagnostic", chip: formatTimingsChip(trimmed), log: trimmed };
   }
   if (isRecallReceiptDetailLine(trimmed)) return { kind: "diagnostic", log: trimmed };
+  // Provider stderr fragments (Rust tracing lines, module paths) belong in the
+  // session log, never the transcript — a truncated "codex_core::session: faile"
+  // above an error card was observed live and reads as breakage.
+  if (/^\d{4}-\d{2}-\d{2}T[\d:.]+Z?\s+(ERROR|WARN|INFO|DEBUG)\b/.test(trimmed) || /^[a-z_]+(?:::[a-z_]+)+:/.test(trimmed)) {
+    return { kind: "diagnostic", log: trimmed };
+  }
   return { kind: "transcript", line };
 }
 
@@ -647,7 +661,10 @@ export function createNarrationPainter(options: NarrationPainterOptions): Narrat
 
 /** Reasoning summaries render dim + italic so they never read as the answer. */
 export function formatReasoningLine(text: string): string {
-  const body = `· ${text.trim()}`;
+  // Reasoning summaries arrive as markdown; painted dim-italic, the emphasis
+  // markers are pure noise ("**Planning code inspection**" — observed live).
+  // Single underscores stay: snake_case identifiers are content, not markup.
+  const body = `· ${text.trim().replace(/\*\*|__|`/g, "").replace(/(^|\s)\*(\S[^*]*\S|\S)\*(?=\s|$)/g, "$1$2")}`;
   if (process.env.NO_COLOR) return body;
   return `${ITALIC}\x1b[38;2;${MUTED_RGB}m${body}${RESET}`;
 }
@@ -683,12 +700,25 @@ export interface CompactHeaderInfo {
  * `/header full` restores the full panel.
  */
 export function buildCompactHeaderLines(info: CompactHeaderInfo): string[] {
-  // Two lines. Model/provider/runtime/speed/scopes live in the status row —
-  // repeating them here was the "too much MUSTER" complaint.
+  // ONE line of idle chrome — the Claude Code bar. Model appears here and
+  // nowhere else while idle (the status row exists only during a turn), so
+  // nothing is ever stated twice on screen.
   return [
-    `${accent("MUSTER")} ${dim(`· ${info.model} · session ${info.session} · ${info.cwd}`)}`,
-    dim("/help commands · /header full · @agent routes a turn"),
+    `${accent("MUSTER")} ${dim(`· ${info.model} · ${info.session} · ${shortenPathForHeader(info.cwd)} · /help`)}`,
   ];
+}
+
+/** `~` for home; long foreign paths keep first and last segments around an ellipsis. */
+export function shortenPathForHeader(cwd: string, max = 48): string {
+  const home = process.env.HOME;
+  const tilded = home && cwd.startsWith(home) ? `~${cwd.slice(home.length)}` : cwd;
+  if (tilded.length <= max) return tilded;
+  const parts = tilded.split("/").filter(Boolean);
+  if (parts.length <= 2) return `…${tilded.slice(-max + 1)}`;
+  const tail = parts.slice(-2).join("/");
+  const head = tilded.startsWith("~") ? "~" : `/${parts[0]}`;
+  const short = `${head}/…/${tail}`;
+  return short.length <= max ? short : `…/${parts[parts.length - 1]}`.slice(0, max);
 }
 
 export function createMusterAutocompleteProvider(options: MusterAutocompleteOptions): AutocompleteProvider {
@@ -765,6 +795,10 @@ export function createMusterChatHarness(options: MusterAutocompleteOptions & {
   return {
     input(data) {
       if (options.onDecisionKey?.(data, sink)) return;
+      if (data === "\x04") {
+        sink.toggleLiveDiff();
+        return;
+      }
       if (data === "\x1b" && sink.interruptTurn()) return;
       if ((matchesKey(data, "enter") || matchesKey(data, "return")) && isToolsOverlayInput(editor.getText())) {
         editor.handleInput("\t");
@@ -828,7 +862,7 @@ export function renderMusterComposer(editor: Editor, width: number): string[] {
   const secondBorder = borderIndexes.find((index) => index > firstBorder) ?? rawLines.length;
   const inputLines = rawLines.slice(firstBorder + 1, secondBorder);
   const completionLines = rawLines.slice(secondBorder + 1);
-  const result = [accent(`╭─ chat ${"─".repeat(Math.max(1, frameWidth - 9))}╮`)];
+  const result = [accent(`╭${"─".repeat(Math.max(1, frameWidth - 2))}╮`)];
 
   if (!inputLines.length) {
     result.push(frameLine(`${highlight("›")} `, innerWidth));
@@ -919,10 +953,15 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
       tui.requestRender(true);
       return { consume: true };
     }
-    if (data === "\x03" || data === "\x04") {
+    if (data === "\x04") {
+      screen.toggleLiveDiff();
+      return { consume: true };
+    }
+    if (data === "\x03") {
       screen.stop();
       return { consume: true };
     }
+    if (matchesKey(data, "escape") && screen.closeLiveDiff(true)) return { consume: true };
     if (matchesKey(data, "escape") && screen.interruptTurn()) return { consume: true };
     if (isClearComposerKey(data)) {
       editor.handleInput("\x1b");
@@ -956,6 +995,8 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
   await screen.refreshStatusLine();
   const rawEscapeHandler = (chunk: Buffer | string): void => {
     const data = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+    if (data === "\x1b" && screen.consumeLiveDiffEscapeSuppression()) return;
+    if (data === "\x1b" && screen.closeLiveDiff()) return;
     if (data === "\x1b" && screen.interruptTurn()) return;
     if (data === "\x1b" && isBareCompletionTrigger(editor.getText())) {
       editor.handleInput(data);
@@ -984,6 +1025,10 @@ class MusterChatScreen implements Component, MusterChatSink {
   private turnRunning = false;
   private interruptRequested = false;
   private pickerOpen = false;
+  private liveDiffTurn = new LiveFileTurnAccumulator();
+  private liveDiffOverlay: LiveFileOverlay | undefined;
+  private liveDiffHandle: OverlayHandle | undefined;
+  private suppressRawLiveDiffEscape = false;
   exited = false;
   onStop?: () => void;
 
@@ -1102,14 +1147,75 @@ class MusterChatScreen implements Component, MusterChatSink {
       ], 6, pickerTheme.settings, (id, value) => {
         if (id === "speed") finish({ kind: "speed", value: value as "session" | "fast" });
       }, () => finish());
+      // Anchor AT the composer like the Codex app's picker — never floating in
+      // the void of a tall terminal. The viewport shows the tail of the content,
+      // so the composer's screen row is the content height clamped to the
+      // terminal, minus its own box; the picker opens directly beneath it.
+      const termRows = Math.max(12, this.tui.terminal.rows);
+      const contentRows = this.lastRenderedRows || termRows;
+      const composerRow = Math.min(contentRows, termRows);
       handle = this.tui.showOverlay(settings, {
-        anchor: "bottom-center",
+        anchor: "top-center",
+        row: Math.max(2, Math.min(composerRow + 1, termRows - 10)),
         width: 72,
         maxHeight: 22,
-        margin: { bottom: 5, left: 1, right: 1 },
+        margin: { left: 1, right: 1 },
       });
       this.tui.requestRender(true);
     });
+  }
+
+  setLiveDiffTurn(turn: LiveFileTurnAccumulator): void {
+    this.liveDiffTurn = turn;
+    this.liveDiffOverlay?.update(turn);
+  }
+
+  updateLiveDiff(turn: LiveFileTurnAccumulator): void {
+    this.liveDiffTurn = turn;
+    this.liveDiffOverlay?.update(turn);
+  }
+
+  toggleLiveDiff(): void {
+    if (this.liveDiffHandle) {
+      this.closeLiveDiff();
+      return;
+    }
+    // pi-tui cannot give a useful full-file viewport this small. Keep the
+    // command honest and readable by appending the cumulative plain delta.
+    if (this.tui.terminal.rows < 20 || !process.stdout.isTTY) {
+      for (const line of renderLiveFilePlain(this.liveDiffTurn)) this.appendLine(line);
+      return;
+    }
+    const overlay = new LiveFileOverlay(this.liveDiffTurn, {
+      terminalRows: () => this.tui.terminal.rows,
+      requestRender: () => this.tui.requestRender(true),
+      close: () => { this.closeLiveDiff(); },
+    });
+    this.liveDiffOverlay = overlay;
+    this.liveDiffHandle = this.tui.showOverlay(overlay, {
+      width: "90%",
+      maxHeight: "85%",
+      anchor: "center",
+      margin: 1,
+    });
+    this.tui.requestRender(true);
+  }
+
+  closeLiveDiff(suppressRawEscape = false): boolean {
+    if (!this.liveDiffHandle) return false;
+    this.suppressRawLiveDiffEscape = suppressRawEscape;
+    this.liveDiffHandle.hide();
+    this.liveDiffHandle = undefined;
+    this.liveDiffOverlay = undefined;
+    this.tui.setFocus(this.editor);
+    this.tui.requestRender(true);
+    return true;
+  }
+
+  consumeLiveDiffEscapeSuppression(): boolean {
+    if (!this.suppressRawLiveDiffEscape) return false;
+    this.suppressRawLiveDiffEscape = false;
+    return true;
   }
 
   async submit(text: string, onSubmit: (text: string, sink: MusterChatSink) => Promise<boolean>): Promise<void> {
@@ -1176,8 +1282,24 @@ class MusterChatScreen implements Component, MusterChatSink {
     // must never come back. renderTranscriptWindow remains exported for
     // cramped non-interactive surfaces only.
     const transcript = this.lines.flatMap((line) => wrapLine(line, frameWidth));
-    return [...fittedHeader, ...transcript, ...status, ...composer].map((line) => padAnsi(line, frameWidth));
+    // Pad to the FULL terminal width, not the capped frame: on ultra-wide
+    // terminals, cells beyond the frame otherwise keep stale glyphs from
+    // earlier wide paints (observed as phantom "["/"]" at screen edges).
+    const padTo = Math.max(frameWidth, this.tui.terminal.columns || frameWidth);
+    // THE LAYOUT LAW (owner-named): the typing area lives at the BOTTOM of the
+    // terminal; responses live above it. While content is shorter than the
+    // viewport, filler rows push the composer down; once content overflows,
+    // filler vanishes and natural scrollback takes over.
+    const termRows = Math.max(8, this.tui.terminal.rows || 24);
+    const contentRows = fittedHeader.length + transcript.length + status.length + composer.length;
+    const filler = Array.from({ length: Math.max(0, termRows - contentRows - 1) }, () => "");
+    const rows = [...fittedHeader, ...transcript, ...filler, ...status, ...composer].map((line) => padAnsi(line, padTo));
+    this.lastRenderedRows = rows.length;
+    return rows;
   }
+
+  /** Total content rows from the last paint — the composer sits at the tail. */
+  private lastRenderedRows = 0;
 
   handleInput(data: string): void {
     this.editor.handleInput(data);
@@ -1196,6 +1318,7 @@ class HarnessSink implements MusterChatSink {
   statusRow = "";
   private turnRunning = false;
   private interruptRequested = false;
+  private liveDiffTurn = new LiveFileTurnAccumulator();
 
   constructor(
     private readonly editor: Editor,
@@ -1239,6 +1362,18 @@ class HarnessSink implements MusterChatSink {
 
   async selectComposerSetting(_state: ComposerPickerState): Promise<ComposerPickerSelection | undefined> {
     return undefined;
+  }
+
+  setLiveDiffTurn(turn: LiveFileTurnAccumulator): void {
+    this.liveDiffTurn = turn;
+  }
+
+  updateLiveDiff(turn: LiveFileTurnAccumulator): void {
+    this.liveDiffTurn = turn;
+  }
+
+  toggleLiveDiff(): void {
+    for (const line of renderLiveFilePlain(this.liveDiffTurn)) this.appendLine(line);
   }
 
   async submit(text: string): Promise<boolean> {
@@ -1741,7 +1876,10 @@ function hangingIndent(clean: string, cleanWidth: number): string {
 function wrapBreakPoint(text: string, limit: number): number {
   if (limit >= text.length) return limit;
   const space = text.lastIndexOf(" ", limit);
-  return space > limit * 0.75 ? space + 1 : limit;
+  // Prefer a word boundary whenever one exists in the latter 60% of the row —
+  // a mid-word "wri/te" break is worse than a slightly ragged edge. Only a
+  // genuinely over-long token gets hard-broken.
+  return space > limit * 0.4 ? space + 1 : limit;
 }
 
 function fitLines(lines: readonly string[], width: number): string[] {

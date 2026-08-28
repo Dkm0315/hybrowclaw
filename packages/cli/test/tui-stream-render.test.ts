@@ -241,7 +241,7 @@ test("exit commands are routed by the TUI itself", async () => {
 
 // ── Defect #6: compact launch header ────────────────────────────────────────
 
-test("compact launch header is two lines and keeps the active model on the wordmark line", () => {
+test("compact launch header is ONE line: model once, session, path, help — nothing else", () => {
   const lines = buildCompactHeaderLines({
     session: "main",
     cwd: "~/code/muster",
@@ -252,15 +252,12 @@ test("compact launch header is two lines and keeps the active model on the wordm
     speed: "session",
   });
 
-  assert.ok(lines.length <= 2, `compact header must stay <= 2 lines, saw ${lines.length}`);
+  assert.equal(lines.length, 1, `idle chrome is exactly one line, saw ${lines.length}`);
   const text = plain(lines).join("\n");
-  assert.match(text, /MUSTER/);
-  assert.match(text, /session main/);
-  assert.match(text, /~\/code\/muster/);
-  assert.match(text, /\/header full/);
-  assert.match(text, /MUSTER · gpt-5\.6-sol/);
-  assert.doesNotMatch(text, /codex · native|speed session|scopes/);
-  assert.equal(plain(lines).some((line) => line.length === 0), false, "no filler rows");
+  assert.match(text, /MUSTER · gpt-5\.6-sol · main · ~\/code\/muster · \/help/);
+  // The model is stated here and ONLY here while idle; provider/runtime/speed/
+  // scopes belong to /status, and no second hint line exists.
+  assert.doesNotMatch(text, /codex · native|speed session|scopes|@agent|\/header/);
 });
 
 // ── the transcript must show exactly what the model said ────────────────────

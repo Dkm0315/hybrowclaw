@@ -255,7 +255,7 @@ rl.on("line", (line) => {
     assert.equal(result.status, "completed");
     assert.deepEqual(deltas, ["partial"]);
     const args = JSON.parse(await readFile(argsLog, "utf8")) as string[];
-    assert.ok(args.includes('model_reasoning_summary="auto"'));
+    assert.ok(args.includes('model_reasoning_summary="detailed"'));
   } finally {
     clearCodexAppServerSessions();
     await rm(dir, { recursive: true, force: true });

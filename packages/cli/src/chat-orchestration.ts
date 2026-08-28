@@ -463,6 +463,7 @@ export async function openBoardStore(options: OpenBoardOptions): Promise<BoardSt
     ? { boardId: events[0].boardId, tenantId: events[0].tenantId, siteId: events[0].siteId }
     : { boardId: boardIdForSession(options.sessionName), tenantId: BOARD_TENANT_ID, siteId: undefined };
   let state = createKanbanBoardState(identity);
+  let writes: Promise<void> = Promise.resolve();
   for (const event of events) {
     try {
       state = reduceKanbanEvent(state, event);
@@ -477,7 +478,8 @@ export async function openBoardStore(options: OpenBoardOptions): Promise<BoardSt
     cwd,
     path,
     state: () => state,
-    async commit(envelope, body) {
+    commit(envelope, body) {
+      const write = writes.then(async () => {
       // Clock skew must never make the log unreplayable (`assertEnvelope` rejects
       // a timestamp that moves backwards), so time is monotonic per board.
       const wall = now().toISOString();
@@ -496,6 +498,9 @@ export async function openBoardStore(options: OpenBoardOptions): Promise<BoardSt
       await appendFile(path, `${JSON.stringify(event)}\n`);
       state = next;
       return state;
+      });
+      writes = write.then(() => undefined, () => undefined);
+      return write;
     },
   };
 }
@@ -793,6 +798,8 @@ export function explainAssignment(state: KanbanBoardState, taskId: string): Assi
 
 export interface MissionTaskRunInput {
   readonly task: KanbanTask;
+  readonly attemptId: string;
+  readonly sessionId: string;
   readonly cardId: string;
   readonly agentId: string;
   readonly onNarration: (text: string) => void;
@@ -805,6 +812,8 @@ export interface MissionTaskRunResult {
   readonly costUsd?: number;
   readonly receiptHash?: string;
   readonly runId?: string;
+  readonly turnId?: string;
+  readonly processId?: string;
 }
 
 export interface OrchestrationDeps {
@@ -819,6 +828,8 @@ export interface OrchestrationDeps {
   readonly detectAuth: () => Promise<BackendAuth>;
   /** Planning turn on the configured model (executeRun in production). */
   readonly plan: (prompt: string) => Promise<string>;
+  /** Resolve/create the durable Muster conversation opened by this task's card. */
+  readonly taskSessionId?: (task: KanbanTask) => Promise<string> | string;
   /** One task execution (spawnSubagent in production). */
   readonly execute: (input: MissionTaskRunInput) => Promise<MissionTaskRunResult>;
   /** Minimum gap between durable task_progress events. */
@@ -932,6 +943,11 @@ export async function runMissionCommand(goal: string, deps: OrchestrationDeps): 
       { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `create task ${task.id}` },
       { type: "task_created", taskId: task.id, task },
     );
+    const sessionId = await (deps.taskSessionId?.(task) ?? `task-session:${deps.sessionName}:${task.id}`);
+    await store.commit(
+      { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `bind ${task.id} to session ${sessionId}` },
+      { type: "task_session_bound", taskId: task.id, sessionId },
+    );
   }
   await registerCards(store, cards);
 
@@ -1015,7 +1031,7 @@ async function runMissionWaves(
       return;
     }
 
-    const routed: { taskId: string; cardId: string; task: KanbanTask }[] = [];
+    const routed: { taskId: string; cardId: string; task: KanbanTask; sessionId: string }[] = [];
     for (const taskId of wave) {
       pending.delete(taskId);
       const entry = store.state().tasks.get(taskId)!;
@@ -1051,22 +1067,27 @@ async function runMissionWaves(
         { type: "task_assigned", taskId, assignment },
       );
       deps.emit(renderTaskAssignedCard({ taskId, title: entry.task.title, cardId: selection.cardId, total: selection.total }, options));
-      routed.push({ taskId, cardId: selection.cardId, task: entry.task });
+      const sessionId = store.state().tasks.get(taskId)?.sessionId;
+      if (!sessionId) throw new Error(`Task ${taskId} has no bound session after task_session_bound.`);
+      routed.push({ taskId, cardId: selection.cardId, task: entry.task, sessionId });
     }
     if (routed.length === 0) continue;
 
     // Started/progress/completion events are serialized through the store (single
     // writer, ordered sequence) while the runs themselves overlap.
     const results = await Promise.all(routed.map(async (entry) => {
+      const attemptId = `attempt-${entry.taskId}-${store.state().tasks.get(entry.taskId)!.attempts + 1}`;
       await store.commit(
-        { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `start ${entry.taskId}` },
-        { type: "task_started", taskId: entry.taskId, agentId: MISSION_AGENT_ID, attemptId: `attempt-${entry.taskId}-${store.state().nextSequence}` },
+        { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `request run ${attemptId}` },
+        { type: "task_attempt_started", taskId: entry.taskId, agentId: MISSION_AGENT_ID, attemptId },
       );
       const progress = createProgressRecorder(store, entry.taskId, deps);
       let result: MissionTaskRunResult;
       try {
         result = await deps.execute({
           task: entry.task,
+          attemptId,
+          sessionId: entry.sessionId,
           cardId: entry.cardId,
           agentId: MISSION_AGENT_ID,
           onNarration: (text) => {
@@ -1077,15 +1098,21 @@ async function runMissionWaves(
       } catch (error) {
         result = { ok: false, summary: `execution threw: ${error instanceof Error ? error.message : String(error)}` };
       }
-      return { ...entry, result, progress };
+      return { ...entry, attemptId, result, progress };
     }));
 
     for (const entry of results) {
       await entry.progress.flush();
       if (!entry.result.ok) {
         await store.commit(
-          { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `block ${entry.taskId}` },
-          { type: "task_blocked", taskId: entry.taskId, reason: clip(entry.result.summary || "run failed", 400) },
+          { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `fail ${entry.attemptId}` },
+          {
+            type: "task_attempt_failed", taskId: entry.taskId, attemptId: entry.attemptId,
+            error: clip(entry.result.summary || "run failed", 400),
+            ...(entry.result.turnId ? { turnId: entry.result.turnId } : {}),
+            ...(entry.result.processId ? { processId: entry.result.processId } : {}),
+            ...(entry.result.costUsd !== undefined ? { costUsd: entry.result.costUsd } : {}),
+          },
         );
         if (entry.result.costUsd !== undefined) costs.set(entry.taskId, entry.result.costUsd);
         deps.emit(renderTaskDoneCard({
@@ -1097,8 +1124,14 @@ async function runMissionWaves(
         continue;
       }
       await store.commit(
-        { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `submit ${entry.taskId} for review` },
-        { type: "task_submitted_for_review", taskId: entry.taskId },
+        { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `complete ${entry.attemptId}` },
+        {
+          type: "task_attempt_completed", taskId: entry.taskId, attemptId: entry.attemptId,
+          ...(entry.result.turnId ? { turnId: entry.result.turnId } : {}),
+          ...(entry.result.processId ? { processId: entry.result.processId } : {}),
+          ...(entry.result.receiptHash ? { receiptHash: entry.result.receiptHash } : {}),
+          ...(entry.result.costUsd !== undefined ? { costUsd: entry.result.costUsd } : {}),
+        },
       );
       await store.commit(
         { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: `complete ${entry.taskId}` },

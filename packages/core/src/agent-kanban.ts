@@ -1348,6 +1348,21 @@ export interface TaskAssignment {
   readonly consultationId?: string;
 }
 
+export type KanbanAttemptStatus = "running" | "completed" | "failed";
+
+/** One retained execution try. A retry appends a new record; it never rewrites this one. */
+export interface KanbanAttemptState {
+  readonly attemptId: string;
+  readonly status: KanbanAttemptStatus;
+  readonly startedAt: string;
+  readonly finishedAt?: string;
+  readonly turnId?: string;
+  readonly processId?: string;
+  readonly costUsd?: number;
+  readonly receiptHash?: string;
+  readonly error?: string;
+}
+
 export type KanbanEventBody =
   | { readonly type: "board_opened"; readonly defaults: { readonly defaultWipPerModel: number; readonly defaultWipPerAgent: number; readonly policy?: SelectionPolicy } }
   | { readonly type: "model_card_registered"; readonly card: ModelCard }
@@ -1360,6 +1375,11 @@ export type KanbanEventBody =
   | { readonly type: "consultation_recorded"; readonly taskId: string; readonly consultation: ConsultationRecord }
   | { readonly type: "task_assigned"; readonly taskId: string; readonly assignment: TaskAssignment }
   | { readonly type: "task_unassigned"; readonly taskId: string; readonly reason: string }
+  | { readonly type: "task_session_bound"; readonly taskId: string; readonly sessionId: string }
+  | { readonly type: "task_attempt_started"; readonly taskId: string; readonly attemptId: string; readonly agentId: string; readonly turnId?: string; readonly processId?: string }
+  | { readonly type: "task_attempt_completed"; readonly taskId: string; readonly attemptId: string; readonly turnId?: string; readonly processId?: string; readonly receiptHash?: string; readonly costUsd?: number }
+  | { readonly type: "task_attempt_failed"; readonly taskId: string; readonly attemptId: string; readonly error: string; readonly turnId?: string; readonly processId?: string; readonly costUsd?: number }
+  /** Legacy lifecycle fact retained so existing JSONL histories remain replayable. */
   | { readonly type: "task_started"; readonly taskId: string; readonly agentId: string; readonly attemptId: string }
   | { readonly type: "task_progress"; readonly taskId: string; readonly note: string; readonly percentComplete?: number }
   | { readonly type: "task_submitted_for_review"; readonly taskId: string; readonly artifactDigests?: readonly string[] }
@@ -1377,6 +1397,9 @@ export interface KanbanTaskState {
   readonly assignment?: TaskAssignment;
   readonly contextBundle?: ContextBundleReceipt;
   readonly consultationId?: string;
+  readonly sessionId?: string;
+  readonly currentAttemptId?: string;
+  readonly attemptHistory: ReadonlyMap<string, KanbanAttemptState>;
   readonly attempts: number;
   readonly reviewRejections: number;
   readonly reason?: string;
@@ -1660,7 +1683,8 @@ export function reduceKanbanEvent(state: KanbanBoardState, event: KanbanEvent): 
       if (issues.length > 0) throw new KanbanEventConflictError(`Invalid task "${event.taskId}": ${issues.join(" ")}`);
       if (event.task.id !== event.taskId) throw new KanbanEventConflictError("task_created taskId must match the task body.");
       tasks.set(event.taskId, {
-        task: event.task, status: "backlog", attempts: 0, reviewRejections: 0, lastEventSequence: event.sequence,
+        task: event.task, status: "backlog", attemptHistory: new Map(), attempts: 0,
+        reviewRejections: 0, lastEventSequence: event.sequence,
       });
       break;
     }
@@ -1764,6 +1788,89 @@ export function reduceKanbanEvent(state: KanbanBoardState, event: KanbanEvent): 
       commit(event.taskId, prior, { status: "ready", assignment: undefined, reason: requireText(event.reason, "task_unassigned reason") });
       break;
     }
+    case "task_session_bound": {
+      const prior = requireTask(event.taskId);
+      const sessionId = requireText(event.sessionId, "task_session_bound sessionId");
+      if (prior.sessionId !== undefined && prior.sessionId !== sessionId) {
+        throw new KanbanEventConflictError(`Task "${event.taskId}" is already bound to session "${prior.sessionId}" and cannot be rebound to "${sessionId}".`);
+      }
+      commit(event.taskId, prior, { sessionId });
+      break;
+    }
+    case "task_attempt_started": {
+      const prior = requireTask(event.taskId);
+      if (prior.status !== "assigned") throw new KanbanEventConflictError(`Task "${event.taskId}" must be assigned before an attempt starts (was ${prior.status}).`);
+      if (!prior.sessionId) throw new KanbanEventConflictError(`Task "${event.taskId}" must bind a session before an attempt starts.`);
+      if (!prior.assignment || prior.assignment.agentId !== event.agentId) {
+        throw new KanbanEventConflictError(`Agent "${event.agentId}" does not own task "${event.taskId}".`);
+      }
+      const attemptId = requireText(event.attemptId, "task_attempt_started attemptId");
+      if (event.turnId !== undefined) requireText(event.turnId, "task_attempt_started turnId");
+      if (event.processId !== undefined) requireText(event.processId, "task_attempt_started processId");
+      if (prior.attemptHistory.has(attemptId)) throw new KanbanEventConflictError(`Attempt "${attemptId}" already exists on task "${event.taskId}".`);
+      const attempts = prior.attempts + 1;
+      if (attempts > MAX_TASK_ATTEMPTS) throw new KanbanEventConflictError(`Task "${event.taskId}" exhausted ${MAX_TASK_ATTEMPTS} attempts; escalate instead of retrying.`);
+      const attemptHistory = new Map(prior.attemptHistory);
+      attemptHistory.set(attemptId, {
+        attemptId,
+        status: "running",
+        startedAt: event.at,
+        ...(event.turnId ? { turnId: event.turnId } : {}),
+        ...(event.processId ? { processId: event.processId } : {}),
+      });
+      commit(event.taskId, prior, { status: "in_progress", attemptHistory, currentAttemptId: attemptId, attempts, reason: undefined });
+      break;
+    }
+    case "task_attempt_completed": {
+      const prior = requireTask(event.taskId);
+      if (prior.status !== "in_progress") throw new KanbanEventConflictError(`Task "${event.taskId}" must be in progress when an attempt completes (was ${prior.status}).`);
+      const attempt = prior.attemptHistory.get(event.attemptId);
+      if (!attempt || prior.currentAttemptId !== event.attemptId) throw new KanbanEventConflictError(`Attempt "${event.attemptId}" is not the current attempt on task "${event.taskId}".`);
+      if (attempt.status !== "running") throw new KanbanEventConflictError(`Attempt "${event.attemptId}" is already ${attempt.status}.`);
+      if (event.turnId !== undefined) requireText(event.turnId, "task_attempt_completed turnId");
+      if (event.processId !== undefined) requireText(event.processId, "task_attempt_completed processId");
+      if (event.receiptHash !== undefined) requireText(event.receiptHash, "task_attempt_completed receiptHash");
+      if (attempt.turnId && event.turnId && attempt.turnId !== event.turnId) throw new KanbanEventConflictError(`Attempt "${event.attemptId}" has conflicting turn identity.`);
+      if (attempt.processId && event.processId && attempt.processId !== event.processId) throw new KanbanEventConflictError(`Attempt "${event.attemptId}" has conflicting process identity.`);
+      if (event.costUsd !== undefined && (!Number.isFinite(event.costUsd) || event.costUsd < 0)) throw new KanbanEventConflictError("task_attempt_completed costUsd must be non-negative and finite.");
+      const attemptHistory = new Map(prior.attemptHistory);
+      attemptHistory.set(event.attemptId, {
+        ...attempt,
+        status: "completed",
+        finishedAt: event.at,
+        ...(event.turnId ? { turnId: event.turnId } : {}),
+        ...(event.processId ? { processId: event.processId } : {}),
+        ...(event.receiptHash ? { receiptHash: event.receiptHash } : {}),
+        ...(event.costUsd !== undefined ? { costUsd: event.costUsd } : {}),
+      });
+      commit(event.taskId, prior, { status: "review", attemptHistory, reason: undefined });
+      break;
+    }
+    case "task_attempt_failed": {
+      const prior = requireTask(event.taskId);
+      if (prior.status !== "in_progress") throw new KanbanEventConflictError(`Task "${event.taskId}" must be in progress when an attempt fails (was ${prior.status}).`);
+      const attempt = prior.attemptHistory.get(event.attemptId);
+      if (!attempt || prior.currentAttemptId !== event.attemptId) throw new KanbanEventConflictError(`Attempt "${event.attemptId}" is not the current attempt on task "${event.taskId}".`);
+      if (attempt.status !== "running") throw new KanbanEventConflictError(`Attempt "${event.attemptId}" is already ${attempt.status}.`);
+      if (event.turnId !== undefined) requireText(event.turnId, "task_attempt_failed turnId");
+      if (event.processId !== undefined) requireText(event.processId, "task_attempt_failed processId");
+      if (attempt.turnId && event.turnId && attempt.turnId !== event.turnId) throw new KanbanEventConflictError(`Attempt "${event.attemptId}" has conflicting turn identity.`);
+      if (attempt.processId && event.processId && attempt.processId !== event.processId) throw new KanbanEventConflictError(`Attempt "${event.attemptId}" has conflicting process identity.`);
+      if (event.costUsd !== undefined && (!Number.isFinite(event.costUsd) || event.costUsd < 0)) throw new KanbanEventConflictError("task_attempt_failed costUsd must be non-negative and finite.");
+      const error = requireText(event.error, "task_attempt_failed error");
+      const attemptHistory = new Map(prior.attemptHistory);
+      attemptHistory.set(event.attemptId, {
+        ...attempt,
+        status: "failed",
+        finishedAt: event.at,
+        error,
+        ...(event.turnId ? { turnId: event.turnId } : {}),
+        ...(event.processId ? { processId: event.processId } : {}),
+        ...(event.costUsd !== undefined ? { costUsd: event.costUsd } : {}),
+      });
+      commit(event.taskId, prior, { status: "blocked", attemptHistory, reason: error });
+      break;
+    }
     case "task_started": {
       const prior = requireTask(event.taskId);
       if (prior.status !== "assigned") throw new KanbanEventConflictError(`Task "${event.taskId}" must be assigned before it starts (was ${prior.status}).`);
@@ -1773,6 +1880,8 @@ export function reduceKanbanEvent(state: KanbanBoardState, event: KanbanEvent): 
       requireText(event.attemptId, "task_started attemptId");
       const attempts = prior.attempts + 1;
       if (attempts > MAX_TASK_ATTEMPTS) throw new KanbanEventConflictError(`Task "${event.taskId}" exhausted ${MAX_TASK_ATTEMPTS} attempts; escalate instead of retrying.`);
+      // Old logs did not retain attempt records or session binding. Preserve
+      // their exact transition while all new execution uses task_attempt_started.
       commit(event.taskId, prior, { status: "in_progress", attempts });
       break;
     }
@@ -1890,7 +1999,101 @@ export function nextKanbanEvent<B extends KanbanEventBody>(
 }
 
 // ============================================================================
-// 9. Gating, planning, snapshot
+// 9. Facts-only board projection
+// ============================================================================
+
+export type BoardViewColumn = "backlog" | "ready" | "running" | "review" | "done";
+
+export interface BoardViewCard {
+  readonly taskId: string;
+  readonly title: string;
+  readonly currentAttempt?: string;
+  readonly sessionId?: string;
+  readonly modelId?: string;
+  readonly score?: number;
+  readonly status: KanbanStatus;
+  readonly startedAt?: string;
+  readonly lastEventAt: string;
+  readonly costUsd?: number;
+  readonly lastNarrationLine?: string;
+}
+
+export interface BoardView {
+  readonly columns: Readonly<Record<BoardViewColumn, readonly string[]>>;
+  readonly cards: Readonly<Record<string, BoardViewCard>>;
+}
+
+const BOARD_VIEW_EVENT_IDS = Symbol("board-view-event-ids");
+type BoardViewWithIds = BoardView & { readonly [BOARD_VIEW_EVENT_IDS]?: ReadonlySet<string> };
+
+function boardColumnForStatus(status: KanbanStatus): BoardViewColumn {
+  if (status === "in_progress") return "running";
+  if (status === "assigned") return "ready";
+  if (status === "blocked" || status === "needs_intervention") return "backlog";
+  return status;
+}
+
+function boardColumns(cards: Readonly<Record<string, BoardViewCard>>): BoardView["columns"] {
+  const columns: Record<BoardViewColumn, string[]> = { backlog: [], ready: [], running: [], review: [], done: [] };
+  for (const card of Object.values(cards)) columns[boardColumnForStatus(card.status)].push(card.taskId);
+  return columns;
+}
+
+function withBoardEventIds(view: BoardView, ids: ReadonlySet<string>): BoardView {
+  Object.defineProperty(view, BOARD_VIEW_EVENT_IDS, { value: ids, enumerable: false, configurable: false, writable: false });
+  return view;
+}
+
+function updateProjectedCard(card: BoardViewCard, event: KanbanEvent): BoardViewCard {
+  let patch: Partial<BoardViewCard> = {};
+  switch (event.type) {
+    case "task_ready": patch = { status: "ready" }; break;
+    case "task_blocked": patch = { status: "blocked" }; break;
+    case "task_escalated": patch = { status: "needs_intervention" }; break;
+    case "task_intervention_resolved": patch = { status: event.resolution === "requeue" ? "ready" : event.resolution === "backlog" ? "backlog" : "blocked" }; break;
+    case "task_assigned": patch = { status: "assigned", modelId: event.assignment.cardId, score: event.assignment.total }; break;
+    case "task_unassigned": patch = { status: "ready", modelId: undefined, score: undefined }; break;
+    case "task_session_bound": patch = { sessionId: event.sessionId }; break;
+    case "task_attempt_started": patch = { status: "in_progress", currentAttempt: event.attemptId, startedAt: event.at }; break;
+    case "task_attempt_completed": patch = { status: "review", costUsd: event.costUsd }; break;
+    case "task_attempt_failed": patch = { status: "blocked", costUsd: event.costUsd }; break;
+    case "task_started": patch = { status: "in_progress", currentAttempt: event.attemptId, startedAt: event.at }; break;
+    case "task_progress": patch = { lastNarrationLine: event.note }; break;
+    case "task_submitted_for_review": patch = { status: "review" }; break;
+    case "task_review_rejected": patch = { status: "assigned" }; break;
+    case "task_completed": patch = { status: "done" }; break;
+    default: break;
+  }
+  return { ...card, ...patch, lastEventAt: event.at };
+}
+
+/** Apply one appended fact without consulting live board or provider state. */
+export function applyEventToBoardView(view: BoardView, event: KanbanEvent): BoardView {
+  const knownIds = (view as BoardViewWithIds)[BOARD_VIEW_EVENT_IDS] ?? new Set<string>();
+  if (knownIds.has(event.id)) return view;
+  const ids = new Set(knownIds);
+  ids.add(event.id);
+  const taskId = "taskId" in event && typeof event.taskId === "string" ? event.taskId : undefined;
+  if (!taskId) return withBoardEventIds({ columns: view.columns, cards: view.cards }, ids);
+
+  const cards: Record<string, BoardViewCard> = { ...view.cards };
+  if (event.type === "task_created") {
+    cards[taskId] = { taskId, title: event.task.title, status: "backlog", lastEventAt: event.at };
+  } else if (cards[taskId]) {
+    cards[taskId] = updateProjectedCard(cards[taskId], event);
+  }
+  return withBoardEventIds({ columns: boardColumns(cards), cards }, ids);
+}
+
+/** Fold the complete UI read model from persisted facts alone. */
+export function projectBoardView(events: readonly KanbanEvent[]): BoardView {
+  let view = withBoardEventIds({ columns: { backlog: [], ready: [], running: [], review: [], done: [] }, cards: {} }, new Set());
+  for (const event of events) view = applyEventToBoardView(view, event);
+  return view;
+}
+
+// ============================================================================
+// 10. Gating, planning, snapshot
 // ============================================================================
 
 function compareTasks(a: KanbanTaskState, b: KanbanTaskState): number {

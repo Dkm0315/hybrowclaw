@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MODEL_CARD_SEED, snapshotKanbanBoard, type KanbanEvent, type KanbanTask } from "@musterhq/core";
+import { MODEL_CARD_SEED, projectBoardView, snapshotKanbanBoard, type KanbanEvent, type KanbanTask } from "@musterhq/core";
 import {
   authenticatedModelCards,
   boardEventsPath,
@@ -13,6 +13,7 @@ import {
   parseBoardCliCommand,
   parseChatOrchestrationCommand,
   parseMissionPlan,
+  readBoardEvents,
   parseOrchestrationInvocation,
   renderBoardView,
   renderMissionSummaryCard,
@@ -472,6 +473,40 @@ test("board state is an event log, and reopening a session replays it byte-for-b
   }));
   assert.equal((await readFile(boardEventsPath("wave", cwd), "utf8")).split("\n").filter(Boolean).length, 3);
   assert.deepEqual(snapshotKanbanBoard(reopened.state()), written);
+});
+
+test("JSONL reload produces the identical facts projection", async () => {
+  const cwd = await workspace();
+  await runMissionCommand("harden the ragbot API", harness(cwd, { plan: async () => TWO_TASK_PLAN }).deps);
+  const rawEvents = (await readFile(boardEventsPath("main", cwd), "utf8"))
+    .split("\n").filter(Boolean).map((line) => JSON.parse(line) as KanbanEvent);
+  const reloadedEvents = await readBoardEvents("main", cwd);
+  assert.deepStrictEqual(reloadedEvents, rawEvents);
+  assert.deepStrictEqual(projectBoardView(reloadedEvents), projectBoardView(rawEvents));
+});
+
+test("attempt start is durable before provider spawn and outcomes append explicit attempt facts", async () => {
+  const cwd = await workspace();
+  let observedBeforeSpawn: readonly KanbanEvent[] = [];
+  const spawnInputs: MissionTaskRunInput[] = [];
+  const { deps } = harness(cwd, {
+    plan: async () => TWO_TASK_PLAN,
+    execute: async (input) => {
+      spawnInputs.push(input);
+      observedBeforeSpawn = await readBoardEvents("main", cwd);
+      return { ok: input.task.id !== "t1", summary: input.task.id === "t1" ? "provider exited 2" : "done", runId: `run-${input.task.id}` };
+    },
+  });
+  await runMissionCommand("harden", deps);
+
+  assert.equal(observedBeforeSpawn.at(-1)?.type, "task_attempt_started");
+  const events = await readBoardEvents("main", cwd);
+  const t1Start = events.findIndex((event) => event.type === "task_attempt_started" && event.taskId === "t1");
+  const t1Failure = events.findIndex((event) => event.type === "task_attempt_failed" && event.taskId === "t1");
+  assert.ok(t1Start >= 0 && t1Failure > t1Start);
+  assert.ok(events.some((event) => event.type === "task_session_bound" && event.taskId === "t1"));
+  assert.ok(spawnInputs.length > 0 && spawnInputs.every((input) => input.attemptId && input.sessionId));
+  assert.equal(events.some((event) => event.type === "task_attempt_completed" && event.taskId === "t1"), false);
 });
 
 test("a repeated event id fails loudly instead of writing a line replay will ignore", async () => {

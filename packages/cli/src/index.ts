@@ -2,6 +2,7 @@
 import { printBanner, renderBanner } from "./banner.js";
 import { buildCompactHeaderLines, createMusterAutocompleteProvider, createNarrationPainter, formatAssistantBlock, formatCostChip, formatStatusLine, formatToolLine, formatUserLine, formatWorkingIndicator, routeEngineLine, runMusterChatTui, type MusterChatSink, type MusterCompletionCatalog, type PickerOption, type ReasoningMode } from "./chat-tui.js";
 import { startLiveDiffFeed } from "./live-diff.js";
+import { LiveFileTurnAccumulator, renderLiveFilePlain } from "./live-file-view.js";
 import {
   BACKEND_CARD_PROVIDERS,
   parseBoardCliCommand,
@@ -1236,6 +1237,8 @@ interface ChatState {
   startedAt?: number;
   /** True only while a TTY composer is available for one-key suggestions. */
   interactive?: boolean;
+  /** Observer-derived cumulative full-file model for the most recent turn. */
+  liveFileTurn?: LiveFileTurnAccumulator;
 }
 
 interface ChatSessionUsage {
@@ -1278,6 +1281,7 @@ const CHAT_COMMANDS: readonly ChatCommandDef[] = [
   { name: "runtime", usage: "/runtime [id]", description: "list or switch active runtime" },
   { name: "speed", usage: "/speed [session|fast]", description: "choose full memory mode or low-latency warm native mode" },
   { name: "live-diff", usage: "/live-diff [on|off]", description: "show inline file diffs live while a turn edits files", aliases: ["livediff", "diffs"] },
+  { name: "diff", usage: "/diff", description: "toggle the current turn's full-file live view" },
   { name: "tasks", usage: "/tasks [\"<goal>\" | why <taskId> | assign <taskId> <cardId>]", description: "plan, inspect, explain, or assign parallel tasks and agents" },
   { name: "reasoning", usage: "/reasoning [auto|low|medium|high|compact|full]", description: "set the reasoning spend tier, or the summary density", aliases: ["think"] },
   { name: "senses", usage: "/senses", description: "show codex-native computer-use, browser, and local endpoint status" },
@@ -1480,6 +1484,7 @@ ${CHAT_COMMANDS.map((command) => `  ${command.usage.padEnd(21)} ${command.descri
 
 Shortcuts:
   Tab                  complete slash commands, toolsets, and session names
+  Ctrl+D               toggle the current turn's full-file live view
   @agent-name <task>   route this turn with agent id agent-name
   End a line with \\   continue multiline input.`);
 }
@@ -1507,7 +1512,10 @@ async function interactiveChat(state: ChatState): Promise<void> {
       pluginReuseProviders: chatReuseProviderOptions,
       integrations: chatIntegrationOptions,
       integrationWorkflows: chatIntegrationWorkflowOptions,
-      statusLine: () => chatStatusLine(state),
+      // Idle chrome is ONE header line; the status row exists only while a
+      // turn runs (startTuiWorkingStatus paints it, the turn's end clears it).
+      // A permanently ticking idle timer was the reported clutter.
+      statusLine: async () => "",
       onInterrupt: () => interruptChatTurn(),
       onDecisionKey: (data, sink) => handleChatDecisionKey(data, state, sink),
       onSubmit: async (text, sink) => {
@@ -1627,6 +1635,24 @@ async function initializeChatComposerState(state: ChatState): Promise<void> {
 
 function activeChatProvider(state: ChatState): ModelProvider {
   return state.activeProvider ?? modelProvider(state.model) ?? (state.runtime === "claude-code" ? "claude" : "codex");
+}
+
+/**
+ * The runtime to name so the plan honors state.model — but ONLY for managed
+ * backends. Resolution mirrors the run's own provider resolution: an explicit
+ * state.provider wins, else the default runtime's provider. Non-managed kinds
+ * (openai-compatible stubs, self-hosted routes) return undefined and keep the
+ * default plan path.
+ */
+function managedRuntimeForChat(
+  config: Awaited<ReturnType<typeof loadConfig>>,
+  state: ChatState,
+): string | undefined {
+  const providerId = state.provider ?? config.runtimes[config.routing.defaultRuntime]?.provider;
+  const kind = providerId ? config.providers[providerId]?.kind : undefined;
+  if (kind === "codex-cli") return "codex";
+  if (activeChatProvider(state) === "claude" || kind === "anthropic") return "claude-code";
+  return undefined;
 }
 
 function applyChatEffort(
@@ -2133,6 +2159,10 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
     case "live-diff":
       toggleChatLiveDiff(args, state);
       return true;
+    case "diff":
+      if (state.statusSink) state.statusSink.toggleLiveDiff();
+      else for (const line of renderLiveFilePlain(state.liveFileTurn ?? new LiveFileTurnAccumulator())) console.log(line);
+      return true;
     case "tasks":
     case "mission":
     case "board":
@@ -2168,6 +2198,26 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
       return true;
     case "codex": {
       const [sub, ...restArgs] = args.split(/\s+/).filter(Boolean);
+      if (!sub) {
+        // No human remembers a thread id. Bare /codex IS the picker: recent
+        // threads as readable rows (this directory's first), pick by number.
+        try {
+          const scan = await discoverCodexSessions({ limit: 60 });
+          const here = scan.sessions.filter((item) => item.cwd === process.cwd());
+          const rows = [...here, ...scan.sessions.filter((item) => item.cwd !== process.cwd())].slice(0, 8);
+          if (!rows.length) {
+            console.log(color("No Codex threads found on this machine.", "dim"));
+            return true;
+          }
+          printChatPanel("Continue a Codex conversation", rows.map((item, index) =>
+            `${color(`${index + 1}.`, "accent")} ${codexProjectLabel(item).padEnd(22)} ${color(formatCodexAge(item.lastActivityAt).padEnd(6), "dim")} ${color((item.firstUserMessage ?? "").replace(/\s+/g, " ").slice(0, 56), "dim")}`));
+          console.log(color("Type a number to continue that conversation here.", "dim"));
+          state.pendingMenu = { kind: "commands", options: rows.map((item) => `codex resume ${item.threadId.slice(0, 12)}`) };
+        } catch (error) {
+          console.log(color(error instanceof Error ? error.message : String(error), "yellow"));
+        }
+        return true;
+      }
       if (sub === "sessions" || sub === "list") {
         await codexSessionsCommand(restArgs.length === 1 && /^\d+$/.test(restArgs[0]!) ? ["--limit", restArgs[0]!] : restArgs);
         return true;
@@ -2340,7 +2390,7 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
 }
 
 /** The commands a daily driver actually reaches for; the rest live behind /help all. */
-const CHAT_DAILY_COMMANDS = ["mission", "board", "codex", "tools", "mcp", "plugins", "model", "reasoning", "sessions", "resume", "memory", "live-diff", "exit"] as const;
+const CHAT_DAILY_COMMANDS = ["mission", "board", "codex", "tools", "mcp", "plugins", "model", "reasoning", "sessions", "resume", "memory", "diff", "live-diff", "exit"] as const;
 
 /** Same catalog, dailies first — the ordering every completion surface uses. */
 function chatCommandsDailyFirst(): typeof CHAT_COMMANDS {
@@ -2369,7 +2419,7 @@ function printChatShortcuts(): void {
     `${color("Tab".padEnd(18), "highlight")} complete slash commands, toolsets, and session names`,
     `${color("@agent <task>".padEnd(18), "highlight")} route a turn with an agent id`,
     `${color("\\ at line end".padEnd(18), "highlight")} continue multiline input`,
-    `${color("Ctrl+D".padEnd(18), "highlight")} exit on an empty line`,
+    `${color("Ctrl+D".padEnd(18), "highlight")} toggle the current turn's full-file live view`,
   ]);
 }
 
@@ -2709,10 +2759,23 @@ async function runChatTurn(text: string, state: ChatState, options: { timeoutMs?
   // The turn SHOWS its own edits: every observed workspace patch becomes a diff
   // card in the transcript while the run streams (docs/STRATEGY_V2.md §9).
   const workspaceCwd = chatWorkspaceCwd(state);
+  const liveFileTurn = new LiveFileTurnAccumulator();
+  state.liveFileTurn = liveFileTurn;
+  state.statusSink?.setLiveDiffTurn(liveFileTurn);
   const liveDiff = await startLiveDiffFeed({
     cwd: workspaceCwd,
     emit: (line) => emitChatLine(state, line),
     enabled: liveDiffEnabled(state),
+    onPatch: (event) => {
+      let currentContent = "";
+      try {
+        currentContent = readFileSync(resolve(event.root, event.path), "utf8");
+      } catch {
+        // A deletion has no current file; its after-state is the empty document.
+      }
+      liveFileTurn.add(event, currentContent);
+      state.statusSink?.updateLiveDiff(liveFileTurn);
+    },
   });
   // Consumed by THIS turn only: once the run completes, executeRun has stored a
   // session handle for the conversation and every later turn resumes from that.
@@ -2737,7 +2800,13 @@ async function runChatTurn(text: string, state: ChatState, options: { timeoutMs?
       onReasoningDelta: painter ? (chunk) => painter.reasoning(chunk) : undefined,
       prompt: agentId ? `Agent route: ${agentId}\n\n${prompt}` : prompt,
       turnContext: state.pendingContinuityContext,
-      runtime: state.runtime,
+      // The managed-runtime plan branch is the ONLY one that honors an explicit
+      // model/provider (verified live: without it, --model was silently ignored
+      // and a stale workspace route billed a different model than the header
+      // showed). Name the runtime ONLY for genuinely managed backends — an
+      // openai-compatible or other provider must keep the default plan path,
+      // or a stub/self-hosted route would spawn the real codex binary.
+      runtime: state.runtime ?? managedRuntimeForChat(loadedConfig, state),
       provider: state.provider,
       model: state.model,
       scopes: state.scopes.length ? state.scopes : undefined,
@@ -2818,6 +2887,13 @@ async function interruptChatTurn(): Promise<boolean> {
     interruptActiveCodexTurn("cli-chat").catch(() => false),
     interruptClaudeSubprocesses(),
   ]);
+  if (codex) {
+    // An interrupted app-server turn can leave the warm thread holding its
+    // writer lock ("already has an active writer" on the next turn — observed
+    // live). Drop the warm sessions so the next turn opens a clean thread; the
+    // one-time cold start is cheaper than a wedged conversation.
+    clearCodexAppServerSessions("cli-chat");
+  }
   return codex || claude;
 }
 
@@ -2999,6 +3075,23 @@ function buildOrchestrationDeps(input: {
         skipAgentRules: true,
       });
       return outcome.episode.responseText ?? "";
+    },
+    taskSessionId(task): string {
+      const store = openSessionStore(input.cwd);
+      try {
+        const parent = store.findOrCreateSession({
+          channel: "cli-chat", peer: input.sessionName, title: input.sessionName, workspaceCwd: input.cwd,
+        });
+        return store.findOrCreateSession({
+          channel: "cli-task",
+          peer: `${input.sessionName}:${task.id}`,
+          title: task.title,
+          parentId: parent.id,
+          workspaceCwd: input.cwd,
+        }).id;
+      } finally {
+        store.close();
+      }
     },
     async execute(task: MissionTaskRunInput): Promise<MissionTaskRunResult> {
       await ensureDefaultConfig(input.cwd);

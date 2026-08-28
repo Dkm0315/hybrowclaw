@@ -231,6 +231,8 @@ export interface LiveDiffFeedOptions {
   readonly observerOptions?: Partial<Omit<WorkspaceObserverOptions, "root" | "onPatch">>;
   /** Seam for tests; defaults to the real createWorkspaceObserver. */
   readonly createObserver?: (options: WorkspaceObserverOptions) => WorkspaceObserver;
+  /** Parallel consumer for Canvas state; failures never affect cards or turns. */
+  readonly onPatch?: (event: WorkspacePatchEvent) => void;
 }
 
 export interface LiveDiffFeed {
@@ -276,6 +278,11 @@ export async function startLiveDiffFeed(options: LiveDiffFeedOptions): Promise<L
     // consult observerOptions.ignore.
     if (isLiveDiffInternalPath(event.path) || isLiveDiffInternalPath(event.previousPath)) return;
     try {
+      try {
+        options.onPatch?.(event);
+      } catch {
+        /* Canvas is additive; its accumulator cannot break transcript cards. */
+      }
       const stat = countDiffStat(event.diff);
       touched.add(event.path);
       additions += stat.additions;

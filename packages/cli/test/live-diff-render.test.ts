@@ -250,6 +250,26 @@ test("the feed streams cards live and closes with a summary", async () => {
   assert.deepEqual(fake.control().calls, ["start", "flush", "stop"], "flush precedes stop so tail edits still render");
 });
 
+test("the feed fans each observer event to Canvas without letting that consumer interfere", async () => {
+  const fake = fakeObserver();
+  const canvas: WorkspacePatchEvent[] = [];
+  const lines: string[] = [];
+  await startLiveDiffFeed({
+    cwd: "/repo",
+    emit: (line) => lines.push(line),
+    color: false,
+    createObserver: fake.create,
+    onPatch: (event) => {
+      canvas.push(event);
+      throw new Error("Canvas repaint failed");
+    },
+  });
+  const observed = patchEvent({ diff: MODIFY_DIFF });
+  fake.control().options.onPatch(observed);
+  assert.deepEqual(canvas, [observed]);
+  assert.match(lines.join("\n"), /Edit\(src\/run\.ts\)/, "normal transcript card survives Canvas failure");
+});
+
 test("a quiet turn stops the observer without printing a summary", async () => {
   const lines: string[] = [];
   const fake = fakeObserver();

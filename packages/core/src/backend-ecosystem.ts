@@ -52,6 +52,35 @@ export interface InheritedPlugin {
   readonly status: InheritedStatus;
   readonly detail?: string;
   readonly guidance?: string;
+  /** The name the Codex app shows for this plugin (manifest interface.displayName). */
+  readonly displayName?: string;
+  /** The one-line description the Codex app shows (manifest interface.shortDescription). */
+  readonly shortDescription?: string;
+}
+
+/**
+ * Read each plugin's own UI contract — `.codex-plugin/plugin.json` `interface`
+ * block — so muster shows plugins exactly as the Codex app does: by their own
+ * displayName and shortDescription, never by muster-invented labels. Missing or
+ * malformed manifests degrade to the bare id, never to an error.
+ */
+export async function enrichCodexPluginInterfaces(plugins: readonly InheritedPlugin[]): Promise<InheritedPlugin[]> {
+  return Promise.all(plugins.map(async (plugin) => {
+    if (!plugin.path) return plugin;
+    try {
+      const raw = await readFile(`${plugin.path}/.codex-plugin/plugin.json`, "utf8");
+      const manifest = JSON.parse(raw) as { interface?: { displayName?: string; shortDescription?: string } };
+      const displayName = manifest.interface?.displayName?.trim();
+      const shortDescription = manifest.interface?.shortDescription?.trim();
+      return {
+        ...plugin,
+        ...(displayName ? { displayName } : {}),
+        ...(shortDescription ? { shortDescription } : {}),
+      };
+    } catch {
+      return plugin;
+    }
+  }));
 }
 
 export interface ComputerUseStatus {
@@ -374,7 +403,9 @@ export async function discoverBackendEcosystem(
   const pluginPolicy = parseCodexPluginPolicy(configToml);
   const codexMcp = await resolveReachability(parseCodexMcpList(mcpJson), { ...options, probeTimeoutMs });
   const claudeMcp = await resolveReachability(parseClaudeMcpServers(claudeJson), { ...options, probeTimeoutMs });
-  const codexPlugins = parseCodexPluginList(pluginText).map((plugin) => applyPluginPolicy(plugin, pluginPolicy));
+  const codexPlugins = await enrichCodexPluginInterfaces(
+    parseCodexPluginList(pluginText).map((plugin) => applyPluginPolicy(plugin, pluginPolicy)),
+  );
 
   return {
     codex: {
