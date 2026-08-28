@@ -122,25 +122,25 @@ const TWO_TASK_PLAN = JSON.stringify({
 /* ------------------------------ command parsing ------------------------------ */
 
 test("chat command parsing covers every orchestration verb, quoted or bare", () => {
-  assert.deepEqual(parseChatOrchestrationCommand('/mission "harden the ragbot API"'), { kind: "mission", goal: "harden the ragbot API" });
-  assert.deepEqual(parseChatOrchestrationCommand("/mission harden the ragbot API"), { kind: "mission", goal: "harden the ragbot API" });
-  assert.deepEqual(parseChatOrchestrationCommand("/mission “smart quoted goal”"), { kind: "mission", goal: "smart quoted goal" });
-  assert.deepEqual(parseChatOrchestrationCommand("/board"), { kind: "board" });
-  assert.deepEqual(parseChatOrchestrationCommand("/why t4"), { kind: "why", taskId: "t4" });
-  assert.deepEqual(parseChatOrchestrationCommand("/assign t4 claude-code/claude-fable-5"), {
+  assert.deepEqual(parseChatOrchestrationCommand('/tasks "harden the ragbot API"'), { kind: "mission", goal: "harden the ragbot API" });
+  assert.deepEqual(parseChatOrchestrationCommand("/tasks harden the ragbot API"), { kind: "mission", goal: "harden the ragbot API" });
+  assert.deepEqual(parseChatOrchestrationCommand("/tasks “smart quoted goal”"), { kind: "mission", goal: "smart quoted goal" });
+  assert.deepEqual(parseChatOrchestrationCommand("/tasks"), { kind: "board" });
+  assert.deepEqual(parseChatOrchestrationCommand("/tasks why t4"), { kind: "why", taskId: "t4" });
+  assert.deepEqual(parseChatOrchestrationCommand("/tasks assign t4 claude-code/claude-fable-5"), {
     kind: "assign", taskId: "t4", cardId: "claude-code/claude-fable-5",
   });
-  // A bare verb explains itself rather than guessing an argument.
-  assert.deepEqual(parseChatOrchestrationCommand("/mission"), { kind: "usage", usage: 'Usage: /mission "<goal>" — plan a goal into board tasks and run them' });
-  assert.equal(parseChatOrchestrationCommand("/why")!.kind, "usage");
-  assert.equal(parseChatOrchestrationCommand("/assign t4")!.kind, "usage");
+  assert.equal(parseChatOrchestrationCommand("/tasks why")!.kind, "usage");
+  assert.equal(parseChatOrchestrationCommand("/tasks assign t4")!.kind, "usage");
+  // Compatibility law: /mission remains a hidden working alias.
+  assert.deepEqual(parseChatOrchestrationCommand('/mission "legacy goal"'), { kind: "mission", goal: "legacy goal" });
   // Non-orchestration input is left entirely alone for the existing dispatcher.
   assert.equal(parseChatOrchestrationCommand("/status"), undefined);
   assert.equal(parseChatOrchestrationCommand("just a normal question"), undefined);
   assert.equal(parseOrchestrationInvocation("status", ""), undefined);
 });
 
-test("the CLI door maps muster board onto the same command union", () => {
+test("the CLI door maps muster tasks onto the same command union", () => {
   assert.deepEqual(parseBoardCliCommand([]), { kind: "board" });
   assert.deepEqual(parseBoardCliCommand(["list"]), { kind: "board" });
   assert.deepEqual(parseBoardCliCommand(["why", "t2"]), { kind: "why", taskId: "t2" });
@@ -264,12 +264,12 @@ test("the mission summary card totals the board without inventing a price", () =
       { taskId: "t3", title: "docs", status: "backlog" },
     ],
   }, { color: false })), [
-    "── mission board.main · harden the ragbot API",
+    "── tasks tasks.main · harden the ragbot API",
     "   3 task(s) · 1 done · 1 stalled · $0.19 · 04:12",
     "   ● t1   rate-limiter                       claude-code/claude-fable-5 (768)   $0.04",
     "   ◼ t2   tests                              codex-cli/gpt-5.5 (712)            cost unpriced",
     "   · t3   docs                               unrouted                           cost unpriced",
-    "   /board for the columns · /why <taskId> for the gate table",
+    "   /tasks for the list · /tasks why <taskId> for the gate table",
   ]);
 });
 
@@ -291,8 +291,8 @@ test("an empty board says so instead of rendering blank columns", async () => {
   const snapshot = await runBoardCommand(deps);
   assert.equal(snapshot.atSequence, 0);
   assert.deepEqual(lines, [
-    "── board board.main · seq 0 · 0 task(s)",
-    '   no tasks yet — /mission "<goal>" opens one',
+    "── tasks tasks.main · seq 0 · 0 task(s)",
+    '   no tasks yet — /tasks "<goal>" opens one',
   ]);
 });
 
@@ -313,13 +313,13 @@ test("a mission plans, routes per task, streams typed cards, and summarizes", as
   assert.equal(executed[1]!.cardId, CLAUDE_CARD);
 
   const text = lines.join("\n");
-  assert.match(text, /^── mission board\.main · codex authenticated · claude on PATH$/m);
+  assert.match(text, /^── tasks tasks\.main · codex authenticated · claude on PATH$/m);
   assert.match(text, new RegExp(`^◔ t1 rate-limiter → (${escapeRegExp(CLAUDE_CARD)}|${escapeRegExp(CODEX_CARD)}) \\(\\d+\\)$`, "m"));
   assert.match(text, /^ {2}⎿ t1 editing t1\/limiter\.ts$/m);
   assert.match(text, /^● t1 done · 14 tests pass · \$0\.04$/m);
   assert.match(text, new RegExp(`^◔ t2 tests → ${escapeRegExp(CLAUDE_CARD)} \\(\\d+\\)$`, "m"));
   assert.match(text, /^● t2 done · 14 tests pass · \$0\.04$/m);
-  assert.match(text, /^── mission board\.main · harden the ragbot API$/m);
+  assert.match(text, /^── tasks tasks\.main · harden the ragbot API$/m);
   assert.match(text, /^ {3}2 task\(s\) · 2 done · 0 stalled · \$0\.08 · 00:00$/m);
   assert.equal(outcome.costUsd, 0.08);
 
@@ -335,7 +335,7 @@ test("the board renders the columns, model and score the mission recorded", asyn
   const reader = harness(cwd, {});
   await runBoardCommand(reader.deps);
   const rendered = reader.lines;
-  assert.match(rendered[0]!, /^── board board\.main · seq \d+ · 2 task\(s\)$/);
+  assert.match(rendered[0]!, /^── tasks tasks\.main · seq \d+ · 2 task\(s\)$/);
   assert.equal(rendered[1], "   DONE (2)");
   // Columns are fixed-width so the model + score line up down the board.
   assert.match(rendered[2]!, new RegExp(`^ {5}● t1 {3}rate-limiter {21}high {5}(${escapeRegExp(CLAUDE_CARD)}|${escapeRegExp(CODEX_CARD)}) \\(\\d+\\)$`));
@@ -350,7 +350,7 @@ test("one authenticated backend still routes, and /why shows the other one's blo
 
   assert.ok(outcome);
   assert.deepEqual(outcome.done, ["t1", "t2"]);
-  assert.match(lines.join("\n"), /^── mission board\.main · codex unavailable · claude on PATH$/m);
+  assert.match(lines.join("\n"), /^── tasks tasks\.main · codex unavailable · claude on PATH$/m);
 
   const reader = harness(cwd, {});
   const explanation = await runWhyCommand("t1", reader.deps);
@@ -482,7 +482,7 @@ test("a repeated event id fails loudly instead of writing a line replay will ign
   });
   await assert.rejects(
     store.commit({ actorId: "o", actorKind: "system", summary: "create" }, { type: "task_created", taskId: "t1", task: sampleTask("t1") }),
-    /event ids must be unique per board/,
+    /event ids must be unique per task set/,
   );
   // The log still replays to exactly what the caller was shown.
   assert.equal((await readFile(boardEventsPath("dup", cwd), "utf8")).split("\n").filter(Boolean).length, 1);
@@ -622,10 +622,10 @@ test("/assign refuses what the reducer would reject, and says which gate blocked
 
   const unknown = harness(cwd, {});
   assert.equal(await runAssignCommand("t9", CLAUDE_CARD, unknown.deps), false);
-  assert.match(unknown.lines.join("\n"), /no task "t9" on board board\.main/);
+  assert.match(unknown.lines.join("\n"), /no task "t9" in tasks\.main/);
   const unknownCard = harness(cwd, {});
   assert.equal(await runAssignCommand("t1", "openai/gpt-5.4", unknownCard.deps), false);
-  assert.match(unknownCard.lines.join("\n"), /card "openai\/gpt-5\.4" is not registered on this board — known: /);
+  assert.match(unknownCard.lines.join("\n"), /card "openai\/gpt-5\.4" is not registered for these tasks — known: /);
 });
 
 test("/assign will not rewrite work already in flight", async () => {
@@ -648,6 +648,6 @@ test("/why on an unknown task points at /board instead of guessing", async () =>
   const cwd = await workspace();
   const { deps, lines } = harness(cwd, {});
   assert.equal(await runWhyCommand("t42", deps), undefined);
-  assert.match(lines.join("\n"), /no task "t42" on board board\.main — \/board lists what exists/);
+  assert.match(lines.join("\n"), /no task "t42" in tasks\.main — \/tasks lists what exists/);
   assert.equal(explainAssignment((await openBoardStore({ sessionName: "main", cwd })).state(), "t42"), undefined);
 });

@@ -8,10 +8,10 @@
  * and it opens INSIDE the conversation (docs/PRODUCT_MODES.md — "a mode
  * renders events; it never invents state"), not in a separate app:
  *
- *   /mission "<goal>"        plan → select → execute → stream typed cards
- *   /board                   the columns, with model + score per assignment
- *   /why <taskId>            the full 9-gate table behind one assignment
- *   /assign <taskId> <card>  manual override, recorded as an event
+ *   /tasks "<goal>"                 plan → select → execute → stream typed cards
+ *   /tasks                          the columns, with model + score per assignment
+ *   /tasks why <taskId>             the full 9-gate table behind one assignment
+ *   /tasks assign <taskId> <card>   manual override, recorded as an event
  *
  * FOUR RULES, enforced everywhere below:
  *
@@ -27,7 +27,7 @@
  * 3. SELECTION RUNS AGAINST AUTHENTICATED REALITY. The 20-card seed is filtered
  *    to backends this machine can actually drive (`codex login status`, `claude`
  *    on PATH) before a single gate is evaluated. One backend → selection still
- *    runs and `/why` shows which gates the others died at. Zero backends → the
+ *    runs and `/tasks why` shows which gates the others died at. Zero backends → the
  *    tasks are escalated to `needs_intervention` rather than pretending.
  *
  * 4. THE MISSION NARRATES WHILE IT RUNS. Assignment, live narration and
@@ -98,6 +98,10 @@ function clip(value: string, width: number): string {
   return flat.length <= width ? flat : `${flat.slice(0, Math.max(0, width - 1))}…`;
 }
 
+function displayTaskSetId(boardId: string): string {
+  return boardId.replace(/^board\./, "tasks.");
+}
+
 // ============================================================================
 // 1. Command parsing
 // ============================================================================
@@ -110,14 +114,14 @@ export type OrchestrationCommand =
   | { readonly kind: "usage"; readonly usage: string };
 
 /** Command names this module owns, in catalog order. */
-export const ORCHESTRATION_COMMAND_NAMES: readonly string[] = ["mission", "board", "why", "assign"];
+export const ORCHESTRATION_COMMAND_NAMES: readonly string[] = ["tasks"];
 
-const MISSION_USAGE = 'Usage: /mission "<goal>" — plan a goal into board tasks and run them';
-const WHY_USAGE = "Usage: /why <taskId> — show the 9-gate table behind that assignment";
-const ASSIGN_USAGE = "Usage: /assign <taskId> <cardId> — override the routed model (recorded as user-override)";
+const TASKS_USAGE = 'Usage: /tasks "<goal>" | /tasks why <taskId> | /tasks assign <taskId> <cardId>';
+const WHY_USAGE = "Usage: /tasks why <taskId> — show the 9-gate table behind that assignment";
+const ASSIGN_USAGE = "Usage: /tasks assign <taskId> <cardId> — override the routed model (recorded as user-override)";
 
 /**
- * Quotes are stripped, not required: `/mission "ship X"` and `/mission ship X`
+ * Quotes are stripped, not required: `/tasks "ship X"` and `/tasks ship X`
  * mean the same thing, and a smart-quoted paste from a chat client works too.
  */
 function unquote(value: string): string {
@@ -145,9 +149,19 @@ export function parseChatOrchestrationCommand(text: string): OrchestrationComman
 export function parseOrchestrationInvocation(name: string, args: string): OrchestrationCommand | undefined {
   const rest = args.trim();
   switch (name) {
+    case "tasks": {
+      if (!rest) return { kind: "board" };
+      const [action, ...parts] = rest.split(/\s+/);
+      if (action === "why") return parts[0] ? { kind: "why", taskId: parts[0] } : { kind: "usage", usage: WHY_USAGE };
+      if (action === "assign") return parts.length >= 2
+        ? { kind: "assign", taskId: parts[0]!, cardId: parts.slice(1).join(" ") }
+        : { kind: "usage", usage: ASSIGN_USAGE };
+      const goal = unquote(rest);
+      return goal ? { kind: "mission", goal } : { kind: "usage", usage: TASKS_USAGE };
+    }
     case "mission": {
       const goal = unquote(rest);
-      return goal ? { kind: "mission", goal } : { kind: "usage", usage: MISSION_USAGE };
+      return goal ? { kind: "mission", goal } : { kind: "usage", usage: TASKS_USAGE };
     }
     case "board":
       return { kind: "board" };
@@ -166,9 +180,9 @@ export function parseOrchestrationInvocation(name: string, args: string): Orches
   }
 }
 
-export const BOARD_CLI_USAGE = "Usage: muster board list | muster board why <taskId> | muster board assign <taskId> <cardId>";
+export const BOARD_CLI_USAGE = "Usage: muster tasks [list] | muster tasks why <taskId> | muster tasks assign <taskId> <cardId>";
 
-/** The non-chat door: `muster board <list|why|assign>` maps onto the same handlers. */
+/** The non-chat door: `muster tasks <list|why|assign>` maps onto the same handlers. */
 export function parseBoardCliCommand(args: readonly string[]): OrchestrationCommand {
   const [action, ...rest] = args.filter((entry) => !entry.startsWith("--"));
   if (action === undefined || action === "list" || action === "ls") return { kind: "board" };
@@ -229,7 +243,7 @@ export function buildMissionPlanPrompt(goal: string, cards: readonly ModelCard[]
     : [...KANBAN_CAPABILITIES];
   const strengths = [...new Set(cards.flatMap((card) => card.strengths))].sort();
   return [
-    "You are the mission planner for a governed agent board. Split the goal below into",
+    "You plan parallel tasks for governed agents. Split the goal below into",
     `${MISSION_MIN_TASKS} to ${MISSION_MAX_TASKS} independently executable tasks.`,
     "",
     `GOAL: ${goal}`,
@@ -476,7 +490,7 @@ export async function openBoardStore(options: OpenBoardOptions): Promise<BoardSt
       // colliding id is a caller bug (production ids are randomUUID-derived), and
       // it fails loudly here rather than corrupting the log.
       if (next === state) {
-        throw new Error(`Kanban event id "${event.id}" is already applied to board ${state.boardId}; event ids must be unique per board.`);
+        throw new Error(`Task event id "${event.id}" is already applied to ${displayTaskSetId(state.boardId)}; event ids must be unique per task set.`);
       }
       await mkdir(dirname(path), { recursive: true });
       await appendFile(path, `${JSON.stringify(event)}\n`);
@@ -579,7 +593,7 @@ export function renderMissionSummaryCard(input: MissionSummaryInput, options: Re
   const done = input.tasks.filter((task) => task.status === "done").length;
   const stalled = input.tasks.filter((task) => task.status === "blocked" || task.status === "needs_intervention").length;
   const lines: string[] = [
-    paint(`── mission ${input.boardId} · ${clip(input.goal, 56)}`, ACCENT_RGB, on),
+    paint(`── tasks ${displayTaskSetId(input.boardId)} · ${clip(input.goal, 56)}`, ACCENT_RGB, on),
     `   ${input.tasks.length} task(s) · ${done} done · ${stalled} stalled · ${formatUsd(input.costUsd)} · ${formatDuration(input.elapsedMs)}`,
   ];
   for (const task of input.tasks) {
@@ -587,7 +601,7 @@ export function renderMissionSummaryCard(input: MissionSummaryInput, options: Re
     const routed = task.cardId ? `${task.cardId}${task.total !== undefined ? ` (${task.total})` : ""}` : "unrouted";
     lines.push(`   ${glyph} ${padEnd(task.taskId, 4)} ${padEnd(clip(task.title, 34), 34)} ${padEnd(routed, 34)} ${formatUsd(task.costUsd)}`);
   }
-  lines.push(paint("   /board for the columns · /why <taskId> for the gate table", MUTED_RGB, on));
+  lines.push(paint("   /tasks for the list · /tasks why <taskId> for the gate table", MUTED_RGB, on));
   return lines;
 }
 
@@ -596,10 +610,10 @@ export function renderBoardView(snapshot: KanbanBoardSnapshot, options: RenderOp
   const on = colorEnabled(options.color);
   const total = Object.values(snapshot.counts).reduce((sum, count) => sum + count, 0);
   const lines: string[] = [
-    paint(`── board ${snapshot.boardId} · seq ${snapshot.atSequence} · ${total} task(s)`, ACCENT_RGB, on),
+    paint(`── tasks ${displayTaskSetId(snapshot.boardId)} · seq ${snapshot.atSequence} · ${total} task(s)`, ACCENT_RGB, on),
   ];
   if (total === 0) {
-    lines.push(paint('   no tasks yet — /mission "<goal>" opens one', MUTED_RGB, on));
+    lines.push(paint('   no tasks yet — /tasks "<goal>" opens one', MUTED_RGB, on));
     return lines;
   }
   for (const status of Object.keys(snapshot.columns) as KanbanStatus[]) {
@@ -687,7 +701,7 @@ export function renderNeedsInterventionCard(input: InterventionCardInput, option
 }
 
 // ============================================================================
-// 6. Explaining one assignment (the /why data path)
+// 6. Explaining one assignment (the /tasks why data path)
 // ============================================================================
 
 /**
@@ -740,18 +754,18 @@ export function explainAssignment(state: KanbanBoardState, taskId: string): Assi
         const gate = candidate.gates.find((entry_) => entry_.id === id);
         return gate ? { id, status: gate.status, summary: gate.summary } : { id, status: "unknown" as const, summary: "not evaluated (blocked earlier)" };
       })
-    : SELECTION_GATE_ORDER.map((id) => ({ id, status: "unknown" as const, summary: assignedCardId ? "assigned card is not registered on this board" : "no assignment yet" }));
+    : SELECTION_GATE_ORDER.map((id) => ({ id, status: "unknown" as const, summary: assignedCardId ? "assigned card is not registered for these tasks" : "no assignment yet" }));
 
   const overridden = entry.assignment?.rationale.startsWith("user-override") === true;
-  if (assignedCardId && !candidate) notes.push(`card "${assignedCardId}" is not among this board's registered cards; gates cannot be re-evaluated`);
+  if (assignedCardId && !candidate) notes.push(`card "${assignedCardId}" is not among these tasks' registered cards; gates cannot be re-evaluated`);
   // Provenance is never inferred from the score: a human pin says so even when
   // the router would have reached the same card on its own.
-  if (overridden) notes.push(`this assignment was recorded by a user-override (/assign), not by the router`);
+  if (overridden) notes.push(`this assignment was recorded by a user-override (/tasks assign), not by the router`);
   if (selection.outcome === "selected" && assignedCardId && selection.cardId !== assignedCardId) {
     notes.push(`re-evaluated now the router would pick ${selection.cardId}; the recorded assignment stands (${overridden ? "user-override" : "routed earlier"})`);
   }
   if (selection.outcome === "needs_intervention") notes.push(`re-evaluation escalates: ${selection.reason} — ${selection.detail}`);
-  notes.push("gates are re-evaluated at read time against the cards this board registered; the score row is the value recorded at assignment.");
+  notes.push("gates are re-evaluated at read time against the cards registered for these tasks; the score row is the value recorded at assignment.");
 
   const rejected = selection.candidates
     .filter((entry_) => !entry_.qualified && entry_.cardId !== assignedCardId)
@@ -835,7 +849,7 @@ function nextTaskIndex(state: KanbanBoardState): number {
 async function ensureBoardOpen(store: BoardStore): Promise<void> {
   if (store.state().opened) return;
   await store.commit(
-    { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: "open chat mission board" },
+    { actorId: ORCHESTRATOR_ID, actorKind: "system", summary: "open chat tasks" },
     {
       type: "board_opened",
       // Two authenticated backends, tasks that may run in parallel waves: a WIP of
@@ -865,7 +879,7 @@ export interface MissionOutcome {
 }
 
 /**
- * `/mission "<goal>"` — plan, route, run, narrate. Every state change below is a
+ * `/tasks "<goal>"` — plan, route, run, narrate. Every state change below is a
  * kanban event; the transcript cards are rendered FROM those events, so what the
  * user reads and what the log replays cannot drift.
  */
@@ -883,7 +897,7 @@ export async function runMissionCommand(goal: string, deps: OrchestrationDeps): 
 
   const auth = await deps.detectAuth();
   const cards = authenticatedModelCards(auth);
-  deps.emit(paint(`── mission ${store.state().boardId} · ${describeBackendAuth(auth)}`, ACCENT_RGB, colorEnabled(deps.color)));
+  deps.emit(paint(`── tasks ${displayTaskSetId(store.state().boardId)} · ${describeBackendAuth(auth)}`, ACCENT_RGB, colorEnabled(deps.color)));
 
   let planText: string;
   try {
@@ -907,7 +921,7 @@ export async function runMissionCommand(goal: string, deps: OrchestrationDeps): 
   if (plan.tasks.length === 0) {
     emitAll(deps, renderNeedsInterventionCard({
       title: `planning "${goal}"`,
-      detail: "the planner produced no board-legal tasks",
+      detail: "the planner produced no valid tasks",
       fixes: ["re-run with a more concrete goal", "/model to switch the planning model"],
     }, options));
     return undefined;
@@ -934,7 +948,7 @@ export async function runMissionCommand(goal: string, deps: OrchestrationDeps): 
     emitAll(deps, renderNeedsInterventionCard({
       title: `${taskIds.length} task(s) planned, none routable`,
       detail: "selection ran against zero authenticated model cards, so every task was escalated rather than routed to a backend that would fail at run time.",
-      fixes: ["codex login", "install Claude Code so `claude` is on PATH", "/board to see the escalated tasks"],
+      fixes: ["codex login", "install Claude Code so `claude` is on PATH", "/tasks to see the escalated tasks"],
     }, options));
   } else {
     await runMissionWaves(store, taskIds, cards, deps, costs);
@@ -1019,7 +1033,7 @@ async function runMissionWaves(
         emitAll(deps, renderNeedsInterventionCard({
           title: `${taskId} ${entry.task.title}`,
           detail: `${selection.reason}: ${selection.detail}`,
-          fixes: [`/why ${taskId} for the full gate table`, `/assign ${taskId} <cardId> to override`],
+          fixes: [`/tasks why ${taskId} for the full gate table`, `/tasks assign ${taskId} <cardId> to override`],
         }, options));
         continue;
       }
@@ -1180,7 +1194,7 @@ export async function runWhyCommand(taskId: string, deps: OrchestrationDeps): Pr
   });
   const explanation = explainAssignment(store.state(), taskId);
   if (!explanation) {
-    deps.emit(paint(`no task "${taskId}" on board ${store.state().boardId} — /board lists what exists`, WARN_RGB, colorEnabled(deps.color)));
+    deps.emit(paint(`no task "${taskId}" in ${displayTaskSetId(store.state().boardId)} — /tasks lists what exists`, WARN_RGB, colorEnabled(deps.color)));
     return undefined;
   }
   emitAll(deps, renderWhyView(explanation, renderOptions(deps)));
@@ -1188,7 +1202,7 @@ export async function runWhyCommand(taskId: string, deps: OrchestrationDeps): Pr
 }
 
 /**
- * `/assign <taskId> <cardId>` — the human wins, but on the record. The override
+ * `/tasks assign <taskId> <cardId>` — the human wins, but on the record. The override
  * is scored against the SAME selector (restricted to the chosen card) so the
  * event carries an arithmetically auditable breakdown, and it is refused when
  * the reducer's never-misassign gate would reject it — with the blocking gate
@@ -1205,13 +1219,13 @@ export async function runAssignCommand(taskId: string, cardId: string, deps: Orc
   });
   const entry = store.state().tasks.get(taskId);
   if (!entry) {
-    deps.emit(paint(`no task "${taskId}" on board ${store.state().boardId} — /board lists what exists`, WARN_RGB, on));
+    deps.emit(paint(`no task "${taskId}" in ${displayTaskSetId(store.state().boardId)} — /tasks lists what exists`, WARN_RGB, on));
     return false;
   }
   const card = store.state().cards.get(cardId);
   if (!card) {
     const known = [...store.state().cards.keys()];
-    deps.emit(paint(`card "${cardId}" is not registered on this board${known.length ? ` — known: ${known.join(", ")}` : ""}`, WARN_RGB, on));
+    deps.emit(paint(`card "${cardId}" is not registered for these tasks${known.length ? ` — known: ${known.join(", ")}` : ""}`, WARN_RGB, on));
     return false;
   }
 
@@ -1252,7 +1266,7 @@ export async function runAssignCommand(taskId: string, cardId: string, deps: Orc
     const candidate = candidateFor(selection, cardId);
     const blocking = candidate?.gates.find((gate) => gate.id === candidate.blockedBy);
     deps.emit(paint(`override refused: ${cardId} is blocked at gate "${candidate?.blockedBy ?? selection.reason}" — ${blocking?.summary ?? selection.detail}`, BAD_RGB, on));
-    deps.emit(paint(`   the board keeps ${taskId} routable; /why ${taskId} shows every gate`, MUTED_RGB, on));
+    deps.emit(paint(`   tasks keeps ${taskId} routable; /tasks why ${taskId} shows every gate`, MUTED_RGB, on));
     return false;
   }
 
@@ -1270,11 +1284,11 @@ export async function runAssignCommand(taskId: string, cardId: string, deps: Orc
     { type: "task_assigned", taskId, assignment },
   );
   deps.emit(renderTaskAssignedCard({ taskId, title: entry.task.title, cardId: selection.cardId, total: selection.total }, options));
-  deps.emit(paint(`   recorded as user-override · /why ${taskId} for the gate table`, MUTED_RGB, on));
+  deps.emit(paint(`   recorded as user-override · /tasks why ${taskId} for the gate table`, MUTED_RGB, on));
   return true;
 }
 
-/** Single entry point shared by the chat dispatcher and `muster board`. */
+/** Single entry point shared by the chat dispatcher and `muster tasks`. */
 export async function runOrchestrationCommand(command: OrchestrationCommand, deps: OrchestrationDeps): Promise<void> {
   switch (command.kind) {
     case "usage":

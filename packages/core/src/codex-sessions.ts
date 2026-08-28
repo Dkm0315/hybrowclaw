@@ -54,10 +54,10 @@
  * on an append-only log is the same fact for free.
  */
 
-import { createReadStream, type Dirent } from "node:fs";
+import { createReadStream, realpathSync, type Dirent } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import type { SessionStore } from "./sessions.js";
 
 /* ---------- errors: fail closed, WorkspaceObserverError idiom ---------- */
@@ -196,6 +196,15 @@ export interface CodexSessionSummary extends CodexSessionMeta {
   /** Which fact `lastActivityAt` came from — reported, never guessed at. */
   readonly lastActivitySource: "rollout" | "mtime";
   readonly sizeBytes: number;
+}
+
+function normalizeCodexWorkspace(cwd: string): string {
+  const absolute = resolve(cwd);
+  try {
+    return realpathSync.native(absolute);
+  } catch {
+    return absolute;
+  }
 }
 
 export interface CodexRolloutSkip {
@@ -812,7 +821,7 @@ export async function discoverCodexSessions(options: DiscoverCodexSessionsOption
         subagentsHidden += 1;
         continue;
       }
-      if (options.cwd !== undefined && meta.cwd !== options.cwd) continue;
+      if (options.cwd !== undefined && normalizeCodexWorkspace(meta.cwd) !== normalizeCodexWorkspace(options.cwd)) continue;
       sessions.push(summarize(await readCodexRollout(file.filePath, limits), file));
     } catch (error) {
       const skip = error instanceof CodexSessionError
@@ -937,7 +946,11 @@ export async function importCodexSession(
       channel: CODEX_IMPORT_CHANNEL,
       peer: codexImportPeer(rollout.meta.cwd),
       title: codexImportTitle(threadId, rollout.meta.cwd),
+      workspaceCwd: rollout.meta.cwd || null,
     }).id;
+  // Re-importing a thread created before the binding column shipped upgrades
+  // that imported row in place; unrelated old rows intentionally stay global.
+  store.setWorkspaceCwd(sessionId, rollout.meta.cwd || null);
 
   const stored = store.loadActiveMessages(sessionId);
   let matched = 0;

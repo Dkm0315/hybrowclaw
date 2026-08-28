@@ -429,10 +429,12 @@ test("discoverCodexSessions hides multi-agent fan-out unless asked for it", asyn
 test("discoverCodexSessions can scope to a single project directory", async (t) => {
   await withCodexHome(t, async (home) => {
     const now = Date.UTC(2026, 7, 27, 12, 0, 0);
-    await writeRollout(home, "2026-08-26", { threadId: "here", cwd: "/Users/dhairya/Documents/muster", turns: [{ user: "a", assistant: "b" }], mtimeMs: now });
-    await writeRollout(home, "2026-08-26", { threadId: "elsewhere", cwd: "/Users/dhairya/Documents/redis-automation", turns: [{ user: "a", assistant: "b" }], mtimeMs: now - 1000 });
+    const workspace = join(home, "workspace");
+    await mkdir(workspace, { recursive: true });
+    await writeRollout(home, "2026-08-26", { threadId: "here", cwd: workspace, turns: [{ user: "a", assistant: "b" }], mtimeMs: now });
+    await writeRollout(home, "2026-08-26", { threadId: "elsewhere", cwd: join(home, "elsewhere"), turns: [{ user: "a", assistant: "b" }], mtimeMs: now - 1000 });
 
-    const scoped = await discoverCodexSessions({ codexHome: home, cwd: "/Users/dhairya/Documents/muster", nowMs: now });
+    const scoped = await discoverCodexSessions({ codexHome: home, cwd: join(workspace, "..", "workspace"), nowMs: now });
 
     assert.deepEqual(scoped.sessions.map((session) => session.threadId), ["here"]);
   });
@@ -620,6 +622,9 @@ test("importCodexSession keeps separate sessions for two threads in one project"
       assert.notEqual(first.sessionId, second.sessionId);
       assert.equal(first.created, true);
       assert.equal(second.created, true);
+      const imported = store.search({ sessionId: first.sessionId });
+      if (imported.shape !== "read") return assert.fail("expected imported session");
+      assert.equal(imported.session.workspaceCwd, "/Users/dhairya/Documents/muster");
     });
   });
 });

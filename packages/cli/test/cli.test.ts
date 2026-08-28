@@ -207,6 +207,10 @@ test("CLI chat exposes a real named terminal chat surface without hanging in non
   assert.match(tools.stdout, /web: .*web_search/);
   assert.match(tools.stdout, /discovery: .*tool_search/);
 
+  const slashTools = await runCli(["chat", "/tools core"], cwd);
+  assert.match(slashTools.stdout, /files: .*read_file/);
+  assert.doesNotMatch(slashTools.stdout, /muster-tools-action|\[enter\] run/, "non-TTY slash usage keeps the text fallback");
+
   const commands = await runCli(["chat", "--commands"], cwd);
   assert.match(commands.stdout, /Commands/);
   assert.match(commands.stdout, /\/sessions \[limit\]/);
@@ -219,6 +223,8 @@ test("CLI chat exposes a real named terminal chat surface without hanging in non
   assert.match(commands.stdout, /\/tokens \[limit\]/);
   assert.match(commands.stdout, /\/capabilities \[query\]/);
   assert.match(commands.stdout, /\/integrations \[id\]/);
+  assert.match(commands.stdout, /\/tasks \[/);
+  assert.doesNotMatch(commands.stdout, /\/mission|\/board|\/why|\/assign/);
 
   const commandCompletion = await runCli(["chat", "--complete", "/sta"], cwd);
   assert.match(commandCompletion.stdout, /\/status/);
@@ -400,7 +406,9 @@ test("CLI sessions expose continuity metadata for audit and recall", async () =>
   const cwd = await mkdtemp(join(tmpdir(), "muster-cli-sessions-audit-"));
   const store = openSessionStore(cwd);
   const session = store.createSession({ channel: "telegram", peer: "alice", title: "Deploy planning" });
+  const elsewhere = store.createSession({ channel: "cli-chat", peer: "other-repo", title: "Other repo", workspaceCwd: join(cwd, "elsewhere") });
   try {
+    store.appendMessage(elsewhere.id, "user", "remember the remote workspace history");
     for (let index = 0; index < 35; index += 1) {
       store.appendMessage(
         session.id,
@@ -415,12 +423,22 @@ test("CLI sessions expose continuity metadata for audit and recall", async () =>
 
   const recent = await runCli(["sessions", "recent", "--limit", "5"], cwd);
   assert.match(recent.stdout, /session_backend=sqlite-/);
+  assert.match(recent.stdout, /scope=\(1 here · 2 total\)/);
   assert.match(recent.stdout, /sessions=1/);
   assert.match(recent.stdout, new RegExp(`session=${session.id}`));
   assert.match(recent.stdout, /title="Deploy planning"/);
   assert.match(recent.stdout, /channel=telegram peer=alice/);
   assert.match(recent.stdout, /tokens_in=1200 tokens_out=300 cost_usd=0\.0123/);
   assert.match(recent.stdout, new RegExp(`next="muster sessions show ${session.id}"`));
+  assert.doesNotMatch(recent.stdout, new RegExp(`session=${elsewhere.id}`));
+
+  const all = await runCli(["sessions", "recent", "--all", "--limit", "5"], cwd);
+  assert.match(all.stdout, /sessions=2/);
+  assert.match(all.stdout, new RegExp(`session=${elsewhere.id}`));
+
+  const detached = await runCli(["chat", "--continue", "other-repo", "--history"], cwd);
+  assert.match(detached.stdout, /this conversation belongs to .*elsewhere — \[enter\] work there · \[c\] continue here/);
+  assert.match(detached.stdout, /remember the remote workspace history/);
 
   const shown = await runCli(["sessions", "show", session.id], cwd);
   assert.match(shown.stdout, /session_backend=sqlite-/);

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createMusterAutocompleteProvider, createMusterChatEditor, createMusterChatHarness, formatWorkingIndicator, isBareCompletionTrigger, isClearComposerKey, renderHeaderWindow, renderMusterComposer, renderTranscriptWindow } from "../src/chat-tui.js";
+import { capabilityConfirmationText, encodeCapabilitySelection } from "../src/capabilities-overlay.js";
 
 const commands = [
   { name: "help", usage: "/help", description: "show full chat help", aliases: ["?"] },
@@ -154,6 +155,66 @@ test("muster TUI completion provider completes toolsets, sessions, and agents", 
   assert.ok(workflowStatus);
   assert.notDeepEqual(workflowStatus.items.map((item) => item.value), ["status"]);
   assert.equal(workflowStatus.items.some((item) => item.value === "status"), false);
+});
+
+test("/tools capability selection replaces the command with ready composer text on Enter", async () => {
+  const readyPrompt = "use the documents plugin to ";
+  const provider = createMusterAutocompleteProvider({
+    commands,
+    toolsets: [],
+    recentSessions: () => [],
+    catalog: {
+      complete: (request) => request.kind === "toolset"
+        ? [{ value: encodeCapabilitySelection(readyPrompt), label: "documents", description: "plugin/codex · active" }]
+        : [],
+    },
+    agents: async () => [],
+  });
+  const suggestions = await provider.getSuggestions(["/tools doc"], 0, 10, { signal: new AbortController().signal });
+  assert.ok(suggestions);
+  const applied = provider.applyCompletion(["/tools doc"], 0, 10, suggestions.items[0]!, suggestions.prefix);
+  assert.deepEqual(applied.lines, [readyPrompt]);
+  assert.equal(applied.cursorCol, readyPrompt.length);
+
+  const harness = createMusterChatHarness({
+    commands,
+    toolsets: [],
+    recentSessions: () => [],
+    catalog: { complete: async (request) => request.kind === "toolset" ? [{ value: encodeCapabilitySelection(readyPrompt), label: "documents" }] : [] },
+    agents: async () => [],
+  });
+  harness.type("/tools doc");
+  await settleAutocomplete();
+  harness.input("\r");
+  assert.equal(harness.text(), readyPrompt);
+});
+
+test("escape cancels a staged /tools state-changing command", () => {
+  const harness = createMusterChatHarness({ commands, toolsets: [], recentSessions: () => [], agents: async () => [] });
+  harness.type(capabilityConfirmationText("codex", ["mcp", "enable", "computer-use"]));
+  harness.input("\x1b");
+  assert.equal(harness.text(), "");
+});
+
+test("/tools disabled row needs a selection Enter and a separate submit Enter", async () => {
+  const confirmation = capabilityConfirmationText("codex", ["mcp", "enable", "computer-use"]);
+  const submitted: string[] = [];
+  const harness = createMusterChatHarness({
+    commands,
+    toolsets: [],
+    recentSessions: () => [],
+    catalog: { complete: async (request) => request.kind === "toolset" ? [{ value: encodeCapabilitySelection(confirmation), label: "computer-use" }] : [] },
+    agents: async () => [],
+    onSubmit: async (text) => { submitted.push(text); return true; },
+  });
+  harness.type("/tools computer");
+  await settleAutocomplete();
+  harness.input("\r");
+  assert.equal(harness.text(), confirmation);
+  assert.deepEqual(submitted, [], "selection must not run a state-changing command");
+  harness.input("\r");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(submitted, [confirmation]);
 });
 
 test("muster TUI completion provider can be backed by one catalog service", async () => {
@@ -516,6 +577,24 @@ test("muster composer recognizes Ctrl+U as a line clear key", () => {
   assert.equal(isClearComposerKey("\x15"), true);
   assert.equal(isClearComposerKey("u"), false);
   assert.equal(isClearComposerKey("\x1b"), false);
+});
+
+test("muster chat harness lets a pending one-line decision consume enter before the editor", () => {
+  let accepted = 0;
+  const harness = createMusterChatHarness({
+    commands,
+    toolsets: ["core"],
+    recentSessions: () => [],
+    agents: () => [],
+    onDecisionKey(data) {
+      if (data !== "\r") return false;
+      accepted += 1;
+      return true;
+    },
+  });
+  harness.input("\r");
+  assert.equal(accepted, 1);
+  assert.equal(harness.text(), "");
 });
 
 async function settleAutocomplete(): Promise<void> {

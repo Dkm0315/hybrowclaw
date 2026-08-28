@@ -265,7 +265,7 @@ test("mission cards use ◔/●/✖ glyphs and aligned columns", () => {
   }));
 
   assert.deepEqual(card, [
-    "⏺ Mission(harden ragbot API)",
+    "⏺ Tasks(harden ragbot API)",
     "  ⎿ 4 tasks · 3 agents · 1 running · $0.31",
     "    ◔ t4  rate-limiter  fable-5  api/limiter.ts +84     41.0s · 8.2k tok",
     "    ● t5  tests         gpt-5.5  12 passing             12.0s · 1.1k tok",

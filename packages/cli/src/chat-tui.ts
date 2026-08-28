@@ -17,6 +17,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { createCoalescer } from "@musterhq/core";
 import { effortDisplayLabel, modelDisplayLabel, modelProvider, type ComposerPickerSelection, type ComposerPickerState, type EffortValue } from "./model-catalog.js";
+import { decodeCapabilitySelection, isCapabilityConfirmationText } from "./capabilities-overlay.js";
 
 export interface MusterChatCommand {
   readonly name: string;
@@ -100,6 +101,8 @@ export interface RunMusterChatTuiOptions extends MusterAutocompleteOptions {
   readonly onSubmit: (text: string, sink: MusterChatSink) => Promise<boolean>;
   /** Interrupt the provider turn currently owned by onSubmit. */
   readonly onInterrupt?: () => boolean | Promise<boolean>;
+  /** Consume a raw key while index.ts owns a one-line pending decision. */
+  readonly onDecisionKey?: (data: string, sink: MusterChatSink) => boolean;
   /** Printed to stdout after teardown when the session exits via /exit. */
   readonly farewell?: string;
 }
@@ -448,7 +451,7 @@ export function formatStatusLine(info: StatusLineInfo): string {
   return `${accent(spinner)} ${dim(body)}`;
 }
 
-/** Kanban/mission statuses collapse to three glyphs: pending, live, ended. */
+/** Task statuses collapse to three glyphs: pending, live, ended. */
 export function missionStatusGlyph(status: string): string {
   switch (status) {
     case "in_progress":
@@ -489,8 +492,8 @@ export interface MissionCard {
 }
 
 /**
- * Board/mission cards wear the same ⏺/⎿ frame as any other action, with the
- * task columns aligned so a three-agent mission reads as a table, not a list.
+ * Task cards wear the same ⏺/⎿ frame as any other action, with columns aligned
+ * so a three-agent task run reads as a table, not a list.
  */
 export function renderMissionCard(card: MissionCard): string[] {
   const summary: string[] = [`${card.rows.length} task${card.rows.length === 1 ? "" : "s"}`];
@@ -516,7 +519,7 @@ export function renderMissionCard(card: MissionCard): string[] {
     return metrics ? `${glyph} ${body}  ${dim(metrics)}` : `${glyph} ${body}`.trimEnd();
   });
   return renderToolBlock({
-    name: "Mission",
+    name: "Tasks",
     target: card.title,
     summary: summary.join(" · "),
     detail,
@@ -748,6 +751,7 @@ export function createMusterChatHarness(options: MusterAutocompleteOptions & {
   readonly onSubmit?: (text: string, sink: MusterChatSink) => Promise<boolean>;
   readonly onInterrupt?: () => boolean | Promise<boolean>;
   readonly initialLines?: readonly string[];
+  readonly onDecisionKey?: (data: string, sink: MusterChatSink) => boolean;
   readonly width?: number;
   readonly rows?: number;
 }): MusterChatHarness {
@@ -760,7 +764,12 @@ export function createMusterChatHarness(options: MusterAutocompleteOptions & {
   };
   return {
     input(data) {
+      if (options.onDecisionKey?.(data, sink)) return;
       if (data === "\x1b" && sink.interruptTurn()) return;
+      if ((matchesKey(data, "enter") || matchesKey(data, "return")) && isToolsOverlayInput(editor.getText())) {
+        editor.handleInput("\t");
+        return;
+      }
       if (isClearComposerKey(data)) {
         editor.handleInput("\x1b");
         editor.setText("");
@@ -768,6 +777,10 @@ export function createMusterChatHarness(options: MusterAutocompleteOptions & {
       }
       if (data === "\x1b" && isBareCompletionTrigger(editor.getText())) {
         editor.handleInput(data);
+        editor.setText("");
+        return;
+      }
+      if (data === "\x1b" && isCapabilityConfirmationText(editor.getText())) {
         editor.setText("");
         return;
       }
@@ -901,6 +914,11 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
   tui.addChild(screen);
   tui.setFocus(editor);
   tui.addInputListener((data) => {
+    if (options.onDecisionKey?.(data, screen)) {
+      editor.setText("");
+      tui.requestRender(true);
+      return { consume: true };
+    }
     if (data === "\x03" || data === "\x04") {
       screen.stop();
       return { consume: true };
@@ -909,6 +927,11 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
     if (isClearComposerKey(data)) {
       editor.handleInput("\x1b");
       editor.setText("");
+      tui.requestRender(true);
+      return { consume: true };
+    }
+    if ((matchesKey(data, "enter") || matchesKey(data, "return")) && isToolsOverlayInput(editor.getText())) {
+      editor.handleInput("\t");
       tui.requestRender(true);
       return { consume: true };
     }
@@ -921,6 +944,11 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
     if (matchesKey(data, "escape") && isBareCompletionTrigger(editor.getText())) {
       editor.handleInput(data);
       editor.setText("");
+      return { consume: true };
+    }
+    if (matchesKey(data, "escape") && isCapabilityConfirmationText(editor.getText())) {
+      editor.setText("");
+      tui.requestRender(true);
       return { consume: true };
     }
     return undefined;
@@ -1562,6 +1590,8 @@ function agentCompletionFragment(trimmed: string): string | undefined {
 
 function completionReplacement(beforeCursor: string, item: AutocompleteItem, prefix: string): string {
   const trimmed = beforeCursor.trimStart();
+  const capabilitySelection = decodeCapabilitySelection(item.value);
+  if (/^\/tools(?:\s+\S*)?$/i.test(trimmed) && capabilitySelection !== undefined) return capabilitySelection;
   switch (trimmed.toLowerCase()) {
     case "/tools":
       return `/tools ${item.value}`;
@@ -1635,6 +1665,10 @@ function completionReplacement(beforeCursor: string, item: AutocompleteItem, pre
 export function isBareCompletionTrigger(text: string): boolean {
   const trimmed = text.trim();
   return trimmed === "/" || trimmed === "@";
+}
+
+export function isToolsOverlayInput(text: string): boolean {
+  return /^\/tools(?:\s+\S*)?$/i.test(text.trimStart());
 }
 
 export function isExitCommand(text: string): boolean {

@@ -13,7 +13,14 @@ import {
   type OrchestrationDeps,
 } from "./chat-orchestration.js";
 import { commandUsageLines, trimDanglingCodeFence } from "./output.js";
+import {
+  buildCapabilityOverlayOptions,
+  composerTextForCapabilityAction,
+  encodeCapabilitySelection,
+  parseCapabilityConfirmation,
+} from "./capabilities-overlay.js";
 import { hasCompletedMusterOnboarding, runMusterOnboardingTui } from "./onboarding-tui.js";
+import { formatWorkspaceMismatchBanner, isParallelWorkPrompt, parallelTaskChoiceForKey, workspaceMismatchChoiceForKey, workspaceOverrideForMismatchChoice } from "./directory-awareness.js";
 import { runFrappe2RealPromptsQa } from "./qa-frappe2.js";
 import { runFrappeConnectCommand } from "./frappe-connect-command.js";
 import { runPtyTuiQa } from "./qa-pty-tui.js";
@@ -277,7 +284,7 @@ const execFileAsync = promisify(execFile);
 import { createServer } from "node:http";
 import { createInterface, emitKeypressEvents, type Interface } from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
-import type { CapabilityPluginPolicy, ChatMessage, EvidenceRecord, FeedbackValue, FlowRunEvent, FlowRunState, FlowToolRegistry, McpServerConfig, MemoryScope, MessageRow, MigrationSource, RunOutcome } from "@musterhq/core";
+import type { CapabilityPluginPolicy, ChatMessage, EvidenceRecord, FeedbackValue, FlowRunEvent, FlowRunState, FlowToolRegistry, McpServerConfig, MemoryScope, MessageRow, MigrationSource, RunOutcome, SessionRow } from "@musterhq/core";
 import type { GatewayConfig, PairedIdentity } from "@musterhq/gateway";
 
 const originalEmitWarning = process.emitWarning.bind(process);
@@ -432,7 +439,8 @@ async function main(): Promise<void> {
     case "subagents":
       await subagentsCommand(args);
       return;
-    case "board":
+    case "tasks":
+    case "board": // legacy hidden alias
       await boardCommand(args);
       return;
     case "demo":
@@ -609,11 +617,11 @@ Usage:
   muster migrate openclaw --dry-run [--profile <channel-name>]
   muster migrate hermes --dry-run
   muster migrate pi --dry-run
-  muster sessions search "query" | show <id> | recent
+  muster sessions search "query" | show <id> | recent [--all]
   muster skills list | catalog | enable <id> | disable <id> | view <name> | index | curate
   muster pulse add "<cron>" [--kind heartbeat|task] [--prompt "..."] | list | resume <id> | run-due
   muster subagents list | reap [--ttl-min N]
-  muster board list | why <taskId> | assign <taskId> <cardId> [--session <chat>]   # the kanban board /mission builds, outside chat
+  muster tasks [list] | why <taskId> | assign <taskId> <cardId> [--session <chat>]   # parallel tasks and agents, outside chat
   muster demo                         # provision a throwaway workspace + stub model, show the full pipeline
   muster benchmark                    # Token Waste Index — prove the ledger savings (deterministic, no model)
   muster run "prompt" [--runtime pi] [--provider anthropic] [--model claude-sonnet-4-5] [--session memory|create|continue] [--scope user:me] [--task-kind coding] [--sensitive]
@@ -1191,6 +1199,8 @@ interface ChatState {
    * the user happened to type the command. undefined ⇒ process.cwd().
    */
   workspaceCwd?: string;
+  /** Persistent home recorded on the session row, independent of detached execution. */
+  sessionWorkspaceCwd?: string;
   /**
    * Native Codex thread to continue on the NEXT turn only. `executeRun` forwards
    * it to `thread/resume`, then persists its own handle for the conversation, so
@@ -1224,6 +1234,8 @@ interface ChatState {
   usage?: ChatSessionUsage;
   /** Wall clock the session started at; the status row's idle elapsed. */
   startedAt?: number;
+  /** True only while a TTY composer is available for one-key suggestions. */
+  interactive?: boolean;
 }
 
 interface ChatSessionUsage {
@@ -1234,10 +1246,10 @@ interface ChatSessionUsage {
 }
 
 const DEFAULT_CHAT_SESSION = "main";
-interface ChatMenu {
-  readonly kind: "commands" | "agents";
-  readonly options: readonly string[];
-}
+type ChatMenu =
+  | { readonly kind: "commands" | "agents"; readonly options: readonly string[] }
+  | { readonly kind: "parallel-tasks"; readonly prompt: string }
+  | { readonly kind: "workspace-mismatch"; readonly sessionName: string; readonly workspaceCwd: string };
 interface ChatSuggestion {
   readonly label: string;
   readonly value: string;
@@ -1266,11 +1278,8 @@ const CHAT_COMMANDS: readonly ChatCommandDef[] = [
   { name: "runtime", usage: "/runtime [id]", description: "list or switch active runtime" },
   { name: "speed", usage: "/speed [session|fast]", description: "choose full memory mode or low-latency warm native mode" },
   { name: "live-diff", usage: "/live-diff [on|off]", description: "show inline file diffs live while a turn edits files", aliases: ["livediff", "diffs"] },
-  { name: "mission", usage: "/mission \"<goal>\"", description: "plan a goal into board tasks, route each to a model, run them here" },
-  { name: "board", usage: "/board", description: "show this chat's kanban board with model and score per task", aliases: ["kanban"] },
-  { name: "why", usage: "/why <taskId>", description: "show the 9-gate selection table behind one assignment" },
-  { name: "assign", usage: "/assign <taskId> <cardId>", description: "override the routed model; recorded as a user-override event" },
-  { name: "reasoning", usage: "/reasoning [effort|compact|full]", description: "set Codex Effort using the same six picker values, or summary density", aliases: ["think"] },
+  { name: "tasks", usage: "/tasks [\"<goal>\" | why <taskId> | assign <taskId> <cardId>]", description: "plan, inspect, explain, or assign parallel tasks and agents" },
+  { name: "reasoning", usage: "/reasoning [auto|low|medium|high|compact|full]", description: "set the reasoning spend tier, or the summary density", aliases: ["think"] },
   { name: "senses", usage: "/senses", description: "show codex-native computer-use, browser, and local endpoint status" },
   { name: "sessions", usage: "/sessions [limit]", description: "list recent named chats", aliases: ["ls"] },
   { name: "resume", usage: "/resume <name|id>", description: "switch to a prior named chat or session id", aliases: ["use"] },
@@ -1306,7 +1315,6 @@ const CHAT_COMMANDS: readonly ChatCommandDef[] = [
 const CHAT_COMMAND_NAMES = CHAT_COMMANDS.flatMap((command) => [command.name, ...(command.aliases ?? [])]);
 const CHAT_COMMAND_ALIASES = new Map(CHAT_COMMANDS.flatMap((command) => (command.aliases ?? []).map((alias) => [alias, command.name] as const)));
 const CHAT_TOOLSETS = ["core", "full", "files", "web", "memory", "sessions", "shell", "results", "discovery"];
-const CHAT_TOOLSET_OPTIONS = CHAT_TOOLSETS.map((toolset) => ({ value: toolset, label: toolset, description: "toolset" }));
 const CHAT_CLOUD_OPTIONS = PROVIDER_PRESETS
   .filter((preset) => preset.category === "cloud" || preset.category === "aggregator")
   .map((preset) => ({
@@ -1385,17 +1393,23 @@ async function chat(commandArgs: string[]): Promise<void> {
   };
   const prompt = stripFlags(commandArgs, ["--session", "--name", "--runtime", "--provider", "--model", "--scope", "--recall-limit", "--timeout-ms", "--continue", "--tools", "--complete", "--limit", "--codex-thread"]).filter((arg) => !["--commands", "--shortcuts", "--list", "--sessions", "--history", "--fast", "--session-speed", "--skip-onboarding", "--no-onboarding", "--live-diff", "--no-live-diff"].includes(arg)).join(" ").trim();
   if (commandArgs.includes("--list") || commandArgs.includes("--sessions")) {
-    printChatSessions(readNumberFlag(commandArgs, "--limit") ?? 15);
+    printChatSessions(readNumberFlag(commandArgs, "--limit") ?? 15, commandArgs.includes("--all"));
     return;
   }
   const continueIndex = commandArgs.indexOf("--continue");
   if (continueIndex >= 0) {
     const maybeName = commandArgs[continueIndex + 1];
     const sessionName = maybeName && !maybeName.startsWith("--") ? maybeName : mostRecentChatSessionName() ?? DEFAULT_CHAT_SESSION;
-    state.sessionName = safeChatSessionName(sessionName);
+    const resumed = findChatSessionForResume(sessionName);
+    state.sessionName = safeChatSessionName(resumed?.peer ?? sessionName);
+    state.sessionWorkspaceCwd = resumed?.workspaceCwd ?? process.cwd();
+    if (resumed?.workspaceCwd && resumed.workspaceCwd !== process.cwd()) {
+      const choice = await promptWorkspaceMismatch(resumed.workspaceCwd);
+      if (choice === "home") state.workspaceCwd = resumed.workspaceCwd;
+    }
   }
   if (commandArgs.includes("--history")) {
-    printChatHistory(state.sessionName, readNumberFlag(commandArgs, "--limit") ?? 40);
+    printChatHistory(state.sessionName, readNumberFlag(commandArgs, "--limit") ?? 40, chatSessionWorkspaceCwd(state));
     return;
   }
   if (commandArgs.includes("--commands")) {
@@ -1471,6 +1485,7 @@ Shortcuts:
 }
 
 async function interactiveChat(state: ChatState): Promise<void> {
+  state.interactive = true;
   if (process.env.MUSTER_LEGACY_READLINE === "1") {
     await legacyInteractiveChat(state);
     return;
@@ -1494,6 +1509,7 @@ async function interactiveChat(state: ChatState): Promise<void> {
       integrationWorkflows: chatIntegrationWorkflowOptions,
       statusLine: () => chatStatusLine(state),
       onInterrupt: () => interruptChatTurn(),
+      onDecisionKey: (data, sink) => handleChatDecisionKey(data, state, sink),
       onSubmit: async (text, sink) => {
         state.statusSink = sink;
         try {
@@ -1515,8 +1531,13 @@ async function legacyInteractiveChat(state: ChatState): Promise<void> {
   const rl = createInterface({ input, output, historySize: 200, removeHistoryDuplicates: true, completer: chatCompleter });
   const hintState = { visible: false, key: "", active: true, baseLine: "", selectedIndex: 0, suggestions: [] as ChatSuggestion[], renderSeq: 0 };
   emitKeypressEvents(input, rl);
-  const onKeypress = (_chunk: string, key: { name?: string; ctrl?: boolean } = {}): void => {
+  const onKeypress = (chunk: string, key: { name?: string; ctrl?: boolean } = {}): void => {
     if (!hintState.active) return;
+    const decisionKey = key.name === "return" || key.name === "enter" ? "\r" : key.name === "escape" ? "\x1b" : chunk;
+    if (handleChatDecisionKey(decisionKey, state)) {
+      setImmediate(() => replaceReadlineLine(rl, ""));
+      return;
+    }
     if (key.name === "return" || key.name === "enter" || key.name === "tab" || key.name === "escape" || (key.ctrl && (key.name === "c" || key.name === "d"))) return;
     if ((key.name === "up" || key.name === "down") && hintState.visible) {
       renderLiveSuggestions(rl, state, hintState, key.name).catch(() => {});
@@ -1648,7 +1669,8 @@ async function printChatHeader(state: ChatState): Promise<void> {
   const leftWidth = Math.max(24, Math.min(34, Math.floor(inner * 0.2)));
   const midWidth = Math.max(42, Math.floor((inner - leftWidth - gutter * 2) * 0.48));
   const rightWidth = inner - leftWidth - midWidth - gutter * 2;
-  const cwd = truncate(process.cwd().replace(process.env.HOME ?? "", "~"), leftWidth - 2);
+  const cwd = truncate(chatWorkspaceCwd(state).replace(process.env.HOME ?? "", "~"), leftWidth - 2);
+  const sessionCounts = chatSessionsByDirectory();
   const config = await loadConfig().catch(() => undefined);
   const runtimeId = state.runtime ?? config?.routing.defaultRuntime ?? "native";
   const runtime = runtimeId ? config?.runtimes[runtimeId] : undefined;
@@ -1681,7 +1703,7 @@ async function printChatHeader(state: ChatState): Promise<void> {
     " ",
     color(model, "accent"),
     color(cwd, "dim"),
-    color(truncate(`Session: ${state.sessionName}`, leftWidth), "dim"),
+    color(truncate(`Session: ${state.sessionName} (${sessionCounts.here.length} here · ${sessionCounts.all.length} total)`, leftWidth), "dim"),
     color(truncate(`Scope: ${formatChatScopes(scopes)}`, leftWidth), "dim"),
   ];
   const rightLines = [
@@ -1858,9 +1880,10 @@ async function buildCompactChatHeaderLines(state: ChatState): Promise<string[]> 
   const runtime = runtimeId ? config?.runtimes[runtimeId] : undefined;
   const providerId = state.provider ?? runtime?.provider ?? "provider";
   const provider = providerId ? config?.providers[providerId] : undefined;
+  const sessionCounts = chatSessionsByDirectory();
   return buildCompactHeaderLines({
-    session: state.sessionName,
-    cwd: process.cwd().replace(process.env.HOME ?? "", "~"),
+    session: `${state.sessionName} (${sessionCounts.here.length} here · ${sessionCounts.all.length} total)`,
+    cwd: chatWorkspaceCwd(state).replace(process.env.HOME ?? "", "~"),
     scopes: formatChatScopes(activeChatScopes(state)),
     model: formatModelStatus(state.model ?? firstRuntimeModel(runtime) ?? provider?.defaultModel, state.effortOverride ?? state.configuredEffort),
     provider: providerId,
@@ -1969,7 +1992,47 @@ function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, "");
 }
 
+function handleChatDecisionKey(data: string, state: ChatState, sink?: MusterChatSink): boolean {
+  const menu = state.pendingMenu;
+  if (!menu || menu.kind === "commands" || menu.kind === "agents") return false;
+  if (menu.kind === "workspace-mismatch") {
+    const choice = workspaceMismatchChoiceForKey(data);
+    if (!choice) return false;
+    state.pendingMenu = undefined;
+    state.sessionName = menu.sessionName;
+    state.workspaceCwd = workspaceOverrideForMismatchChoice(menu.workspaceCwd, choice);
+    void refreshChatTuiHeader(state);
+    return true;
+  }
+  if (menu.kind !== "parallel-tasks") return false;
+
+  const choice = parallelTaskChoiceForKey(data);
+  state.pendingMenu = undefined;
+  const run = async (): Promise<void> => {
+    state.statusSink = sink;
+    try {
+      if (choice === "tasks") {
+        const parsed = parseOrchestrationInvocation("tasks", menu.prompt);
+        if (parsed) await runOrchestrationCommand(parsed, chatOrchestrationDeps(state));
+      } else {
+        await runChatTurn(menu.prompt, state);
+      }
+    } finally {
+      state.statusSink = undefined;
+    }
+  };
+  void (sink ? captureConsoleToSink(run, sink) : run()).catch((error) => {
+    emitChatLine(state, color(error instanceof Error ? error.message : String(error), "yellow"));
+  });
+  return true;
+}
+
 async function handleChatInput(text: string, state: ChatState): Promise<boolean> {
+  const capabilityCommand = parseCapabilityConfirmation(text);
+  if (capabilityCommand) {
+    await runConfirmedCapabilityCommand(capabilityCommand.command, capabilityCommand.args);
+    return true;
+  }
   const suggested = state.pendingSuggestion;
   state.pendingSuggestion = undefined;
   if (text === "/" || text === "@") {
@@ -1995,13 +2058,18 @@ async function handleChatInput(text: string, state: ChatState): Promise<boolean>
   if (selected !== undefined) return selected;
   state.pendingMenu = undefined;
   if (text.startsWith("/")) return handleChatCommand(text, state);
+  if (state.interactive && isParallelWorkPrompt(text)) {
+    state.pendingMenu = { kind: "parallel-tasks", prompt: text };
+    console.log(color("run as parallel tasks? [enter] yes · [esc] single turn", "dim"));
+    return true;
+  }
   await runChatTurn(text, state);
   return true;
 }
 
 async function handlePendingChatMenu(text: string, state: ChatState): Promise<boolean | undefined> {
   const menu = state.pendingMenu;
-  if (!menu) return undefined;
+  if (!menu || menu.kind === "parallel-tasks" || menu.kind === "workspace-mismatch") return undefined;
   const index = Number(text);
   if (!Number.isInteger(index) || index < 1 || index > menu.options.length) {
     if (text.startsWith("/") || text.startsWith("@")) {
@@ -2065,6 +2133,7 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
     case "live-diff":
       toggleChatLiveDiff(args, state);
       return true;
+    case "tasks":
     case "mission":
     case "board":
     case "kanban":
@@ -2088,21 +2157,19 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
       return true;
     case "sessions":
     case "resume-list":
-      printChatSessions(args ? Number(args) || 15 : 15);
+      printChatSessions(readNumberFromText(args) ?? 15, args.split(/\s+/).includes("--all"));
       return true;
     case "resume":
       if (!args) {
         console.log(color("Usage: /resume <name|session-id>", "yellow"));
         return true;
       }
-      state.sessionName = safeChatSessionName(resolveChatSessionName(args));
-      appendNamedChatHistory(state.statusSink, state.sessionName);
-      console.log(color(`session=${state.sessionName}`, "green"));
+      selectChatSessionForResume(args, state);
       return true;
     case "codex": {
       const [sub, ...restArgs] = args.split(/\s+/).filter(Boolean);
       if (sub === "sessions" || sub === "list") {
-        await codexSessionsCommand(restArgs.length ? ["--limit", restArgs[0]] : []);
+        await codexSessionsCommand(restArgs.length === 1 && /^\d+$/.test(restArgs[0]!) ? ["--limit", restArgs[0]!] : restArgs);
         return true;
       }
       if (sub === "resume" && restArgs[0]) {
@@ -2111,12 +2178,16 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
           const { session, imported } = await importCodexThreadByPrefix(restArgs[0], restArgs.slice(1));
           state.sessionName = safeChatSessionName(`codex-${session.threadId.slice(0, 8)}`);
           state.resumeThreadId = forked ? undefined : session.threadId;
-          const workspace = codexResumeWorkspace(session, []);
-          if (workspace) state.workspaceCwd = workspace;
-          ensureNamedChatSession(state.sessionName);
-          console.log(color(`codex thread ${session.threadId} → session ${state.sessionName}${workspace ? ` · workspace ${workspace}` : ""}`, "green"));
+          state.sessionWorkspaceCwd = session.cwd || process.cwd();
+          const workspace = session.cwd && session.cwd !== process.cwd() ? session.cwd : undefined;
+          ensureNamedChatSession(state.sessionName, workspace ?? process.cwd());
+          console.log(color(`codex thread ${session.threadId} → session ${state.sessionName}`, "green"));
           console.log(color(`imported ${imported.appended} new message(s); your next message continues the native thread`, "dim"));
           appendImportedHistory(state.statusSink, imported.sessionId, `codex ${session.threadId.slice(0, 8)}`);
+          if (workspace) {
+            state.pendingMenu = { kind: "workspace-mismatch", sessionName: state.sessionName, workspaceCwd: workspace };
+            console.log(color(formatWorkspaceMismatchBanner(workspace), "dim"));
+          }
         } catch (error) {
           console.log(color(error instanceof Error ? error.message : String(error), "yellow"));
         }
@@ -2131,11 +2202,12 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
         return true;
       }
       state.sessionName = safeChatSessionName(args);
-      ensureNamedChatSession(state.sessionName);
+      state.sessionWorkspaceCwd = chatWorkspaceCwd(state);
+      ensureNamedChatSession(state.sessionName, chatSessionWorkspaceCwd(state));
       console.log(color(`session=${state.sessionName}`, "green"));
       return true;
     case "history":
-      printChatHistory(state.sessionName, args ? Number(args) || 40 : 40);
+      printChatHistory(state.sessionName, args ? Number(args) || 40 : 40, chatSessionWorkspaceCwd(state));
       return true;
     case "memory":
       await printChatMemory(args, state);
@@ -2147,6 +2219,10 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
       printChatScopes(state);
       return true;
     case "tools":
+      if (!args && state.statusSink) {
+        state.statusSink.openPicker("/tools ");
+        return true;
+      }
       await printChatTools(args);
       return true;
     case "whoami":
@@ -2243,8 +2319,9 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
       return true;
     case "new": {
       state.sessionName = safeChatSessionName(args || `chat-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`);
+      state.sessionWorkspaceCwd = chatWorkspaceCwd(state);
       const removed = await clearConversationSessionHandles(chatConversationKey(state.sessionName));
-      ensureNamedChatSession(state.sessionName);
+      ensureNamedChatSession(state.sessionName, chatSessionWorkspaceCwd(state));
       console.log(color(`session=${state.sessionName} provider_handles_cleared=${removed}`, "green"));
       return true;
     }
@@ -2359,6 +2436,9 @@ function chatCompletions(line: string): string[] {
 
 async function chatTuiCompletions(line: string, state: ChatState): Promise<string[]> {
   await ensureDefaultConfig();
+  // `--complete` is a script surface. Keep its historical plain toolset values;
+  // encoded interactive actions belong only inside the pi-tui editor.
+  if (/^\/tools(?:\s+\S*)?$/i.test(line.trimStart())) return chatCompletions(line);
   const provider = createMusterAutocompleteProvider({
     commands: chatCommandsDailyFirst(),
     toolsets: CHAT_TOOLSETS,
@@ -2681,7 +2761,7 @@ async function runChatTurn(text: string, state: ChatState, options: { timeoutMs?
     stopWorking();
     await liveDiff.finish().catch(() => {});
   }
-  persistChatTranscriptIfMissing(state.sessionName, prompt, outcome);
+  persistChatTranscriptIfMissing(state.sessionName, prompt, outcome, chatSessionWorkspaceCwd(state));
   state.pendingContinuityContext = undefined;
   recordChatUsage(state, outcome.tokens);
   // Already painted delta-by-delta — reprinting the body would double it.
@@ -2698,6 +2778,10 @@ async function runChatTurn(text: string, state: ChatState, options: { timeoutMs?
 /** The workspace a turn runs against — the resumed Codex thread's repo, or here. */
 function chatWorkspaceCwd(state: ChatState): string {
   return state.workspaceCwd ?? process.cwd();
+}
+
+function chatSessionWorkspaceCwd(state: ChatState): string {
+  return state.sessionWorkspaceCwd ?? process.cwd();
 }
 
 function liveDiffEnabled(state: ChatState): boolean {
@@ -2844,7 +2928,7 @@ function toggleChatLiveDiff(args: string, state: ChatState): void {
   console.log(color(`live-diff=${mode}`, "green"));
 }
 
-/* ---------- chat-embedded orchestration (/mission /board /why /assign) ---------- */
+/* ---------- chat-embedded orchestration (/tasks) ---------- */
 
 /**
  * A board card names a BACKEND, so the run is routed by runtime id. The card's
@@ -2957,7 +3041,7 @@ function chatOrchestrationDeps(state: ChatState): OrchestrationDeps {
   });
 }
 
-/** The non-chat door onto the same board: `muster board list|why|assign`. */
+/** The non-chat door onto the same task state: `muster tasks list|why|assign`. */
 async function boardCommand(commandArgs: string[]): Promise<void> {
   const sessionName = readFlag(commandArgs, "--session") ?? DEFAULT_CHAT_SESSION;
   const parsed = parseBoardCliCommand(commandArgs.filter((entry, index, all) => {
@@ -3171,10 +3255,10 @@ function uniqueMemoryScopes(scopes: readonly MemoryScope[]): MemoryScope[] {
   return [...new Map(scopes.map((scope) => [formatMemoryScope(scope), scope])).values()];
 }
 
-function persistChatTranscriptIfMissing(sessionName: string, prompt: string, outcome: RunOutcome): void {
+function persistChatTranscriptIfMissing(sessionName: string, prompt: string, outcome: RunOutcome, workspaceCwd: string): void {
   const store = openSessionStore();
   try {
-    const session = store.findOrCreateSession({ channel: "cli-chat", peer: sessionName, title: sessionName });
+    const session = store.findOrCreateSession({ channel: "cli-chat", peer: sessionName, title: sessionName, workspaceCwd });
     store.setTitle(session.id, sessionName);
     const messages = store.loadActiveMessages(session.id);
     const lastTwo = messages.slice(-2);
@@ -3189,24 +3273,39 @@ function persistChatTranscriptIfMissing(sessionName: string, prompt: string, out
   }
 }
 
-function ensureNamedChatSession(sessionName: string): void {
+function ensureNamedChatSession(sessionName: string, workspaceCwd = process.cwd()): void {
   const store = openSessionStore();
   try {
-    const session = store.findOrCreateSession({ channel: "cli-chat", peer: sessionName, title: sessionName });
+    const session = store.findOrCreateSession({ channel: "cli-chat", peer: sessionName, title: sessionName, workspaceCwd });
     store.setTitle(session.id, sessionName);
   } finally {
     store.close();
   }
 }
 
-function printChatSessions(limit: number): void {
+function chatSessionsByDirectory(limit = 5000): { here: SessionRow[]; all: SessionRow[] } {
   const store = openSessionStore();
   try {
     const result = store.search({ limit });
+    if (result.shape !== "browse") return { here: [], all: [] };
+    const all = result.sessions.filter((session) => session.channel === "cli-chat");
+    return { here: all.filter((session) => session.workspaceCwd === process.cwd()), all };
+  } finally {
+    store.close();
+  }
+}
+
+function printChatSessions(limit: number, includeAll = false): void {
+  const store = openSessionStore();
+  try {
+    const result = store.search({ limit: 5000 });
     if (result.shape !== "browse") return;
-    const sessions = result.sessions.filter((session) => session.channel === "cli-chat");
+    const all = result.sessions.filter((session) => session.channel === "cli-chat");
+    const here = all.filter((session) => session.workspaceCwd === process.cwd());
+    const sessions = (includeAll ? [...here, ...all.filter((session) => session.workspaceCwd !== process.cwd())] : here).slice(0, limit);
+    console.log(color(`(${here.length} here · ${all.length} total)`, "dim"));
     if (!sessions.length) {
-      console.log("No named chat sessions yet.");
+      console.log(includeAll ? "No named chat sessions yet." : "No chat sessions in this directory. Use /sessions --all to list everything.");
       return;
     }
     console.log(color("name\tupdated\tmessages\tusage", "cyan"));
@@ -3220,24 +3319,18 @@ function printChatSessions(limit: number): void {
 }
 
 function recentChatSessionNames(limit = 25): string[] {
-  const store = openSessionStore();
-  try {
-    const result = store.search({ limit });
-    if (result.shape !== "browse") return [];
-    return result.sessions.filter((session) => session.channel === "cli-chat").map((session) => session.peer);
-  } finally {
-    store.close();
-  }
+  const sessions = chatSessionsByDirectory();
+  return sessions.here.slice(0, limit).map((session) => session.peer);
 }
 
 function mostRecentChatSessionName(): string | undefined {
   return recentChatSessionNames(1)[0];
 }
 
-function printChatHistory(sessionName: string, limit: number): void {
+function printChatHistory(sessionName: string, limit: number, workspaceCwd = process.cwd()): void {
   const store = openSessionStore();
   try {
-    const session = store.findOrCreateSession({ channel: "cli-chat", peer: sessionName, title: sessionName });
+    const session = store.findOrCreateSession({ channel: "cli-chat", peer: sessionName, title: sessionName, workspaceCwd });
     const messages = store.loadActiveMessages(session.id).slice(-Math.max(1, limit));
     console.log(color(`session=${sessionName} messages=${messages.length}`, "cyan"));
     for (const message of messages) printChatMessage(message);
@@ -3263,7 +3356,7 @@ async function printChatStatus(state: ChatState): Promise<void> {
   const model = state.model ?? firstRuntimeModel(rt) ?? provider?.defaultModel;
   const store = openSessionStore();
   try {
-    const session = store.findOrCreateSession({ channel: "cli-chat", peer: state.sessionName, title: state.sessionName });
+    const session = store.findOrCreateSession({ channel: "cli-chat", peer: state.sessionName, title: state.sessionName, workspaceCwd: chatSessionWorkspaceCwd(state) });
     const messages = store.loadActiveMessages(session.id).length;
     printChatPanel("Status", [
       `${color("session".padEnd(12), "accent")} ${state.sessionName}`,
@@ -4364,7 +4457,7 @@ function createChatCompletionCatalog(state: ChatState): MusterCompletionCatalog 
             { value: "full", label: "summaries: full", description: "every provider-approved summary line" },
           ], request.fragment);
         case "toolset":
-          return filterPickerOptions(CHAT_TOOLSET_OPTIONS, request.fragment);
+          return filterPickerOptions(await chatToolsOverlayOptions(), request.fragment);
         case "session":
           return filterPickerOptions(recentChatSessionNames().map((name) => ({ value: name, label: name, description: "chat session" })), request.fragment);
         case "provider":
@@ -4525,6 +4618,24 @@ async function chatMcpOptions(): Promise<PickerOption[]> {
     description: `${configured.has(option.value) ? "configured · " : ""}${option.description ?? ""}`,
   })), [...configured][0]);
   return [...servers, ...CHAT_MCP_ACTION_OPTIONS];
+}
+
+async function chatToolsOverlayOptions(): Promise<PickerOption[]> {
+  const ecosystem = await inheritedEcosystem();
+  return buildCapabilityOverlayOptions(ecosystem, { toolsets: CHAT_TOOLSETS, skills: chatSkillOptions() })
+    .map((option) => ({
+      value: encodeCapabilitySelection(composerTextForCapabilityAction(option.action)),
+      label: option.label,
+      description: option.description,
+    }));
+}
+
+async function runConfirmedCapabilityCommand(command: string, args: readonly string[]): Promise<void> {
+  const rendered = [command, ...args].join(" ");
+  const result = await probeCommand(command, args, 30_000);
+  const outputLines = result.output ? result.output.split(/\r?\n/).filter(Boolean) : [result.ok ? "command completed" : "command failed without output"];
+  console.log(color(`${result.ok ? "enabled" : "failed"} ${rendered}`, result.ok ? "green" : "yellow"));
+  for (const line of outputLines) console.log(color(`  ⎿ ${line}`, "dim"));
 }
 
 function chatIntegrationOptions(): PickerOption[] {
@@ -5042,16 +5153,60 @@ function summarizeCatalog<T>(
   return [...grouped.entries()].slice(0, 8).map(([category, ids]) => `${category}: ${ids.join(", ")}`);
 }
 
-function resolveChatSessionName(value: string): string {
-  if (!value.startsWith("sess_")) return value;
+function findChatSessionForResume(value: string): SessionRow | undefined {
   const store = openSessionStore();
   try {
-    const result = store.search({ sessionId: value });
-    if (result.shape === "read" && result.session.channel === "cli-chat") return result.session.peer;
-    return value;
+    if (value.startsWith("sess_")) {
+      const result = store.search({ sessionId: value });
+      return result.shape === "read" && result.session.channel === "cli-chat" ? result.session : undefined;
+    }
+    const result = store.search({ limit: 5000 });
+    if (result.shape !== "browse") return undefined;
+    const matches = result.sessions.filter((session) => session.channel === "cli-chat" && session.peer === value);
+    return matches.find((session) => session.workspaceCwd === process.cwd()) ?? matches[0];
   } finally {
     store.close();
   }
+}
+
+function selectChatSessionForResume(value: string, state: ChatState): void {
+  const requested = value.trim();
+  const session = findChatSessionForResume(requested);
+  state.sessionName = safeChatSessionName(session?.peer ?? requested);
+  state.sessionWorkspaceCwd = session?.workspaceCwd ?? process.cwd();
+  if (session?.workspaceCwd && session.workspaceCwd !== process.cwd()) {
+    state.pendingMenu = { kind: "workspace-mismatch", sessionName: state.sessionName, workspaceCwd: session.workspaceCwd };
+    console.log(color(formatWorkspaceMismatchBanner(session.workspaceCwd), "dim"));
+    return;
+  }
+  state.workspaceCwd = undefined;
+  console.log(color(`session=${state.sessionName}`, "green"));
+}
+
+function readNumberFromText(value: string): number | undefined {
+  const token = value.split(/\s+/).find((part) => /^\d+$/.test(part));
+  return token ? Number(token) : undefined;
+}
+
+async function promptWorkspaceMismatch(workspaceCwd: string): Promise<"home" | "here"> {
+  console.log(color(formatWorkspaceMismatchBanner(workspaceCwd), "dim"));
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return "here";
+  if (!existsSync(workspaceCwd)) return "here";
+  emitKeypressEvents(input);
+  const wasRaw = input.isRaw;
+  input.setRawMode?.(true);
+  input.resume();
+  return new Promise((resolveChoice) => {
+    const onKey = (chunk: string, key: { name?: string } = {}): void => {
+      const data = key.name === "return" || key.name === "enter" ? "\r" : chunk;
+      const choice = workspaceMismatchChoiceForKey(data);
+      if (!choice) return;
+      input.off("keypress", onKey);
+      input.setRawMode?.(Boolean(wasRaw));
+      resolveChoice(choice);
+    };
+    input.on("keypress", onKey);
+  });
 }
 
 function chatConversationKey(sessionName: string): string {
@@ -8846,7 +9001,13 @@ function readCodexScanFlags(args: string[], defaultLimit: number): CodexScanFlag
 
 async function codexSessionsCommand(args: string[]): Promise<void> {
   const flags = readCodexScanFlags(args, 20);
-  const result = await discoverCodexSessions(flags);
+  const defaultHere = !args.includes("--here") && !args.includes("--all");
+  let result = await discoverCodexSessions(defaultHere ? { ...flags, cwd: process.cwd() } : flags);
+  let fellBackToAll = false;
+  if (defaultHere && result.sessions.length === 0) {
+    result = await discoverCodexSessions(flags);
+    fellBackToAll = result.sessions.length > 0;
+  }
   if (args.includes("--json")) {
     console.log(JSON.stringify(result, undefined, 2));
     return;
@@ -8856,6 +9017,7 @@ async function codexSessionsCommand(args: string[]): Promise<void> {
     if (result.subagentsHidden) console.log(`${result.subagentsHidden} subagent thread(s) hidden — pass --all to include them.`);
     return;
   }
+  if (fellBackToAll) console.log(color("no Codex sessions match this directory; showing all", "dim"));
   // Two clocks, because one was read as the other: `age` is how old the THREAD
   // is (a month-old redis session), `active` is how long since its last turn.
   // A single "age" column made a long-lived thread that was touched minutes ago
@@ -9032,10 +9194,20 @@ async function codexResumeCommand(args: string[]): Promise<void> {
     // --fork: keep the imported history but start a FRESH provider thread — the
     // path out of a thread-store writer conflict with another Codex client.
     ...(args.includes("--fork") ? {} : { resumeThreadId: session.threadId }),
-    ...(codexResumeWorkspace(session, args) ? { workspaceCwd: codexResumeWorkspace(session, args) } : {}),
+    sessionWorkspaceCwd: session.cwd || process.cwd(),
+    // Run in the thread's original workspace when it still exists — its context
+    // is full of paths from that repo. A vanished dir falls back to cwd.
+    ...(session.cwd && existsSync(session.cwd) ? { workspaceCwd: session.cwd } : {}),
     initialTranscriptLines: importedHistoryLines(imported.sessionId, `codex ${session.threadId.slice(0, 8)}`),
   };
-  ensureNamedChatSession(state.sessionName);
+  const mismatchWorkspace = session.cwd && session.cwd !== process.cwd() ? session.cwd : undefined;
+  if (mismatchWorkspace && !args.includes("--here")) {
+    const choice = await promptWorkspaceMismatch(mismatchWorkspace);
+    if (choice === "home") state.workspaceCwd = mismatchWorkspace;
+  } else if (mismatchWorkspace) {
+    console.log(color(formatWorkspaceMismatchBanner(mismatchWorkspace), "dim"));
+  }
+  ensureNamedChatSession(state.sessionName, session.cwd || process.cwd());
   console.log(`chat        ${state.sessionName} (next turn continues the native Codex thread)`);
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     const prefix = state.workspaceCwd ? `cd ${state.workspaceCwd} && ` : "";
@@ -9044,22 +9216,6 @@ async function codexResumeCommand(args: string[]): Promise<void> {
     return;
   }
   await interactiveChat(state);
-}
-
-/**
- * Run the resumed thread in the workspace it was started in — a Codex thread's
- * context is full of paths from that repo. Falls back to the current directory
- * when the original is gone (a temp dir, an unmounted volume), because a stale
- * cwd would fail the run outright.
- */
-function codexResumeWorkspace(session: CodexSessionSummary, args: string[]): string | undefined {
-  if (args.includes("--here")) return undefined;
-  if (!session.cwd || session.cwd === process.cwd()) return undefined;
-  if (!existsSync(session.cwd)) {
-    console.log(color(`original workspace ${session.cwd} is gone — running in ${process.cwd()}`, "yellow"));
-    return undefined;
-  }
-  return session.cwd;
 }
 
 async function claude(args: string[]): Promise<void> {
@@ -12364,13 +12520,15 @@ function withoutUndefined<T extends Record<string, unknown>>(input: T): T {
 
 
 async function sessionsCommand(commandArgs: string[]): Promise<void> {
-  const [action, ...rest] = commandArgs;
+  const [first, ...tail] = commandArgs;
+  const action = first?.startsWith("--") ? undefined : first;
+  const rest = action === undefined ? commandArgs : tail;
   const store = openSessionStore();
   try {
     if (action === "search") {
-      const query = stripFlags(rest, ["--limit"]).join(" ").trim();
+      const query = stripFlags(rest, ["--limit"]).filter((entry) => entry !== "--all").join(" ").trim();
       if (!query) throw new Error('Usage: muster sessions search "query" [--limit N]');
-      const result = store.search({ query, limit: readNumberFlag(rest, "--limit") });
+      const result = store.search({ query, limit: readNumberFlag(rest, "--limit"), ...(rest.includes("--all") ? {} : { workspaceCwd: process.cwd() }) });
       if (result.shape !== "discover") return;
       console.log(`session_backend=${store.backend}`);
       console.log(`query=${JSON.stringify(query)} hits=${result.hits.length}`);
@@ -12386,7 +12544,7 @@ async function sessionsCommand(commandArgs: string[]): Promise<void> {
       if (result.shape !== "read") return;
       const activeMessages = result.head.length + result.tail.length + result.omitted;
       console.log(`session_backend=${store.backend}`);
-      console.log(`session=${result.session.id} title=${JSON.stringify(result.session.title || "(untitled)")} channel=${result.session.channel} peer=${result.session.peer}`);
+      console.log(`session=${result.session.id} title=${JSON.stringify(result.session.title || "(untitled)")} channel=${result.session.channel} peer=${result.session.peer} workspace=${JSON.stringify(result.session.workspaceCwd ?? "(global)")}`);
       console.log(`tokens_in=${result.session.tokensIn} tokens_out=${result.session.tokensOut} cost_usd=${result.session.costUsd.toFixed(4)} active_messages=${activeMessages} omitted=${result.omitted}`);
       for (const message of [...result.head, ...(result.omitted ? [{ role: "system", content: `… ${result.omitted} messages omitted …` } as { role: string; content: string }] : []), ...result.tail]) {
         console.log(`  ${message.role.padEnd(9)} ${message.content.slice(0, 100)}`);
@@ -12394,16 +12552,20 @@ async function sessionsCommand(commandArgs: string[]): Promise<void> {
       return;
     }
     if (action === "recent" || action === undefined) {
-      const result = store.search({ limit: readNumberFlag(rest, "--limit") ?? 15 });
-      if (result.shape !== "browse") return;
+      const limit = readNumberFlag(rest, "--limit") ?? 15;
+      const allResult = store.search({ limit: 5000 });
+      const result = rest.includes("--all") ? store.search({ limit }) : store.search({ limit, workspaceCwd: process.cwd() });
+      if (result.shape !== "browse" || allResult.shape !== "browse") return;
+      const here = allResult.sessions.filter((session) => session.workspaceCwd === process.cwd()).length;
       console.log(`session_backend=${store.backend}`);
+      console.log(`scope=(${here} here · ${allResult.sessions.length} total)`);
       console.log(`sessions=${result.sessions.length}`);
       for (const session of result.sessions) {
-        console.log(`session=${session.id} created=${session.createdAt.slice(0, 16)} title=${JSON.stringify(session.title || "(untitled)")} channel=${session.channel} peer=${session.peer} tokens_in=${session.tokensIn} tokens_out=${session.tokensOut} cost_usd=${session.costUsd.toFixed(4)} next=${JSON.stringify(`muster sessions show ${session.id}`)}`);
+        console.log(`session=${session.id} created=${session.createdAt.slice(0, 16)} title=${JSON.stringify(session.title || "(untitled)")} channel=${session.channel} peer=${session.peer} workspace=${JSON.stringify(session.workspaceCwd ?? "(global)")} tokens_in=${session.tokensIn} tokens_out=${session.tokensOut} cost_usd=${session.costUsd.toFixed(4)} next=${JSON.stringify(`muster sessions show ${session.id}`)}`);
       }
       return;
     }
-    throw new Error("Usage: muster sessions search|show|recent");
+    throw new Error("Usage: muster sessions search|show|recent [--all]");
   } finally {
     store.close();
   }
