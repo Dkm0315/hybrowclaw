@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { matchesKey, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import type { BoardViewCard, MessageRow } from "@musterhq/core";
-import { formatAssistantBlock, formatReasoningLine, formatToolLine, formatToolResultLines, formatUserLine } from "./chat-tui.js";
+import { formatAssistantBlock, formatReasoningLine, formatToolLine, formatToolResultLines, formatUserLine, isUserTranscriptLine } from "./chat-tui.js";
+import { bandUserRow } from "./prose-renderer.js";
 import { followScrollTarget, LiveFileTurnAccumulator, renderFullFileLine } from "./live-file-view.js";
 
 const RESET = "\x1b[0m";
@@ -35,7 +36,7 @@ export function renderTaskTranscript(rows: readonly TaskTranscriptRow[]): string
         if (typeof parsed.target === "string") target = parsed.target;
         if (typeof parsed.summary === "string") summary = parsed.summary;
       } catch { /* older rows store only the result text */ }
-      lines.push(formatToolLine(name, target), ...formatToolResultLines(summary));
+      lines.push(formatToolLine(name, target, "success"), ...formatToolResultLines(summary));
     }
   }
   return lines;
@@ -108,7 +109,18 @@ export class TaskView implements Component {
     const transcriptTop = this.following ? Math.max(0, transcript.length - transcriptHeight) : Math.min(this.transcriptScroll, Math.max(0, transcript.length - transcriptHeight));
     const rows: string[] = [pad(`${accent(card.title, color)} ${dim(`· ${card.modelId ?? "unassigned"} · ${card.status}`, color)}`, width)];
     rows.push(pad(dim("transcript", color), width));
-    for (const line of transcript.slice(transcriptTop, transcriptTop + transcriptHeight)) rows.push(pad(truncateToWidth(line, width, ""), width));
+    let userBandOpen = false;
+    for (let index = 0; index < transcriptTop; index += 1) {
+      const line = transcript[index]!;
+      if (isUserTranscriptLine(line)) userBandOpen = true;
+      else if (!line.replace(/\x1b\[[0-9;]*m/g, "").startsWith("  ")) userBandOpen = false;
+    }
+    for (const line of transcript.slice(transcriptTop, transcriptTop + transcriptHeight)) {
+      if (isUserTranscriptLine(line)) userBandOpen = true;
+      else if (!line.replace(/\x1b\[[0-9;]*m/g, "").startsWith("  ")) userBandOpen = false;
+      const fitted = pad(truncateToWidth(line, width, ""), width);
+      rows.push(userBandOpen ? bandUserRow(fitted, width) : fitted);
+    }
     while (rows.length < transcriptHeight + 2) rows.push("");
 
     const accumulator = this.options.diff();

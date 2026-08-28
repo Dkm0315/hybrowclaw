@@ -96,7 +96,17 @@ test("narration painter never splits a markdown code fence mid-block", () => {
   assert.match(transcript, /const lease = renewLease/);
 });
 
-test("reasoning summaries render dim italic and above the message they explain", () => {
+test("narration painter heuristically separates sentence-start deltas after terminal punctuation", () => {
+  const painted: string[] = [];
+  const painter = createNarrationPainter({ emit: (line) => painted.push(line), minChars: 200, maxChars: 400 });
+  painter.delta("The suite is green now.");
+  painter.delta("Tests pass without a join.");
+  painter.finish();
+  const lines = plain(painted);
+  assert.deepEqual(lines, ["● The suite is green now.", "  ", "  Tests pass without a join."]);
+});
+
+test("reasoning summaries render violet italic with a sparkle above the message they explain", () => {
   const painted: string[] = [];
   const painter = createNarrationPainter({ emit: (line) => painted.push(line), minChars: 8, maxChars: 64 });
   painter.reasoning("Checking whether the spool lease is renewed.\n");
@@ -107,10 +117,10 @@ test("reasoning summaries render dim italic and above the message they explain",
   const messageIndex = painted.findIndex((line) => stripAnsi(line).includes("The lease renews"));
   assert.ok(reasoningIndex >= 0 && messageIndex >= 0);
   assert.ok(reasoningIndex < messageIndex, "reasoning must render above the message");
-  assert.match(stripAnsi(painted[reasoningIndex]), /^· /);
+  assert.match(stripAnsi(painted[reasoningIndex]), /^✻ /);
   if (!process.env.NO_COLOR) {
     assert.ok(painted[reasoningIndex].includes("\x1b[3m"), "reasoning renders italic");
-    assert.ok(formatReasoningLine("x").includes("148;144;140"), "reasoning renders dim");
+    assert.ok(formatReasoningLine("x").includes("183;157;219"), "reasoning uses the sanctioned violet");
   }
 });
 

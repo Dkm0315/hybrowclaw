@@ -16,10 +16,9 @@ const commands = [
   { name: "integrations", usage: "/integrations [id]", description: "guided channel/plugin/MCP setup workflow", aliases: ["integration"] },
 ] as const;
 
-test("ordinary working status stays alive without exposing elapsed time", () => {
+test("ordinary working status uses the sparkle identity without exposing diagnostic metrics", () => {
   const frames = Array.from({ length: 8 }, (_, index) => formatWorkingIndicator(undefined, index));
-  assert.ok(frames.every((frame) => frame.includes("working")));
-  assert.equal(new Set(frames).size, 4, "the activity indicator still animates");
+  assert.ok(frames.every((frame) => frame === "✻ working"));
   assert.doesNotMatch(frames.join(" "), /\b\d+(?:\.\d+)?(?:ms|s)\b|latency|p50|p95|cache/i);
 });
 
@@ -252,13 +251,14 @@ test("muster TUI completion provider can be backed by one catalog service", asyn
   assert.deepEqual(seen, ["provider-model:gpt:openai", "agent:re:"]);
 });
 
-test("muster composer render encloses the actual editor and grows for multiline input", () => {
+test("muster composer is a naked prompt and grows for multiline input", () => {
   const editor = createMusterChatEditor(fakeTui(120, 40));
   editor.setText("first line\nsecond line");
   const lines = renderMusterComposer(editor, 80);
 
-  assert.match(stripAnsi(lines[0]), /^╭─+╮$/);
-  assert.match(stripAnsi(lines.at(-1) ?? ""), /^╰/);
+  assert.match(stripAnsi(lines[0]), /^❯ first line/);
+  assert.match(stripAnsi(lines[1]), /^  second line/);
+  assert.doesNotMatch(stripAnsi(lines.join("\n")), /[╭╮╰╯│]/u);
   assert.ok(lines.some((line) => stripAnsi(line).includes("first line")));
   assert.ok(lines.some((line) => stripAnsi(line).includes("second line")));
   assert.ok(lines.every((line) => stripAnsi(line).length === 80), "composer lines should stay width-stable");
@@ -364,8 +364,8 @@ test("muster chat harness escape closes bare completion and restores normal prom
 
   assert.equal(harness.text(), "");
   assert.doesNotMatch(screen, /suggestions/);
-  assert.match(screen, /╭─+╮/);
-  assert.match(screen, /╰─+/);
+  assert.match(screen, /^❯/m);
+  assert.doesNotMatch(screen, /[╭╮╰╯│]/u);
 });
 
 test("muster chat harness replays prompt history when completion is not open", async () => {

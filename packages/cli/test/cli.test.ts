@@ -861,8 +861,8 @@ test("CLI chat checks mentioned skills, plugins, and MCPs before routing a norma
 
     assert.match(result.stdout, /Capability Check/);
     assert.match(result.stdout, /plugin:telegram/);
-    assert.match(result.stdout, /next="\/plugins telegram\s+/);
-    assert.match(result.stdout, /--allow-high-risk"/);
+    assert.match(result.stdout, /next="\/tools" \(review\s+telegram first\)/);
+    assert.doesNotMatch(result.stdout, /--allow-high-risk/);
     assert.match(result.stdout, /mcp:browser/);
     assert.match(result.stdout, /next="\/mcp browser"/);
     assert.match(result.stdout, /Capability mention acknowledged\./);

@@ -146,8 +146,8 @@ async function caseEscapeClosesOverlay(): Promise<QaPtyTuiCase> {
   await settleAutocomplete();
   harness.input("\x1b");
   const screen = stripAnsi(harness.visible(100).join("\n"));
-  const evidence = { text: harness.text(), suggestionsCount: count(screen, "suggestions"), hasRails: /╭─+╮/.test(screen) && /╰─+╯/.test(screen) };
-  return makeCase("escape_closes_bare_completion", evidence.text === "" && evidence.suggestionsCount === 0 && evidence.hasRails, "Escape closes bare slash overlay and returns to an empty composer", screen, evidence);
+  const evidence = { text: harness.text(), suggestionsCount: count(screen, "suggestions"), hasNakedPrompt: /^❯/m.test(screen), hasComposerRails: /[╭╮╰╯│]/u.test(screen) };
+  return makeCase("escape_closes_bare_completion", evidence.text === "" && evidence.suggestionsCount === 0 && evidence.hasNakedPrompt && !evidence.hasComposerRails, "Escape closes bare slash overlay and returns to a naked empty prompt", screen, evidence);
 }
 
 async function caseHistoryNavigation(): Promise<QaPtyTuiCase> {
@@ -320,14 +320,14 @@ async function caseResponsiveWidths(): Promise<QaPtyTuiCase> {
     const lines = stripAnsi(harness.visible(width).join("\n")).split("\n");
     checks.push({
       width,
-      hasTopRail: lines.some((line) => /^╭─+╮/.test(line)),
+      hasNakedPrompt: lines.some((line) => /^❯/.test(line)),
       hasBottomRail: lines.some((line) => /^╰─+╯$/.test(line)),
       hasSuggestions: lines.some((line) => line.includes("suggestions")),
       maxLineWidth: Math.max(...lines.map((line) => line.length)),
     });
   }
-  const passed = checks.every((entry) => entry.hasTopRail && entry.hasBottomRail && entry.hasSuggestions && Number(entry.maxLineWidth) <= Number(entry.width));
-  return makeCase("responsive_widths", passed, "composer rails and suggestions survive 80, 120, and 200 column widths", checks.map((entry) => JSON.stringify(entry)).join("\n"), { checks });
+  const passed = checks.every((entry) => entry.hasNakedPrompt && entry.hasBottomRail && entry.hasSuggestions && Number(entry.maxLineWidth) <= Number(entry.width));
+  return makeCase("responsive_widths", passed, "naked composer and suggestions survive 80, 120, and 200 column widths", checks.map((entry) => JSON.stringify(entry)).join("\n"), { checks });
 }
 
 async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Promise<QaPtyTuiCase> {
@@ -354,7 +354,7 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
     evidence.stage = "wait-baseline";
     const baseline = await waitForPtyScreen(session, (screen) => {
       const visible = stripAnsi(screen);
-      return /╭─+╮/.test(visible) && visible.includes("│ ›");
+      return /^❯/m.test(visible);
     });
     screens.push(`baseline\n${stripAnsi(baseline)}`);
 
@@ -411,7 +411,7 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
       historyOlder: composerValue(historyOlder),
       historyForward: composerValue(historyForward),
       bottomRailVisible: /╰─+╯/.test(stripAnsi(navigated)),
-      composerAliveAfterEscape: composerValue(afterEscape) === "" && /╰─+╯/.test(stripAnsi(afterEscape)),
+      composerAliveAfterEscape: composerValue(afterEscape) === "" && /^❯/m.test(stripAnsi(afterEscape)),
     });
     const passed = evidence.overlayCount === 1
       && evidence.overlayPersisted === true
@@ -484,15 +484,13 @@ function composerValue(screen: string): string | undefined {
   const lines = stripAnsi(screen).split("\n");
   let line: string | undefined;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (lines[index].includes("│ ›")) {
+    if (/^❯/.test(lines[index])) {
       line = lines[index];
       break;
     }
   }
   if (!line) return undefined;
-  const start = line.indexOf("│ ›") + 3;
-  const end = line.lastIndexOf("│");
-  return line.slice(start, end > start ? end : undefined).trim();
+  return line.slice(line.indexOf("❯") + 1).trim();
 }
 
 function selectedSuggestion(screen: string): string | undefined {

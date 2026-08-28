@@ -18,13 +18,13 @@ test("board layout snapshot is stable and contains the five task columns", () =>
   const layout = renderBoardLayout(fixture, 100, 18, { column: 2, row: 0 }, { color: false, nowMs: Date.parse("2026-08-28T09:02:03.000Z"), spinnerFrame: 0 });
   const snapshot = layout.lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
   assert.deepEqual(snapshot, [
-    "tasks · 5 tasks",
+    "tasks · 5",
     "Backlog 1           Ready 2             Running 1           Review 0            Done 1",
-    "· Write the plan    · Build board       ⠋ Wire live updat…                      · Ship it",
+    "● Write the plan    ◔ Build board       ◔ Wire live updat…                      ● Ship it",
     "  unassigned          gpt-5.6-sol (91)    gpt-5.6-terra (…                        gpt-5.6-luna (7…",
     "  — · cost —          — · cost —          2m · $0.014                             — · $0.020",
     "  backlog             assigned            Reading the ses…                        done",
-    "", "                    · Test navigation", "                      sonnet-5 (84)",
+    "", "                    ◔ Test navigation", "                      sonnet-5 (84)",
     "                      — · cost —", "                      assigned", "", "", "", "", "", "",
     "↑↓←→ move · enter open · esc/q chat · mouse click",
   ]);
@@ -37,6 +37,14 @@ test("focus movement matrix preserves rows, skips empty columns, and clamps", ()
   assert.deepEqual(moveBoardFocus(fixture, { column: 1, row: 0 }, "down"), { column: 1, row: 1 });
   assert.deepEqual(moveBoardFocus(fixture, { column: 1, row: 1 }, "down"), { column: 1, row: 1 });
   assert.deepEqual(moveBoardFocus(fixture, { column: 0, row: 0 }, "left"), { column: 0, row: 0 });
+});
+
+test("an empty board compacts all empty columns into one dim line", () => {
+  const empty: BoardView = { columns: { backlog: [], ready: [], running: [], review: [], done: [] }, cards: {} };
+  const lines = renderBoardLayout(empty, 80, 8, { column: 0, row: 0 }, { color: false }).lines.map((line) => line.trimEnd());
+  assert.equal(lines[0], "tasks · 0");
+  assert.equal(lines[1], "Backlog · Ready · Running · Review — empty");
+  assert.equal(lines.some((line) => /Backlog 0|Ready 0|Running 0|Review 0|Done 0/.test(line)), false);
 });
 
 test("card open and board close callbacks round-trip without losing focus", () => {

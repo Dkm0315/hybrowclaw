@@ -29,6 +29,8 @@ import { runFrappeConnectCommand } from "./frappe-connect-command.js";
 import { CHAT_COMMANDS, directPluginCommand, dynamicPluginCommands, type ChatCommandDef } from "./chat-command-catalog.js";
 import { unknownShellCommandMessage, unknownSlashCommandMessage } from "./command-suggestion.js";
 import { threadConflictCure } from "./thread-conflict.js";
+import { composerPrefillForCapabilityMention, intentfulCapabilityMentions } from "./capability-mention.js";
+import { formatEarlierHistoryLine, pruneHistory } from "./prose-renderer.js";
 import { runPtyTuiQa } from "./qa-pty-tui.js";
 import {
   buildComposerCatalog,
@@ -3370,7 +3372,7 @@ async function printMentionedCapabilityChecks(
   config: Awaited<ReturnType<typeof loadConfig>>,
   options: { interactive?: boolean } = {},
 ): Promise<readonly BuiltinCapabilityMention[]> {
-  const mentions = resolveBuiltinCapabilityMentions(prompt, { limit: 5 });
+  const mentions = intentfulCapabilityMentions(prompt, resolveBuiltinCapabilityMentions(prompt, { limit: 5 }));
   if (!mentions.length) return [];
   const lines: string[] = [];
   for (const mention of mentions) {
@@ -3398,16 +3400,15 @@ function openMentionedCapabilityPicker(
     ?? mentions.find((candidate) => candidate.kind === "skill")
     ?? mentions[0];
   if (!mention) return;
-  if (mention.kind === "plugin") {
-    const suffix = mention.risk === "high" && !isMentionedPluginEnabled(mention, config) ? " --allow-high-risk" : "";
-    openNextPicker(state, `/plugins ${mention.id}${suffix}`);
+  const prefill = composerPrefillForCapabilityMention(mention, {
+    enabled: isMentionedPluginEnabled(mention, config),
+    configured: isMentionedMcpConfigured(mention, config),
+  });
+  if (!prefill) {
+    state.statusSink.appendLine(color(`suggestion · review ${mention.id} in /tools before enabling it`, "dim"));
     return;
   }
-  if (mention.kind === "skill") {
-    openNextPicker(state, `/skills ${mention.id}`);
-    return;
-  }
-  openNextPicker(state, `/mcp ${isMentionedMcpConfigured(mention, config) ? `test ${mention.id}` : mention.id}`);
+  openNextPicker(state, prefill);
 }
 
 function isMentionedPluginEnabled(
@@ -3444,7 +3445,7 @@ async function formatMentionedCapabilityCheck(
     const missing = missingSetupEnv(plugin?.setup);
     const next = enabled
       ? `"/plugins check ${mention.id}"`
-      : `"/plugins ${mention.id}${mention.risk === "high" ? " --allow-high-risk" : ""}"`;
+      : mention.risk === "high" ? `"/tools" (review ${mention.id} first)` : `"/plugins ${mention.id}"`;
     return `${color(label, "accent")} ${enabled ? color("enabled", "green") : color("available", "yellow")} action=${mention.actionability ?? "-"} risk=${mention.risk}${missing.length ? ` missing=${missing.join(",")}` : ""} next=${next}`;
   }
   const configured = Boolean(config.tools?.mcp?.servers?.[safeConfigKey(mention.id)]);
@@ -5397,13 +5398,12 @@ async function printChatAgents(options: { numbered?: boolean } = {}): Promise<vo
 
 /**
  * A command's answer is an ACTION RESULT, not a window: `⏺ Status` on its own
- * line with the body indented beneath it. The full-width ╭─╮ frames are gone
- * from the chat surface — the composer is the only box left, because it is a
- * control rather than content.
+ * line with the body indented beneath it. Full-width frames are gone from the
+ * chat surface; the composer is a bare `❯ ` prompt.
  */
 function printChatPanel(title: string, lines: readonly string[]): void {
   const width = Math.min(Math.max((process.stdout.columns || 100) - 4, 72), 140);
-  console.log(formatToolLine(title));
+  console.log(formatToolLine(title, undefined, "success"));
   for (const line of lines) {
     for (const part of wrapPreserveLines(line || "", width - 4)) {
       console.log(part ? `  ${part}` : "");
@@ -9350,15 +9350,15 @@ function formatCodexAge(iso: string, nowMs = Date.now()): string {
 function importedHistoryLines(storeSessionId: string, title: string): string[] {
   const store = openSessionStore();
   try {
-    const result = store.search({ sessionId: storeSessionId });
-    if (result.shape !== "read") return [];
-    const rows = [...result.head, ...result.tail];
-    if (!rows.length) return [];
-    const users = rows.filter((row) => row.role === "user").length;
-    const assistants = rows.filter((row) => row.role === "assistant").length;
-    const omittedNote = result.omitted > 0 ? ` · ${result.omitted} older omitted` : "";
-    const lines = [color(`── history: ${title} · ${rows.length} messages (${users} user · ${assistants} assistant)${omittedNote} ──`, "dim")];
-    for (const row of rows) {
+    const all = store.loadActiveMessages(storeSessionId);
+    if (!all.length) return [];
+    const history = pruneHistory(all, 12);
+    const users = history.rows.filter((row) => row.role === "user").length;
+    const assistants = history.rows.filter((row) => row.role === "assistant").length;
+    const lines = [color(`── history: ${title} · ${history.rows.length} messages (${users} user · ${assistants} assistant) ──`, "dim")];
+    if (history.earlier > 0) lines.push(color(formatEarlierHistoryLine(history.earlier), "dim"));
+    if (history.trivial > 0) lines.push(color(`… ${history.trivial} brief ${history.trivial === 1 ? "message" : "messages"} collapsed`, "dim"));
+    for (const row of history.rows) {
       const parts = row.content.split(/\r?\n/);
       if (row.role === "user") {
         lines.push(formatUserLine(parts[0] ?? ""), ...parts.slice(1).map((line) => `  ${line}`));

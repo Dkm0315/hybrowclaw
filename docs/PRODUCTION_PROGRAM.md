@@ -4,6 +4,13 @@ Owner's mandate, verbatim intent: *"Break my harness down but build it up so
 no one can complain. Production-level, end-to-end, world-class — completing my
 daily work better than I do it today."*
 
+RULE ZERO — THE SHIP QUESTION (supersedes everything):
+Before any feature is called done, one question is asked and answered
+honestly: "Would this ship in Claude Code or the Codex app, under my own
+name?" The bar is the Apple bar — fluidity, polish, finish. A NO means the
+feature does not exist yet, whatever the tests say. Asked at every gate, by
+fable, on the rendered pixels and the lived feel — never on the diff.
+
 Rules of the program:
 1. Every surface below has a DEFINITION OF DONE (DoD). A surface is IN
    PROGRESS or DONE — there is no "mostly". Done requires: suite green + a

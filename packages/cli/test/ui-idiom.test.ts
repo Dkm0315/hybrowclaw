@@ -223,7 +223,7 @@ test("the status line carries model, session, tokens, cost and elapsed on one ro
   assert.equal(status.includes("\n"), false, "the status row is exactly one row");
 });
 
-test("the spinner rides the left edge of the status row and nothing else", () => {
+test("the working sparkle rides the left edge of the status row and nothing else", () => {
   const frames = Array.from({ length: 6 }, (_, frame) => stripAnsi(formatStatusLine({
     model: "fable-5",
     session: "main",
@@ -232,7 +232,7 @@ test("the spinner rides the left edge of the status row and nothing else", () =>
     elapsedMs: 3000,
   })));
 
-  assert.equal(new Set(frames).size, 6, "the spinner animates");
+  assert.equal(new Set(frames).size, 1, "the working line keeps one calm identity");
   for (const frame of frames) {
     assert.match(frame, /^\S \@review · fable-5 · main · 3\.0s$/);
   }
@@ -269,13 +269,13 @@ test("mission cards use ◔/●/✖ glyphs and aligned columns", () => {
     "  ⎿ 4 tasks · 3 agents · 1 running · $0.31",
     "    ◔ t4  rate-limiter  fable-5  api/limiter.ts +84     41.0s · 8.2k tok",
     "    ● t5  tests         gpt-5.5  12 passing             12.0s · 1.1k tok",
-    "    ○ t7  docs          —        —",
+    "    ● t7  docs          —        —",
     "    ✖ t8  bench         fable-5  needs a gateway token",
   ]);
 
   assert.equal(missionStatusGlyph("review"), "◔");
   assert.equal(missionStatusGlyph("needs_intervention"), "✖");
-  assert.equal(missionStatusGlyph("ready"), "○");
+  assert.equal(missionStatusGlyph("ready"), "●");
 });
 
 test("a mission card never collapses its own rows behind a count", () => {
@@ -309,9 +309,9 @@ test("a reasoning summary opens a NEW block below it and collapses to one row", 
   painter.finish();
 
   const lines = plain(painted);
-  const reasoningAt = lines.findIndex((line) => line.startsWith("· "));
+  const reasoningAt = lines.findIndex((line) => line.startsWith("✻ "));
   assert.ok(reasoningAt > 0, "the summary lands between the two blocks");
-  assert.equal(lines[reasoningAt], "· Checking whether the spool lease is renewed. Then confirming the fencing token.");
+  assert.equal(lines[reasoningAt], "✻ Checking whether the spool lease is renewed. Then confirming the fencing token.");
   assert.match(lines[reasoningAt + 1] ?? "", /^● Second answer paragraph\./, "the message it explains starts a fresh bullet below it");
 });
 
@@ -319,7 +319,7 @@ test("/reasoning full paints every summary line; compact truncates with an ellip
   const full: string[] = [];
   createNarrationPainter({ emit: (line) => full.push(line), reasoningMode: "full", minChars: 4, maxChars: 400 })
     .reasoning("line one of the summary\nline two of the summary\n");
-  assert.deepEqual(plain(full).slice(0, 2), ["· line one of the summary", "· line two of the summary"]);
+  assert.deepEqual(plain(full).slice(0, 2), ["✻ line one of the summary", "✻ line two of the summary"]);
 
   const compact: string[] = [];
   const painter = createNarrationPainter({ emit: (line) => compact.push(line), minChars: 4, maxChars: 4000 });

@@ -1,5 +1,6 @@
 import { matchesKey, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import type { BoardView, BoardViewCard, BoardViewColumn } from "@musterhq/core";
+import { EMPTY_BOARD_COLUMNS, formatBoardHeader, renderMissionStatusGlyph } from "./prose-renderer.js";
 
 const RESET = "\x1b[0m";
 const DIM = "\x1b[2m";
@@ -7,7 +8,6 @@ const MUTED = "148;144;140";
 const ACCENT = "217;119;87";
 export const BOARD_COLUMNS: readonly BoardViewColumn[] = ["backlog", "ready", "running", "review", "done"];
 const COLUMN_LABELS: Readonly<Record<BoardViewColumn, string>> = { backlog: "Backlog", ready: "Ready", running: "Running", review: "Review", done: "Done" };
-const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 
 export interface BoardFocus { readonly column: number; readonly row: number }
 export interface CardRect { readonly taskId: string; readonly column: number; readonly row: number; readonly x: number; readonly y: number; readonly width: number; readonly height: number }
@@ -76,13 +76,15 @@ function modelLabel(card: BoardViewCard): string {
 export function renderBoardLayout(view: BoardView, width: number, height: number, focus: BoardFocus, options: { readonly color?: boolean; readonly nowMs?: number; readonly spinnerFrame?: number } = {}): BoardLayout {
   const color = options.color ?? !process.env.NO_COLOR;
   const nowMs = options.nowMs ?? Date.now();
-  const frame = options.spinnerFrame ?? 0;
   const gutter = 1;
   const usable = Math.max(40, width - gutter * (BOARD_COLUMNS.length - 1));
   const columnWidth = Math.max(8, Math.floor(usable / BOARD_COLUMNS.length));
   const normalized = normalizeBoardFocus(view, focus);
-  const header = pad(`tasks · ${Object.keys(view.cards).length} ${Object.keys(view.cards).length === 1 ? "task" : "tasks"}`, width);
-  const columnHeaders = BOARD_COLUMNS.map((column) => dim(pad(`${COLUMN_LABELS[column]} ${view.columns[column].length}`, columnWidth), color)).join(" ");
+  const header = pad(formatBoardHeader(Object.keys(view.cards).length), width);
+  const empty = BOARD_COLUMNS.every((column) => view.columns[column].length === 0);
+  const columnHeaders = empty
+    ? dim(EMPTY_BOARD_COLUMNS, color)
+    : BOARD_COLUMNS.map((column) => dim(pad(`${COLUMN_LABELS[column]} ${view.columns[column].length}`, columnWidth), color)).join(" ");
   const lines: string[] = [header, columnHeaders];
   const rects: CardRect[] = [];
   const cardHeight = 5;
@@ -95,7 +97,7 @@ export function renderBoardLayout(view: BoardView, width: number, height: number
       const card = view.cards[taskId]!;
       const active = normalized.column === column && normalized.row === row;
       const inner = Math.max(1, columnWidth - 3);
-      const glyph = card.status === "in_progress" ? SPINNER[frame % SPINNER.length] : "·";
+      const glyph = renderMissionStatusGlyph(card.status);
       const cost = card.costUsd === undefined ? "cost —" : `$${card.costUsd.toFixed(3)}`;
       const rows = [
         `${glyph} ${clip(card.title, inner)}`,

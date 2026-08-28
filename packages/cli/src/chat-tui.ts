@@ -24,6 +24,15 @@ import { decodeCapabilitySelection, isCapabilityConfirmationText } from "./capab
 import { LiveFileOverlay, LiveFileTurnAccumulator, renderLiveFilePlain } from "./live-file-view.js";
 import { BoardScreen, parseSgrMouseSequence, stripMouseSequences, type SgrMouseEvent } from "./board-screen.js";
 import { openFileWithEditorGuard, TaskView } from "./task-view.js";
+import {
+  bandUserRow,
+  missionStatusGlyph as sharedMissionStatusGlyph,
+  renderChip,
+  renderActionBullet,
+  renderMissionStatusGlyph,
+  renderProse,
+  renderReasoningLine,
+} from "./prose-renderer.js";
 
 export interface MusterChatCommand {
   readonly name: string;
@@ -147,11 +156,10 @@ export interface MusterChatHarness {
   status(): string;
 }
 
-const WORKING_FRAMES = ["|", "/", "-", "\\"] as const;
-
 export function formatWorkingIndicator(agentId: string | undefined, frame: number): string {
   const label = agentId ? `@${agentId} working` : "working";
-  return `${WORKING_FRAMES[Math.abs(frame) % WORKING_FRAMES.length]} ${label}`;
+  void frame;
+  return `✻ ${label}`;
 }
 
 const RESET = "\x1b[0m";
@@ -164,7 +172,6 @@ const HIGHLIGHT_RGB = "224;175;104";
 const MUTED_RGB = "148;144;140";
 const RED_RGB = "255;107;122";
 const SELECTION_BG_RGB = "217;119;87";
-const ITALIC = "\x1b[3m";
 
 /**
  * ─────────────────────────────────────────────────────────────────────────────
@@ -230,7 +237,7 @@ export function routeEngineLine(line: string): EngineLineRoute {
 
 /** A spinner frame — `⟨frame⟩ working` / `⟨frame⟩ @agent working`. */
 export function isWorkingStatusLine(line: string): boolean {
-  return /^[|/\\-]\s+(?:@[A-Za-z0-9_.:-]+\s+)?working$/.test(stripAnsi(line).trim());
+  return /^(?:✻|[|/\\-])\s+(?:@[A-Za-z0-9_.:-]+\s+)?working$/.test(stripAnsi(line).trim());
 }
 
 function isRecallReceiptDetailLine(line: string): boolean {
@@ -269,14 +276,14 @@ export function formatCostChip(record: CostChipRecord): string {
   if (typeof record.outputTokens === "number") parts.push(`${compactCount(record.outputTokens)}${estimated} out`);
   if (typeof record.costUsd === "number") parts.push(`$${record.costUsd.toFixed(4)}`);
   if (typeof record.durationMs === "number") parts.push(formatDuration(record.durationMs));
-  return dim(`▸ ${parts.join(" · ")}`);
+  return renderChip(`▸ ${parts.join(" · ")}`);
 }
 
 /** `memory backend=… recalled=2 …` → `▸ recalled 2 memories`; nothing when 0. */
 export function formatRecallChip(line: string): string | undefined {
   const recalled = Number(stripAnsi(line).match(/\brecalled=(\d+)/)?.[1] ?? Number.NaN);
   if (!Number.isFinite(recalled) || recalled <= 0) return undefined;
-  return dim(`▸ recalled ${recalled} ${recalled === 1 ? "memory" : "memories"}`);
+  return renderChip(`▸ recalled ${recalled} ${recalled === 1 ? "memory" : "memories"}`);
 }
 
 /** `timings total=8335ms provider=8259ms …` → `▸ 8.3s total · 8.3s provider`. */
@@ -289,7 +296,7 @@ export function formatTimingsChip(line: string): string | undefined {
   if (Number.isFinite(provider)) parts.push(`${formatDuration(provider)} provider`);
   const firstToken = Number(clean.match(/\bfirst_token_ms=(\d+)/)?.[1] ?? Number.NaN);
   if (Number.isFinite(firstToken)) parts.push(`first token ${formatDuration(firstToken)}`);
-  return dim(`▸ ${parts.join(" · ")}`);
+  return renderChip(`▸ ${parts.join(" · ")}`);
 }
 
 export function compactCount(value: number): string {
@@ -326,8 +333,8 @@ export function formatDuration(ms: number): string {
  *       @@ -1,4 +1,5 @@                            with the detail indented
  *       … +7 lines
  *
- * No box frames: whitespace and gutters do the separating. The only remaining
- * ╭─╮ in the chat surface is the composer, which is a control, not content.
+ * No box frames: whitespace and gutters do the separating. The composer is a
+ * bare `❯ ` prompt; only transient suggestion overlays keep their own frame.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
@@ -342,7 +349,7 @@ export const RESULT_ELBOW = "⎿";
 /** Result detail beyond this many rows collapses to a "… +n lines" count. */
 export const TOOL_RESULT_MAX_LINES = 6;
 /** Spinner frames for the single status row (never the transcript). */
-export const STATUS_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
+export const STATUS_SPINNER_FRAMES = ["✻"] as const;
 
 /** `> deploy the limiter` — the gutter is dim, the user's own words are not. */
 export function formatUserLine(text: string): string {
@@ -364,17 +371,17 @@ export function isUserTranscriptLine(line: string): boolean {
  * — deltas paint into the SAME bullet instead of sprouting one per chunk.
  */
 export function formatAssistantBlock(text: string, options: { readonly continued?: boolean } = {}): string[] {
-  const rows = String(text).split(/\r?\n/);
-  while (rows.length && !rows[0]!.trim()) rows.shift();
-  while (rows.length && !rows[rows.length - 1]!.trim()) rows.pop();
-  if (!rows.length) return [];
-  return rows.map((row, index) => (index === 0 && !options.continued ? `${accent(ASSISTANT_BULLET)} ${row}` : `  ${row}`));
+  return renderProse(text, {
+    firstPrefix: `${accent(ASSISTANT_BULLET)} `,
+    continuationPrefix: "  ",
+    continued: options.continued,
+  });
 }
 
 /** `⏺ Edit(server.js)` — the action, on its own line, above its result. */
-export function formatToolLine(name: string, target?: string): string {
+export function formatToolLine(name: string, target?: string, status: "pending" | "success" | "failure" = "pending"): string {
   const label = target ? `${name}(${target})` : name;
-  return `${accent(TOOL_BULLET)} ${label}`;
+  return `${renderActionBullet(status)} ${label}`;
 }
 
 export interface ToolResultOptions {
@@ -413,7 +420,7 @@ export interface ToolBlockOptions extends ToolResultOptions {
 
 /** The whole ⏺/⎿ frame for one action. */
 export function renderToolBlock(options: ToolBlockOptions): string[] {
-  return [formatToolLine(options.name, options.target), ...formatToolResultLines(options.summary, options)];
+  return [formatToolLine(options.name, options.target, "success"), ...formatToolResultLines(options.summary, options)];
 }
 
 export interface ToolSummaryParts {
@@ -484,25 +491,7 @@ export function formatStatusLine(info: StatusLineInfo): string {
 }
 
 /** Task statuses collapse to three glyphs: pending, live, ended. */
-export function missionStatusGlyph(status: string): string {
-  switch (status) {
-    case "in_progress":
-    case "running":
-    case "assigned":
-    case "review":
-      return "◔";
-    case "done":
-    case "completed":
-      return "●";
-    case "blocked":
-    case "failed":
-    case "needs_intervention":
-    case "cancelled":
-      return "✖";
-    default:
-      return "○";
-  }
-}
+export const missionStatusGlyph = sharedMissionStatusGlyph;
 
 export interface MissionCardRow {
   readonly id: string;
@@ -543,7 +532,7 @@ export function renderMissionCard(card: MissionCard): string[] {
   ]);
   const widths = [0, 1, 2, 3].map((index) => Math.max(...columns.map((cells) => visibleWidth(cells[index] ?? "")), 0));
   const detail = columns.map((cells, index) => {
-    const glyph = missionStatusGlyph(card.rows[index]!.status);
+    const glyph = renderMissionStatusGlyph(card.rows[index]!.status);
     const body = cells.slice(0, 4).map((cell, column) => padPlain(cell ?? "", widths[column] ?? 0)).join("  ");
     const metrics = cells[4] ?? "";
     // Trim BEFORE tinting: padding hidden inside an escape sequence would
@@ -616,6 +605,7 @@ export function createNarrationPainter(options: NarrationPainterOptions): Narrat
   const message = createCoalescer({ minChars, maxChars, breakPreference: "newline", now: options.now });
   const reasoning = createCoalescer({ minChars, maxChars, breakPreference: "newline", now: options.now });
   let painted = 0;
+  let lastDelta = "";
   /** True while a `●` block is open, so the next delta continues it. */
   let blockOpen = false;
 
@@ -654,7 +644,14 @@ export function createNarrationPainter(options: NarrationPainterOptions): Narrat
     delta(text) {
       if (!text) return;
       if (reasoning.pending) drainReasoning();
-      for (const event of message.push(text)) {
+      // Provider item boundaries occasionally arrive without their separating
+      // whitespace (ledger #9: "now.Tests"). This is intentionally a narrow
+      // heuristic: terminal punctuation followed immediately by an uppercase
+      // sentence start becomes a paragraph boundary. It runs before the
+      // fence-aware coalescer, which still owns all fence splitting.
+      const joined = /[.!?]["')\]]?$/.test(lastDelta) && /^[A-Z]/.test(text) ? `\n\n${text}` : text;
+      lastDelta = text;
+      for (const event of message.push(joined)) {
         if (event.type === "block") paintMessage(event.text);
       }
     },
@@ -677,14 +674,9 @@ export function createNarrationPainter(options: NarrationPainterOptions): Narrat
   };
 }
 
-/** Reasoning summaries render dim + italic so they never read as the answer. */
+/** Reasoning summaries render violet + italic so they never read as the answer. */
 export function formatReasoningLine(text: string): string {
-  // Reasoning summaries arrive as markdown; painted dim-italic, the emphasis
-  // markers are pure noise ("**Planning code inspection**" — observed live).
-  // Single underscores stay: snake_case identifiers are content, not markup.
-  const body = `· ${text.trim().replace(/\*\*|__|`/g, "").replace(/(^|\s)\*(\S[^*]*\S|\S)\*(?=\s|$)/g, "$1$2")}`;
-  if (process.env.NO_COLOR) return body;
-  return `${ITALIC}\x1b[38;2;${MUTED_RGB}m${body}${RESET}`;
+  return renderReasoningLine(text);
 }
 
 /** Longest single-row reasoning summary before "…" (compact mode). */
@@ -870,7 +862,7 @@ export function createMusterChatHarness(options: MusterAutocompleteOptions & {
 export function renderMusterComposer(editor: Editor, width: number): string[] {
   const frameWidth = Math.max(32, Math.floor(width));
   const innerWidth = frameWidth - 4;
-  const editorWidth = Math.max(8, innerWidth - 2);
+  const editorWidth = Math.max(8, frameWidth - 2);
   const rawLines = editor.render(editorWidth);
   const borderIndexes = rawLines
     .map((line, index) => ({ line: stripAnsi(line).trim(), index }))
@@ -880,25 +872,24 @@ export function renderMusterComposer(editor: Editor, width: number): string[] {
   const secondBorder = borderIndexes.find((index) => index > firstBorder) ?? rawLines.length;
   const inputLines = rawLines.slice(firstBorder + 1, secondBorder);
   const completionLines = rawLines.slice(secondBorder + 1);
-  const result = [accent(`╭${"─".repeat(Math.max(1, frameWidth - 2))}╮`)];
+  const result: string[] = [];
 
   if (!inputLines.length) {
-    result.push(frameLine(`${highlight("›")} `, innerWidth));
+    result.push(`${highlight("❯")} `);
   } else {
     inputLines.forEach((line, index) => {
-      const prefix = index === 0 ? `${highlight("›")} ` : "  ";
-      result.push(frameLine(prefix + line, innerWidth));
+      const prefix = index === 0 ? `${highlight("❯")} ` : "  ";
+      result.push(prefix + line);
     });
   }
 
   if (completionLines.length) {
-    result.push(accent(`├─ suggestions ${"─".repeat(Math.max(1, frameWidth - 16))}┤`));
+    result.push(accent(`╭─ suggestions ${"─".repeat(Math.max(1, frameWidth - 16))}╮`));
     for (const line of completionLines) {
-      result.push(frameLine(line, innerWidth));
+      result.push(frameLine(truncateToWidth(line, innerWidth, ""), innerWidth));
     }
+    result.push(accent(`╰${"─".repeat(frameWidth - 2)}╯`));
   }
-
-  result.push(accent(`╰${"─".repeat(frameWidth - 2)}╯`));
   return result.map((line) => padAnsi(line, frameWidth));
 }
 
@@ -1458,11 +1449,17 @@ class MusterChatScreen implements Component, MusterChatSink {
     // renderTranscriptWindow budget) is what made running history vanish; it
     // must never come back. renderTranscriptWindow remains exported for
     // cramped non-interactive surfaces only.
-    const transcript = this.lines.flatMap((line) => wrapLine(line, frameWidth));
     // Pad to the FULL terminal width, not the capped frame: on ultra-wide
     // terminals, cells beyond the frame otherwise keep stale glyphs from
     // earlier wide paints (observed as phantom "["/"]" at screen edges).
     const padTo = Math.max(frameWidth, this.tui.terminal.columns || frameWidth);
+    let userBandOpen = false;
+    const transcript = this.lines.flatMap((line) => {
+      const plain = stripAnsi(line);
+      if (isUserTranscriptLine(line)) userBandOpen = true;
+      else if (!plain.startsWith("  ")) userBandOpen = false;
+      return wrapLine(line, frameWidth).map((row) => userBandOpen ? bandUserRow(row, padTo) : row);
+    });
     // THE LAYOUT LAW, corrected by the owner's eye: content and input travel
     // TOGETHER — the composer sits directly under the last message, drifting
     // to the bottom naturally as the screen fills. A filler void between the
@@ -2014,35 +2011,74 @@ function frameLine(content: string, innerWidth: number): string {
 function wrapLine(line: string, width: number): string[] {
   const cleanWidth = Math.max(10, width - 2);
   if (visibleWidth(line) <= cleanWidth) return [line];
-  const indent = hangingIndent(stripAnsi(line), cleanWidth);
+  const plain = stripAnsi(line);
+  const indent = hangingIndent(plain, cleanWidth);
   const chunks: string[] = [];
-  let rest = stripAnsi(line);
+  let cursor = 0;
   for (;;) {
+    const rest = plain.slice(cursor);
     // Continuations keep the row's own gutter column, so a wrapped `●` block
     // still reads as ONE block instead of restarting at column zero.
     const prefix = chunks.length ? indent : "";
     const limit = Math.max(1, cleanWidth - prefix.length);
     if (visibleWidth(rest) <= limit) {
-      if (rest) chunks.push(prefix + rest);
+      if (rest) chunks.push(prefix + sliceAnsiRange(line, cursor, plain.length));
       break;
     }
     const fitted = stripAnsi(truncateToWidth(rest, limit, ""));
     // A zero-width fit would loop forever; take one character and move on.
     const take = fitted.length > 0 ? wrapBreakPoint(rest, fitted.length) : 1;
-    chunks.push(prefix + rest.slice(0, take));
-    rest = rest.slice(take);
+    chunks.push(prefix + sliceAnsiRange(line, cursor, cursor + take));
+    cursor += take;
   }
   return chunks.length ? chunks : [line];
 }
 
 /**
+ * Slice by plain-text offsets while replaying the SGR state active at the
+ * slice boundary. Semantic paint used to disappear as soon as prose wrapped;
+ * keeping this here makes terminal width a layout concern, never a style gate.
+ */
+function sliceAnsiRange(value: string, start: number, end: number): string {
+  const sgr = /\u001b\[[0-9;]*m/g;
+  let plainAt = 0;
+  let rawAt = 0;
+  let active: string[] = [];
+  let output = "";
+  let started = false;
+  for (;;) {
+    sgr.lastIndex = rawAt;
+    const match = sgr.exec(value);
+    const nextEscape = match?.index ?? value.length;
+    const text = value.slice(rawAt, nextEscape);
+    const textStart = plainAt;
+    const textEnd = plainAt + text.length;
+    if (textEnd > start && textStart < end) {
+      if (!started) { output += active.join(""); started = true; }
+      output += text.slice(Math.max(0, start - textStart), Math.min(text.length, end - textStart));
+    }
+    plainAt = textEnd;
+    if (!match || plainAt >= end) break;
+    const code = match[0];
+    if (code === RESET || code === "\x1b[m") active = [];
+    else active.push(code);
+    if (plainAt >= start && plainAt < end) {
+      if (!started) { output += active.join(""); started = true; }
+      else output += code;
+    }
+    rawAt = nextEscape + code.length;
+  }
+  return process.env.NO_COLOR || !output ? output : `${output}${RESET}`;
+}
+
+/**
  * The column a wrapped row resumes at: its own leading whitespace plus the
- * width of a gutter glyph (`●`, `⏺`, `⎿`, `>`, `·`) when it wears one. Clamped
+ * width of a gutter glyph (`●`, `⏺`, `⎿`, `>`, `✻`) when it wears one. Clamped
  * so a deeply indented row can never wrap itself down to a one-character
  * column.
  */
 function hangingIndent(clean: string, cleanWidth: number): string {
-  const match = clean.match(/^( *)(?:([●⏺⎿>·]) )?/u);
+  const match = clean.match(/^( *)(?:([●⏺⎿>✻]) )?/u);
   const leading = match?.[1]?.length ?? 0;
   const glyph = match?.[2] ? 2 : 0;
   return " ".repeat(Math.max(0, Math.min(leading + glyph, cleanWidth - 10)));
