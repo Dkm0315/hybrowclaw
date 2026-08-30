@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { adjudicateFeedback } from "./feedback.js";
 import { verifyIntegrity } from "./integrity.js";
-import { addMemory, searchMemory } from "./memory.js";
+import { addMemory, MemoryPolicyError, searchMemory } from "./memory.js";
 import { executeRun, type RunOptions } from "./run.js";
 import { appendFeedback } from "./store.js";
 import { buildTokenRecord } from "./tokens.js";
@@ -156,7 +156,14 @@ export async function runHarnessChecks(cwd = process.cwd()): Promise<HarnessChec
       detail: leaked ? "Scoped memory leaked into global search" : undefined,
     });
   } catch (error) {
-    checks.push({ id: "memory_isolation", description: "User/session-scoped memory is invisible to global-scope retrieval", status: "failed", detail: String(error) });
+    // A policy refusal is not an isolation defect: the check could not run
+    // because config.memory.policy forbids the durable probe it needs. Still
+    // reported as failed — an unverified guarantee is not a verified one — but
+    // the detail must not claim scoped memory leaked.
+    const detail = error instanceof MemoryPolicyError
+      ? `check not run: the durable probe it needs was refused. ${error.message}`
+      : String(error);
+    checks.push({ id: "memory_isolation", description: "User/session-scoped memory is invisible to global-scope retrieval", status: "failed", detail });
   }
 
   // 2. Replay-waste detection: the token ledger must flag continuation bloat.

@@ -149,8 +149,8 @@ test("a guided Frappe create keeps required-field state across natural follow-up
       }
       return {
         status: "executed",
-        result: { created: { name: "SUP-0001", subject: "final issue" } },
-        verification: { verified: true, fetched: { name: "SUP-0001", subject: "final issue" } },
+        result: { created: { name: "SUP-0001", ...(args.doc as Record<string, unknown>) } },
+        verification: { verified: true, fetched: { name: "SUP-0001", ...(args.doc as Record<string, unknown>) } },
       };
     },
   };
@@ -243,6 +243,9 @@ test("issue reporting targets the configured Helpdesk OAuth grant and preserves 
   const enterprise = createInMemoryGatewayEnterpriseRuntime();
   const interactionCalls: Record<string, unknown>[] = [];
   const safeWriteCalls: Record<string, unknown>[] = [];
+  let throwOnExecution = false;
+  let reconcileRecord: Record<string, unknown> | undefined;
+  let lastExecutedRecord: Record<string, unknown> | undefined;
   const registry: FlowToolRegistry = {
     "frappe-federated-bridge__frappe_fast_route": async () => ({ intent: "record_create", candidateDoctypes: ["HD Ticket"] }),
     "frappe-federated-bridge__frappe_chat_interaction_plan": async (args) => {
@@ -278,15 +281,29 @@ test("issue reporting targets the configured Helpdesk OAuth grant and preserves 
           bindingRequirements: [],
         },
       };
+      if (throwOnExecution) {
+        reconcileRecord = { name: "HD-TICKET-UNCERTAIN", ...(args.doc as Record<string, unknown>) };
+        throw new Error("ambiguous upstream timeout");
+      }
+      lastExecutedRecord = { name: "HD-TICKET-0042", ...(args.doc as Record<string, unknown>) };
       return {
         status: "executed",
-        result: { created: { name: "HD-TICKET-0042" } },
-        verification: { verified: true, fetched: { name: "HD-TICKET-0042" } },
+        result: { created: lastExecutedRecord },
+        verification: { verified: true, fetched: lastExecutedRecord },
       };
     },
   };
   const authorizationSites: string[] = [];
   const frappeOAuth = {
+    authorization: async (connectionId: string) => {
+      authorizationSites.push(`connection:${connectionId}`);
+      return connectionId === "hybrow-support" ? {
+        connectionId,
+        site: "https://support.hybrowlabs.com",
+        header: "Bearer support-user-secret",
+        identity: { site: "https://support.hybrowlabs.com", user: "engineer@example.test", userName: "NPD Engineer", roles: ["Customer"] },
+      } : undefined;
+    },
     authorizationForActor: async (_actor: unknown, expectedSite?: string) => {
       authorizationSites.push(expectedSite ?? "");
       if (expectedSite === "https://support.hybrowlabs.com") return {
@@ -317,12 +334,22 @@ test("issue reporting targets the configured Helpdesk OAuth grant and preserves 
     registry,
     frappeOAuth,
     enterprise,
+    fetcher: async (input) => {
+      const url = new URL(String(input));
+      const direct = /\/api\/resource\/HD%20Ticket\//.test(url.pathname);
+      return new Response(JSON.stringify({ data: direct ? lastExecutedRecord : reconcileRecord ? [reconcileRecord] : [] }), {
+        status: direct && !lastExecutedRecord ? 404 : 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
   });
   try {
     const reply = await send("Report this engineering revision mismatch to support");
     assert.match("text" in reply ? reply.text : "", /review the support ticket/i);
     assert.deepEqual("presentation" in reply ? reply.presentation?.actions?.map((action) => action.label) : [], ["Approve & send to support", "Cancel ticket"]);
-    assert.ok(authorizationSites.includes("https://support.hybrowlabs.com"));
+    const previewRows = "presentation" in reply ? reply.presentation?.tables?.[0]?.rows ?? [] : [];
+    assert.match(String(previewRows.find((row) => row[0] === "Evidence preview")?.[1]), /Source site/);
+    assert.ok(authorizationSites.includes("connection:hybrow-support"));
     assert.equal(interactionCalls.at(-1)?.siteUrl, "https://support.hybrowlabs.com");
     assert.equal(interactionCalls.at(-1)?.apiToken, "support-user-secret");
     assert.doesNotMatch(JSON.stringify(interactionCalls.at(-1)), /vinman-user-secret/);
@@ -336,6 +363,33 @@ test("issue reporting targets the configured Helpdesk OAuth grant and preserves 
     assert.equal(safeWriteCalls[0]?.siteUrl, "https://support.hybrowlabs.com");
     assert.equal(safeWriteCalls[1]?.siteUrl, "https://support.hybrowlabs.com");
     assert.equal((safeWriteCalls[0]?.doc as Record<string, unknown>).customer, "Vinman Engineering Private Limited");
+
+    await send("Please raise this engineering mismatch with support");
+    const concurrentStart = safeWriteCalls.length;
+    const concurrent = await Promise.all([send("/accept"), send("/accept")]);
+    assert.equal(
+      safeWriteCalls.slice(concurrentStart).filter((args) => args.approvalReceipt).length,
+      1,
+      "atomic admission must allow only one executed write",
+    );
+    assert.ok(concurrent.every((reply) => /already being processed|created|no request waiting/i.test("text" in reply ? reply.text : "")));
+
+    await send("after update this page not opening. check and send to support");
+    throwOnExecution = true;
+    const uncertain = await send("/accept");
+    assert.match("text" in uncertain ? uncertain.text : "", /will not send the request again/i);
+    const callsAfterUncertainResult = safeWriteCalls.length;
+    reconcileRecord = undefined;
+    const unresolvedRetry = await send("/accept");
+    assert.match("text" in unresolvedRetry ? unresolvedRetry.text : "", /already admitted|will not send it again/i);
+    assert.equal(safeWriteCalls.length, callsAfterUncertainResult, "an uncertain write must never be replayed blindly");
+    const unsafeCancel = await send("/cancel");
+    assert.match("text" in unsafeCancel ? unsafeCancel.text : "", /cannot be discarded safely/i);
+    assert.equal(safeWriteCalls.length, callsAfterUncertainResult, "cancelling an uncertain write must not execute or erase it");
+    reconcileRecord = { name: "HD-TICKET-UNCERTAIN", ...(safeWriteCalls.at(-1)?.doc as Record<string, unknown>) };
+    const reconciled = await send("/accept");
+    assert.match("text" in reconciled ? reconciled.text : "", /HD-TICKET-UNCERTAIN/);
+    assert.equal(safeWriteCalls.length, callsAfterUncertainResult, "reconciliation must remain read-only");
   } finally {
     await enterprise.close?.();
     await rm(cwd, { recursive: true, force: true });

@@ -3,8 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Muster Docs — Governed Agent Harness, MCP, Memory, Token Ledger</title>
-  <meta name="description" content="Muster docs for the open-source governed agent harness: getting started, multi-provider routing, scoped memory, token ledger, eval-gated learning, MCP, capability packs, browser automation, and Frappe / ERPNext support." />
+  <title>Muster Docs — Open Source AI Agent Framework</title>
+  <meta name="description" content="Documentation for Muster, an open source AI agent framework: getting started, multi-provider routing, scoped memory, the token ledger, eval-gated learning, MCP, capability packs, and ERPNext support." />
+  <meta name="keywords" content="open source AI agent framework, self-hosted AI agent, AI agent docs, MCP agent, scoped memory, token ledger, ERPNext AI agent" />
   <meta name="robots" content="index, follow, max-image-preview:large" />
   <link rel="canonical" href="https://themuster.dev/docs.html" />
   <meta name="theme-color" content="#F0EEE9" />
@@ -21,12 +22,12 @@
     })();
   </script>
   <meta property="og:type" content="website" />
-  <meta property="og:title" content="Muster Docs — Governed Agent Harness" />
+  <meta property="og:title" content="Muster Docs — Open Source AI Agent Framework" />
   <meta property="og:description" content="Documentation for scoped memory, token visibility, eval-gated learning, MCP capabilities, browser automation, and Frappe / ERPNext workflows." />
   <meta property="og:url" content="https://themuster.dev/docs.html" />
   <meta property="og:image" content="https://themuster.dev/assets/brand/muster-og.png" />
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="Muster Docs — Governed Agent Harness" />
+  <meta name="twitter:title" content="Muster Docs — Open Source AI Agent Framework" />
   <meta name="twitter:description" content="Docs for scoped memory, token ledger, eval-gated learning, MCP, capability packs, browser automation, and Frappe / ERPNext workflows." />
   <meta name="twitter:image" content="https://themuster.dev/assets/brand/muster-og.png" />
   <link rel="preconnect" href="https://api.fontshare.com" crossorigin />
@@ -68,31 +69,33 @@
 
       <main class="runlog docs-main">
 
+        <h1 class="docs-title">Muster documentation</h1>
+
         <section id="getting-started" class="docs-section reveal">
-          <h1>Getting started</h1>
+          <h2>Getting started</h2>
           <p>Muster is a monorepo of small packages around one CLI. Initialize a workspace, point it at a provider, run, and check the ledger.</p>
 
-          <h2>1 · Initialize</h2>
+          <h3>1 · Initialize</h3>
           <pre class="mono codeblock">$ muster init
 Created or reused Muster config: .muster/config.json
 Default provider: generated from local config; use provider presets to pick cloud, open-source, self-hosted, Gemini, aggregator, or CLI-auth routes
 Next: muster doctor</pre>
           <p><code>muster doctor</code> checks the config, routing policy (<em>one active runtime per run</em>), and probes every configured provider's <code>/models</code> endpoint. <code>muster doctor --fix</code> repairs the config and data directory.</p>
 
-          <h2>2 · Add a provider</h2>
+          <h3>2 · Add a provider</h3>
           <pre class="mono codeblock">$ muster provider add openai                 # any preset id — see Providers below
 $ muster provider add anthropic --model claude-sonnet-4-6
 $ muster provider add-openai-compatible myllm http://localhost:8000/v1 served-model
 $ muster runtime use-provider native openai  # bind the native runtime to it</pre>
 
-          <h2>3 · Run</h2>
+          <h3>3 · Run</h3>
           <pre class="mono codeblock">$ muster run "Summarize what changed on uat-erp since Friday." --scope user:me
 recalled 1 scoped memories into context
 run=ea59ad5f… runtime=native model=stub/stub-model task=simple_qa status=completed
 tokens in=54~ out=64~</pre>
           <p>Every run is recorded as an episode with scoped memory recall and token estimates. Options: <code>--runtime pi</code>, <code>--provider gemini|groq|openrouter|vllm|...</code>, <code>--model …</code>, <code>--session memory|create|continue</code>, <code>--task-kind coding</code>, <code>--sensitive</code>.</p>
 
-          <h2>4 · Audit</h2>
+          <h3>4 · Audit</h3>
           <pre class="mono codeblock">$ muster tokens        # per-run ledger + totals by model + waste flags
 $ muster episodes      # every recorded run
 $ muster verify        # line-level integrity check of all JSONL stores
@@ -101,10 +104,10 @@ $ muster status        # one-screen mission control</pre>
         </section>
 
         <section id="providers" class="docs-section reveal">
-          <h1>Providers</h1>
+          <h2>Providers</h2>
           <p>No API or AI provider should be a bottleneck. Muster is provider-family agnostic: direct cloud APIs, Gemini, OpenAI-compatible endpoints, aggregators, local/open-source servers, Pi, and optional CLI-auth runtimes are all supported through the same governed run loop. List presets any time with <code>muster provider presets</code>. Source: <code>packages/core/src/providers-catalog.ts</code>.</p>
 
-          <h2>Cloud providers</h2>
+          <h3>Cloud providers</h3>
           <table class="docs-table">
             <thead><tr><th>id</th><th>provider</th><th>key env</th><th>default model</th></tr></thead>
             <tbody>
@@ -123,7 +126,7 @@ $ muster status        # one-screen mission control</pre>
             </tbody>
           </table>
 
-          <h2>Aggregators (one key, many models)</h2>
+          <h3>Aggregators (one key, many models)</h3>
           <table class="docs-table">
             <thead><tr><th>id</th><th>provider</th><th>key env</th><th>default model</th></tr></thead>
             <tbody>
@@ -133,7 +136,7 @@ $ muster status        # one-screen mission control</pre>
             </tbody>
           </table>
 
-          <h2>Local / self-hosted (open source, air-gap friendly)</h2>
+          <h3>Local / self-hosted (open source, air-gap friendly)</h3>
           <table class="docs-table">
             <thead><tr><th>id</th><th>provider</th><th>base URL</th><th>notes</th></tr></thead>
             <tbody>
@@ -143,7 +146,7 @@ $ muster status        # one-screen mission control</pre>
             </tbody>
           </table>
 
-          <h2>CLI-auth runtimes (optional subscription auth, no raw API key)</h2>
+          <h3>CLI-auth runtimes (optional subscription auth, no raw API key)</h3>
           <pre class="mono codeblock">codex-cli      OpenAI Codex CLI — uses your local `codex` login (default gpt-5.5)
 
 Also available without presets:
@@ -153,7 +156,7 @@ Also available without presets:
         </section>
 
         <section id="flows" class="docs-section reveal">
-          <h1>Flows</h1>
+          <h2>Flows</h2>
           <p>Flows are deterministic pipelines-as-data: validated definitions, durable runs, budgets, and approval gates that show the approver the <em>actual</em> output, not a step name. Source spec: <code>docs/FLOW_ENGINE_SPEC.md</code>.</p>
 
           <pre class="mono codeblock">id: weekly-ticket-digest
@@ -176,7 +179,7 @@ steps:
     tool: frappe_records_create
     when: approve.granted</pre>
 
-          <h2>Core properties</h2>
+          <h3>Core properties</h3>
           <ul>
             <li><strong>Preflight</strong> — <code>muster flow check &lt;id&gt;</code> validates schema, tool existence, template variables and permissions <em>before</em> anything runs.</li>
             <li><strong>Durable runs as data</strong> — every step result appends to <code>.muster/data/flows/&lt;run&gt;.jsonl</code>; gate state lives in the run record, not a magic token, so it survives restarts.</li>
@@ -185,7 +188,7 @@ steps:
             <li><strong>Loops</strong> — <code>muster flow loop &lt;flow-id&gt; --cron "0 9 * * 1"</code> binds a flow to the scheduler.</li>
           </ul>
 
-          <h2>Lifecycle</h2>
+          <h3>Lifecycle</h3>
           <pre class="mono codeblock">$ muster flow save deploy-digest.json     # validate + store the definition
 $ muster flow check deploy-digest         # preflight=ok
 $ muster flow run deploy-digest           # runs until a gate → awaiting_approval
@@ -195,7 +198,7 @@ $ muster flow show flowrun_89e4607c       # full step-by-step run record</pre>
         </section>
 
         <section id="gateway" class="docs-section reveal">
-          <h1>Gateway &amp; surfaces</h1>
+          <h2>Gateway &amp; surfaces</h2>
           <p>One gateway process, one message envelope, any frontend. Six webhook adapters ship in <code>packages/gateway/src/adapters</code> — <strong>telegram, slack, discord, whatsapp, gchat, teams</strong> — plus a browser client in <code>packages/surface</code>. Discord interactions are verified with native ed25519 signatures.</p>
 
           <pre class="mono codeblock">$ muster gateway status              # safe readiness check; token is never printed
@@ -205,7 +208,7 @@ $ muster gateway start --port 7460
 $ muster pairing list                # pending senders
 $ muster pairing approve &lt;code&gt;      # first message from an unknown sender requires pairing</pre>
 
-          <h2>Web client</h2>
+          <h3>Web client</h3>
           <p>The whole client is one authenticated POST (from <code>packages/surface/demo/index.html</code>):</p>
           <pre class="mono codeblock">const surface = (url, token) =&gt; ({
   async send(text) {
@@ -220,12 +223,12 @@ $ muster pairing approve &lt;code&gt;      # first message from an unknown sende
         </section>
 
         <section id="capability-packs" class="docs-section reveal">
-          <h1>Capability packs</h1>
+          <h2>Capability packs</h2>
           <p>Capability packs are sandboxed tool bundles with a manifest, declared permissions, secrets and evals. Inspect before you load:</p>
           <pre class="mono codeblock">$ muster capability inspect capability-packs/frappe
 $ muster capability load capability-packs/frappe [--allow-high-risk]</pre>
 
-          <h2>frappe — Frappe/ERPNext Federated Bridge</h2>
+          <h3>frappe — Frappe/ERPNext Federated Bridge</h3>
           <p>From <code>capability-packs/frappe/manifest.json</code> (v0.1.0): permission-scoped Frappe/ERPNext tools with federated OAuth identity. Every read and write executes as the paired Frappe user; <em>Frappe remains the only authorization authority</em>. Sandbox: <code>network_limited</code>; declared secrets: <code>FRAPPE_SITE_URL</code>, <code>FRAPPE_API_TOKEN</code>; ships with identity-resolution and permission-scoping eval suites.</p>
           <table class="docs-table">
             <thead><tr><th>implemented tools</th><th>planned tools</th></tr></thead>
@@ -238,7 +241,7 @@ $ muster capability load capability-packs/frappe [--allow-high-risk]</pre>
         </section>
 
         <section id="cli" class="docs-section reveal">
-          <h1>CLI reference</h1>
+          <h2>CLI reference</h2>
           <p>Verbatim from <code>muster help</code> (<code>packages/cli/src/index.ts</code>):</p>
           <pre class="mono codeblock">Muster v0
 

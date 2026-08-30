@@ -1,6 +1,6 @@
 {
   "name": "@musterhq/cli",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "type": "module",
   "engines": {
     "node": ">=24"
@@ -21,7 +21,7 @@
     "@musterhq/gateway": "workspace:*",
     "qrcode-terminal": "^0.12.0"
   },
-  "description": "Muster CLI — governed agent harness for production AI agents.",
+  "description": "Muster CLI \u2014 governed agent harness for production AI agents.",
   "license": "MIT",
   "author": "Muster contributors",
   "repository": {

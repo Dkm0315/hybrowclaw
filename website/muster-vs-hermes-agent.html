@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hermes Agent Alternative — Muster</title>
+  <meta name="description" content="Hermes Agent has 40+ tools, seven terminal backends and cross-session search. Muster has an observed-truth file-change audit, scoped memory and a token ledger. An honest comparison for self-hosted AI agent teams." />
+  <meta name="keywords" content="Hermes agent alternative, alternative to Hermes Agent, Nous Research Hermes agent, self-hosted AI agent, AI agent with memory, AI agent audit trail" />
+  <meta name="robots" content="index, follow, max-image-preview:large" />
+  <link rel="canonical" href="https://themuster.dev/muster-vs-hermes-agent.html" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="Muster" />
+  <meta property="og:title" content="Hermes Agent Alternative — Muster" />
+  <meta property="og:description" content="Hermes wins on execution backends and tool count. Muster wins on receipted, observed file-change truth. Side by side, honestly." />
+  <meta property="og:url" content="https://themuster.dev/muster-vs-hermes-agent.html" />
+  <meta property="og:image" content="https://themuster.dev/assets/brand/muster-og.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:image" content="https://themuster.dev/assets/brand/muster-og.png" />
+  <link rel="preconnect" href="https://api.fontshare.com" crossorigin />
+  <link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=clash-display@600,700&f[]=hanken-grotesk@400,500,600,700&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" />
+  <script type="module" src="/src/main.ts"></script>
+  <script type="application/ld+json">
+    {"@context":"https://schema.org","@type":"Article","headline":"Hermes Agent Alternative — Muster","description":"An honest comparison between Nous Research's Hermes Agent and Muster for teams choosing a self-hosted, open-source AI agent framework.","url":"https://themuster.dev/muster-vs-hermes-agent.html","mainEntityOfPage":"https://themuster.dev/muster-vs-hermes-agent.html","author":{"@type":"Organization","name":"Muster","url":"https://themuster.dev/"},"publisher":{"@type":"Organization","name":"Muster","url":"https://themuster.dev/"},"dateModified":"2026-08-27"}
+  </script>
+</head>
+<body>
+  <div id="scroll-progress" aria-hidden="true"></div>
+  <div id="hero-stage" aria-hidden="true"><canvas id="hero-canvas"></canvas></div>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Muster home"><img src="/assets/brand/muster-logo.png" alt="Muster" /></a>
+    <nav aria-label="Main">
+      <a href="/">Home</a>
+      <a href="/live-inline-diff.html">Live diff</a>
+      <a href="/docs.html">Docs</a>
+      <a href="/guides.html">Guides</a>
+      <a class="nav-cta" href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+    </nav>
+  </header>
+  <main>
+    <section class="hero">
+      <div class="hero-inner">
+        <p class="kicker hero-step">comparison · hermes agent alternative</p>
+        <h1 class="hero-step">Hermes Agent alternative: Muster, when the run has to be auditable.</h1>
+        <p class="sub hero-step">Hermes Agent from Nous Research is the better tool runner — 40+ tools across seven execution backends, with cross-session search and autonomous skill creation. Muster is the better witness: it observes what actually changed on disk instead of recording what the agent said it changed.</p>
+        <div class="hero-actions hero-step">
+          <a class="btn-cta" href="/live-inline-diff.html">See the head-to-head evidence</a>
+          <a class="btn-ghost" href="https://github.com/Dkm0315/muster" rel="noopener">Read the source →</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" data-reveal>
+      <p class="sec-kicker reveal-child">Side by side</p>
+      <h2 class="reveal-child">Two different bets on what a harness is for.</h2>
+      <p class="sec-sub reveal-child">Hermes figures were read from the Nous Research repository during the Muster strategy review on 2026-08-27. Muster publishes no star count — it is early, and the number would not help you decide.</p>
+      <div class="proof-table cmp reveal-child" role="region" aria-label="Hermes Agent compared with Muster">
+        <table>
+          <thead>
+            <tr><th>Dimension</th><th>Hermes Agent (Nous)</th><th>Muster</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Scale (2026-08-27)</td><td>237.1k stars, 48k forks, 25,737 commits</td><td class="muster">Young project, no star claim made</td></tr>
+            <tr><td>Tooling</td><td>40+ tools, mature and broad</td><td class="muster">MCP-brokered tools plus 34 capability packs (2 substantial)</td></tr>
+            <tr><td>Execution backends</td><td>Seven: local, Docker, SSH, Singularity, Modal, Daytona, Vercel</td><td class="muster">Local plus pluggable runtimes: native, Codex, Claude Code, Cursor SDK, OpenHands, Pi</td></tr>
+            <tr><td>Cross-session recall</td><td>FTS5 full-text search with LLM summarization</td><td class="muster">Indexed retrieval inside scoped lanes with leakage tests</td></tr>
+            <tr><td>Memory boundaries</td><td>Search across your sessions</td><td class="muster"><strong>Tenant, workspace, user, role, session</strong> — enforced, not conventional</td></tr>
+            <tr><td>Skills</td><td>Autonomous skill creation; follows the agentskills.io open standard</td><td class="muster">Eval-gated: feedback becomes a fixture before behaviour changes</td></tr>
+            <tr><td>File-change record</td><td>Reported by the agent loop</td><td class="muster"><strong>Observed from git + filesystem</strong>, sha256 before/after</td></tr>
+            <tr><td>Audit receipts</td><td>Not a stated design goal</td><td class="muster"><strong>Deterministic <code>receiptHash</code></strong> — reproducible off-machine</td></tr>
+            <tr><td>Token accounting</td><td>Provider-side</td><td class="muster">Local ledger with replay-waste flags</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="proof-link reveal-child"><a href="/live-inline-diff.html">How the observed file-change stream was measured →</a></p>
+    </section>
+
+    <section class="band band-alt" data-reveal>
+      <p class="sec-kicker reveal-child">The honest read</p>
+      <h2 class="reveal-child">Hermes is ahead on capability. Muster is ahead on evidence.</h2>
+      <div class="prose reveal-child">
+        <p>Hermes Agent is a serious piece of engineering and the comparison should start by saying so. Seven terminal backends is not a marketing bullet — being able to run the same agent locally, in Docker, over SSH, in Singularity, on Modal, on Daytona, or on Vercel is real portability work, and most harnesses do not attempt it. The FTS5 cross-session search with LLM summarization is a better answer to "what did we talk about last month" than most projects have. And by adopting the agentskills.io open standard rather than inventing a private skill format, Hermes made a genuinely community-minded choice.</p>
+        <p>Muster is not going to out-build that. Anyone telling you a young project will out-feature 25,737 commits is selling something. The argument for Muster is a different axis entirely.</p>
+
+        <h3>The question Hermes does not try to answer</h3>
+        <p>Ask any harness — Hermes included — "which files did this run modify?" and it will answer from its own event log. That log is populated by the agent loop reporting its own actions. The reporting is honest; the coverage is not complete, because modern coding agents perform most edits by shelling out. A <code>python - &lt;&lt;EOF</code> block that rewrites four files is, from the structured-patch channel's point of view, one opaque shell command.</p>
+        <p>Muster measured how bad this gets rather than speculating. Against the Codex app-server protocol, across five live runs — three protocol probes plus two full head-to-head recordings — the structured file-change notification fired <strong>zero times out of five</strong> while all the edits landed on disk. Both of the head-to-head runs also showed zero <code>turn/diff/updated</code> notifications. The self-report channel was not merely lossy. It was empty.</p>
+        <p>Muster's workspace observer sidesteps the whole reporting question. It pins a git baseline at <code>start()</code>, then re-derives the entire change set from git plus the filesystem on every cycle, hashing file contents before and after. Filesystem watch events are used only as a signal to re-derive — never as data — because on macOS they arrive type-less, coalesced, and sometimes with a null filename. It is strictly read-only against your repository and its git index: never <code>git add</code>, never the index lock, with all writes confined to a shadow tree outside the watched root so the observer cannot trigger itself. In the two head-to-head runs it reported the change in <strong>86ms and 75ms</strong> against a 1000ms budget, with a <code>git apply</code>-verified diff.</p>
+
+        <h3>Memory: search versus scope</h3>
+        <p>This is the sharpest genuine difference and it is worth being precise about. Hermes's cross-session recall is a <em>search</em> problem well solved: index everything, retrieve by relevance, summarize. Muster's is a <em>boundary</em> problem: a memory belongs to a tenant, a workspace, a user, a role, or a session, and retrieval is filtered by which of those lanes the current run is permitted to see, with tests that specifically try to make one scope leak into another.</p>
+        <p>If you are one person running one agent over your own work, search is straightforwardly better — it finds more. If you are running agents for several customers on shared infrastructure, unbounded search across all your sessions is precisely the thing you must not have. The two designs are optimising for different rooms.</p>
+
+        <h3>Skills: autonomous versus gated</h3>
+        <p>Hermes lets an agent create its own skills. Muster deliberately will not, and treats that restraint as a feature: feedback has to become a test fixture before it is allowed to change durable behaviour. That is slower and less impressive in a demo. It is also the only version of "the agent learned" that you can put in front of a reviewer, because every behaviour change has a test attached explaining what it is supposed to do and a way to check it still does it.</p>
+
+        <h3>Choose Hermes Agent when</h3>
+        <ul>
+          <li>Execution portability matters — you need the same agent on Docker, SSH, Modal, Daytona or Vercel.</li>
+          <li>You want the largest ready-made tool library and an open, shared skill standard.</li>
+          <li>Broad recall across your own history is more valuable than strict separation between contexts.</li>
+        </ul>
+
+        <h3>Choose Muster when</h3>
+        <ul>
+          <li>You will have to demonstrate which files an agent changed, to someone who will not accept the agent's own word for it.</li>
+          <li>Multiple tenants, customers, or teams share one deployment and memory must not cross between them.</li>
+          <li>You want token spend and replay waste in your own ledger.</li>
+          <li>Frappe or ERPNext is the system of record — Muster's depth there is real, while its general breadth is not.</li>
+        </ul>
+        <p>These are not mutually exclusive positions. Muster is designed to wrap other runtimes rather than replace them, and treats Codex, Claude Code, Cursor SDK, OpenHands and Pi as adapters behind its own contract. Governance staying outside the backend is the whole point.</p>
+        <p class="proof-link"><a href="/muster-vs-openclaw.html">Compare against OpenClaw →</a> <a href="/muster-vs-qm.html">Compare against QM →</a> <a href="/docs.html">Read the docs →</a></p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>© <span id="year">2026</span> Muster — open source, MIT</span>
+      <span class="footer-sep">·</span>
+      <a href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+      <span class="footer-sep">·</span>
+      <a href="/docs.html">Docs</a>
+      <span class="footer-sep">·</span>
+      <a href="/live-inline-diff.html">Live diff evidence</a>
+    </div>
+  </footer>
+</body>
+</html>

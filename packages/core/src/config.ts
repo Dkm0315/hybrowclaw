@@ -7,6 +7,15 @@ import type { MusterConfig, ProviderConfig, TaskKind } from "./types.js";
 export const CONFIG_DIR = ".muster";
 export const CONFIG_FILE = "config.json";
 
+/**
+ * The model the seeded codex route runs. This exact id is what the local
+ * `codex` CLI is configured with (`~/.codex/config.toml` model = "gpt-5.6-sol",
+ * 2026-08-27) and is what `docs/PRODUCT_MODES.md` routes deep review to, so the
+ * seed, the CLI's offered models, and the backend agree. Never seed a model the
+ * CLI does not offer — see `modelHintsForProvider` in packages/cli/src/index.ts.
+ */
+export const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
+
 export function defaultConfig(): MusterConfig {
   return {
     version: 1,
@@ -14,7 +23,7 @@ export function defaultConfig(): MusterConfig {
       codex: {
         id: "codex",
         kind: "codex-cli",
-        defaultModel: "gpt-5.5",
+        defaultModel: DEFAULT_CODEX_MODEL,
         timeoutMs: 120_000
       }
     },
@@ -24,10 +33,10 @@ export function defaultConfig(): MusterConfig {
         enabled: true,
         provider: "codex",
         routes: {
-          simple_qa: { provider: "codex", model: "gpt-5.5", reasoning: "low" },
-          research: { provider: "codex", model: "gpt-5.5", reasoning: "medium" },
-          architecture: { provider: "codex", model: "gpt-5.5", reasoning: "high" },
-          private_analysis: { provider: "codex", model: "gpt-5.5", reasoning: "medium" }
+          simple_qa: { provider: "codex", model: DEFAULT_CODEX_MODEL, reasoning: "low" },
+          research: { provider: "codex", model: DEFAULT_CODEX_MODEL, reasoning: "medium" },
+          architecture: { provider: "codex", model: DEFAULT_CODEX_MODEL, reasoning: "high" },
+          private_analysis: { provider: "codex", model: DEFAULT_CODEX_MODEL, reasoning: "medium" }
         }
       }
     },
@@ -37,7 +46,8 @@ export function defaultConfig(): MusterConfig {
       preferLocalForSensitive: false,
       maxCostUsdPerRun: 1,
       approvalRequiredAboveUsd: 3
-    }
+    },
+    memory: { policy: "auto" }
   };
 }
 

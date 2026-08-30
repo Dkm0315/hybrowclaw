@@ -1,6 +1,6 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { dataDir } from "./store.js";
 import { estimateTokens } from "./tokens.js";
@@ -35,6 +35,8 @@ export interface SessionRow {
   readonly peer: string;
   readonly createdAt: string;
   readonly parentId?: string;
+  /** Directory this conversation belongs to. null means an old/global row. */
+  readonly workspaceCwd: string | null;
   readonly tokensIn: number;
   readonly tokensOut: number;
   readonly costUsd: number;
@@ -54,6 +56,8 @@ export interface SessionSearchArgs {
   readonly sessionId?: string;
   readonly aroundMessageId?: number;
   readonly limit?: number;
+  /** Restrict discovery/browse results to sessions created in this directory. */
+  readonly workspaceCwd?: string;
 }
 
 export interface SearchHit {
@@ -82,12 +86,13 @@ interface SqliteDatabase {
 
 export interface SessionStore {
   readonly backend: "sqlite-fts5" | "sqlite-like";
-  createSession(input: { channel: string; peer: string; title?: string; parentId?: string }): SessionRow;
+  createSession(input: { channel: string; peer: string; title?: string; parentId?: string; workspaceCwd?: string | null }): SessionRow;
   /** Reuse the most recent session for (channel, peer), or create one — the conversation↔session mapping for multi-turn continuity. */
-  findOrCreateSession(input: { channel: string; peer: string; title?: string; parentId?: string }): SessionRow;
+  findOrCreateSession(input: { channel: string; peer: string; title?: string; parentId?: string; workspaceCwd?: string | null }): SessionRow;
   appendMessage(sessionId: string, role: string, content: string): MessageRow;
   addUsage(sessionId: string, tokensIn: number, tokensOut: number, costUsd?: number): void;
   setTitle(sessionId: string, title: string): void;
+  setWorkspaceCwd(sessionId: string, workspaceCwd: string | null): void;
   search(args: SessionSearchArgs): SessionSearchResult;
   /** All active (non-compacted) messages for a session, oldest first — the prior turns the renderer budgets. */
   loadActiveMessages(sessionId: string): MessageRow[];
@@ -98,6 +103,15 @@ export interface SessionStore {
 
 export function sessionsDbPath(cwd = process.cwd()): string {
   return join(dataDir(cwd), "sessions.db");
+}
+
+function normalizeWorkspaceCwd(cwd: string): string {
+  const absolute = resolve(cwd);
+  try {
+    return realpathSync.native(absolute);
+  } catch {
+    return absolute;
+  }
 }
 
 export function openSessionStore(cwd = process.cwd()): SessionStore {
@@ -118,6 +132,11 @@ export function openSessionStore(cwd = process.cwd()): SessionStore {
     );
     CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
   `);
+  const sessionColumns = db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name?: unknown }>;
+  if (!sessionColumns.some((column) => column.name === "workspace_cwd")) {
+    // Additive rollout: older rows remain NULL/global until new sessions are made.
+    db.exec("ALTER TABLE sessions ADD COLUMN workspace_cwd TEXT");
+  }
   let backend: SessionStore["backend"] = "sqlite-like";
   try {
     db.exec(`
@@ -134,6 +153,7 @@ export function openSessionStore(cwd = process.cwd()): SessionStore {
   const toSession = (row: Record<string, unknown>): SessionRow => ({
     id: String(row.id), title: String(row.title), channel: String(row.channel), peer: String(row.peer),
     createdAt: String(row.created_at), parentId: row.parent_id ? String(row.parent_id) : undefined,
+    workspaceCwd: typeof row.workspace_cwd === "string" && row.workspace_cwd ? String(row.workspace_cwd) : null,
     tokensIn: Number(row.tokens_in), tokensOut: Number(row.tokens_out), costUsd: Number(row.cost_usd),
   });
   const toMessage = (row: Record<string, unknown>): MessageRow => ({
@@ -145,14 +165,17 @@ export function openSessionStore(cwd = process.cwd()): SessionStore {
     (db.prepare("SELECT * FROM messages WHERE session_id = ? AND id BETWEEN ? AND ? AND active = 1 ORDER BY id")
       .all(sessionId, messageId - span, messageId + span) as Record<string, unknown>[]).map(toMessage);
 
-  const makeSession = (input: { channel: string; peer: string; title?: string; parentId?: string }): SessionRow => {
+  const storeWorkspaceCwd = normalizeWorkspaceCwd(cwd);
+  const makeSession = (input: { channel: string; peer: string; title?: string; parentId?: string; workspaceCwd?: string | null }): SessionRow => {
+    const workspaceCwd = input.workspaceCwd === null ? null : normalizeWorkspaceCwd(input.workspaceCwd ?? storeWorkspaceCwd);
     const row: SessionRow = {
       id: `sess_${randomUUID().slice(0, 12)}`, title: input.title ?? "", channel: input.channel,
       peer: input.peer, createdAt: new Date().toISOString(), parentId: input.parentId,
+      workspaceCwd,
       tokensIn: 0, tokensOut: 0, costUsd: 0,
     };
-    db.prepare("INSERT INTO sessions (id, title, channel, peer, created_at, parent_id) VALUES (?,?,?,?,?,?)")
-      .run(row.id, row.title, row.channel, row.peer, row.createdAt, row.parentId ?? null);
+    db.prepare("INSERT INTO sessions (id, title, channel, peer, created_at, parent_id, workspace_cwd) VALUES (?,?,?,?,?,?,?)")
+      .run(row.id, row.title, row.channel, row.peer, row.createdAt, row.parentId ?? null, row.workspaceCwd);
     return row;
   };
 
@@ -163,8 +186,12 @@ export function openSessionStore(cwd = process.cwd()): SessionStore {
       // The conversation↔session mapping: reuse the most recent session for this
       // (channel, peer) so a multi-turn chat accumulates ONE transcript instead
       // of a fresh session per turn. Foundation of the renderer's prior-turn load.
-      const rows = db.prepare("SELECT * FROM sessions WHERE channel = ? AND peer = ? ORDER BY created_at DESC LIMIT 1")
-        .all(input.channel, input.peer) as Record<string, unknown>[];
+      const workspaceCwd = input.workspaceCwd === null ? null : normalizeWorkspaceCwd(input.workspaceCwd ?? storeWorkspaceCwd);
+      const rows = workspaceCwd === null
+        ? db.prepare("SELECT * FROM sessions WHERE channel = ? AND peer = ? AND workspace_cwd IS NULL ORDER BY created_at DESC LIMIT 1")
+            .all(input.channel, input.peer) as Record<string, unknown>[]
+        : db.prepare("SELECT * FROM sessions WHERE channel = ? AND peer = ? AND workspace_cwd = ? ORDER BY created_at DESC LIMIT 1")
+            .all(input.channel, input.peer, workspaceCwd) as Record<string, unknown>[];
       return rows.length ? toSession(rows[0]) : makeSession(input);
     },
     appendMessage(sessionId, role, content) {
@@ -180,6 +207,9 @@ export function openSessionStore(cwd = process.cwd()): SessionStore {
     },
     setTitle(sessionId, title) {
       db.prepare("UPDATE sessions SET title = ? WHERE id = ?").run(title.slice(0, 80), sessionId);
+    },
+    setWorkspaceCwd(sessionId, workspaceCwd) {
+      db.prepare("UPDATE sessions SET workspace_cwd = ? WHERE id = ?").run(workspaceCwd ? normalizeWorkspaceCwd(workspaceCwd) : null, sessionId);
     },
     loadActiveMessages(sessionId) {
       return (db.prepare("SELECT * FROM messages WHERE session_id = ? AND active = 1 ORDER BY id")
@@ -213,8 +243,9 @@ export function openSessionStore(cwd = process.cwd()): SessionStore {
         const hits: SearchHit[] = [];
         for (const raw of rows.map(toMessage)) {
           if (seen.has(raw.sessionId)) continue;
-          seen.add(raw.sessionId);
           const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(raw.sessionId) as Record<string, unknown> | undefined;
+          if (args.workspaceCwd && (!session || toSession(session).workspaceCwd !== normalizeWorkspaceCwd(args.workspaceCwd))) continue;
+          seen.add(raw.sessionId);
           hits.push({
             sessionId: raw.sessionId,
             title: session ? String(session.title) : "",
@@ -226,7 +257,10 @@ export function openSessionStore(cwd = process.cwd()): SessionStore {
         }
         return { shape: "discover", hits };
       }
-      const sessions = (db.prepare("SELECT * FROM sessions ORDER BY created_at DESC LIMIT ?").all(limit) as Record<string, unknown>[]).map(toSession);
+      const rows = args.workspaceCwd
+        ? db.prepare("SELECT * FROM sessions WHERE workspace_cwd = ? ORDER BY created_at DESC LIMIT ?").all(normalizeWorkspaceCwd(args.workspaceCwd), limit)
+        : db.prepare("SELECT * FROM sessions ORDER BY created_at DESC LIMIT ?").all(limit);
+      const sessions = (rows as Record<string, unknown>[]).map(toSession);
       return { shape: "browse", sessions };
     },
     close() {

@@ -23,12 +23,14 @@ from muster.orchestration.workflow_proposal import (
     attended_proposal_preview,
     issue_destructive_approval_evidence,
     preflight_attended_proposal_save,
+    preflight_attended_proposal_submit,
     publish_approved_proposal,
     proposal_attended_operation,
     request_workflow_proposal,
     start_published_proposal_mission,
     validate_workflow_descriptor,
     verify_attended_proposal_record,
+    verify_attended_proposal_submit,
 )
 
 
@@ -160,6 +162,35 @@ def preflight_attended_save(
     return preflight_attended_proposal_save(
         proposal, frappe.session.user, record_name, record_revision
     )
+
+
+@frappe.whitelist()
+def preflight_attended_submit(
+    proposal: str,
+    record_name: str,
+    record_revision: str,
+    confirmed: int | str = 0,
+) -> dict[str, Any]:
+    """Read-only authority and revision check before native Submit."""
+    _require_post()
+    _idempotency_key()
+    if not cint(confirmed):
+        frappe.throw(_("Submit confirmation requires explicit confirmation"), frappe.ValidationError)
+    return preflight_attended_proposal_submit(
+        proposal, frappe.session.user, record_name, record_revision
+    )
+
+
+@frappe.whitelist()
+def verify_attended_submit(
+    proposal: str, record_name: str, confirmed: int | str = 0,
+) -> dict[str, Any]:
+    """Verify that Frappe completed the separately confirmed Submit."""
+    _require_post()
+    _idempotency_key()
+    if not cint(confirmed):
+        frappe.throw(_("Submit verification requires explicit confirmation"), frappe.ValidationError)
+    return verify_attended_proposal_submit(proposal, frappe.session.user, record_name)
 
 
 @frappe.whitelist()

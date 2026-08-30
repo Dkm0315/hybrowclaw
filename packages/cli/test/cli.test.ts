@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
-import { openSessionStore } from "@musterhq/core";
+import { DEFAULT_CODEX_MODEL, openSessionStore } from "@musterhq/core";
 
 const execFileAsync = promisify(execFile);
 const cliPath = resolve(import.meta.dirname, "..", "src", "index.ts");
@@ -81,7 +81,7 @@ test("gateway init redacts bearer token unless explicitly requested", async () =
   const coldStatus = await runCli(["gateway", "status"], cwd);
   assert.match(coldStatus.stdout, /gateway_status=missing/);
   assert.match(coldStatus.stdout, /token=missing/);
-  assert.match(coldStatus.stdout, /channels_ready=0\/7/);
+  assert.match(coldStatus.stdout, /channels_ready=0\/8/);
   assert.match(coldStatus.stdout, /next="muster gateway init"/);
 
   const redacted = await runCli(["gateway", "init"], cwd);
@@ -93,7 +93,7 @@ test("gateway init redacts bearer token unless explicitly requested", async () =
   const initializedStatus = await runCli(["gateway", "status"], cwd);
   assert.match(initializedStatus.stdout, /gateway_status=configured/);
   assert.match(initializedStatus.stdout, /token=configured/);
-  assert.match(initializedStatus.stdout, /channels_ready=1\/7/);
+  assert.match(initializedStatus.stdout, /channels_ready=1\/8/);
   assert.match(initializedStatus.stdout, /next="muster gateway daemon start --port 7460"/);
   assert.doesNotMatch(initializedStatus.stdout, /token=[0-9a-f]{48}/);
 
@@ -108,31 +108,59 @@ test("gateway init redacts bearer token unless explicitly requested", async () =
   assert.match(daemonStatus.stdout, /next=muster gateway daemon start/);
 });
 
+/**
+ * The onboarding body is a wrapped column beside the "So far:" summary rail, so
+ * a sentence the screen shows can legitimately span two rows. Flatten the box
+ * (drop the rail, drop the borders, collapse whitespace) before asserting on
+ * prose; the assertions stay about what the user can READ, not about where the
+ * renderer happened to break a line.
+ */
+function onboardingBodyText(stdout: string): string {
+  // Strip ANSI first: an inherited FORCE_COLOR (e.g. from a CI or agent shell)
+  // legitimately colors the preview, and border parsing must survive that.
+  return stdout
+    .replace(/\x1b\[[0-9;]*m/g, "")
+    .split("\n")
+    .map((line) => line.replace(/^\s*[╭╰].*$/, "").replace(/^│/, "").replace(/│.*$/, ""))
+    .join(" ")
+    .replace(/\s+/g, " ");
+}
+
 test("CLI onboarding preview exposes setup controls, impacts, and separate channel credentials", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-cli-onboarding-"));
 
-  const purpose = await runCli(["onboard", "--preview", "--step", "purpose"], cwd);
-  assert.match(purpose.stdout, /Welcome to Muster/);
-  assert.match(purpose.stdout, /Set up Frappe \/ ERPNext/);
-  assert.match(purpose.stdout, /Frappe answers will prefer module, DocType, field, and workflow context/);
+  const purposeRaw = await runCli(["onboard", "--preview", "--step", "purpose"], cwd);
+  const purpose = onboardingBodyText(purposeRaw.stdout);
+  assert.match(purpose, /Welcome to Muster/);
+  assert.match(purpose, /Set up Frappe \/ ERPNext/);
+  assert.match(purpose, /Frappe answers will prefer module, DocType, field, and workflow context/);
+  assert.match(purpose, /every step optional — s starts coding now/, "every step must say it is skippable");
+  assert.match(purposeRaw.stdout, /So far:/, "the running summary rail is present on every step");
 
-  const integrations = await runCli(["onboard", "--preview", "--step", "integrations"], cwd);
-  assert.match(integrations.stdout, /Choose your assistant's senses/);
-  assert.match(integrations.stdout, /Frappe \/ ERPNext/);
-  assert.match(integrations.stdout, /Deep graph indexing improves module\/field accuracy/);
-  assert.doesNotMatch(integrations.stdout, /Slack/);
+  const integrationsRaw = await runCli(["onboard", "--preview", "--step", "integrations"], cwd);
+  const integrations = onboardingBodyText(integrationsRaw.stdout);
+  assert.match(integrations, /Choose your assistant's senses/);
+  assert.match(integrations, /Frappe \/ ERPNext/);
+  assert.match(integrations, /Deep graph indexing improves module\/field accuracy/);
+  assert.doesNotMatch(integrationsRaw.stdout, /Slack/);
 
-  const channels = await runCli(["onboard", "--preview", "--step", "channels"], cwd);
-  assert.match(channels.stdout, /Where should your assistant talk/);
-  assert.match(channels.stdout, /Slack/);
-  assert.match(channels.stdout, /WhatsApp/);
-  assert.match(channels.stdout, /SLACK_BOT_TOKEN/);
-  assert.match(channels.stdout, /WHATSAPP_ACCESS_TOKEN/);
-  assert.match(channels.stdout, /Draft-first keeps humans in control/);
+  const channelsRaw = await runCli(["onboard", "--preview", "--step", "channels"], cwd);
+  const channels = onboardingBodyText(channelsRaw.stdout);
+  assert.match(channels, /Where should your assistant talk/);
+  assert.match(channels, /Slack/);
+  assert.match(channels, /WhatsApp/);
+  assert.match(channels, /SLACK_BOT_TOKEN/);
+  assert.match(channels, /muster channels login whatsapp/);
+  assert.match(channels, /Meta ToS gray zone/);
+  assert.match(channels, /Draft-first keeps humans in control/);
+  // Honest fields: every credential is named inside a runnable command, never
+  // as a field that looks typeable on a screen with no text input.
+  assert.match(channels, /configure later: muster channels setup slack --bot-token-env SLACK_BOT_TOKEN/);
+  assert.doesNotMatch(channels, /Bot token\/env:/, "the fake enterable field must be gone");
 
-  const memory = await runCli(["onboarding", "--preview", "--step", "memory"], cwd);
-  assert.match(memory.stdout, /Recall strictness/);
-  assert.match(memory.stdout, /Maximum privacy/);
+  const memory = onboardingBodyText((await runCli(["onboarding", "--preview", "--step", "memory"], cwd)).stdout);
+  assert.match(memory, /Recall strictness/);
+  assert.match(memory, /Maximum privacy/);
 
   const colored = await runCli(["onboard", "--preview", "--step", "channels", "--color=always"], cwd);
   assert.match(colored.stdout, /\x1b\[/);
@@ -148,11 +176,11 @@ test("CLI chat exposes a real named terminal chat surface without hanging in non
   const help = await runCli(["chat", "--help"], cwd);
   assert.match(help.stdout, /muster chat/);
   assert.match(help.stdout, /\/resume <name\|id>/);
-  assert.match(help.stdout, /\/tools \[toolset\]/);
+  assert.match(help.stdout, /\/tools \[all\|toolset\]/);
   assert.match(help.stdout, /\/agents/);
   assert.match(help.stdout, /\/provider <id> \[model\]/);
   assert.match(help.stdout, /\/cloud \[preset\]/);
-  assert.match(help.stdout, /\/model <name>/);
+  assert.match(help.stdout, /\/model \[name\]/);
   assert.match(help.stdout, /\/runtime \[id\]/);
   assert.match(help.stdout, /\/tokens \[limit\]/);
   assert.match(help.stdout, /\/scope <kind:id/);
@@ -167,7 +195,7 @@ test("CLI chat exposes a real named terminal chat surface without hanging in non
 
   const status = await runCli(["chat", "--session", "release-audit", "/status"], cwd);
   assert.match(status.stdout, /Status/);
-  assert.match(status.stdout, /session\s+release-audit/);
+  assert.match(status.stdout, /conversation\s+release-audit/);
   assert.match(status.stdout, /resume\s+\/resume release-audit/);
   assert.match(status.stdout, /history\s+\/history 10/);
   assert.match(status.stdout, /inspect\s+muster sessions show sess_/);
@@ -180,18 +208,24 @@ test("CLI chat exposes a real named terminal chat surface without hanging in non
   assert.match(tools.stdout, /web: .*web_search/);
   assert.match(tools.stdout, /discovery: .*tool_search/);
 
+  const slashTools = await runCli(["chat", "/tools core"], cwd);
+  assert.match(slashTools.stdout, /files: .*read_file/);
+  assert.doesNotMatch(slashTools.stdout, /muster-tools-action|\[enter\] run/, "non-TTY slash usage keeps the text fallback");
+
   const commands = await runCli(["chat", "--commands"], cwd);
   assert.match(commands.stdout, /Commands/);
   assert.match(commands.stdout, /\/sessions \[limit\]/);
   assert.match(commands.stdout, /\/provider <id> \[model\]/);
   assert.match(commands.stdout, /\/providers/);
   assert.match(commands.stdout, /\/cloud \[preset\]/);
-  assert.match(commands.stdout, /\/model <name>/);
+  assert.match(commands.stdout, /\/model \[name\]/);
   assert.match(commands.stdout, /\/runtime \[id\]/);
   assert.match(commands.stdout, /\/scope <kind:id/);
   assert.match(commands.stdout, /\/tokens \[limit\]/);
   assert.match(commands.stdout, /\/capabilities \[query\]/);
   assert.match(commands.stdout, /\/integrations \[id\]/);
+  assert.match(commands.stdout, /\/tasks \[/);
+  assert.doesNotMatch(commands.stdout, /\/mission|\/board|\/why|\/assign/);
 
   const commandCompletion = await runCli(["chat", "--complete", "/sta"], cwd);
   assert.match(commandCompletion.stdout, /\/status/);
@@ -373,7 +407,9 @@ test("CLI sessions expose continuity metadata for audit and recall", async () =>
   const cwd = await mkdtemp(join(tmpdir(), "muster-cli-sessions-audit-"));
   const store = openSessionStore(cwd);
   const session = store.createSession({ channel: "telegram", peer: "alice", title: "Deploy planning" });
+  const elsewhere = store.createSession({ channel: "cli-chat", peer: "other-repo", title: "Other repo", workspaceCwd: join(cwd, "elsewhere") });
   try {
+    store.appendMessage(elsewhere.id, "user", "remember the remote workspace history");
     for (let index = 0; index < 35; index += 1) {
       store.appendMessage(
         session.id,
@@ -388,12 +424,22 @@ test("CLI sessions expose continuity metadata for audit and recall", async () =>
 
   const recent = await runCli(["sessions", "recent", "--limit", "5"], cwd);
   assert.match(recent.stdout, /session_backend=sqlite-/);
+  assert.match(recent.stdout, /scope=\(1 here · 2 total\)/);
   assert.match(recent.stdout, /sessions=1/);
   assert.match(recent.stdout, new RegExp(`session=${session.id}`));
   assert.match(recent.stdout, /title="Deploy planning"/);
   assert.match(recent.stdout, /channel=telegram peer=alice/);
   assert.match(recent.stdout, /tokens_in=1200 tokens_out=300 cost_usd=0\.0123/);
   assert.match(recent.stdout, new RegExp(`next="muster sessions show ${session.id}"`));
+  assert.doesNotMatch(recent.stdout, new RegExp(`session=${elsewhere.id}`));
+
+  const all = await runCli(["sessions", "recent", "--all", "--limit", "5"], cwd);
+  assert.match(all.stdout, /sessions=2/);
+  assert.match(all.stdout, new RegExp(`session=${elsewhere.id}`));
+
+  const detached = await runCli(["chat", "--continue", "other-repo", "--history"], cwd);
+  assert.match(detached.stdout, /this conversation belongs to .*elsewhere — \[enter\] work there · \[c\] continue here/);
+  assert.match(detached.stdout, /remember the remote workspace history/);
 
   const shown = await runCli(["sessions", "show", session.id], cwd);
   assert.match(shown.stdout, /session_backend=sqlite-/);
@@ -816,8 +862,8 @@ test("CLI chat checks mentioned skills, plugins, and MCPs before routing a norma
 
     assert.match(result.stdout, /Capability Check/);
     assert.match(result.stdout, /plugin:telegram/);
-    assert.match(result.stdout, /next="\/plugins telegram\s+/);
-    assert.match(result.stdout, /--allow-high-risk"/);
+    assert.match(result.stdout, /next="\/tools" \(review\s+telegram first\)/);
+    assert.doesNotMatch(result.stdout, /--allow-high-risk/);
     assert.match(result.stdout, /mcp:browser/);
     assert.match(result.stdout, /next="\/mcp browser"/);
     assert.match(result.stdout, /Capability mention acknowledged\./);
@@ -975,7 +1021,8 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(pluginCatalog.stdout, /slack\s+openclaw.*channels=slack/);
   assert.match(pluginCatalog.stdout, /google-chat\s+openclaw.*channels=gchat.*aliases=gchat/);
   assert.match(pluginCatalog.stdout, /discord\s+openclaw.*pack=yes.*channels=discord/);
-  assert.match(pluginCatalog.stdout, /whatsapp\s+openclaw.*pack=yes.*channels=whatsapp/);
+  assert.match(pluginCatalog.stdout, /whatsapp\s+openclaw.*pack=no.*channels=whatsapp/);
+  assert.match(pluginCatalog.stdout, /whatsapp-cloud\s+openclaw.*pack=yes.*channels=whatsapp-cloud/);
   assert.match(pluginCatalog.stdout, /teams\s+openclaw.*pack=yes.*channels=teams/);
   assert.match(pluginCatalog.stdout, /mcp-bridge\s+openclaw.*pack=yes.*mcps=filesystem,git,browser,postgres,sqlite,github,google-drive,notion,figma,linear,n8n,data-analytics-widgets,openai-api-key-local-confirmation/);
 
@@ -1036,16 +1083,23 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   const whatsappPluginSetup = await runCli(["plugins", "setup", "whatsapp"], cwd);
   assert.match(whatsappPluginSetup.stdout, /plugin=whatsapp source=openclaw risk=high/);
   assert.match(whatsappPluginSetup.stdout, /channel=whatsapp status=needs_setup command="muster channels ready whatsapp"/);
-  assert.match(whatsappPluginSetup.stdout, /Meta app setup/);
+  assert.match(whatsappPluginSetup.stdout, /Unofficial protocol; Meta ToS gray zone/);
 
   const whatsappPluginCheck = await runCli(["plugins", "check", "whatsapp"], cwd);
   assert.match(whatsappPluginCheck.stdout, /plugin=whatsapp source=openclaw risk=high enabled=false/);
-  assert.match(whatsappPluginCheck.stdout, /pack=capability-packs\/whatsapp status=ready tools=3/);
+  assert.match(whatsappPluginCheck.stdout, /action=runtime_adapter/);
   assert.match(whatsappPluginCheck.stdout, /plugin_env=ready/);
 
   const enabledWhatsappPlugin = await runCli(["plugins", "enable", "whatsapp", "--allow-high-risk"], cwd);
   assert.match(enabledWhatsappPlugin.stdout, /enabled plugin=whatsapp/);
   assert.match(enabledWhatsappPlugin.stdout, /available_channels=whatsapp/);
+
+  const whatsappCloudPluginCheck = await runCli(["plugins", "check", "whatsapp-cloud"], cwd);
+  assert.match(whatsappCloudPluginCheck.stdout, /plugin=whatsapp-cloud source=openclaw risk=high enabled=false/);
+  assert.match(whatsappCloudPluginCheck.stdout, /pack=capability-packs\/whatsapp status=ready tools=3/);
+  const enabledWhatsappCloudPlugin = await runCli(["plugins", "enable", "whatsapp-cloud", "--allow-high-risk"], cwd);
+  assert.match(enabledWhatsappCloudPlugin.stdout, /enabled plugin=whatsapp-cloud/);
+  assert.match(enabledWhatsappCloudPlugin.stdout, /available_channels=whatsapp-cloud/);
 
   const teamsPluginSetup = await runCli(["plugins", "setup", "teams"], cwd);
   assert.match(teamsPluginSetup.stdout, /plugin=teams source=openclaw risk=high/);
@@ -1475,6 +1529,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(listedPlugins.stdout, /entry=google-chat enabled=true/);
   assert.match(listedPlugins.stdout, /entry=discord enabled=true/);
   assert.match(listedPlugins.stdout, /entry=whatsapp enabled=true/);
+  assert.match(listedPlugins.stdout, /entry=whatsapp-cloud enabled=true/);
   assert.match(listedPlugins.stdout, /entry=telegram enabled=true/);
   assert.match(listedPlugins.stdout, /entry=teams enabled=true/);
   assert.match(listedPlugins.stdout, /web-search/);
@@ -1552,6 +1607,8 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(disabledDiscordPlugin.stdout, /disabled plugin=discord/);
   const disabledWhatsappPlugin = await runCli(["plugins", "disable", "whatsapp"], cwd);
   assert.match(disabledWhatsappPlugin.stdout, /disabled plugin=whatsapp/);
+  const disabledWhatsappCloudPlugin = await runCli(["plugins", "disable", "whatsapp-cloud"], cwd);
+  assert.match(disabledWhatsappCloudPlugin.stdout, /disabled plugin=whatsapp-cloud/);
   const disabledTelegramPlugin = await runCli(["plugins", "disable", "telegram"], cwd);
   assert.match(disabledTelegramPlugin.stdout, /disabled plugin=telegram/);
   const disabledTeamsPlugin = await runCli(["plugins", "disable", "teams"], cwd);
@@ -1564,7 +1621,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   const dashboard = await runCli(["dashboard", "status"], cwd);
   assert.match(dashboard.stdout, /profile=default/);
   assert.match(dashboard.stdout, /configured=true/);
-  assert.match(dashboard.stdout, /personal_agent packs_enabled=\d+\/6 channels_ready=\d+\/7 mcps_configured=\d+\/4/);
+  assert.match(dashboard.stdout, /personal_agent packs_enabled=\d+\/6 channels_ready=\d+\/8 mcps_configured=\d+\/4/);
   assert.match(dashboard.stdout, /memory=backend=.* jsonl_objects=\d+ index_objects=\d+ scopes=\d+ fresh=/);
   assert.match(dashboard.stdout, /token_ledger=records=\d+ today_in=\d+ today_out=\d+ today_cost_usd=\d+\.\d{4}/);
   assert.match(dashboard.stdout, /sessions=backend=sqlite-(fts5|like) recent=\d+ latest=/);
@@ -1574,9 +1631,9 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(dashboard.stdout, /start=muster dashboard start --port 7461/);
 
   const channelCatalog = await runCli(["channels", "list"], cwd);
-  assert.match(channelCatalog.stdout, /telegram\t--bot-token-env\tmuster channels ready telegram/);
-  assert.match(channelCatalog.stdout, /slack\t--bot-token-env,--app-token-env\tmuster channels ready slack/);
-  assert.match(channelCatalog.stdout, /gchat\t--audience\tmuster channels ready gchat/);
+  assert.match(channelCatalog.stdout, /telegram\tTelegram Bot\t--bot-token-env\tmuster channels ready telegram/);
+  assert.match(channelCatalog.stdout, /slack\tSlack App\t--bot-token-env,--app-token-env\tmuster channels ready slack/);
+  assert.match(channelCatalog.stdout, /gchat\tGoogle Chat App\t--audience\tmuster channels ready gchat/);
 
   const coldChannelStatus = await runCli(["channels", "status"], cwd);
   assert.match(coldChannelStatus.stdout, /gateway_config=missing next="muster gateway init"/);
@@ -1588,7 +1645,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(coldTelegramStatus.stdout, /channel=telegram ready=false/);
 
   const coldChannelDoctor = await runCli(["channels", "doctor"], cwd);
-  assert.match(coldChannelDoctor.stdout, /channel_doctor=all status=needs_setup ready=0\/7/);
+  assert.match(coldChannelDoctor.stdout, /channel_doctor=all status=needs_setup ready=0\/8/);
   assert.match(coldChannelDoctor.stdout, /gateway_config=missing/);
   assert.match(coldChannelDoctor.stdout, /operator_matrix/);
   assert.match(coldChannelDoctor.stdout, /channel=web status=needs_setup missing=gateway\.token .* next="muster gateway init"/);
@@ -1598,7 +1655,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(gatewayInitForChannels.stdout, /gateway_config=/);
 
   const channelDoctorBeforeSetup = await runCli(["channels", "doctor"], cwd);
-  assert.match(channelDoctorBeforeSetup.stdout, /channel_doctor=all status=needs_setup ready=1\/7/);
+  assert.match(channelDoctorBeforeSetup.stdout, /channel_doctor=all status=needs_setup ready=1\/8/);
   assert.match(channelDoctorBeforeSetup.stdout, /gateway_config=configured/);
   assert.match(channelDoctorBeforeSetup.stdout, /operator_matrix/);
   assert.match(channelDoctorBeforeSetup.stdout, /channel=telegram status=needs_setup missing=telegram\.botToken/);
@@ -1626,8 +1683,8 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
 
   const whatsappSimulation = await runCli(["channels", "simulate", "whatsapp", "--message", "show my payroll approvals"], cwd);
   assert.match(whatsappSimulation.stdout, /channel_simulation=whatsapp normalized=true/);
-  assert.match(whatsappSimulation.stdout, /surface=whatsapp:PNLOCAL/);
-  assert.match(whatsappSimulation.stdout, /sender=919999999999/);
+  assert.match(whatsappSimulation.stdout, /surface=whatsapp:default/);
+  assert.match(whatsappSimulation.stdout, /sender=919999999999@s\.whatsapp\.net/);
   assert.match(whatsappSimulation.stdout, /next=run gateway handler, apply pairing\/policy, record tokens, then draft or send reply/);
 
   const telegramDoctorBeforeSetup = await runCli(["channels", "doctor", "telegram"], cwd);
@@ -1728,7 +1785,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.doesNotMatch(slackPlanAfterSetup.stdout, /xoxb-secret|xapp-secret/);
 
   const channelDoctorAfterSetup = await runCli(["channels", "doctor"], cwd);
-  assert.match(channelDoctorAfterSetup.stdout, /channel_doctor=all status=needs_setup ready=3\/7/);
+  assert.match(channelDoctorAfterSetup.stdout, /channel_doctor=all status=needs_setup ready=3\/8/);
   assert.match(channelDoctorAfterSetup.stdout, /channel=telegram status=warning missing=- warnings=telegram\.live_check_available auth=secret-token-header-recommended reply=draft_stream next="muster channels doctor telegram --live"/);
   assert.match(channelDoctorAfterSetup.stdout, /channel=slack status=warning missing=- warnings=slack\.live_check_available,slack\.files_write_live_check_available auth=slack-socket-app-token reply=draft_stream next="muster channels doctor slack --live"/);
   assert.match(channelDoctorAfterSetup.stdout, /channel=gchat status=needs_setup missing=gchat\.verification\.audience/);
@@ -3470,8 +3527,8 @@ test("CLI doctor --fix bootstraps a fresh workspace and status renders mission c
 
   // status must never crash on an empty workspace
   const fresh = await runCli(["status"], cwd);
-  assert.match(fresh.stdout, /muster status —/);
-  assert.match(fresh.stdout, /providers\s+no config \(run: muster doctor --fix\)/);
+  assert.match(fresh.stdout, /0 runs today, no previous runs/);
+  assert.match(fresh.stdout, /no config \(run: muster doctor --fix\)/);
 
   const fixed = await runCli(["doctor", "--fix"], cwd);
   assert.match(fixed.stdout, /fix config/);
@@ -3481,13 +3538,12 @@ test("CLI doctor --fix bootstraps a fresh workspace and status renders mission c
   await runCli(["schedule", "add", "* * * * *", "daily digest"], cwd);
 
   const { stdout } = await runCli(["status"], cwd);
-  assert.match(stdout, /profile\s+default/);
-  assert.match(stdout, /providers\s+1 configured \(codex\)/);
-  assert.match(stdout, /episodes\s+0 recorded/);
-  assert.match(stdout, /tokens today\s+0 across 0 runs/);
-  assert.match(stdout, /schedules\s+1 total, 1 due now/);
-  assert.match(stdout, /flows pending gate\s+none/);
-  assert.match(stdout, /verify\s+OK/);
+  assert.match(stdout, /Profile default/);
+  assert.match(stdout, /1 configured \(codex\)/);
+  assert.match(stdout, /0 runs today/);
+  assert.match(stdout, /1 schedules, 1 due/);
+  assert.match(stdout, /0 flows waiting for approval/);
+  assert.match(stdout, /verify OK/);
 });
 
 test("CLI codex doctor and QA scorecard expose runtime maturity without false positives", async () => {
@@ -3513,7 +3569,9 @@ test("CLI codex doctor and QA scorecard expose runtime maturity without false po
   assert.match(scorecard.stdout, /release_ready=unknown mode=advisory reason=run_with_--strict-release_before_release_claims/);
   assert.match(scorecard.stdout, /required_suites=pty_tui,provider_latency,mcp_auth_failure,memory_retrieval_speed,channel_plugin_setup,frappe2_real_prompts,pack_readiness/);
   assert.match(scorecard.stdout, /providers:/);
-  assert.match(scorecard.stdout, /passed\s+codex\s+codex-cli model=gpt-5\.5/);
+  // Pinned to the seeded default so a model bump that forgets the scorecard is
+  // caught here rather than shipping a doctor that names a model nothing seeds.
+  assert.match(scorecard.stdout, new RegExp(`passed\\s+codex\\s+codex-cli model=${DEFAULT_CODEX_MODEL.replace(/\./g, "\\.")}`));
 
   const suites = await runCli(["qa", "suites"], cwd);
   assert.match(suites.stdout, /suite=pty_tui/);
@@ -3552,8 +3610,12 @@ test("CLI codex doctor and QA scorecard expose runtime maturity without false po
     assert.equal(ptyManifest.status, "passed");
     assert.ok(ptyManifest.caseCount >= 12);
     const ptyScreen = await readFile(join(ptyRunArtifact, "screens", "slash_overlay_stable.txt"), "utf8");
-    assert.match(ptyScreen, /suggestions/);
-    assert.match(ptyScreen, /╰─+╯/);
+    assert.match(ptyScreen, /→ \/memory <query>/);
+    assert.doesNotMatch(ptyScreen, /^\s*\d+\/\d+\s*$/m, "no count row — the reference shows none");
+    assert.doesNotMatch(ptyScreen, /suggestions/u);
+    // The reference draws NO box glyphs anywhere.
+    assert.doesNotMatch(ptyScreen, /[╭╮╰╯│]/u, "no box glyphs — the ruled composer has none");
+    assert.ok(ptyScreen.indexOf("/memory <query>") < ptyScreen.indexOf("❯ /"));
     const partialScorecard = await runCliAllowFailure(["qa", "scorecard", "--codex-command", codex, "--latest-version", "0.1.0", "--evidence", ptyEvidencePath], cwd);
     assert.equal(partialScorecard.code, 1);
     assert.match(partialScorecard.stdout, /passed\s+qa\.pty_tui\s+PTY\/TUI hostile interaction checks passed/);
@@ -3874,9 +3936,13 @@ process.exit(3);
 }
 
 async function runCli(args: string[], cwd = resolve(import.meta.dirname, "..", "..", ".."), env: Record<string, string> = {}): Promise<{ stdout: string; stderr: string }> {
+  const inheritedEnv = { ...process.env };
+  // Node warns when an agent shell exports both values. Tests request color
+  // explicitly where it matters, so keep subprocess stderr deterministic.
+  delete inheritedEnv.FORCE_COLOR;
   return execFileAsync("tsx", [cliPath, ...args], {
     cwd,
-    env: { ...process.env, MUSTER_ONBOARDING_HOME: join(cwd, ".test-home"), ...env },
+    env: { ...inheritedEnv, MUSTER_ONBOARDING_HOME: join(cwd, ".test-home"), ...env },
     timeout: args.includes("pty_tui") ? 180_000 : 30_000,
     maxBuffer: 1024 * 1024
   });

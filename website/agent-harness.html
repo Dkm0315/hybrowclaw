@@ -3,15 +3,15 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Agent Harness for Production AI Agents — Muster</title>
-  <meta name="description" content="Muster is an open-source agent harness for production AI agents with governed execution, scoped memory, token ledger, MCP policy, channel adapters, and eval-gated learning." />
-  <meta name="keywords" content="agent harness, AI agent harness, governed agent harness, production AI agents, AI agent framework, scoped memory, token ledger, MCP agent, browser automation agent" />
+  <title>Self-Hosted AI Agent — Muster</title>
+  <meta name="description" content="Run a self-hosted AI agent on your own infrastructure: MIT-licensed, local SQLite store, your choice of model provider, scoped memory, a local token ledger, and file changes observed from the filesystem." />
+  <meta name="keywords" content="self-hosted AI agent, self hosted AI agent framework, on-premise AI agent, open source AI agent framework, AI agent audit trail, scoped memory, token ledger" />
   <meta name="robots" content="index, follow, max-image-preview:large" />
   <link rel="canonical" href="https://themuster.dev/agent-harness.html" />
   <meta property="og:type" content="website" />
   <meta property="og:site_name" content="Muster" />
-  <meta property="og:title" content="Agent Harness for Production AI Agents — Muster" />
-  <meta property="og:description" content="Governed execution for long-running agents: scoped memory, token ledger, MCP policy, channel adapters, and eval-gated learning." />
+  <meta property="og:title" content="Self-Hosted AI Agent — Muster" />
+  <meta property="og:description" content="Your infrastructure, your models, your ledger. Scoped memory, MCP policy, channel adapters, and observed file-change evidence." />
   <meta property="og:url" content="https://themuster.dev/agent-harness.html" />
   <meta property="og:image" content="https://themuster.dev/assets/brand/muster-og.png" />
   <meta name="twitter:card" content="summary_large_image" />
@@ -39,9 +39,9 @@
   <main>
     <section class="hero">
       <div class="hero-inner">
-        <p class="kicker hero-step">agent harness · governed execution</p>
-        <h1 class="hero-step">An agent harness for AI systems that have to keep running.</h1>
-        <p class="sub hero-step">Muster wraps model calls, tools, memory, channels, MCP servers, and evals in one governed run loop so agents do not leak context, hide token spend, or learn without tests.</p>
+        <p class="kicker hero-step">self-hosted · your infrastructure</p>
+        <h1 class="hero-step">A self-hosted AI agent that runs entirely on your own infrastructure.</h1>
+        <p class="sub hero-step">Muster wraps model calls, tools, memory, channels, MCP servers, and evals in one governed run loop that you host yourself — so agents do not leak context, hide token spend, or learn without tests, and nothing about the run has to leave your network.</p>
         <div class="hero-actions hero-step">
           <a class="btn-cta" href="/docs.html">Read the docs</a>
           <a class="btn-ghost" href="https://github.com/Dkm0315/muster" rel="noopener">Star on GitHub -></a>
@@ -63,7 +63,41 @@
       <p class="sec-kicker reveal-child">Where it fits</p>
       <h2 class="reveal-child">Use Muster around your agent framework, not only instead of one.</h2>
       <p class="sec-sub reveal-child">Muster is useful when your team already has prompts, tools, MCP servers, business apps, or model routes and needs governance around the run: memory boundaries, token visibility, setup checks, and reproducible eval evidence.</p>
+      <div class="prose reveal-child">
+        <h3>What "self-hosted" actually covers here</h3>
+        <p>Self-hosted is an overloaded word in agent tooling. Plenty of products describe themselves that way while the memory index, the usage accounting, or the audit log still lives on someone else's server. The useful question is which parts of the run leave your machine, so it is worth being specific about Muster.</p>
+        <ul>
+          <li><strong>The session store is local.</strong> Sessions, messages, recalled memory, and usage rows sit in a SQLite database on the machine running the harness. There is no account to create and no telemetry requirement.</li>
+          <li><strong>The token ledger is yours.</strong> Every run records tokens in and out, estimated cost, and a replay-waste flag locally. You are not reading your own spend back out of a provider dashboard.</li>
+          <li><strong>The model is a route, not the platform.</strong> Muster routes to cloud APIs, aggregators, open-weight models, or self-hosted endpoints. Governance lives in the harness, so switching providers does not mean rebuilding memory scoping, policy, or evals.</li>
+          <li><strong>The workspace is read-only to the observer.</strong> The file-change observer never runs <code>git add</code>, never writes objects, and never takes the index lock. Its only writes go to a shadow tree outside the watched root.</li>
+          <li><strong>Channels terminate on your gateway.</strong> Terminal, web, Telegram, Slack, Google Chat, Teams, Discord, and WhatsApp all enter the same envelope on infrastructure you run.</li>
+        </ul>
+
+        <h3>Why teams self-host an agent in the first place</h3>
+        <p>Usually one of three reasons, and they want different things from the harness. The first is data residency: the work touches customer records, source code, or an ERP system that contractually cannot be shipped to a third-party agent service. For those teams the deciding features are scoped memory boundaries and the ability to point every model call at an endpoint inside their own network.</p>
+        <p>The second is cost control. A long-running agent that replays its entire history every turn burns money in a way that is invisible until the invoice arrives. Muster measures this deterministically: across five scenarios and 170 turns, a replay-everything harness sends 875.8k tokens where Muster sends 355.2k — a 59.4% reduction, and 62.7% on the longest thread. No model is called during the benchmark; run <code>muster benchmark</code> and you will get the same numbers.</p>
+        <p>The third is audit. Someone downstream — a security reviewer, a customer, a regulator — will eventually ask which files an agent modified and how you know. Most harnesses answer from the agent's own report of its actions, which is a problem, because coding agents do most of their editing through the shell where the structured patch channel never fires. Measured live against Codex across five runs, that channel reported <strong>zero</strong> of the real edits. Muster's observer derives the change set from git and the filesystem instead, catching the edit in 86ms with a diff verified by <code>git apply</code> and a receipt hash that reproduces on a machine that was never there.</p>
+
+        <h3>What it does not give you</h3>
+        <p>Muster is early and deliberately narrow. It ships 34 capability packs of which only two are substantial; it is not a plugin ecosystem and will not become one. If you need the largest available library of ready-made integrations, a larger project is the better answer and this page is not going to pretend otherwise. What Muster is trying to be is the layer that makes a self-hosted agent defensible after the demo.</p>
+        <p class="proof-link"><a href="/live-inline-diff.html">See the observed file-change evidence -&gt;</a> <a href="/muster-vs-openclaw.html">Compare with OpenClaw -&gt;</a> <a href="/docs.html">Read the docs -&gt;</a></p>
+      </div>
     </section>
   </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>© <span id="year">2026</span> Muster — open source, MIT</span>
+      <span class="footer-sep">·</span>
+      <a href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+      <span class="footer-sep">·</span>
+      <a href="/docs.html">Docs</a>
+      <span class="footer-sep">·</span>
+      <a href="/live-inline-diff.html">Audit trail</a>
+      <span class="footer-sep">·</span>
+      <a href="/muster-vs-openclaw.html">Comparisons</a>
+    </div>
+  </footer>
 </body>
 </html>

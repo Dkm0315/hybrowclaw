@@ -20,6 +20,37 @@
   <main>
     <section class="hero"><div class="hero-inner"><p class="kicker hero-step">Google Chat · Workspace bot</p><h1 class="hero-step">A Google Chat AI agent with pairing and approvals.</h1><p class="sub hero-step">Muster maps Google Chat message events to the shared gateway envelope and can render pairing prompts and approval cards while keeping memory, tokens, and MCP tools governed.</p><div class="hero-actions hero-step"><a class="btn-cta" href="/docs.html#gateway">Read gateway docs</a><a class="btn-ghost" href="/frappe-ai.html">Frappe AI -></a></div></div></section>
     <section class="band" data-reveal><p class="sec-kicker reveal-child">Workspace flow</p><h2 class="reveal-child">Chat messages become governed agent runs.</h2><div class="cards five"><article class="card reveal-child"><h3>Message mapping</h3><p>Google Chat MESSAGE events are converted to Muster SurfaceMessage objects.</p></article><article class="card reveal-child"><h3>Echo guard</h3><p>Bot messages are ignored so the gateway does not loop on itself.</p></article><article class="card reveal-child"><h3>Approval cards</h3><p>Gate approvals can be rendered as Chat cards with approve/reject actions.</p></article><article class="card reveal-child"><h3>Pairing</h3><p>Unpaired senders receive an operator approval code before the agent acts.</p></article><article class="card reveal-child"><h3>Shared policy</h3><p>Workspace turns share the same memory, token, MCP, and tool policies as the CLI.</p></article></div></section>
+
+    <section class="band band-alt" data-reveal>
+      <p class="sec-kicker reveal-child">In practice</p>
+      <h2 class="reveal-child">Workspace bots inherit Workspace expectations.</h2>
+      <div class="prose reveal-child">
+        <p>Google Chat sits inside an organisation's identity system, which changes what people assume about a bot living there. If it is in Workspace, users assume it respects the same boundaries their Drive and Calendar do. An agent that reads from one team's conversation and volunteers it in another's violates an expectation nobody wrote down but everybody has.</p>
+        <h3>Events in, governed runs out</h3>
+        <p>Muster maps Google Chat <code>MESSAGE</code> events into the same <code>SurfaceMessage</code> envelope that the terminal, web, Slack, Telegram, Teams, Discord, and WhatsApp surfaces produce. One envelope means one place where sender identity, active scope, provider route, budget, and tool policy are decided. A Workspace turn is not a special case with its own rules; it is a normal Muster run that happened to arrive from Chat.</p>
+        <h3>The echo guard is not a small detail</h3>
+        <p>Bot messages are ignored so the gateway cannot loop on its own output. This sounds trivial until it happens: an agent replies, the reply arrives as a new message event, the agent replies to itself, and a runaway loop burns tokens at machine speed inside a room full of people watching it happen. Filtering the bot's own authorship at the adapter is the cheap fix, and it belongs there rather than in a prompt.</p>
+        <h3>Approvals belong in the room, not in a terminal</h3>
+        <p>Gates can render as Chat cards with approve and reject actions, which puts the decision where the accountable person actually is. An approval flow that requires someone to SSH into a box is an approval flow that gets rubber-stamped or bypassed. Pairing works the same way: an unpaired sender receives an operator approval code before the agent acts on their behalf, so being in the Workspace is not by itself authorisation to spend the agent's budget or reach its tools.</p>
+        <h3>Same memory, same ledger, same policy</h3>
+        <p>Workspace turns share the memory lanes, token ledger, MCP policy, and tool setup checks that the CLI uses. Memory is scoped by tenant, workspace, user, role, and session, so what the agent learned in one room is not automatically retrievable in another. Usage, estimated cost, and replay waste are recorded locally per run rather than read back out of a provider dashboard. If a run touched a repository, its file changes were derived from git and the filesystem rather than taken from the agent's self-report &mdash; measured live, that self-report channel reported zero of five real edits.</p>
+        <p class="proof-link"><a href="/live-inline-diff.html">How file changes are observed -&gt;</a> <a href="/frappe-ai.html">ERPNext AI agent -&gt;</a> <a href="/docs.html">Gateway docs -&gt;</a></p>
+      </div>
+    </section>
   </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>&copy; <span id="year">2026</span> Muster &mdash; open source, MIT</span>
+      <span class="footer-sep">&middot;</span>
+      <a href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/docs.html">Docs</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/live-inline-diff.html">Audit trail</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/muster-vs-openclaw.html">Comparisons</a>
+    </div>
+  </footer>
 </body>
 </html>

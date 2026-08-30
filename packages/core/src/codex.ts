@@ -25,7 +25,7 @@ export interface CodexRunInput {
   readonly cwd: string;
   /** User's chosen model, preserved (e.g. gpt-5.5). */
   readonly model?: string;
-  readonly reasoning?: "none" | "low" | "medium" | "high";
+  readonly reasoning?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   /**
    * muster memory + skill index, injected as a system-level instructions file
    * (-c experimental_instructions_file=). Goes to the system prompt, NOT the

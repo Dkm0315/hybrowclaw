@@ -380,19 +380,48 @@ export function buildRecalledBlock(recalled: readonly ContextObject[]): string {
   return `Recalled context (scoped memory, provenance-tracked; verify before relying on it):\n${lines.join("\n")}`;
 }
 
-function planForManagedRuntime(runtimeId: "pi" | "claude-code" | "codex", options: RunOptions): RunPlan {
-  const defaults = runtimeId === "pi"
+function planForManagedRuntime(
+  config: MusterConfig,
+  runtimeId: "pi" | "claude-code" | "codex",
+  options: RunOptions,
+): RunPlan {
+  const taskKind = classifyTask(options.prompt, options.taskKind);
+  const builtIn = runtimeId === "pi"
     ? { provider: "pi-default", model: "pi-default" }
     : runtimeId === "codex"
       ? { provider: "codex", model: "gpt-5.5" }
       : { provider: "anthropic", model: "sonnet" };
+  const acceptsProvider = (providerId: string): boolean => {
+    if (runtimeId === "pi") return true;
+    const kind = config.providers[providerId]?.kind;
+    return runtimeId === "codex" ? kind === "codex-cli" : kind === "anthropic";
+  };
+  const configuredRuntimes = [
+    config.runtimes[runtimeId],
+    config.runtimes[config.routing.defaultRuntime],
+    ...Object.values(config.runtimes),
+  ].filter((runtime, index, runtimes) => runtime?.enabled && runtimes.indexOf(runtime) === index);
+  const configuredRoute = configuredRuntimes
+    .map((runtime) => runtime?.routes[taskKind])
+    .find((route): route is ModelRoute => Boolean(route && acceptsProvider(route.provider)));
+  const configuredProviderId = options.provider
+    ?? configuredRoute?.provider
+    ?? configuredRuntimes.map((runtime) => runtime?.provider).find((providerId) => providerId && acceptsProvider(providerId))
+    ?? Object.values(config.providers).find((provider) => acceptsProvider(provider.id))?.id;
+  const configuredProvider = configuredProviderId ? config.providers[configuredProviderId] : undefined;
+  const defaults = {
+    provider: configuredProviderId ?? builtIn.provider,
+    model: configuredRoute?.model ?? configuredProvider?.defaultModel ?? builtIn.model,
+    reasoning: configuredRoute?.reasoning,
+  };
   return {
     runId: `run_${randomUUID()}`,
-    taskKind: classifyTask(options.prompt, options.taskKind),
+    taskKind,
     runtimeId,
     route: {
       provider: options.provider ?? defaults.provider,
       model: options.model ?? defaults.model,
+      reasoning: defaults.reasoning,
     },
     sensitive: options.sensitive ?? false,
     createdAt: new Date().toISOString(),
@@ -841,7 +870,7 @@ export async function executeRun(config: MusterConfig, options: RunOptions): Pro
   const cwd = options.cwd ?? process.cwd();
   const planningStartedAt = Date.now();
   const plan = options.runtime === "pi" || options.runtime === "claude-code" || options.runtime === "claude" || options.runtime === "codex"
-    ? planForManagedRuntime(options.runtime === "pi" ? "pi" : options.runtime === "codex" ? "codex" : "claude-code", options)
+    ? planForManagedRuntime(config, options.runtime === "pi" ? "pi" : options.runtime === "codex" ? "codex" : "claude-code", options)
     : planRun(config, {
         prompt: options.prompt,
         runtime: options.runtime,

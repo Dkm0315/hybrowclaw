@@ -8,7 +8,7 @@ try:
     import frappe
     from frappe.tests.utils import FrappeTestCase
 
-    from muster.api.ask import _buying_training_fast_reply, _explicit_attended_form_intent, _handoffs, _instructional_form_fast_reply, _instructional_intent, _presentable_answer, _presentable_tool_calls, _prompt_form_doctype, _request_form_doctype, _require_user, _issue_clarification, _verified_exact_record, accept_handoff, poll, submit
+    from muster.api.ask import _GATEWAY_INTERACTION_COMMAND, _buying_training_fast_reply, _customization_repair_candidate, _customization_repair_fast_reply, _explicit_attended_form_intent, _explicit_support_report_intent, _handoffs, _instructional_form_fast_reply, _instructional_intent, _presentable_answer, _presentable_presentation, _presentable_tool_calls, _prompt_form_doctype, _recent_ui_error_text, _request_form_doctype, _require_user, _issue_clarification, _verified_exact_record, accept_handoff, poll, submit
     from muster.api.catalog import _commands, _named_runtime_items, _personas
 except ModuleNotFoundError as exc:
     raise unittest.SkipTest("Frappe integration tests require an installed test site") from exc
@@ -86,6 +86,16 @@ class TestAskAPI(FrappeTestCase):
         frappe.set_user("Administrator")
         self.assertEqual(_require_user(), "Administrator")
 
+    def test_explicit_support_reporting_is_not_preempted_by_form_handoff(self):
+        self.assertTrue(_explicit_support_report_intent(
+            "This report stopped after the update. Check it and send it to support."
+        ))
+        self.assertFalse(_explicit_support_report_intent(
+            "Check this report, but do not send it to support."
+        ))
+        self.assertTrue(_GATEWAY_INTERACTION_COMMAND.match("/accept"))
+        self.assertTrue(_GATEWAY_INTERACTION_COMMAND.match("/cancel"))
+
     def test_poll_is_bound_to_current_user_and_filters_reasoning_and_untrusted_artifacts(self):
         gateway = Mock()
         run_id = "msg_22222222-2222-4222-8222-222222222222"
@@ -151,6 +161,22 @@ class TestAskAPI(FrappeTestCase):
         self.assertEqual(answer, "Three invoices are overdue.\n\nReview them before sending reminders.")
         self.assertNotIn("Provider", answer)
         self.assertNotIn("localhost", answer)
+
+    def test_structured_presentation_is_bounded_and_keeps_governed_actions(self):
+        value = _presentable_presentation({
+            "kind": "report", "title": "Engineering impact", "summary": "Three records require review.",
+            "kpis": [{"label": "Affected", "value": "3", "tone": "warning"}],
+            "tables": [{"id": "impact", "columns": ["Record", "State"], "rows": [["Routing", "Stale"]]}],
+            "filters": [{"id": "state", "label": "State", "options": [{"label": "Stale", "value": "stale"}],
+                         "action": {"id": "filter", "label": "Apply", "command": "/impact state={value}", "kind": "filter"}}],
+            "actions": [
+                {"id": "accept", "label": "Approve correction", "command": "/accept", "style": "primary", "kind": "confirm"},
+                {"id": "unsafe", "label": "Unsafe", "command": "javascript:alert(1)"},
+            ],
+        })
+        self.assertEqual(value["tables"][0]["rows"], [["Routing", "Stale"]])
+        self.assertEqual(value["filters"][0]["action"]["command"], "/impact state={value}")
+        self.assertEqual([row["command"] for row in value["actions"]], ["/accept"])
 
     def test_palette_catalog_is_permission_filtered_and_bounded(self):
         remote = [
@@ -272,17 +298,60 @@ class TestAskAPI(FrappeTestCase):
             result = submit("Create a customer and show every Desk step.", "desk-session-3", {"route": "/desk"}, "ask-effect-offer")
         self.assertEqual(result["status"], "queued")
         self.assertEqual([row["kind"] for row in result["handoffs"]], ["attended_browser"])
-        self.assertEqual(result["handoffs"][0]["label"], "Open the form and review changes")
+        self.assertEqual(result["handoffs"][0]["label"], "Start guided review")
         self.assertTrue(all(row["requires"] == "explicit_confirmation" for row in result["handoffs"]))
         answer_context = gateway.request.call_args_list[-1].kwargs["payload"]["context"]
         self.assertEqual(answer_context["fastReply"], {
-            "text": "I’ve gathered the details needed for the next step. Open the form to review them in Frappe. "
-                    "I’ll fill the fields and leave the document unsaved."
+            "text": "I have the details. I’ll open the form and guide you through each field, child table, and "
+                    "available action. I’ll pause only when your approval is required before a change such as Save or Submit."
         })
         turn = frappe.get_doc("Muster Ask Turn", result["turn_id"])
         self.assertEqual(turn.status, "Offered")
         self.assertFalse(turn.workflow_proposal)
         self.assertFalse(frappe.db.exists("Muster Mission", {"objective": "Create a customer and show every Desk step."}))
+
+    def test_generic_diagnostic_fix_investigates_before_offering_a_form_handoff(self):
+        gateway = Mock()
+        acknowledgement = {
+            "runId": "msg_56565656-5656-4656-8656-565656565656",
+            "pollUrl": "/v1/integrations/frappe/messages/runs/msg_56565656-5656-4656-8656-565656565656",
+            "status": "queued", "replayed": False,
+        }
+        frappe.set_user(self.user)
+        with (
+            patch("muster.api.ask._require_post"),
+            patch("muster.api.ask._client_for_user", return_value=(gateway, {"X-Signed": "yes"}, self.binding)),
+            patch("muster.api.ask.build_read_catalog", return_value=[{"doctype": "Drawing Review", "fields": ["name", "revision"]}]),
+            patch("muster.api.ask.execute_read_plan", return_value={
+                "kind": "fresh_permission_filtered_frappe_evidence", "permissionFiltered": True,
+                "queries": [{"doctype": "Drawing Review", "mode": "records", "rows": [{"name": "DR-1", "revision": "B"}]}],
+            }) as execute,
+        ):
+            def request(method, path, **kwargs):
+                if path.endswith("/ask-intents"):
+                    request_id = kwargs["payload"]["requestId"]
+                    return {"schemaVersion": 1, "requestId": request_id, "status": "classified", "intent": {
+                        "schemaVersion": 1, "requestId": request_id,
+                        "requestedOutcomes": ["attended_browser"], "requiresClarification": False,
+                    }}
+                if path.endswith("/read-plans"):
+                    request_id = kwargs["payload"]["requestId"]
+                    return {"schemaVersion": 1, "requestId": request_id, "status": "planned", "plan": {
+                        "schemaVersion": 1, "requestId": request_id, "disposition": "query",
+                        "reason": "Inspect the permitted engineering records first.", "queries": [],
+                    }}
+                return acknowledgement
+            gateway.request.side_effect = request
+            result = submit(
+                "The drawing changed but inspection still shows the old operation. What happened? Check and fix it.",
+                "desk-diagnostic", {"route": "/app", "scope_mode": "context"}, "ask-diagnostic-first",
+            )
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(result["handoffs"], [])
+        execute.assert_called_once()
+        answer_context = gateway.request.call_args_list[-1].kwargs["payload"]["context"]
+        self.assertNotIn("fastReply", answer_context)
+        self.assertEqual(answer_context["ask"]["requestedOutcomes"], ["live_read", "answer"])
 
     def test_form_question_identifies_custom_fields_and_property_setters_as_data(self):
         gateway = Mock()
@@ -337,6 +406,15 @@ class TestAskAPI(FrappeTestCase):
             )
         self.assertEqual(target, "Customer")
 
+    def test_record_identifier_does_not_become_an_explicit_form_target(self):
+        readable = SimpleNamespace(get_can_read=lambda: ["Item", "BOM"])
+        with patch.object(frappe, "get_user", return_value=readable):
+            target = _prompt_form_doctype(
+                "Make a manufacturing recipe for MUSTER-DEMO-ITEM-001 using MUSTER-DEMO-COMPONENT-001.",
+                "", self.user,
+            )
+        self.assertIsNone(target)
+
         context = __import__("muster.api.ask", fromlist=["_merge_form_evidence"])._merge_form_evidence({}, {
             "doctype": "Customer", "authority": {"read": True, "write": True},
             "fields": [
@@ -345,8 +423,11 @@ class TestAskAPI(FrappeTestCase):
             ],
             "doctype_property_setters": [], "workflow": None, "client_scripts": [], "schema_hash": "a" * 64, "revision": "b" * 64,
         })["summary"]
-        self.assertIn('"writable_fields":[{"fieldname":"customer_name"', context)
-        self.assertNotIn('"fieldname":"tax_id","fieldtype"', context)
+        form_evidence = json.loads(context)["effectiveFormSchema"]
+        self.assertEqual(
+            [field["fieldname"] for field in form_evidence["writable_fields"]],
+            ["customer_name"],
+        )
 
     def test_large_form_evidence_is_compacted_without_losing_required_fields(self):
         merge = __import__("muster.api.ask", fromlist=["_merge_form_evidence"])._merge_form_evidence
@@ -414,6 +495,57 @@ class TestAskAPI(FrappeTestCase):
     def test_form_guidance_does_not_become_an_execution_request(self):
         self.assertTrue(_instructional_intent("How do I create a PO?", "Purchase Order"))
         self.assertTrue(_instructional_intent("Teach me how to prepare a purchase order", "Purchase Order"))
+
+    def test_vague_fix_request_resolves_only_from_one_live_form_candidate(self):
+        candidate = {
+            "schema_version": 1, "client_script": "Reviewed Order Guidance",
+            "target_doctype": "Purchase Order", "version": "VERSION-0001",
+            "live_hash": "1" * 64, "proposed_hash": "2" * 64,
+            "source": "Frappe Version", "current_source_verified": True,
+            "generated_source": False,
+        }
+        with patch(
+            "muster.orchestration.client_script_repair.resolve_previous_version_candidate",
+            return_value=candidate,
+        ) as resolver:
+            result = _customization_repair_candidate(
+                "why this error coming? i did everything correctly. please check and fix",
+                "Purchase Order",
+                self.user,
+            )
+        self.assertEqual(result, candidate)
+        resolver.assert_called_once_with(
+            "Purchase Order",
+            self.user,
+            "why this error coming? i did everything correctly. please check and fix",
+        )
+        self.assertIsNone(_customization_repair_candidate("please check and fix", None, self.user))
+
+    def test_customization_repair_handoff_is_explicit_and_business_readable(self):
+        handoffs = _handoffs(["answer", "customization_repair"], "intent-repair")
+        self.assertEqual(len(handoffs), 1)
+        self.assertEqual(handoffs[0]["kind"], "customization_repair")
+        self.assertEqual(handoffs[0]["requires"], "explicit_confirmation")
+        self.assertIn("exact customization repair", handoffs[0]["label"].lower())
+        text = _customization_repair_fast_reply({})["text"]
+        self.assertIn("recorded Frappe Version", text)
+        self.assertIn("Nothing has changed yet", text)
+
+    def test_recent_ui_error_is_stable_and_rejects_oversized_untrusted_text(self):
+        self.assertEqual(
+            _recent_ui_error_text({
+                "recent_ui_error": {
+                    "title": "Validation failed",
+                    "message": "Only revision A is permitted for this operation.",
+                    "observed_at": "2026-08-16T10:30:00Z",
+                }
+            }),
+            "Validation failed Only revision A is permitted for this operation.",
+        )
+        self.assertEqual(
+            _recent_ui_error_text({"recent_ui_error": {"title": "x", "message": "y" * 501}}),
+            "",
+        )
 
     def test_form_guidance_is_derived_from_the_effective_required_schema(self):
         reply = _instructional_form_fast_reply({

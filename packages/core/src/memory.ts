@@ -5,7 +5,8 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { dataDir } from "./store.js";
-import type { ContextObject, MemoryScope, MemoryScopeKind } from "./types.js";
+import { configPath } from "./config.js";
+import type { ContextObject, MemoryScope, MemoryScopeKind, MemoryWritePolicy } from "./types.js";
 
 export interface AddMemoryInput {
   readonly kind?: string;
@@ -18,6 +19,33 @@ export interface AddMemoryInput {
   readonly scopes: MemoryScope[];
   readonly redactionState?: ContextObject["redactionState"];
   readonly links?: string[];
+  /**
+   * True only when the human in the loop asked for this fact to be remembered
+   * ("remember that…", `muster memory add`). The one thing that satisfies a
+   * `never` policy — never set it from a heuristic.
+   */
+  readonly explicitUserRequest?: boolean;
+  /**
+   * Proof that consent was obtained for this write under an `ask` policy: the
+   * id//description of the confirmation the user answered. Free-form so callers
+   * can cite an approval id, a turn id, or a CLI flag.
+   */
+  readonly consentReceipt?: string;
+}
+
+/**
+ * Thrown when config.memory.policy forbids a durable write. Enforcement lives in
+ * `addMemory` itself, so no caller — including the goal loop in run.ts — can
+ * route around it: the policy holds by construction, not by prompt string.
+ */
+export class MemoryPolicyError extends Error {
+  readonly policy: MemoryWritePolicy;
+
+  constructor(policy: MemoryWritePolicy, message: string) {
+    super(message);
+    this.name = "MemoryPolicyError";
+    this.policy = policy;
+  }
 }
 
 export interface SearchMemoryInput {
@@ -87,6 +115,8 @@ export interface MemoryStoreInspection {
     readonly initialized: boolean;
     readonly fresh: boolean;
     readonly backend?: "sqlite-fts5" | "sqlite-like";
+    /** Derived-index schema marker (`version:tokenizer`); differs from current when a migration is pending. */
+    readonly schema?: string;
     readonly size: number;
     readonly mtimeMs: number;
     readonly objectCount?: number;
@@ -121,6 +151,17 @@ export interface MemoryLatencyProbeResult {
   readonly recalledCount: number;
 }
 
+/**
+ * FTS5 tokenizer for the derived recall index. `porter` stems English terms so a
+ * "deploy" query recalls a "deploys" summary; `unicode61` keeps the non-ASCII
+ * folding the default tokenizer already provided.
+ */
+const MEMORY_FTS_TOKENIZER = "porter unicode61";
+/** Bump whenever the derived index shape or tokenizer changes; older indexes then re-derive on open. */
+const MEMORY_INDEX_SCHEMA_VERSION = 2;
+const MEMORY_INDEX_SCHEMA_KEY = "index_schema";
+const MEMORY_INDEX_SCHEMA_MARKER = `${MEMORY_INDEX_SCHEMA_VERSION}:${MEMORY_FTS_TOKENIZER}`;
+
 export function memoryPath(cwd = process.cwd()): string {
   return join(dataDir(cwd), "memory.jsonl");
 }
@@ -129,21 +170,77 @@ export function memoryDbPath(cwd = process.cwd()): string {
   return join(dataDir(cwd), "memory.db");
 }
 
+/**
+ * The configured durable-write policy for `cwd`, defaulting to "auto".
+ *
+ * Reads the profile config directly rather than through `loadConfig` so a
+ * missing, unreadable, or older config degrades to today's behaviour instead of
+ * failing a write, and an unknown policy string is treated as the strictest
+ * thing it can safely mean: nothing (auto) is never inferred from garbage —
+ * garbage is rejected loudly at write time.
+ */
+export async function memoryWritePolicy(cwd = process.cwd()): Promise<MemoryWritePolicy> {
+  let raw: string;
+  try {
+    raw = await readFile(configPath(cwd), "utf8");
+  } catch {
+    return "auto";
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return "auto";
+  }
+  const policy = (parsed as { memory?: { policy?: unknown } } | null)?.memory?.policy;
+  if (policy === undefined || policy === null) return "auto";
+  if (policy === "auto" || policy === "ask" || policy === "never") return policy;
+  throw new MemoryPolicyError(
+    "never",
+    `Unknown config.memory.policy: ${JSON.stringify(policy)}. Set it to "auto", "ask", or "never" — durable writes stay blocked until it is a policy Muster can enforce.`,
+  );
+}
+
+/**
+ * Enforce config.memory.policy for one write. Exported so callers that want to
+ * check before doing expensive work can, but `addMemory` calls it itself: the
+ * gate is not optional.
+ */
+export async function assertMemoryWriteAllowed(input: AddMemoryInput, cwd = process.cwd()): Promise<MemoryWritePolicy> {
+  const policy = await memoryWritePolicy(cwd);
+  if (policy === "never" && input.explicitUserRequest !== true) {
+    throw new MemoryPolicyError(
+      "never",
+      "config.memory.policy is \"never\": Muster does not write durable memory on its own. Only a write the user explicitly asked for is allowed — pass explicitUserRequest: true for that case. To change the policy, re-run `muster onboard` and pick a different memory option, or set memory.policy in .muster/config.json.",
+    );
+  }
+  if (policy === "ask" && input.explicitUserRequest !== true) {
+    const receipt = typeof input.consentReceipt === "string" ? input.consentReceipt.trim() : "";
+    if (!receipt) {
+      throw new MemoryPolicyError(
+        "ask",
+        "config.memory.policy is \"ask\": obtain the user's confirmation for this memory before writing it, then pass consentReceipt with the id of that confirmation (an approval id, turn id, or the flag the user answered). Writes without a consent receipt are refused.",
+      );
+    }
+  }
+  return policy;
+}
+
 export async function addMemory(input: AddMemoryInput, cwd = process.cwd()): Promise<ContextObject> {
-  validateMemoryInput(input);
+  const validated = validateMemoryInput(input);
+  await assertMemoryWriteAllowed(input, cwd);
   const previousStats = await memorySourceStats(cwd);
-  const now = input.observedAt ?? new Date().toISOString();
   const object: ContextObject = {
     id: `mem_${randomUUID()}`,
-    kind: input.kind ?? "note",
-    summary: input.summary.trim(),
-    sourceUri: input.sourceUri,
-    observedAt: now,
-    confidence: input.confidence ?? 0.7,
-    provenance: input.provenance.map((item) => item.trim()).filter(Boolean),
-    scopes: normalizeScopes(input.scopes),
-    redactionState: input.redactionState ?? "none",
-    links: input.links?.filter(Boolean)
+    kind: validated.kind,
+    summary: validated.summary,
+    sourceUri: validated.sourceUri,
+    observedAt: validated.observedAt ?? new Date().toISOString(),
+    confidence: validated.confidence,
+    provenance: validated.provenance,
+    scopes: validated.scopes,
+    redactionState: validated.redactionState,
+    links: validated.links
   };
   await appendMemory(object, cwd);
   await indexMemoryObject(object, cwd, previousStats);
@@ -155,58 +252,48 @@ export async function listMemory(cwd = process.cwd()): Promise<ContextObject[]> 
 }
 
 export async function findMemory(id: string, cwd = process.cwd()): Promise<ContextObject | undefined> {
+  const memoryId = requiredString(id, "findMemory", "id", "a non-empty memory id such as mem_1234.");
   const store = await openMemoryIndex(cwd, { rebuildPolicy: "if-missing" });
   try {
-    const object = store.find(id);
+    const object = store.find(memoryId);
     if (object) return object;
   } finally {
     store.close();
   }
   const objects = await listMemory(cwd);
-  return objects.find((object) => object.id === id);
+  return objects.find((object) => object.id === memoryId);
 }
 
 export async function searchMemory(input: SearchMemoryInput, cwd = process.cwd()): Promise<ContextObject[]> {
-  const allowedScopes = normalizeScopes(input.scopes);
-  if (!allowedScopes.length) throw new Error("At least one query scope is required.");
-  const effectiveScopes = input.includeGlobal
-    ? [...allowedScopes, { kind: "global" as const, id: "global" }]
-    : allowedScopes;
+  const validated = validateSearchInput(input, "searchMemory");
   const store = await openMemoryIndex(cwd, { rebuildPolicy: "if-missing" });
   try {
-    return store.search({ query: input.query, scopes: effectiveScopes, limit: input.limit, match: input.match });
+    return store.search({ query: validated.query, scopes: validated.effectiveScopes, limit: validated.limit, match: validated.match });
   } finally {
     store.close();
   }
 }
 
 export async function searchMemoryWithReceipts(input: SearchMemoryReceiptInput, cwd = process.cwd()): Promise<SearchMemoryReceiptResult> {
-  const limit = Math.max(1, Math.floor(input.limit ?? 5));
-  const candidateLimit = Math.max(limit, Math.floor(input.candidateLimit ?? Math.max(limit * 20, 50)));
-  const minScore = input.minScore ?? 0.15;
-  const query = input.query?.trim() ?? "";
-  const allowedScopes = normalizeScopes(input.scopes);
-  if (!allowedScopes.length) throw new Error("At least one query scope is required.");
-  const effectiveScopes = input.includeGlobal
-    ? [...allowedScopes, { kind: "global" as const, id: "global" }]
-    : allowedScopes;
+  const validated = validateReceiptSearchInput(input, "searchMemoryWithReceipts");
+  const { limit, candidateLimit, minScore, query, scopes: allowedScopes, effectiveScopes } = validated;
   const store = await openMemoryIndex(cwd, { rebuildPolicy: "if-missing" });
   try {
     const lexical = query
-      ? store.search({ query, scopes: effectiveScopes, limit: candidateLimit, match: input.match ?? "any" })
+      ? store.search({ query, scopes: effectiveScopes, limit: candidateLimit, match: validated.match ?? "any" })
       : [];
     const scored = rankMemoryCandidates(query, lexical, minScore);
     let fallbackUsed = false;
     let candidates = lexical;
     let receipts = scored;
     let linkedCandidateCount = 0;
-    if (input.expandLinked && query && lexical.length) {
+    if (validated.expandLinked && query && lexical.length) {
       const linked = linkedMemoryReceipts({
         seeds: lexical,
         store,
         scopes: effectiveScopes,
         seenIds: new Set(),
-        limit: input.graphNeighborLimit ?? Math.max(limit * 4, 20),
+        limit: validated.graphNeighborLimit ?? Math.max(limit * 4, 20),
       });
       linkedCandidateCount = linked.length;
       if (linked.length) {
@@ -225,11 +312,11 @@ export async function searchMemoryWithReceipts(input: SearchMemoryReceiptInput, 
     return {
       query,
       scopes: allowedScopes,
-      includeGlobal: input.includeGlobal ?? false,
+      includeGlobal: validated.includeGlobal,
       backend: store.backend,
       requestedLimit: limit,
       candidateCount: candidates.length,
-      linkedCandidateCount: input.expandLinked ? linkedCandidateCount : undefined,
+      linkedCandidateCount: validated.expandLinked ? linkedCandidateCount : undefined,
       receipts: receipts.slice(0, limit),
       fallbackUsed,
     };
@@ -239,11 +326,13 @@ export async function searchMemoryWithReceipts(input: SearchMemoryReceiptInput, 
 }
 
 export async function promoteMemory(input: PromoteMemoryInput, cwd = process.cwd()): Promise<ContextObject> {
-  const source = await findMemory(input.id, cwd);
-  if (!source) throw new Error(`Memory not found: ${input.id}`);
-  const targetScopes = normalizeScopes(input.targetScopes);
-  if (!targetScopes.length) throw new Error("At least one target scope is required.");
-  if (targetScopes.some((scope) => scope.kind === "global") && !input.allowGlobal) {
+  const raw = requireInputObject(input, "promoteMemory", "{ id, targetScopes }");
+  const id = requiredString(raw.id, "promoteMemory", "id", "a non-empty memory id such as mem_1234.");
+  const targetScopes = requiredScopes(raw.targetScopes, "promoteMemory", "targetScopes");
+  const allowGlobal = optionalBoolean(raw.allowGlobal, "promoteMemory", "allowGlobal") ?? false;
+  const source = await findMemory(id, cwd);
+  if (!source) throw new Error(`Memory not found: ${id}`);
+  if (targetScopes.some((scope) => scope.kind === "global") && !allowGlobal) {
     throw new Error("Promoting memory to global requires allowGlobal=true.");
   }
   const promoted: ContextObject = {
@@ -282,11 +371,12 @@ export async function inspectMemoryStore(cwd = process.cwd()): Promise<MemorySto
   const scopeCounts = new Map<string, number>();
   if (!jsonlError) {
     for (const object of objects) {
-      if (ids.has(object.id)) duplicateIds += 1;
-      ids.add(object.id);
-      const scopes = normalizeScopes(object.scopes);
+      const id = typeof object?.id === "string" ? object.id : "";
+      if (id && ids.has(id)) duplicateIds += 1;
+      ids.add(id);
+      const scopes = safeNormalizeScopes(object?.scopes);
       if (!scopes.length) zeroScopeObjects += 1;
-      if (object.redactionState === "blocked") blockedObjects += 1;
+      if (object?.redactionState === "blocked") blockedObjects += 1;
       for (const scope of scopes) {
         const key = formatMemoryScope(scope);
         scopeCounts.set(key, (scopeCounts.get(key) ?? 0) + 1);
@@ -345,6 +435,15 @@ export async function inspectMemoryStore(cwd = process.cwd()): Promise<MemorySto
       status: index.backend === "sqlite-fts5" ? "passed" : "warning",
       detail: index.backend === "sqlite-fts5" ? "FTS5 available" : index.exists ? "using LIKE fallback or unreadable index" : "backend unknown until index is built",
     },
+    {
+      label: "index_schema",
+      status: index.schema === MEMORY_INDEX_SCHEMA_MARKER ? "passed" : "warning",
+      detail: index.schema === MEMORY_INDEX_SCHEMA_MARKER
+        ? `schema ${MEMORY_INDEX_SCHEMA_MARKER}`
+        : index.exists
+          ? `schema ${index.schema ?? "pre-tokenizer"}; it re-derives to ${MEMORY_INDEX_SCHEMA_MARKER} on next open`
+          : `no derived index yet; it will be built as ${MEMORY_INDEX_SCHEMA_MARKER}`,
+    },
   ];
   return {
     memoryPath: sourcePath,
@@ -370,7 +469,8 @@ export async function rebuildMemoryIndex(cwd = process.cwd()): Promise<RebuildMe
 }
 
 export async function probeMemorySearchLatency(input: MemoryLatencyProbeInput, cwd = process.cwd()): Promise<MemoryLatencyProbeResult> {
-  const runs = Math.max(1, Math.min(200, Math.floor(input.runs ?? 25)));
+  const validated = validateReceiptSearchInput(input, "probeMemorySearchLatency");
+  const runs = Math.max(1, Math.min(200, Math.floor(optionalFiniteNumber(input.runs, "probeMemorySearchLatency", "runs", "a finite number of probe runs.") ?? 25)));
   const timings: number[] = [];
   let latest: SearchMemoryReceiptResult | undefined;
   for (let index = 0; index < runs; index += 1) {
@@ -382,7 +482,7 @@ export async function probeMemorySearchLatency(input: MemoryLatencyProbeInput, c
   const p50Ms = percentileValue(timings, 0.5);
   const p95Ms = percentileValue(timings, 0.95);
   return {
-    query: latest?.query ?? input.query?.trim() ?? "",
+    query: latest?.query ?? validated.query,
     runs,
     p50Ms,
     p95Ms,
@@ -395,21 +495,29 @@ export async function probeMemorySearchLatency(input: MemoryLatencyProbeInput, c
 }
 
 export function parseMemoryScope(value: string): MemoryScope {
-  const [kind, ...rest] = value.split(":");
+  const raw = requiredString(value, "parseMemoryScope", "value", 'a "kind:id" string, for example user:dhairya.');
+  const [kind, ...rest] = raw.split(":");
   const id = rest.join(":");
   if (!isScopeKind(kind) || !id.trim()) {
-    throw new Error(`Invalid memory scope "${value}". Use kind:id, for example user:dhairya or tenant:oxygenhr.`);
+    throw new Error(`Invalid memory scope "${raw}". Use kind:id, for example user:dhairya or tenant:oxygenhr.`);
   }
   return { kind, id: normalizeScopeId(kind, id) };
 }
 
 export function formatMemoryScope(scope: MemoryScope): string {
+  if (!isScopeObject(scope)) {
+    throw new Error(`formatMemoryScope requires scope: an object like { kind: "user", id: "dhairya" }, received ${describeValue(scope)}.`);
+  }
   return `${scope.kind}:${scope.id}`;
 }
 
 export function isVisibleInScopes(object: ContextObject, allowedScopes: readonly MemoryScope[]): boolean {
-  const normalizedAllowed = normalizeScopes(allowedScopes);
-  return normalizeScopes(object.scopes).every((scope) => normalizedAllowed.some((candidate) => sameScope(scope, candidate)));
+  const target = requireInputObject(object, "isVisibleInScopes", "a memory object with scopes");
+  const normalizedAllowed = requiredScopes(allowedScopes, "isVisibleInScopes", "allowedScopes");
+  const objectScopes = normalizeScopes(scopeArray(target.scopes, "isVisibleInScopes", "object.scopes"));
+  // Zero-scope rows are malformed; the scoped SQL path hides them, so direct reads must too.
+  if (!objectScopes.length) return false;
+  return objectScopes.every((scope) => normalizedAllowed.some((candidate) => sameScope(scope, candidate)));
 }
 
 async function appendMemory(object: ContextObject, cwd: string): Promise<void> {
@@ -528,9 +636,11 @@ async function openMemoryIndex(cwd: string, options: { skipRebuild?: boolean; ex
     CREATE INDEX IF NOT EXISTS idx_memory_observed ON memory(observed_at DESC);
     CREATE INDEX IF NOT EXISTS idx_memory_scope_lookup ON memory_scope(scope, memory_id);
   `);
+  const staleSchema = readMetaString(db, MEMORY_INDEX_SCHEMA_KEY) !== MEMORY_INDEX_SCHEMA_MARKER;
+  if (staleSchema) dropMemoryFts(db);
   try {
     db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(searchable_text, content='memory', content_rowid='rowid');
+      CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(searchable_text, content='memory', content_rowid='rowid', tokenize='${MEMORY_FTS_TOKENIZER}');
       CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory BEGIN
         INSERT INTO memory_fts(rowid, searchable_text) VALUES (new.rowid, new.searchable_text);
       END;
@@ -543,8 +653,14 @@ async function openMemoryIndex(cwd: string, options: { skipRebuild?: boolean; ex
       END;
     `);
     backend = "sqlite-fts5";
+    if (staleSchema) {
+      // External-content FTS: re-derive every row from `memory` so pre-porter indexes migrate in place.
+      db.exec("INSERT INTO memory_fts(memory_fts) VALUES('rebuild');");
+      writeMetaString(db, MEMORY_INDEX_SCHEMA_KEY, MEMORY_INDEX_SCHEMA_MARKER);
+    }
   } catch {
     // FTS5 is optional in Node builds; LIKE still uses the scoped index.
+    // The schema marker stays unwritten so the next open retries the migration.
   }
 
   const upsert = (object: ContextObject): void => {
@@ -583,9 +699,8 @@ async function openMemoryIndex(cwd: string, options: { skipRebuild?: boolean; ex
 
   const updateSourceStats = async (): Promise<void> => {
     const stats = await memorySourceStats(cwd);
-    const stmt = db.prepare("INSERT INTO memory_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
-    stmt.run("source_size", String(stats.size));
-    stmt.run("source_mtime_ms", String(stats.mtimeMs));
+    writeMetaString(db, "source_size", String(stats.size));
+    writeMetaString(db, "source_mtime_ms", String(stats.mtimeMs));
   };
 
   const rebuild = async (): Promise<void> => {
@@ -643,6 +758,12 @@ async function openMemoryIndex(cwd: string, options: { skipRebuild?: boolean; ex
     return { sql: " LIMIT ?", params: [Math.max(1, Math.floor(limit))] };
   };
 
+  /**
+   * Fallback used when FTS5 is unavailable (or a MATCH query fails to parse). This is a raw
+   * substring scan over `searchable_text`, so it cannot stem: "deploy" matches "deploys"
+   * only because "deploys" contains it, while "running" never matches "runs". Porter
+   * stemming exists only on the FTS5 path.
+   */
   const runLikeSearch = (query: string | undefined, scopes: readonly MemoryScope[], limit?: number): ContextObject[] => {
     const visible = visibleClause(scopes);
     const trimmed = query?.trim();
@@ -686,6 +807,33 @@ async function openMemoryIndex(cwd: string, options: { skipRebuild?: boolean; ex
   };
 }
 
+function readMetaString(db: SqliteDatabase, key: string): string | undefined {
+  try {
+    const row = db.prepare("SELECT value FROM memory_meta WHERE key = ?").get(key) as { value?: string } | undefined;
+    return row?.value;
+  } catch {
+    return undefined; // Index predates memory_meta, or the file is not a readable memory index.
+  }
+}
+
+function writeMetaString(db: SqliteDatabase, key: string, value: string): void {
+  db.prepare("INSERT INTO memory_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
+}
+
+/** Removes the derived FTS table and its sync triggers together so `memory` writes never target a missing table. */
+function dropMemoryFts(db: SqliteDatabase): void {
+  try {
+    db.exec(`
+      DROP TRIGGER IF EXISTS memory_ai;
+      DROP TRIGGER IF EXISTS memory_ad;
+      DROP TRIGGER IF EXISTS memory_au;
+      DROP TABLE IF EXISTS memory_fts;
+    `);
+  } catch {
+    // A build without FTS5 cannot drop an fts5 table; the LIKE fallback still answers searches.
+  }
+}
+
 async function indexStale(db: SqliteDatabase, stats: MemorySourceStats): Promise<boolean> {
   const size = db.prepare("SELECT value FROM memory_meta WHERE key = ?").get("source_size") as { value?: string } | undefined;
   const mtime = db.prepare("SELECT value FROM memory_meta WHERE key = ?").get("source_mtime_ms") as { value?: string } | undefined;
@@ -722,6 +870,7 @@ function inspectMemoryIndex(indexPath: string, size: number, mtimeMs: number, so
         initialized,
         fresh,
         backend: fts ? "sqlite-fts5" : "sqlite-like",
+        schema: readMetaString(db, MEMORY_INDEX_SCHEMA_KEY),
         size,
         mtimeMs,
         objectCount: tableExists(db, "memory") ? readCount(db, "memory") : 0,
@@ -746,10 +895,9 @@ function inspectMemoryIndex(indexPath: string, size: number, mtimeMs: number, so
 }
 
 function readMetaNumber(db: SqliteDatabase, key: string): number | undefined {
-  if (!tableExists(db, "memory_meta")) return undefined;
-  const row = db.prepare("SELECT value FROM memory_meta WHERE key = ?").get(key) as { value?: string } | undefined;
-  if (row?.value === undefined) return undefined;
-  const value = Number(row.value);
+  const raw = readMetaString(db, key);
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
   return Number.isFinite(value) ? value : undefined;
 }
 
@@ -848,27 +996,178 @@ function compareReceipts(a: MemoryReceipt, b: MemoryReceipt): number {
 }
 
 function escapeLike(value: string): string {
-  return value.replace(/[%_]/g, (match) => `\\${match}`);
+  // The escape character itself must be escaped first; otherwise a literal `\`
+  // in the query consumes the next pattern character (querying `a\b` would
+  // match "ab", and a trailing `\` would turn `%` into a literal-percent match).
+  return value.replace(/[\\%_]/g, (match) => `\\${match}`);
 }
 
-function validateMemoryInput(input: AddMemoryInput): void {
-  if (!input.summary.trim()) throw new Error("Memory summary is required.");
-  if (!input.scopes.length) throw new Error("At least one memory scope is required.");
-  if (!input.provenance.length || !input.provenance.some((item) => item.trim())) {
-    throw new Error("At least one provenance entry is required.");
+/**
+ * Every exported entry point funnels missing or wrong-typed fields through these guards so callers
+ * see `<entryPoint> requires <field>: <expectation>` instead of a raw TypeError from deep inside SQLite.
+ */
+function requireInputObject<T>(input: T, entryPoint: string, shape: string): Record<string, unknown> {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new Error(`${entryPoint} requires an input object: pass ${shape}, received ${describeValue(input)}.`);
   }
-  if (input.confidence !== undefined && (input.confidence < 0 || input.confidence > 1)) {
-    throw new Error("Memory confidence must be between 0 and 1.");
+  return input as Record<string, unknown>;
+}
+
+function requiredString(value: unknown, entryPoint: string, field: string, expectation: string): string {
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${entryPoint} requires ${field}: ${expectation}`);
+  return value.trim();
+}
+
+function optionalString(value: unknown, entryPoint: string, field: string, expectation: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") throw new Error(`${entryPoint} requires ${field}: ${expectation}`);
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function optionalFiniteNumber(value: unknown, entryPoint: string, field: string, expectation: string): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${entryPoint} requires ${field}: ${expectation}`);
+  return value;
+}
+
+function optionalBoolean(value: unknown, entryPoint: string, field: string): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "boolean") throw new Error(`${entryPoint} requires ${field}: true or false when provided.`);
+  return value;
+}
+
+function optionalMatchMode(value: unknown, entryPoint: string): "all" | "any" | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (value !== "all" && value !== "any") throw new Error(`${entryPoint} requires match: "all" or "any" when provided.`);
+  return value;
+}
+
+function stringList(value: unknown, entryPoint: string, field: string, expectation: string): string[] {
+  if (!Array.isArray(value)) throw new Error(`${entryPoint} requires ${field}: ${expectation}`);
+  for (const item of value) {
+    if (typeof item !== "string") throw new Error(`${entryPoint} requires ${field}: every entry must be a string, received ${describeValue(item)}.`);
   }
-  if (input.observedAt !== undefined && Number.isNaN(Date.parse(input.observedAt))) {
-    throw new Error("Memory observedAt must be a valid ISO timestamp.");
+  return value.map((item) => (item as string).trim()).filter(Boolean);
+}
+
+function scopeArray(value: unknown, entryPoint: string, field: string): MemoryScope[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`${entryPoint} requires ${field}: an array of memory scopes like { kind: "user", id: "dhairya" }, received ${describeValue(value)}.`);
   }
+  return value as MemoryScope[];
+}
+
+function requiredScopes(value: unknown, entryPoint: string, field: string): MemoryScope[] {
+  const scopes = normalizeScopes(scopeArray(value, entryPoint, field));
+  if (!scopes.length) throw new Error(`${entryPoint} requires ${field}: at least one memory scope like { kind: "user", id: "dhairya" }.`);
+  return scopes;
+}
+
+function optionalRedactionState(value: unknown, entryPoint: string): ContextObject["redactionState"] {
+  if (value === undefined || value === null) return "none";
+  if (value !== "none" && value !== "redacted" && value !== "hashed" && value !== "blocked") {
+    throw new Error(`${entryPoint} requires redactionState: one of none, redacted, hashed, blocked.`);
+  }
+  return value;
+}
+
+function describeValue(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "an array";
+  return typeof value;
+}
+
+interface ValidatedMemoryInput {
+  readonly kind: string;
+  readonly summary: string;
+  readonly sourceUri?: string;
+  readonly observedAt?: string;
+  readonly confidence: number;
+  readonly provenance: string[];
+  readonly scopes: MemoryScope[];
+  readonly redactionState: ContextObject["redactionState"];
+  readonly links?: string[];
+}
+
+function validateMemoryInput(input: AddMemoryInput): ValidatedMemoryInput {
+  const raw = requireInputObject(input, "addMemory", "{ summary, provenance, scopes }");
+  const observedAt = optionalString(raw.observedAt, "addMemory", "observedAt", "an ISO timestamp string when provided.");
+  if (observedAt !== undefined && Number.isNaN(Date.parse(observedAt))) {
+    throw new Error("addMemory requires observedAt: a valid ISO timestamp.");
+  }
+  const confidence = optionalFiniteNumber(raw.confidence, "addMemory", "confidence", "a number between 0 and 1.") ?? 0.7;
+  if (confidence < 0 || confidence > 1) throw new Error("addMemory requires confidence: a number between 0 and 1.");
+  const provenance = stringList(raw.provenance, "addMemory", "provenance", "at least one non-empty source.");
+  if (!provenance.length) throw new Error("addMemory requires provenance: at least one non-empty source.");
+  const links = raw.links === undefined || raw.links === null
+    ? undefined
+    : stringList(raw.links, "addMemory", "links", "an array of memory ids when provided.");
+  return {
+    kind: optionalString(raw.kind, "addMemory", "kind", "a string when provided.") ?? "note",
+    summary: requiredString(raw.summary, "addMemory", "summary", "a non-empty statement of the fact to remember."),
+    sourceUri: optionalString(raw.sourceUri, "addMemory", "sourceUri", "a string when provided."),
+    observedAt,
+    confidence,
+    provenance,
+    scopes: requiredScopes(raw.scopes, "addMemory", "scopes"),
+    redactionState: optionalRedactionState(raw.redactionState, "addMemory"),
+    links,
+  };
+}
+
+interface ValidatedSearchInput {
+  readonly query: string;
+  readonly scopes: MemoryScope[];
+  readonly effectiveScopes: MemoryScope[];
+  readonly includeGlobal: boolean;
+  readonly limit?: number;
+  readonly match?: "all" | "any";
+}
+
+function validateSearchInput(input: SearchMemoryInput, entryPoint: string): ValidatedSearchInput {
+  const raw = requireInputObject(input, entryPoint, "{ scopes, query? }");
+  const scopes = requiredScopes(raw.scopes, entryPoint, "scopes");
+  const includeGlobal = optionalBoolean(raw.includeGlobal, entryPoint, "includeGlobal") ?? false;
+  return {
+    query: optionalString(raw.query, entryPoint, "query", "a string when provided.") ?? "",
+    scopes,
+    effectiveScopes: includeGlobal ? [...scopes, { kind: "global" as const, id: "global" }] : scopes,
+    includeGlobal,
+    limit: optionalFiniteNumber(raw.limit, entryPoint, "limit", "a finite number of results when provided."),
+    match: optionalMatchMode(raw.match, entryPoint),
+  };
+}
+
+interface ValidatedReceiptSearchInput extends ValidatedSearchInput {
+  readonly limit: number;
+  readonly candidateLimit: number;
+  readonly minScore: number;
+  readonly expandLinked: boolean;
+  readonly graphNeighborLimit?: number;
+}
+
+function validateReceiptSearchInput(input: SearchMemoryReceiptInput, entryPoint: string): ValidatedReceiptSearchInput {
+  const raw = requireInputObject(input, entryPoint, "{ scopes, query? }");
+  const base = validateSearchInput(input, entryPoint);
+  const limit = Math.max(1, Math.floor(base.limit ?? 5));
+  const requestedCandidateLimit = optionalFiniteNumber(raw.candidateLimit, entryPoint, "candidateLimit", "a finite number of candidates when provided.");
+  return {
+    ...base,
+    limit,
+    candidateLimit: Math.max(limit, Math.floor(requestedCandidateLimit ?? Math.max(limit * 20, 50))),
+    minScore: optionalFiniteNumber(raw.minScore, entryPoint, "minScore", "a finite score threshold when provided.") ?? 0.15,
+    expandLinked: optionalBoolean(raw.expandLinked, entryPoint, "expandLinked") ?? false,
+    graphNeighborLimit: optionalFiniteNumber(raw.graphNeighborLimit, entryPoint, "graphNeighborLimit", "a finite neighbor budget when provided."),
+  };
 }
 
 function normalizeScopes(scopes: readonly MemoryScope[]): MemoryScope[] {
+  if (!Array.isArray(scopes)) throw new Error(`Memory scopes must be an array of { kind, id } entries, received ${describeValue(scopes)}.`);
   const seen = new Set<string>();
   const result: MemoryScope[] = [];
   for (const scope of scopes) {
+    if (!isScopeObject(scope)) throw new Error(`Invalid memory scope entry: expected { kind, id } strings, received ${describeValue(scope)}.`);
     if (!isScopeKind(scope.kind)) throw new Error(`Invalid memory scope kind: ${scope.kind}`);
     const normalized: MemoryScope = { kind: scope.kind, id: normalizeScopeId(scope.kind, scope.id) };
     const key = formatMemoryScope(normalized);
@@ -878,6 +1177,21 @@ function normalizeScopes(scopes: readonly MemoryScope[]): MemoryScope[] {
     }
   }
   return result;
+}
+
+/** Inspection must report on malformed rows rather than throw, so bad scope payloads count as zero-scope. */
+function safeNormalizeScopes(scopes: unknown): MemoryScope[] {
+  try {
+    return normalizeScopes(scopes as readonly MemoryScope[]);
+  } catch {
+    return [];
+  }
+}
+
+function isScopeObject(value: unknown): value is MemoryScope {
+  if (typeof value !== "object" || value === null) return false;
+  const scope = value as { kind?: unknown; id?: unknown };
+  return typeof scope.kind === "string" && typeof scope.id === "string";
 }
 
 function normalizeScopeId(kind: MemoryScopeKind, id: string): string {

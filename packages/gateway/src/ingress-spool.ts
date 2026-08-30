@@ -12,9 +12,9 @@ import {
 
 const MAX_SPOOLED_BODY_BYTES = 1_000_000;
 const MAX_PREPARED_BYTES = 2_000_000;
-const ASYNC_ADAPTERS = new Set(["telegram", "slack", "whatsapp"]);
+const ASYNC_ADAPTERS = new Set(["telegram", "slack", "whatsapp-cloud"]);
 
-export type GatewayAsyncAdapterId = "telegram" | "slack" | "whatsapp";
+export type GatewayAsyncAdapterId = "telegram" | "slack" | "whatsapp-cloud";
 export type GatewayIngressSpoolState =
   | "accepted"
   | "execution-completed"

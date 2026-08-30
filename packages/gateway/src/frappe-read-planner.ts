@@ -208,6 +208,7 @@ export function buildFrappeReadPlannerPrompt(
       'When counting, aggregate must be the object {"function":"count"}, never the string "count". Numeric aggregates must be objects such as {"function":"sum","field":"outstanding_amount"}.',
       "The JSON requestId must exactly equal the required request identity above; never invent, shorten, or reformat it.",
       "Disposition is query when fresh site records are required, action_needed when the user is asking to change something, or unsupported when no live record read is needed/can be mapped safely. Non-query dispositions must have queries:[].",
+      "When a request combines diagnosis or inspection with a later correction, plan the read-only evidence needed for diagnosis now. The host handles any later change through a separate evidence-bound approval path; do not return action_needed merely because the question also says fix, update, or correct.",
       "Use only exact DocTypes and fields in the catalog. Maximum 4 independent queries, 12 fields/filters each, 2 order fields, limit 100.",
       "Before returning JSON, mechanically check every selected, filtered, aggregated, and ordered field against the exact fields array for that query's DocType. If even one required field is absent, return unsupported; never approximate a field name.",
       "Operators are =, !=, <, <=, >, >=, in, not in, between, like, is. Like is prefix-only (example ACME%). Aggregates are count, sum, avg, min, max.",

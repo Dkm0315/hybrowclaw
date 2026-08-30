@@ -23,6 +23,38 @@
 $ muster channels setup telegram
 $ muster gateway start --port 7460
 $ muster pairing approve &lt;code&gt;</pre><div class="capability-board reveal-child"><article class="capability-panel"><span class="cap-label">webhook</span><h3>Webhook adapter</h3><p>Telegram updates become the same SurfaceMessage envelope as every other channel.</p></article><article class="capability-panel"><span class="cap-label">long poll</span><h3>No public URL mode</h3><p>The gateway also includes long-poll support for development or private setups.</p></article><article class="capability-panel"><span class="cap-label">governance</span><h3>Pairing and memory scope</h3><p>Unknown chat IDs are challenged; accepted chats get scoped session continuity.</p></article><article class="capability-panel"><span class="cap-label">ledger</span><h3>Token receipts</h3><p>Telegram conversations remain accountable through the same run ledger.</p></article></div></section>
+
+    <section class="band band-alt" data-reveal>
+      <p class="sec-kicker reveal-child">In practice</p>
+      <h2 class="reveal-child">Telegram is a public front door. Treat it like one.</h2>
+      <div class="prose reveal-child">
+        <p>Telegram is the fastest way to put an agent in front of people and the fastest way to put it in front of the wrong people. A bot token is one message to BotFather, and from that moment any chat ID on the network can message your bot. There is no workspace boundary to hide behind, so the boundary has to be in the adapter.</p>
+        <h3>Webhook or long-poll, same envelope</h3>
+        <p>Muster's Telegram adapter runs either way. Webhook mode is the production path, with an optional secret-token check so that only Telegram's own delivery is accepted. Long-poll mode exists for development and for private deployments with no public URL &mdash; useful when the machine running the agent sits inside a network you are not going to expose. Either way, the update becomes the same <code>SurfaceMessage</code> envelope as a terminal turn, a Slack message, or a Google Chat event, so the governance path does not fork per channel.</p>
+        <h3>Unknown chat IDs get a challenge, not a conversation</h3>
+        <p>An unrecognised sender receives a pairing challenge and an operator approves the code before the agent responds to anything substantive. This is the single most important control on a Telegram deployment, because without it your bot's tool access and token budget are available to anyone who guesses the handle. Once a chat is accepted, it gets scoped session continuity: the conversation persists, and it persists inside a lane rather than in a global history shared with every other chat.</p>
+        <h3>Memory scoping matters more in DMs than in channels</h3>
+        <p>Direct messages are where people volunteer things they would not post in a shared room &mdash; account numbers, internal deadlines, complaints about colleagues. If the agent's memory is one pool, that content is retrievable from the next conversation with someone else. Muster's lanes are tenant, workspace, user, role, and session, and recall is filtered by entitlement at retrieval time rather than trusted at write time, with leakage tests that specifically try to break the boundary.</p>
+        <h3>The ledger keeps a chat bot honest</h3>
+        <p>Chat threads grow, and a harness that replays the entire thread every turn gets expensive in a way nobody notices until the bill. Every Telegram turn records usage, estimated cost, and a replay-waste flag locally. Muster's deterministic benchmark measures the general shape of this: 875.8k naive tokens against 355.2k across five scenarios and 170 turns, with the widest gap &mdash; 62.7% &mdash; on the longest thread. Reproduce it with <code>muster benchmark</code>; no model is called.</p>
+        <p>Draft-style replies let a long answer appear progressively rather than arriving as one delayed wall of text, which in a chat interface is the difference between a bot that feels alive and one that feels broken.</p>
+        <p class="proof-link"><a href="/agent-harness.html">Run it self-hosted -&gt;</a> <a href="/guide-governed-memory.html">How memory scoping works -&gt;</a> <a href="/docs.html">Gateway docs -&gt;</a></p>
+      </div>
+    </section>
   </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>&copy; <span id="year">2026</span> Muster &mdash; open source, MIT</span>
+      <span class="footer-sep">&middot;</span>
+      <a href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/docs.html">Docs</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/live-inline-diff.html">Audit trail</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/muster-vs-openclaw.html">Comparisons</a>
+    </div>
+  </footer>
 </body>
 </html>

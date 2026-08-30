@@ -20,6 +20,38 @@
   <main>
     <section class="hero"><div class="hero-inner"><p class="kicker hero-step">browser automation · web apps</p><h1 class="hero-step">Browser agents need evidence, not blind clicks.</h1><p class="sub hero-step">Muster routes browser and web-app work through setup checks, scoped memory, token receipts, MCP/browser tools, and eval-backed workflows so automation can be reviewed and repeated.</p><div class="hero-actions hero-step"><a class="btn-cta" href="/docs.html">Read the docs</a><a class="btn-ghost" href="/agent-harness.html">Agent harness -></a></div></div></section>
     <section class="band" data-reveal><p class="sec-kicker reveal-child">Browser work</p><h2 class="reveal-child">Built for web QA, app operators, and enterprise workflows.</h2><div class="capability-board reveal-child"><article class="capability-panel"><span class="cap-label">qa</span><h3>Web QA</h3><p>Use governed runs for repeatable browser checks, visual verification, and regression evidence.</p></article><article class="capability-panel"><span class="cap-label">apps</span><h3>Enterprise web apps</h3><p>Keep app actions behind setup and policy instead of letting a model click without context.</p></article><article class="capability-panel"><span class="cap-label">memory</span><h3>Scoped state</h3><p>Browser facts can be remembered by tenant, workspace, user, and session instead of global history.</p></article><article class="capability-panel"><span class="cap-label">ledger</span><h3>Token and run receipts</h3><p>Every browser-assisted answer stays visible in the same run ledger.</p></article></div></section>
+
+    <section class="band band-alt" data-reveal>
+      <p class="sec-kicker reveal-child">In practice</p>
+      <h2 class="reveal-child">A browser agent that cannot show its work is a liability.</h2>
+      <div class="prose reveal-child">
+        <p>Browser automation is the highest-consequence thing most teams let an agent do. A wrong answer in chat is embarrassing; a wrong click in an admin console changes state in a system of record, often with no undo. The difference between a browser agent that is useful and one that is a liability is not model quality. It is whether anyone can reconstruct what it did.</p>
+        <h3>Evidence first, autonomy second</h3>
+        <p>The useful ordering is to make a run reviewable before making it autonomous. That means setup checks that fail loudly when a credential or a target environment is missing, rather than a session that half-works and produces plausible nonsense. It means capturing what the run saw and did as artifacts you can look at afterwards. And it means the run being repeatable &mdash; if a check cannot be run again next week and produce a comparable result, it is a demo, not a test.</p>
+        <h3>Where scoped memory earns its keep</h3>
+        <p>Browser work accumulates exactly the kind of facts that should not be global: which environment a tenant uses, which selector on which internal app, which login belongs to which customer. Muster keeps those in lanes &mdash; tenant, workspace, user, role, session &mdash; with recall filtered by entitlement at retrieval time. A fact learned while working one customer's console does not surface while working another's, which is the failure that turns a helpful automation into an incident report.</p>
+        <h3>The ledger, because browser runs are long</h3>
+        <p>Browser tasks produce a lot of context: page text, DOM fragments, screenshots described back into the conversation. Replayed naively every turn, that context dominates the token bill. Every run records usage, estimated cost, and a replay-waste flag locally. The deterministic benchmark shows the general effect across five scenarios and 170 turns &mdash; 875.8k naive tokens versus 355.2k, a 59.4% reduction &mdash; and the pattern is most pronounced exactly where browser work sits, on the longest threads.</p>
+        <h3>When the browser run also edits a repository</h3>
+        <p>Web QA and app-operator work frequently ends with a code change. That is where the audit story stops being abstract: measured live across five runs against the Codex app-server protocol, the structured file-change notification reported zero of the real edits while every one of them landed on disk. Muster derives the change set from git and the filesystem instead, catching the edit in 86ms with a diff verified by <code>git apply</code> and a receipt hash that reproduces on a machine that was never there.</p>
+        <p>Tool access &mdash; browser control, MCP servers, custom capabilities &mdash; stays behind explicit include and exclude policy with result caps and circuit breakers, so an agent operating a web app is working inside a declared boundary rather than whatever it can reach.</p>
+        <p class="proof-link"><a href="/live-inline-diff.html">See the observed file-change evidence -&gt;</a> <a href="/mcp-agent-harness.html">MCP tool policy -&gt;</a> <a href="/docs.html">Read the docs -&gt;</a></p>
+      </div>
+    </section>
   </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>&copy; <span id="year">2026</span> Muster &mdash; open source, MIT</span>
+      <span class="footer-sep">&middot;</span>
+      <a href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/docs.html">Docs</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/live-inline-diff.html">Audit trail</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/muster-vs-openclaw.html">Comparisons</a>
+    </div>
+  </footer>
 </body>
 </html>

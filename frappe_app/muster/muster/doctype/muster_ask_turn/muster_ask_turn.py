@@ -6,8 +6,8 @@ from hashlib import sha256
 import frappe
 from frappe.model.document import Document
 
-_OUTCOMES = {"answer", "live_read", "artifact", "governed_change", "durable_workflow", "attended_browser", "development_workflow"}
-_HANDOFF_KINDS = {"governed_change", "workflow_proposal", "attended_browser", "development_workflow"}
+_OUTCOMES = {"answer", "live_read", "artifact", "governed_change", "durable_workflow", "attended_browser", "development_workflow", "lineage_remediation", "customization_repair"}
+_HANDOFF_KINDS = {"governed_change", "workflow_proposal", "attended_browser", "development_workflow", "lineage_remediation", "customization_repair"}
 
 
 class MusterAskTurn(Document):

@@ -25,6 +25,8 @@ from muster.orchestration.read_plan import (
     merge_read_evidence,
 )
 from muster.orchestration.form_schema import effective_form_schema
+from muster.orchestration.lineage_diagnostic import configured_lineage_reply
+from muster.orchestration.support_evidence import build_support_evidence
 
 ASYNC_PATH = "/v1/integrations/frappe/messages/async"
 ASYNC_RUNS_PATH = "/v1/integrations/frappe/messages/runs"
@@ -62,23 +64,56 @@ _ATTENDED_FORM_CHANGE = re.compile(
     r"\b(?:create|make|prepare|update|change|edit)\b",
     re.IGNORECASE,
 )
+_LINEAGE_REPAIR_REQUEST = re.compile(
+    r"\b(?:fix|repair|correct|update|resolve|make\s+it\s+right)\b",
+    re.IGNORECASE,
+)
+_CUSTOMIZATION_REPAIR_REQUEST = re.compile(
+    r"\b(?:fix|repair|correct|resolve|make\s+it\s+work|please\s+check\s+and\s+fix)\b",
+    re.IGNORECASE,
+)
+_DIAGNOSTIC_FIRST_REQUEST = re.compile(
+    r"\b(?:why|what\s+happened|check|investigate|diagnose|error|issue|problem|"
+    r"wrong|stale|old|mismatch|not\s+(?:working|updated|matching)|still\s+(?:showing|using))\b",
+    re.IGNORECASE,
+)
+_READ_CONTEXT_CONTINUATION = re.compile(
+    r"(?:^(?:and|also|but|so)\b|\b(?:continue|investigation|affected|that|those|"
+    r"same|previous|earlier|above|it\s+is|this\s+is)\b)",
+    re.IGNORECASE,
+)
 _BUYING_TRAINING_REQUEST = re.compile(
     r"\b(?:train|teach|guide|walk)\b.*\b(?:buying|procure(?:ment)?|purchase)\b|"
     r"\b(?:buying|procure(?:ment)?|purchase)\b.*\b(?:workflow|module|end[ -]?to[ -]?end)\b",
     re.IGNORECASE,
 )
+_EXPLICIT_SUPPORT_REPORT_REQUEST = re.compile(
+    r"(?:\b(?:report|raise|log|escalate|send)\b.{0,80}\b(?:support|ticket)\b|"
+    r"\b(?:support\s+ticket|ticket\s+for\s+support)\b)",
+    re.IGNORECASE,
+)
+_NEGATED_SUPPORT_REPORT_REQUEST = re.compile(
+    r"\b(?:do\s+not|don't|dont|without|no\s+need\s+to)\b.{0,40}"
+    r"\b(?:report|raise|log|escalate|send|create|open)\b",
+    re.IGNORECASE,
+)
+_GATEWAY_INTERACTION_COMMAND = re.compile(r"^/(?:accept|cancel)\s*$", re.IGNORECASE)
 _ASK_OUTCOMES = {
     "answer", "live_read", "artifact", "governed_change",
-    "durable_workflow", "attended_browser", "development_workflow",
+    "durable_workflow", "attended_browser", "development_workflow", "lineage_remediation",
+    "customization_repair",
 }
 _HANDOFF_LABELS = {
     "governed_change": _("Start guided review"),
     "durable_workflow": _("Create a reusable workflow proposal"),
     "attended_browser": _("Start guided review"),
     "development_workflow": _("Prepare a reviewed development workflow"),
+    "lineage_remediation": _("Review and correct the affected records"),
+    "customization_repair": _("Review the exact customization repair"),
 }
 _EFFECTFUL_OUTCOMES = {
-    "governed_change", "durable_workflow", "attended_browser", "development_workflow",
+    "governed_change", "durable_workflow", "attended_browser", "development_workflow", "lineage_remediation",
+    "customization_repair",
 }
 _TOOL_CALL_KINDS = {"tool", "mcp"}
 _TOOL_CALL_STATUSES = {"queued", "running", "completed", "failed", "denied"}
@@ -105,6 +140,102 @@ _INTERNAL_ARTIFACT = re.compile(
 )
 
 
+def _read_plan_cache_key(user: str, question: str, catalog: list[dict[str, Any]]) -> str:
+    """Cache only the planner IR; Frappe still revalidates and executes every read."""
+    material = _canonical({"user": user.lower(), "question": question, "catalog": catalog})
+    return f"muster:read-plan:v1:{sha256(material.encode()).hexdigest()}"
+
+
+def _cached_read_plan(key: str, request_id: str) -> dict[str, Any] | None:
+    raw = frappe.cache.get_value(key)
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="strict")
+    if not isinstance(raw, str):
+        return None
+    try:
+        plan = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(plan, dict) or plan.get("schemaVersion") != 1:
+        return None
+    return {**plan, "requestId": request_id}
+
+
+def _cache_read_plan(key: str, plan: dict[str, Any]) -> None:
+    template = {**plan, "requestId": "cached-template"}
+    frappe.cache.set_value(key, _canonical(template), expires_in_sec=300)
+
+
+def _diagnostic_read_fast_reply(question: str, evidence: dict[str, Any], site: str) -> dict[str, str] | None:
+    """Render fresh diagnostic evidence without paying for a second model turn."""
+    if not _DIAGNOSTIC_FIRST_REQUEST.search(question):
+        return None
+    queries = evidence.get("queries")
+    if not isinstance(queries, list):
+        return None
+    lines = ["I checked the live records you can access. The engineering chain is not aligned."]
+    revision_values: dict[str, list[str]] = {}
+    operation_values: list[str] = []
+    links: list[str] = []
+    row_count = 0
+    for query in queries:
+        if not isinstance(query, dict) or query.get("mode") != "list":
+            continue
+        doctype = str(query.get("doctype") or "Record")
+        rows = query.get("rows")
+        if not isinstance(rows, list):
+            continue
+        for row in rows[:3]:
+            if not isinstance(row, dict):
+                continue
+            row_count += 1
+            name = str(row.get("name") or "").strip()
+            details: list[str] = []
+            for field, value in row.items():
+                if field == "name" or value in (None, ""):
+                    continue
+                normalized = field.lower()
+                if "rev" in normalized:
+                    label = frappe.get_meta(doctype).get_label(field) or field.replace("_", " ").title()
+                    text = str(value)
+                    revision_values.setdefault(label, []).append(text)
+                    details.append(f"{label}: {text}")
+                elif normalized in {"operation", "status", "control_plan", "custom_control_plan_no", "drawing_review_no", "bom_no"}:
+                    label = frappe.get_meta(doctype).get_label(field) or field.replace("_", " ").title()
+                    text = str(value)
+                    if normalized == "operation":
+                        operation_values.append(text)
+                    details.append(f"{label}: {text}")
+            link = ""
+            if name:
+                link = f"{site.rstrip('/')}/app/{quote(frappe.scrub(doctype), safe='')}/{quote(name, safe='')}"
+                links.append(f"[{doctype} {name}]({link})")
+            summary = " · ".join(details[:5]) or "Record found"
+            lines.append(f"- **{doctype}**{f' [{name}]({link})' if link else ''}: {summary}")
+    # A planner may return evidence in a shape that this bounded renderer does
+    # not understand (for example `records` instead of `list`).  In that case
+    # leave the evidence with the provider; never turn an unrendered result
+    # into the materially different claim that no matching records exist.
+    if not row_count:
+        return None
+    distinct_revisions = sorted({value for values in revision_values.values() for value in values})
+    distinct_operations = sorted(set(operation_values))
+    findings: list[str] = []
+    if len(distinct_revisions) > 1:
+        findings.append(f"revision references disagree ({', '.join(distinct_revisions)})")
+    if len(distinct_operations) > 1:
+        findings.append(f"released operations disagree ({', '.join(distinct_operations)})")
+    if findings:
+        lines.insert(1, f"**What happened:** {'; '.join(findings)}. The revised drawing did not propagate consistently to every downstream record.")
+    else:
+        lines.insert(1, "**What happened:** downstream production or inspection records still reference a different approved state from the latest drawing record.")
+    lines.extend([
+        "",
+        "**Next step:** review the linked records above, then I can prepare the exact correction for approval. Nothing has been changed yet.",
+    ])
+    return {"text": "\n".join(lines)}
+
+
 def _effectful_fast_reply(outcomes: list[str]) -> dict[str, str] | None:
     """Keep proposed work out of the provider narration lane."""
     if not _EFFECTFUL_OUTCOMES.intersection(outcomes):
@@ -114,6 +245,50 @@ def _effectful_fast_reply(outcomes: list[str]) -> dict[str, str] | None:
             "I have the details. I’ll open the form and guide you through each field, child table, and available action. I’ll pause only when your approval is required before a change such as Save or Submit."
         )
     }
+
+
+def _customization_repair_candidate(
+    text: str,
+    target_doctype: str | None,
+    user: str,
+) -> dict[str, Any] | None:
+    """Resolve a vague fix request only from the current permission-filtered form."""
+    if (
+        not target_doctype
+        or not _DIAGNOSTIC_FIRST_REQUEST.search(text)
+        or not _CUSTOMIZATION_REPAIR_REQUEST.search(text)
+    ):
+        return None
+    from muster.orchestration.client_script_repair import (
+        resolve_previous_version_candidate,
+    )
+
+    try:
+        return resolve_previous_version_candidate(target_doctype, user, text)
+    except (frappe.PermissionError, frappe.ValidationError):
+        return None
+
+
+def _customization_repair_fast_reply(candidate: dict[str, Any]) -> dict[str, str]:
+    return {
+        "text": _(
+            "I found one customization attached to this screen whose current browser rule "
+            "matches a recorded Frappe Version. I can show the business impact, the exact "
+            "difference, and a reversible repair for your approval. Nothing has changed yet."
+        )
+    }
+
+
+def _recent_ui_error_text(scope: dict[str, Any]) -> str:
+    recent = scope.get("recent_ui_error")
+    if not isinstance(recent, dict):
+        return ""
+    title = str(recent.get("title") or "").strip()
+    message = str(recent.get("message") or "").strip()
+    observed_at = str(recent.get("observed_at") or "").strip()
+    if len(title) > 120 or len(message) > 500 or len(observed_at) > 80:
+        return ""
+    return f"{title} {message}".strip()
 
 
 def _instructional_intent(text: str, form_doctype: str | None) -> bool:
@@ -131,6 +306,14 @@ def _explicit_attended_form_intent(text: str, form_doctype: str | None) -> bool:
         form_doctype
         and _ATTENDED_FORM_CHANGE.search(text)
         and _EXPLICIT_FORM_CONTINUATION.search(text)
+    )
+
+
+def _explicit_support_report_intent(text: str) -> bool:
+    """Leave explicit support reporting to the gateway's durable approval flow."""
+    return bool(
+        _EXPLICIT_SUPPORT_REPORT_REQUEST.search(text)
+        and not _NEGATED_SUPPORT_REPORT_REQUEST.search(text)
     )
 
 
@@ -251,11 +434,75 @@ def _buying_training_fast_reply(user: str) -> dict[str, str]:
     return {"text": "\n".join(lines)}
 
 
+def _structural_create_form_doctype(text: str, user: str) -> str | None:
+    """Resolve an unnamed create workflow from live schema relationships."""
+    if not re.search(r"\b(?:add|create|make|new|prepare)\b", text, re.IGNORECASE):
+        return None
+    if not re.search(r"\bsubmit\b", text, re.IGNORECASE):
+        return None
+    identifiers = list(dict.fromkeys(
+        token.rstrip(".")
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.-]{4,}", text)
+    ))
+    item_names = [name for name in identifiers if frappe.db.exists("Item", name)]
+    if len(item_names) < 2:
+        return None
+    words = {
+        word for word in re.findall(r"[a-z][a-z0-9]+", text.casefold())
+        if word not in {
+            "make", "create", "submit", "new", "using", "with", "from", "one",
+            "each", "what", "mean", "move", "through", "real", "form", "wait",
+            "before", "again",
+        }
+    }
+    candidates: list[tuple[int, int, str]] = []
+    for doctype in frappe.get_user().get_can_read() or []:
+        if not isinstance(doctype, str) or not doctype or not frappe.has_permission(doctype, "create", user=user):
+            continue
+        try:
+            meta = frappe.get_meta(doctype, cached=False)
+        except Exception:
+            continue
+        if getattr(meta, "istable", 0) or not getattr(meta, "is_submittable", 0):
+            continue
+        parent_item = any(
+            field.fieldtype == "Link" and field.options == "Item" and not field.read_only
+            for field in meta.fields
+        )
+        child_item = False
+        searchable = [doctype, str(getattr(meta, "module", "") or "")]
+        required = 0
+        for field in meta.fields:
+            searchable.extend([str(field.label or ""), str(field.description or "")])
+            if field.reqd and not field.default and not field.read_only:
+                required += 1
+            if field.fieldtype != "Table" or field.read_only or not field.options:
+                continue
+            try:
+                child_meta = frappe.get_meta(field.options, cached=False)
+            except Exception:
+                continue
+            searchable.append(str(field.options))
+            for child in child_meta.fields:
+                searchable.extend([str(child.label or ""), str(child.description or "")])
+                if child.fieldtype == "Link" and child.options == "Item" and not child.read_only:
+                    child_item = True
+        if not parent_item or not child_item:
+            continue
+        metadata_words = set(re.findall(r"[a-z][a-z0-9]+", " ".join(searchable).casefold()))
+        score = 40 + 4 * len(words & metadata_words) - min(required, 12)
+        candidates.append((score, -len(doctype), doctype))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][2] if len(candidates) == 1 or candidates[0][:2] > candidates[1][:2] else None
+
+
 def _request_form_doctype(text: str, selected_doctype: str, user: str) -> str | None:
     """Keep a module curriculum broader than form names mentioned inside it."""
     if _BUYING_TRAINING_REQUEST.search(text):
         return None
-    return _prompt_form_doctype(text, selected_doctype, user)
+    return _prompt_form_doctype(text, selected_doctype, user) or _structural_create_form_doctype(text, user)
 
 
 def _presentable_tool_calls(value: Any) -> list[dict[str, Any]]:
@@ -308,6 +555,114 @@ def _presentable_answer(value: str) -> str:
         public_lines.append(line.rstrip())
     public = re.sub(r"\n{3,}", "\n\n", "\n".join(public_lines)).strip()
     return public or _("Muster completed the request. No additional details are available.")
+
+
+def _presentable_presentation(value: Any) -> dict[str, Any] | None:
+    """Validate the gateway's channel-neutral UI before it reaches Desk."""
+    if not isinstance(value, dict) or value.get("kind") not in {"menu", "report", "status", "form"}:
+        return None
+
+    def text(raw: Any, limit: int) -> str:
+        return _presentable_answer(raw)[:limit] if isinstance(raw, str) else ""
+
+    title, summary = text(value.get("title"), 180), text(value.get("summary"), 2_000)
+    if not title or not summary:
+        return None
+    result: dict[str, Any] = {"kind": value["kind"], "title": title, "summary": summary}
+    if value.get("audience") in {"general", "self", "manager", "admin"}:
+        result["audience"] = value["audience"]
+
+    kpis = []
+    for row in (value.get("kpis") or [])[:12]:
+        if not isinstance(row, dict):
+            continue
+        label, metric = text(row.get("label"), 80), text(row.get("value"), 120)
+        detail = text(row.get("detail"), 240)
+        if label and metric:
+            kpis.append({"label": label, "value": metric, **({"detail": detail} if detail else {}),
+                **({"tone": row["tone"]} if row.get("tone") in {"neutral", "positive", "warning", "critical"} else {})})
+    if kpis:
+        result["kpis"] = kpis
+
+    tables = []
+    for table in (value.get("tables") or [])[:8]:
+        if not isinstance(table, dict) or not isinstance(table.get("columns"), list) or not isinstance(table.get("rows"), list):
+            continue
+        columns = [text(column, 100) for column in table["columns"][:12]]
+        if not columns or any(not column for column in columns):
+            continue
+        table_id = text(table.get("id"), 100) or f"table-{len(tables) + 1}"
+        rows = []
+        for row in table["rows"][:100]:
+            if not isinstance(row, list):
+                continue
+            rendered = []
+            for index, cell in enumerate(row[:len(columns)]):
+                is_support_evidence = (
+                    table_id == "request-preview"
+                    and index == 1
+                    and row
+                    and str(row[0]).strip() == "Evidence preview"
+                )
+                rendered.append(text(cell, 16_000 if is_support_evidence else 500))
+            rows.append(rendered)
+        title_text = text(table.get("title"), 160)
+        tables.append({"id": table_id,
+            **({"title": title_text} if title_text else {}), "columns": columns, "rows": rows,
+            **({"pagination": table["pagination"]} if isinstance(table.get("pagination"), dict) else {})})
+    if tables:
+        result["tables"] = tables
+
+    def action(raw: Any) -> dict[str, Any] | None:
+        if not isinstance(raw, dict):
+            return None
+        command, label = raw.get("command"), text(raw.get("label"), 120)
+        if not isinstance(command, str) or not command.startswith("/") or len(command) > 512 or not label:
+            return None
+        detail = text(raw.get("detail"), 240)
+        return {"id": text(raw.get("id"), 100) or sha256(command.encode()).hexdigest()[:16], "label": label,
+            "command": command, **({"detail": detail} if detail else {}),
+            **({"style": raw["style"]} if raw.get("style") in {"default", "primary", "danger"} else {}),
+            **({"kind": raw["kind"]} if raw.get("kind") in {"command", "drilldown", "filter", "page", "confirm"} else {})}
+
+    filters = []
+    for row in (value.get("filters") or [])[:12]:
+        if not isinstance(row, dict):
+            continue
+        label, bound_action = text(row.get("label"), 100), action(row.get("action"))
+        options = []
+        for option in (row.get("options") or [])[:50]:
+            if isinstance(option, dict):
+                option_label, option_value = text(option.get("label"), 100), text(option.get("value"), 200)
+                if option_label and option_value:
+                    options.append({"label": option_label, "value": option_value})
+        selected = text(row.get("selected"), 200)
+        if label and bound_action:
+            filters.append({"id": text(row.get("id"), 80) or f"filter-{len(filters) + 1}", "label": label,
+                **({"selected": selected} if selected else {}), **({"options": options} if options else {}), "action": bound_action})
+    if filters:
+        result["filters"] = filters
+
+    for key in ("drilldowns", "actions"):
+        actions = [validated for raw in (value.get(key) or [])[:24] if (validated := action(raw))]
+        if actions:
+            result[key] = actions
+
+    work = value.get("work")
+    if isinstance(work, dict) and work.get("state") in {"accepted", "running", "waiting", "completed", "failed"}:
+        label, detail = text(work.get("label"), 160), text(work.get("detail"), 500)
+        if label:
+            result["work"] = {"id": text(work.get("id"), 120), "state": work["state"], "label": label,
+                **({"detail": detail} if detail else {}),
+                **({"updatedAt": text(work.get("updatedAt"), 80)} if text(work.get("updatedAt"), 80) else {})}
+    notice = text(value.get("notice"), 1_000)
+    if notice:
+        result["notice"] = notice
+    privacy = value.get("privacy")
+    if isinstance(privacy, dict):
+        note = text(privacy.get("note"), 500)
+        result["privacy"] = {"rawPromptsIncluded": bool(privacy.get("rawPromptsIncluded")), **({"note": note} if note else {})}
+    return result
 
 
 def _require_user() -> str:
@@ -885,7 +1240,9 @@ def _prompt_form_doctype(text: str, selected: str, user: str) -> str | None:
         if not isinstance(doctype, str) or not doctype or len(doctype) > 140:
             continue
         escaped = re.escape(doctype)
-        exact = bool(re.search(rf"(?<!\w){escaped}(?!\w)", text, re.IGNORECASE))
+        # A record identifier such as ``MUSTER-DEMO-ITEM-001`` is evidence
+        # about a value, not an explicit request to open the Item form.
+        exact = bool(re.search(rf"(?<![A-Za-z0-9_-]){escaped}(?![A-Za-z0-9_-])", text, re.IGNORECASE))
         acronym = "".join(part[0] for part in re.findall(r"[A-Za-z0-9]+", doctype) if part).lower()
         if not exact and (len(acronym) < 2 or acronym not in words):
             continue
@@ -941,6 +1298,32 @@ def _conversation_form_doctype(user: str, conversation: str, text: str) -> str |
     return None
 
 
+def _conversation_read_question(user: str, conversation: str, text: str, current_turn: str) -> str:
+    """Bind a short read continuation to the preceding user question.
+
+    The provider planner otherwise sees only fragments such as "it is ITEM-1"
+    and loses the business nouns that selected the relevant live schema. The
+    stored prompt remains encrypted at rest and is used only for this same-user,
+    same-conversation planning turn.
+    """
+    if not _READ_CONTEXT_CONTINUATION.search(text):
+        return text
+    rows = frappe.get_all(
+        "Muster Ask Turn",
+        filters={"requested_by": user, "conversation_id": conversation, "name": ["!=", current_turn]},
+        fields=["name"],
+        order_by="creation desc",
+        limit_page_length=1,
+    )
+    if not rows:
+        return text
+    prior = frappe.get_doc("Muster Ask Turn", rows[0].name)
+    prior_text = (prior.get_password("prompt_secret") or "").strip()
+    if not prior_text:
+        return text
+    return f"Previous question: {prior_text[:4000]}\nContinuation: {text[:4000]}"
+
+
 @frappe.whitelist()
 def submit(
     prompt: str,
@@ -983,12 +1366,31 @@ def submit(
             "page_type": "Form",
             "page_name": form_doctype,
         }
+    error_text = _recent_ui_error_text(requested_scope)
+    support_report = _explicit_support_report_intent(text)
+    if requested_scope.get("recent_ui_error") and not error_text:
+        requested_scope.pop("recent_ui_error", None)
+    customization_repair = _customization_repair_candidate(
+        f"{text} {error_text}".strip(), form_doctype, user
+    )
+    if customization_repair:
+        # Persist only hashes and the exact Version identity. Source code stays
+        # inside Frappe and is reread after the user accepts the handoff.
+        requested_scope = {
+            **requested_scope,
+            "customization_repair": customization_repair,
+        }
     client, headers, binding = _client_for_user(user)
     context = permission_filtered_context(requested_scope, user)
+    if support_report:
+        support_evidence = build_support_evidence(requested_scope, user, text, form_doctype)
+        if support_evidence:
+            context["supportEvidence"] = support_evidence
     intent_request_id = f"intent-{sha256(f'{user}:{conversation}:{key}'.encode()).hexdigest()[:32]}"
     preplanned_read_catalog = None
     preplanned_read_plan = None
     verified_fast_reply = None
+    lineage_fast_reply = configured_lineage_reply(text, user, binding.site_origin)
     instructional_fast_reply = None
     buying_training_fast_reply = None
     prior_name = frappe.db.get_value("Muster Ask Turn", {"request_id": key}, "name")
@@ -1026,10 +1428,30 @@ def submit(
             handoffs = inherited["handoffs"]
         else:
             read_request_id = f"read-{sha256(f'{user}:{conversation}:{key}'.encode()).hexdigest()[:32]}"
-            if _LIVE_READ_REQUEST.search(text):
+            if lineage_fast_reply:
+                outcomes = ["live_read", "answer"]
+                if _LINEAGE_REPAIR_REQUEST.search(text):
+                    outcomes.append("lineage_remediation")
+                intent = {"outcomes": outcomes, "clarification": None}
+            elif _LIVE_READ_REQUEST.search(text):
                 preplanned_read_catalog = deterministic_count_catalog(text, user)
                 preplanned_read_plan = deterministic_count_plan(text, preplanned_read_catalog, read_request_id)
-            if _explicit_attended_form_intent(text, form_doctype):
+            if lineage_fast_reply:
+                pass
+            elif support_report:
+                # Support handoff is owned by the gateway's durable review,
+                # exactly-once create, and reread-verification workflow.
+                intent = {"outcomes": ["answer"], "clarification": None}
+            elif customization_repair:
+                intent = {
+                    "outcomes": ["answer", "customization_repair"],
+                    "clarification": None,
+                }
+            elif _GATEWAY_INTERACTION_COMMAND.match(text):
+                # Approval and cancellation operate on gateway-owned durable
+                # interaction state. They are commands, not model intents.
+                intent = {"outcomes": ["answer"], "clarification": None}
+            elif _explicit_attended_form_intent(text, form_doctype):
                 intent = {"outcomes": ["attended_browser"], "clarification": None}
             elif buying_training_request:
                 intent = {"outcomes": ["answer"], "clarification": None}
@@ -1038,6 +1460,11 @@ def submit(
                 intent = {"outcomes": ["answer"], "clarification": None}
             elif preplanned_read_plan is not None:
                 intent = {"outcomes": ["live_read"], "clarification": None}
+            elif not form_doctype and _DIAGNOSTIC_FIRST_REQUEST.search(text):
+                # Diagnosis on a generic page is a read-first operation. This
+                # host route avoids a slow classifier turn and cannot grant a
+                # write or browser capability from vague business language.
+                intent = {"outcomes": ["live_read", "answer"], "clarification": None}
             else:
                 classified = client.request(
                     "POST",
@@ -1052,6 +1479,18 @@ def submit(
                     headers=headers,
                 )
                 intent = _validated_intent(classified, intent_request_id)
+                # A request can ask both "what happened?" and "fix it". On a
+                # generic Desk route there is no exact record authority for an
+                # attended mutation. Investigate through permission-filtered
+                # live reads first; a later, evidence-bound turn may offer the
+                # precise reviewed action. This prevents business nouns in a
+                # vague prompt from being mistaken for a form target.
+                if (
+                    not form_doctype
+                    and _DIAGNOSTIC_FIRST_REQUEST.search(text)
+                    and _EFFECTFUL_OUTCOMES.intersection(intent["outcomes"])
+                ):
+                    intent = {"outcomes": ["live_read", "answer"], "clarification": None}
             handoffs = _handoffs(intent["outcomes"], intent_request_id)
         turn = _ask_turn(
             user, conversation, key, text, requested_scope, intent["outcomes"], handoffs,
@@ -1089,13 +1528,17 @@ def submit(
                 "modelProfile": agent.model_profile,
             }
         form_evidence = True
+    if not form_evidence and lineage_fast_reply:
+        verified_fast_reply = lineage_fast_reply
+        form_evidence = True
     # Broad live-data questions use two separate trust stages: the gateway may
     # propose only a bounded data IR, then Frappe independently revalidates and
     # executes it as this session user. The provider never receives credentials
     # and never gets a SQL/method/URL escape hatch.
     if not form_evidence and ("live_read" in intent["outcomes"] or _LIVE_READ_REQUEST.search(text)):
         read_request_id = f"read-{sha256(f'{user}:{conversation}:{key}'.encode()).hexdigest()[:32]}"
-        catalog = preplanned_read_catalog or build_read_catalog(text, requested_scope, user)
+        read_question = _conversation_read_question(user, conversation, text, turn.name)
+        catalog = preplanned_read_catalog or build_read_catalog(read_question, requested_scope, user)
         if not catalog:
             return {
                 "status": "needs_read_plan",
@@ -1103,32 +1546,39 @@ def submit(
             }
         read_plan = preplanned_read_plan or deterministic_count_plan(text, catalog, read_request_id)
         if read_plan is None:
-            planned = client.request(
-                "POST",
-                READ_PLANS_PATH,
-                payload={
-                    "schemaVersion": 1,
-                    "requestId": read_request_id,
-                    "question": text,
-                    "catalog": catalog,
-                    "context": {key: value for key, value in context.items() if key != "summary"},
-                },
-                idempotency_key=f"{read_request_id}-plan",
-                headers=headers,
-            )
-            if (
-                planned.get("schemaVersion") != 1
-                or planned.get("requestId") != read_request_id
-                or planned.get("status") != "planned"
-            ):
-                frappe.throw(_("The gateway returned an invalid permission-filtered read plan"), frappe.ValidationError)
-            read_plan = planned.get("plan")
-            if not isinstance(read_plan, dict):
-                frappe.throw(_("The gateway returned an invalid permission-filtered read plan"), frappe.ValidationError)
+            plan_cache_key = _read_plan_cache_key(user, read_question, catalog)
+            read_plan = _cached_read_plan(plan_cache_key, read_request_id)
+            if read_plan is None:
+                planned = client.request(
+                    "POST",
+                    READ_PLANS_PATH,
+                    payload={
+                        "schemaVersion": 1,
+                        "requestId": read_request_id,
+                        "question": read_question,
+                        "catalog": catalog,
+                        "context": {key: value for key, value in context.items() if key != "summary"},
+                    },
+                    idempotency_key=f"{read_request_id}-plan",
+                    headers=headers,
+                )
+                if (
+                    planned.get("schemaVersion") != 1
+                    or planned.get("requestId") != read_request_id
+                    or planned.get("status") != "planned"
+                ):
+                    frappe.throw(_("The gateway returned an invalid permission-filtered read plan"), frappe.ValidationError)
+                read_plan = planned.get("plan")
+                if not isinstance(read_plan, dict):
+                    frappe.throw(_("The gateway returned an invalid permission-filtered read plan"), frappe.ValidationError)
+                _cache_read_plan(plan_cache_key, read_plan)
         disposition = read_plan.get("disposition")
         if disposition == "query":
             evidence = execute_read_plan(read_plan, read_request_id, user)
             context = merge_read_evidence(context, evidence)
+            diagnostic_reply = _diagnostic_read_fast_reply(text, evidence, binding.site_origin)
+            if diagnostic_reply:
+                verified_fast_reply = diagnostic_reply
             if preplanned_read_plan is not None and len(evidence.get("queries") or []) == 1:
                 checked = evidence["queries"][0]
                 if checked.get("mode") == "aggregate" and checked.get("aggregate") == "count":
@@ -1150,7 +1600,12 @@ def submit(
         "requestedOutcomes": intent["outcomes"],
     }}
     fast_reply = _effectful_fast_reply(intent["outcomes"])
-    if fast_reply:
+    # A lineage diagnosis is fresh, permission-filtered Frappe evidence. Keep
+    # that business explanation visible when the same turn also offers a
+    # reviewed repair; the generic effectful-action preface must not replace it.
+    if lineage_fast_reply and verified_fast_reply:
+        context["fastReply"] = verified_fast_reply
+    elif fast_reply:
         context["fastReply"] = fast_reply
     elif verified_fast_reply:
         context["fastReply"] = verified_fast_reply
@@ -1158,6 +1613,10 @@ def submit(
         context["fastReply"] = buying_training_fast_reply
     elif instructional_fast_reply:
         context["fastReply"] = instructional_fast_reply
+    if customization_repair and not support_report:
+        # This verified host reply intentionally takes precedence over the
+        # generic effectful preface; it describes the evidence actually found.
+        context["fastReply"] = _customization_repair_fast_reply(customization_repair)
     response = client.request(
         "POST",
         ASYNC_PATH,
@@ -1192,6 +1651,43 @@ def submit(
     }
 
 
+def _customization_repair_launch(turn, user: str) -> dict[str, Any]:
+    try:
+        scope = json.loads(turn.scope_json or "{}")
+    except (TypeError, ValueError) as error:
+        raise frappe.ValidationError(_("The stored customization context is invalid")) from error
+    stored = scope.get("customization_repair") if isinstance(scope, dict) else None
+    target = str(scope.get("doctype") or "").strip() if isinstance(scope, dict) else ""
+    prompt = (turn.get_password("prompt_secret") or "").strip()
+    if not isinstance(stored, dict) or not target or _hash_text(prompt) != turn.prompt_hash:
+        frappe.throw(_("The customization repair evidence is no longer available"), frappe.ValidationError)
+    current = _customization_repair_candidate(
+        f"{prompt} {_recent_ui_error_text(scope)}".strip(), target, user
+    )
+    keys = (
+        "schema_version", "client_script", "target_doctype", "version",
+        "live_hash", "proposed_hash", "source", "current_source_verified",
+        "generated_source",
+    )
+    if not current or any(current.get(key) != stored.get(key) for key in keys):
+        frappe.throw(
+            _("The live customization or its Version evidence changed; ask Muster to diagnose it again"),
+            frappe.ValidationError,
+        )
+    return {
+        "schema_version": 1,
+        "client_script": current["client_script"],
+        "target_doctype": target,
+        "version": current["version"],
+        "live_hash": current["live_hash"],
+        "proposed_hash": current["proposed_hash"],
+        "business_reason": _(
+            "The current {0} workflow is blocked by the reported customization behavior. "
+            "User report: {1}"
+        ).format(target, prompt[:500]),
+    }
+
+
 @frappe.whitelist()
 def accept_handoff(
     turn_id: str,
@@ -1222,6 +1718,23 @@ def accept_handoff(
     if not selected or selected.get("state") != "offered" or selected.get("requires") != "explicit_confirmation":
         frappe.throw(_("This Ask handoff is unavailable"), frappe.PermissionError)
     if turn.status == "Accepted":
+        if selected.get("kind") == "customization_repair":
+            return {
+                "turn_id": turn.name,
+                "handoff_id": handoff_id,
+                "status": "Prepared",
+                "replayed": True,
+                "executed": False,
+                "customization_repair_launch": _customization_repair_launch(turn, user),
+            }
+        if selected.get("kind") == "lineage_remediation":
+            from muster.api.lineage import prepare_from_turn
+            prepared = prepare_from_turn(turn, _client_for_user(user)[2].site_origin)
+            return {
+                "turn_id": turn.name, "handoff_id": handoff_id,
+                "status": "Prepared", "replayed": True, "executed": False,
+                "lineage_plan": prepared,
+            }
         linked = turn.development_proposal if selected.get("kind") == "development_workflow" else turn.workflow_proposal
         if turn.accepted_handoff_id != handoff_id or not linked:
             frappe.throw(_("Another handoff from this Ask turn was already accepted"), frappe.ValidationError)
@@ -1243,6 +1756,32 @@ def accept_handoff(
     if _hash_text(_canonical(requested_scope)) != turn.scope_hash:
         frappe.throw(_("The stored Ask context no longer matches its evidence"), frappe.ValidationError)
     proposal_key = f"ask-{sha256(f'{turn.name}:{handoff_id}:{key}'.encode()).hexdigest()[:56]}"
+    if selected.get("kind") == "customization_repair":
+        launch = _customization_repair_launch(turn, user)
+        turn.db_set({
+            "status": "Accepted", "accepted_handoff_id": handoff_id,
+            "accepted_at": now_datetime(),
+        }, update_modified=False)
+        return {
+            "turn_id": turn.name,
+            "handoff_id": handoff_id,
+            "status": "Prepared",
+            "replayed": False,
+            "executed": False,
+            "customization_repair_launch": launch,
+        }
+    if selected.get("kind") == "lineage_remediation":
+        from muster.api.lineage import prepare_from_turn
+        prepared = prepare_from_turn(turn, _client_for_user(user)[2].site_origin)
+        turn.db_set({
+            "status": "Accepted", "accepted_handoff_id": handoff_id,
+            "accepted_at": now_datetime(),
+        }, update_modified=False)
+        return {
+            "turn_id": turn.name, "handoff_id": handoff_id,
+            "status": "Prepared", "replayed": False, "executed": False,
+            "lineage_plan": prepared,
+        }
     if selected.get("kind") == "development_workflow":
         if not development_app or not policy:
             frappe.throw(_("Select a registered app and enabled policy for this development proposal"), frappe.ValidationError)
@@ -1314,6 +1853,9 @@ def poll(run_id: str, wait_ms: int | str = 0) -> dict[str, Any]:
         if not isinstance(reply, dict) or not isinstance(reply.get("text"), str):
             frappe.throw(_("The gateway returned an invalid Ask Muster answer"), frappe.ValidationError)
         result["answer"] = _presentable_answer(reply["text"])
+        presentation = _presentable_presentation(reply.get("presentation"))
+        if presentation:
+            result["presentation"] = presentation
         artifacts = []
         for index, artifact in enumerate(reply.get("artifacts") or []):
             if not isinstance(artifact, dict):

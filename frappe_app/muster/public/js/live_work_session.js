@@ -304,12 +304,18 @@
     const recordRevision = value.record_revision == null ? null : value.record_revision;
     if ((value.operation === "update" && recordName === null)
       || (value.operation === "create" && (recordName !== null || recordRevision !== null))) throw new Error(t("Muster could not verify this attended preview."));
+    const submitRequested = value.submit_requested === true;
+    if (submitRequested && (value.submit_requires_confirmation !== true || typeof value.submit_authorized !== "boolean")) {
+      throw new Error(t("Muster could not verify this attended preview."));
+    }
     return Object.freeze({
       proposal: text(value.proposal, 140), objective: text(value.objective, 10_000, true),
       operation: value.operation, doctype: text(value.doctype, 140),
       recordName: value.operation === "update" ? text(recordName) : null,
       recordRevision: value.operation === "update" ? text(recordRevision, 100) : null,
       saveAuthorized: value.save_authorized,
+      submitRequested,
+      submitAuthorized: submitRequested && value.submit_authorized === true,
       fields: Object.freeze(fields),
     });
   }
@@ -424,6 +430,7 @@
       this.lastCursor = null;
       this.deleteReady = false;
       this.deleteInFlight = false;
+      this.draftVerified = false;
     }
 
     async start(receipt) {
@@ -433,6 +440,7 @@
       this.lastCursor = null;
       this.deleteReady = false;
       this.deleteInFlight = false;
+      this.draftVerified = false;
       this.renderStatus(t("Guided training"), t("Opening the live form and reading the controls available to you…"), false);
       try {
         await this.openActualForm();
@@ -739,10 +747,14 @@
         this.overlay = document.createElement("section");
         this.overlay.className = "muster-attended-overlay";
         this.overlay.setAttribute("role", "status");
+        this.overlay.dataset.musterTakeover = "true";
         document.body.appendChild(this.overlay);
       }
       this.overlay.dataset.waiting = waiting ? "true" : "false";
-      const decision = waiting && this.preview?.operation === "delete" && this.deleteReady
+      this.overlay.dataset.musterTakeoverState = waiting ? "waiting" : "working";
+      const decision = waiting && this.draftVerified && this.preview?.submitRequested && this.preview?.submitAuthorized
+        ? `<button type="button" class="btn btn-sm btn-default" data-attended-stop>${html(t("Take control"))}</button><button type="button" class="btn btn-sm btn-primary" data-attended-submit>${html(t("Continue to Submit"))}</button>`
+        : waiting && this.preview?.operation === "delete" && this.deleteReady
         ? `<button type="button" class="btn btn-sm btn-default" data-attended-stop>${html(t("Take control"))}</button>`
         : waiting && this.preview?.operation === "delete" && this.preview.deleteAuthorized
           ? `<button type="button" class="btn btn-sm btn-default" data-attended-stop>${html(t("Take control"))}</button><button type="button" class="btn btn-sm btn-danger" data-attended-delete>${html(t("Begin delete review"))}</button>`
@@ -754,6 +766,7 @@
       this.applyCursor();
       this.overlay.querySelector("[data-attended-stop]")?.addEventListener("click", () => this.stop());
       this.overlay.querySelector("[data-attended-save]")?.addEventListener("click", () => this.confirmSave());
+      this.overlay.querySelector("[data-attended-submit]")?.addEventListener("click", () => this.submit().catch((error) => this.showStopped(error)));
       this.overlay.querySelector("[data-attended-delete]")?.addEventListener("click", () => this.requestDeleteInitiation());
       this.overlay.querySelector("[data-attended-review]")?.addEventListener("click", () => this.returnForApproval().catch((error) => this.showStopped(error)));
     }
@@ -966,6 +979,7 @@
       this.assertActiveForm();
       if (!this.preview.saveAuthorized) throw new Error(t("Approve this proposal before Muster can Save."));
       this.preview.fields.forEach((field) => {
+        if (field.control === "table") return;
         if (String(cur_frm.doc[field.fieldname] ?? "") !== field.value) throw new Error(`${field.label}: ${t("the value changed after review.")}`);
       });
       const preflight = await frappe.call({
@@ -1000,8 +1014,99 @@
         });
         return;
       }
+      if (this.preview.submitRequested) {
+        this.preview = Object.freeze({
+          ...this.preview,
+          operation: "update",
+          recordName,
+          recordRevision: String(cur_frm.doc?.modified || ""),
+        });
+        this.draftVerified = true;
+        this.renderStatus(
+          t("Draft saved and verified"),
+          t("The document is still a draft. Continue only when you are ready to open Frappe's separate Submit confirmation; Submit may trigger workflow, stock, accounting, or downstream production effects."),
+          true,
+        );
+        return;
+      }
       this.finish();
       frappe.show_alert({message: `${t("Saved and verified")}: ${html(recordName)}`, indicator: "green"}, 10);
+    }
+
+    async submit() {
+      this.assertActiveForm();
+      if (!this.draftVerified || !this.preview?.submitRequested || !this.preview.submitAuthorized) {
+        throw new Error(t("The reviewed draft is not ready for Submit."));
+      }
+      const preflight = await frappe.call({
+        method: "muster.api.mission.preflight_attended_submit", type: "POST",
+        args: {
+          proposal: this.preview.proposal,
+          record_name: this.preview.recordName,
+          record_revision: this.preview.recordRevision,
+          confirmed: 1,
+          idempotency_key: frappe.utils.get_random(24),
+        },
+      });
+      if (preflight.message?.current !== true || preflight.message?.docstatus !== 0
+        || preflight.message?.record_name !== this.preview.recordName) {
+        throw new Error(t("The draft changed or Submit permission is no longer available."));
+      }
+      const root = cur_frm.page?.wrapper || cur_frm.wrapper || cur_frm.$wrapper;
+      const submitButton = this.visibleActionByLabel(root, [t("Submit")]);
+      if (!submitButton) throw new Error(t("Frappe's native Submit action is not visible."));
+      await this.pointToElement(submitButton);
+      this.renderStatus(
+        t("Human approval required"),
+        t("Opening Frappe's own Submit confirmation. Read it and choose the final action yourself."),
+        false,
+      );
+      const existingDialogs = new Set(this.visibleNativeDialogs());
+      submitButton.click();
+      await this.waitFor(() => this.visibleNativeDialogs().some((dialog) => !existingDialogs.has(dialog)) || Number(cur_frm?.doc?.docstatus) === 1);
+      const confirmation = this.visibleNativeDialogs().find((dialog) => !existingDialogs.has(dialog));
+      if (confirmation) {
+        const confirmButton = [...confirmation.querySelectorAll("button")].find((candidate) =>
+          attendedElementVisible(candidate)
+          && [t("Yes"), t("Submit")].map((label) => label.trim().toLowerCase()).includes(String(candidate.textContent || "").trim().toLowerCase())
+        );
+        if (confirmButton) await this.pointToElement(confirmButton);
+        this.renderStatus(
+          t("Your decision"),
+          t("Frappe is waiting for you. Confirm Submit to continue, or cancel to keep the verified draft."),
+          false,
+        );
+      }
+      await this.waitFor(() => Number(cur_frm?.doc?.docstatus) === 1, 120_000);
+      const verified = await frappe.call({
+        method: "muster.api.mission.verify_attended_submit", type: "POST",
+        args: {
+          proposal: this.preview.proposal,
+          record_name: this.preview.recordName,
+          confirmed: 1,
+          idempotency_key: frappe.utils.get_random(24),
+        },
+      });
+      if (verified.message?.verified !== true || verified.message?.docstatus !== 1
+        || typeof verified.message?.proof_hash !== "string") {
+        throw new Error(t("Frappe submitted the document, but the evidence receipt could not be sealed."));
+      }
+      const recordName = this.preview.recordName;
+      this.renderLifecycleReceipt(recordName, verified.message.proof_hash);
+      this.finish();
+      frappe.show_alert({message: `${t("Submitted and verified")}: ${html(recordName)}`, indicator: "green"}, 12);
+    }
+
+    renderLifecycleReceipt(recordName, proofHash) {
+      document.querySelectorAll("[data-muster-receipt][data-muster-scenario='guided-workflow']").forEach((node) => node.remove());
+      const receipt = document.createElement("section");
+      receipt.className = "muster-attended-receipt";
+      receipt.dataset.musterReceipt = "true";
+      receipt.dataset.musterScenario = "guided-workflow";
+      receipt.dataset.musterReceiptStatus = "verified";
+      receipt.dataset.musterReceiptId = proofHash;
+      receipt.innerHTML = `<strong>${html(t("Submitted with human approval"))}</strong><span>${html(`${this.preview.doctype} ${recordName}. ${t("Frappe completed the lifecycle action and Muster reread the submitted record.")}`)}</span>`;
+      document.body.appendChild(receipt);
     }
 
     showStopped(error) {
@@ -1019,6 +1124,7 @@
       this.lastCursor = null;
       this.deleteReady = false;
       this.deleteInFlight = false;
+      this.draftVerified = false;
     }
 
     delay(milliseconds) { return new Promise((resolve) => window.setTimeout(resolve, milliseconds)); }
@@ -1032,7 +1138,157 @@
     }
   }
 
-  window.MusterLiveSessionModel = {parsePayload, normalizedEvent, derivePresence, viewModel, attendedReceipt, attendedDeleteReceipt, attendedControlUnavailable, attendedElementVisible, attendedFieldGuidance, attendedActionGuidance, savePreflightMatches, AttendedDeskPreview, ATTENDED_ACTION_PACE_MS};
+  class LineageRemediationPreview extends AttendedDeskPreview {
+    constructor() {
+      super();
+      this.plan = null;
+      this.action = null;
+      this.authorized = false;
+      this.receipts = [];
+    }
+
+    async start(plan) {
+      if (this.plan || !plan || plan.schema_version !== 1 || !Array.isArray(plan.actions) || !plan.actions.length) {
+        throw new Error(t("This reviewed correction is unavailable."));
+      }
+      this.plan = plan;
+      this.receipts = [];
+      try {
+        await this.walkLineage();
+        await this.reviewLineage();
+        const authorization = await frappe.call({
+          method: "muster.api.lineage.authorize", type: "POST",
+          args: {plan_id: plan.plan_id, confirmed: 1},
+        });
+        if (authorization.message?.authorized !== true) throw new Error(t("The correction approval could not be verified."));
+        this.authorized = true;
+        for (let index = 0; index < plan.actions.length; index += 1) {
+          this.action = plan.actions[index];
+          const fields = this.action.fields.map((field) => field.control === "table" ? {
+            fieldname: field.fieldname, label: field.label, control: "table",
+            child_doctype: field.child_doctype, rows: field.rows,
+          } : {
+            fieldname: field.fieldname, label: field.label, control: field.control,
+            value: String(field.value ?? ""),
+          });
+          const receipt = {
+            proposal: `lineage:${plan.plan_id}`,
+            objective: t("Correct the reviewed engineering lineage"),
+            operation: "update",
+            doctype: this.action.doctype,
+            record_name: this.action.record_name,
+            record_revision: this.action.record_revision,
+            fields,
+            save_requires_confirmation: true,
+            save_authorized: true,
+            executed: false,
+          };
+          await super.start(receipt);
+          this.renderStatus(
+            `${t("Saving reviewed correction")} ${index + 1}/${plan.actions.length}`,
+            `${this.action.doctype} ${this.action.record_name}: ${t("the visible values match the approved repair plan.")}`,
+            false,
+          );
+          await this.delay(Math.max(ATTENDED_ACTION_PACE_MS, 1200));
+          await this.save();
+        }
+        frappe.show_alert({
+          message: `${t("Corrected and verified")} ${this.receipts.length} ${t("affected records")}`,
+          indicator: "green",
+        }, 12);
+        this.renderReceipt();
+      } finally {
+        this.finish();
+        this.plan = null;
+        this.action = null;
+        this.authorized = false;
+      }
+    }
+
+    async walkLineage() {
+      const records = (this.plan?.lineage || []).flatMap((stage) =>
+        (stage.records || []).map((record) => ({record, stage})),
+      );
+      for (let index = 0; index < records.length; index += 1) {
+        const {record, stage} = records[index];
+        frappe.set_route("Form", stage.doctype, record.name);
+        await this.waitFor(() => cur_frm?.doctype === stage.doctype && cur_frm?.docname === record.name, 20_000);
+        this.renderStatus(
+          `${t("Engineering lineage")} ${index + 1}/${records.length}: ${stage.label}`,
+          `${stage.status}. ${stage.summary}`,
+          false,
+        );
+        const form = attendedElement(cur_frm?.wrapper);
+        if (attendedElementVisible(form)) {
+          await this.pointToElement(form);
+        } else {
+          await this.delay(Math.max(ATTENDED_ACTION_PACE_MS, 1600));
+        }
+      }
+      this.finish();
+    }
+
+    reviewLineage() {
+      const stages = this.plan?.lineage || [];
+      const rows = stages.map((stage, index) => {
+        const records = (stage.records || []).map((record) => html(record.name)).join(", ") || t("No linked record");
+        const tone = ["Inconsistent", "Blocked"].includes(stage.status) ? "danger"
+          : ["Requires review", "Requires regeneration"].includes(stage.status) ? "warning"
+          : stage.status === "Current" ? "success" : "muted";
+        return `<li data-lineage-status="${html(tone)}"><b>${index + 1}</b><div><strong>${html(stage.label)}</strong><span>${records}</span><small>${html(`${stage.status}. ${stage.summary}`)}</small></div></li>`;
+      }).join("");
+      const root = document.createElement("section");
+      root.className = "muster-lineage-review";
+      root.dataset.musterLineageReview = "true";
+      root.innerHTML = `<div class="muster-lineage-review-card"><header><img src="/assets/muster/images/muster-mark.png" alt=""><div><strong>${html(t("Review the complete engineering chain"))}</strong><small>${html(`${stages.length} ${t("stages checked from the live Frappe records. Only the affected records will change.")}`)}</small></div></header><ol>${rows}</ol><footer><button type="button" class="btn btn-default" data-lineage-cancel>${html(t("Cancel"))}</button><button type="button" class="btn btn-primary" data-lineage-approve>${html(t("Approve affected corrections"))}</button></footer></div>`;
+      document.body.appendChild(root);
+      return new Promise((resolve, reject) => {
+        root.querySelector("[data-lineage-approve]")?.addEventListener("click", () => { root.remove(); resolve(); });
+        root.querySelector("[data-lineage-cancel]")?.addEventListener("click", () => { root.remove(); reject(new Error(t("The reviewed correction was not approved."))); });
+      });
+    }
+
+    renderReceipt() {
+      const proofs = this.receipts.map((receipt) => receipt.proof_hash).filter(Boolean);
+      if (!proofs.length) return;
+      const records = [...new Set((this.plan?.actions || []).map((action) => `${action.doctype} ${action.record_name}`))];
+      document.querySelectorAll("[data-muster-receipt][data-muster-scenario='revision-escape']").forEach((node) => node.remove());
+      const receipt = document.createElement("section");
+      receipt.className = "muster-attended-receipt";
+      receipt.dataset.musterReceipt = "true";
+      receipt.dataset.musterScenario = "revision-escape";
+      receipt.dataset.musterReceiptStatus = "verified";
+      receipt.dataset.musterReceiptId = proofs.at(-1);
+      receipt.innerHTML = `<strong>${html(t("Correction verified"))}</strong><span>${html(`${records.join(" · ")}. ${this.receipts.length} ${t("affected records were saved through Frappe and reread successfully.")}`)}</span>`;
+      document.body.appendChild(receipt);
+    }
+
+    confirmSave() {
+      // The one-use plan approval happens before the sequence starts. Every
+      // native Save still has a fresh server preflight and reread proof.
+    }
+
+    async save() {
+      this.assertActiveForm();
+      if (!this.authorized || !this.plan || !this.action) throw new Error(t("The reviewed correction is not authorized."));
+      const preflight = await frappe.call({
+        method: "muster.api.lineage.preflight", type: "POST",
+        args: {plan_id: this.plan.plan_id, action_id: this.action.id},
+      });
+      if (preflight.message?.current !== true) throw new Error(t("The record changed after review."));
+      await cur_frm.save();
+      const verified = await frappe.call({
+        method: "muster.api.lineage.verify", type: "POST",
+        args: {plan_id: this.plan.plan_id, action_id: this.action.id},
+      });
+      if (verified.message?.verified !== true) throw new Error(t("The saved correction could not be verified."));
+      this.receipts.push(verified.message);
+      this.finish();
+    }
+  }
+
+  window.MusterLiveSessionModel = {parsePayload, normalizedEvent, derivePresence, viewModel, attendedReceipt, attendedDeleteReceipt, attendedControlUnavailable, attendedElementVisible, attendedFieldGuidance, attendedActionGuidance, savePreflightMatches, AttendedDeskPreview, LineageRemediationPreview, ATTENDED_ACTION_PACE_MS};
   window.musterLiveSession = window.musterLiveSession || new LiveWorkSession();
   window.musterAttendedPreview = window.musterAttendedPreview || new AttendedDeskPreview();
+  window.musterLineagePreview = window.musterLineagePreview || new LineageRemediationPreview();
 })();

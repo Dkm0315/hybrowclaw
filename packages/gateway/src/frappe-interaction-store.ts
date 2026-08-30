@@ -18,11 +18,15 @@ export interface PendingFrappeInteraction {
   readonly surfaceId: string;
   readonly conversationId: string;
   readonly senderId: string;
+  /** Exact configured OAuth connection for cross-site actions such as Helpdesk handoff. */
+  readonly connectionId?: string;
   readonly doctype: string;
   readonly operation: FrappeInteractionOperation;
   readonly values: Readonly<Record<string, unknown>>;
   readonly requiredFields: readonly PendingFrappeField[];
-  readonly phase: "collecting" | "review";
+  readonly phase: "collecting" | "review" | "executing" | "uncertain";
+  /** Proposal already admitted for execution. Retained to prevent blind retries. */
+  readonly attemptId?: string;
   readonly createdAtMs: number;
   readonly updatedAtMs: number;
   readonly expiresAtMs: number;
@@ -31,6 +35,7 @@ export interface PendingFrappeInteraction {
 export interface FrappeInteractionStore {
   read(key: string, nowMs?: number): PendingFrappeInteraction | undefined;
   put(interaction: PendingFrappeInteraction): void;
+  claimExecution(key: string, expectedUpdatedAtMs: number, attemptId: string, nowMs: number): PendingFrappeInteraction | undefined;
   clear(key: string): void;
   close?(): void;
 }
@@ -62,6 +67,20 @@ export class InMemoryFrappeInteractionStore implements FrappeInteractionStore {
   put(interaction: PendingFrappeInteraction): void {
     validateInteraction(interaction);
     this.#records.set(interaction.key, structuredClone(interaction));
+  }
+
+  claimExecution(key: string, expectedUpdatedAtMs: number, attemptId: string, nowMs: number): PendingFrappeInteraction | undefined {
+    const current = this.#records.get(key);
+    if (!current || current.phase !== "review" || current.updatedAtMs !== expectedUpdatedAtMs || current.expiresAtMs <= nowMs) return undefined;
+    const claimed: PendingFrappeInteraction = {
+      ...current,
+      phase: "executing",
+      attemptId,
+      updatedAtMs: nowMs,
+      expiresAtMs: nowMs + 30 * 24 * 60 * 60_000,
+    };
+    this.#records.set(key, structuredClone(claimed));
+    return structuredClone(claimed);
   }
 
   clear(key: string): void {
@@ -116,6 +135,26 @@ export class SqliteFrappeInteractionStore implements FrappeInteractionStore {
     `).run(interaction.key, JSON.stringify(interaction), interaction.updatedAtMs, interaction.expiresAtMs);
   }
 
+  claimExecution(key: string, expectedUpdatedAtMs: number, attemptId: string, nowMs: number): PendingFrappeInteraction | undefined {
+    this.#assertOpen();
+    const current = this.read(key, nowMs);
+    if (!current || current.phase !== "review" || current.updatedAtMs !== expectedUpdatedAtMs) return undefined;
+    const claimed: PendingFrappeInteraction = {
+      ...current,
+      phase: "executing",
+      attemptId,
+      updatedAtMs: nowMs,
+      expiresAtMs: nowMs + 30 * 24 * 60 * 60_000,
+    };
+    const result = this.#db.prepare(`
+      UPDATE gateway_frappe_interactions
+      SET payload_json = ?, updated_at_ms = ?, expires_at_ms = ?
+      WHERE interaction_key = ? AND updated_at_ms = ?
+        AND json_extract(payload_json, '$.phase') = 'review'
+    `).run(JSON.stringify(claimed), claimed.updatedAtMs, claimed.expiresAtMs, key, expectedUpdatedAtMs);
+    return Number(result.changes ?? 0) === 1 ? claimed : undefined;
+  }
+
   clear(key: string): void {
     this.#assertOpen();
     this.#db.prepare("DELETE FROM gateway_frappe_interactions WHERE interaction_key = ?").run(key);
@@ -141,6 +180,12 @@ function parseInteraction(value: string): PendingFrappeInteraction {
 function validateInteraction(value: PendingFrappeInteraction): void {
   for (const field of ["key", "site", "principal", "surfaceId", "conversationId", "senderId", "doctype", "operation", "phase"] as const) {
     if (typeof value[field] !== "string" || !value[field].trim()) throw new Error(`Pending Frappe interaction requires ${field}.`);
+  }
+  if (value.connectionId !== undefined && (typeof value.connectionId !== "string" || !value.connectionId.trim() || value.connectionId.length > 80)) {
+    throw new Error("Pending Frappe interaction connectionId is invalid.");
+  }
+  if (value.attemptId !== undefined && (typeof value.attemptId !== "string" || !value.attemptId.trim() || value.attemptId.length > 200)) {
+    throw new Error("Pending Frappe interaction attemptId is invalid.");
   }
   if (!Number.isSafeInteger(value.createdAtMs) || !Number.isSafeInteger(value.updatedAtMs) || !Number.isSafeInteger(value.expiresAtMs)) {
     throw new Error("Pending Frappe interaction timestamps are invalid.");

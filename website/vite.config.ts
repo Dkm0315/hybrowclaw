@@ -22,6 +22,18 @@ export default defineConfig({
         guideMcpAgentHarness: resolve(__dirname, "guide-mcp-agent-harness.html"),
         guideFrappeAi: resolve(__dirname, "guide-frappe-ai.html"),
         guideGovernedMemory: resolve(__dirname, "guide-governed-memory.html"),
+        // Comparison / alternative pages + the evidence feature page. These are
+        // the pages that carry the long-form static prose, so they must be in
+        // this list or they never reach dist and their canonicals point at a
+        // 404 — which is exactly the state roadmap.html is in: it is NOT listed
+        // here because src/roadmap.ts imports ./roadmap.css, which has never
+        // existed in the repo, so adding it breaks the build. Until that CSS
+        // lands, roadmap.html is undeployable and stays out of the sitemap too.
+        liveInlineDiff: resolve(__dirname, "live-inline-diff.html"),
+        musterVsOpenclaw: resolve(__dirname, "muster-vs-openclaw.html"),
+        musterVsHermesAgent: resolve(__dirname, "muster-vs-hermes-agent.html"),
+        musterVsQm: resolve(__dirname, "muster-vs-qm.html"),
+        resumeCodexSessions: resolve(__dirname, "resume-codex-sessions.html"),
         onboarding: resolve(__dirname, "onboarding.html"),
         spatial: resolve(__dirname, "spatial.html")
       }

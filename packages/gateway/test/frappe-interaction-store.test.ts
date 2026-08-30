@@ -41,3 +41,21 @@ test("pending Frappe interactions survive restart and expire closed", async () =
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+test("two gateway stores can atomically admit only one execution", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "muster-frappe-interaction-race-"));
+  const filename = join(cwd, "control.db");
+  try {
+    const first = new SqliteFrappeInteractionStore(filename);
+    const second = new SqliteFrappeInteractionStore(filename);
+    first.put({ ...interaction("actor-a", 1_000), phase: "review", requiredFields: [] });
+    const left = first.claimExecution("actor-a", 1_000, "attempt-left", 2_000);
+    const right = second.claimExecution("actor-a", 1_000, "attempt-right", 2_000);
+    assert.equal([left, right].filter(Boolean).length, 1);
+    assert.equal(first.read("actor-a", 2_001)?.phase, "executing");
+    first.close();
+    second.close();
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});

@@ -1,0 +1,10 @@
+tasks · 3 tasks
+Backlog 1       Ready 1         Running 1       Review 0        Done 0
+· Fixture task…  · Fixture task…  ⠋ Fixture task…
+  unassigned      unassigned      gpt-5.6-sol…
+  — · cost —      — · cost —      54s · cost —
+  backlog         ready           Rendering t…
+
+↑↓←→ move · enter open · esc/q chat · mouse click
+
+PTY: unified exec PTY, 80×24. SGR mouse mode enabled on entry.

@@ -92,6 +92,24 @@ def _attended_field_retained(fieldtype: str, actual: Any, planned: Any) -> tuple
     return False, False
 
 
+def _attended_submit_requested(objective: str, doctype: str) -> bool:
+    """Recognize an explicit submit request without turning Save into Submit.
+
+    Submission remains a separate native Frappe action.  This flag only lets
+    the attended controller offer that second, visibly confirmed boundary.
+    """
+    text = str(objective or "")
+    if not re.search(r"\bsubmit(?:ted|ting)?\b", text, re.IGNORECASE):
+        return False
+    if re.search(
+        r"\b(?:do\s+not|don't|dont|never|without)\b[^.!?]{0,80}\bsubmit(?:ted|ting)?\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return False
+    return bool(getattr(frappe.get_meta(doctype, cached=False), "is_submittable", False))
+
+
 def proposal_attended_operation(proposal) -> str | None:
     """Read one immutable attended operation without granting execution authority."""
     try:
@@ -574,6 +592,66 @@ def verify_attended_proposal_record(
     }
 
 
+def preflight_attended_proposal_submit(
+    proposal_name: str, actor: str, record_name: str, expected_revision: str,
+) -> dict[str, Any]:
+    """Recheck a verified draft immediately before native Frappe Submit."""
+    _bounded_text(record_name, "record name", 500)
+    _bounded_text(expected_revision, "record revision", 100)
+    preview = attended_proposal_preview(proposal_name, actor)
+    if not preview.get("submit_requested") or not preview.get("submit_authorized"):
+        raise WorkflowProposalError(_("This proposal does not authorize a submitted document"))
+    # This also proves that every reviewed value survived the native Save.
+    verify_attended_proposal_record(proposal_name, actor, record_name)
+    doc = frappe.get_doc(preview["doctype"], record_name)
+    if doc.docstatus != 0:
+        raise WorkflowProposalError(_("Only the reviewed draft can be submitted"))
+    if str(doc.modified or "") != expected_revision:
+        raise WorkflowProposalError(_("The draft changed after review; inspect it before submitting"))
+    if not doc.has_permission("submit", user=actor):
+        frappe.throw(_("You are not permitted to submit this document"), frappe.PermissionError)
+    return {
+        "proposal": proposal_name,
+        "doctype": preview["doctype"],
+        "record_name": record_name,
+        "record_revision": expected_revision,
+        "current": True,
+        "docstatus": 0,
+        "executed": False,
+    }
+
+
+def verify_attended_proposal_submit(
+    proposal_name: str, actor: str, record_name: str,
+) -> dict[str, Any]:
+    """Seal evidence only after the native Frappe lifecycle submitted it."""
+    _bounded_text(record_name, "record name", 500)
+    preview = attended_proposal_preview(proposal_name, actor)
+    if not preview.get("submit_requested") or not preview.get("submit_authorized"):
+        raise WorkflowProposalError(_("This proposal does not authorize a submitted document"))
+    doc = frappe.get_doc(preview["doctype"], record_name)
+    if not doc.has_permission("read", user=actor):
+        frappe.throw(_("The submitted record is not readable by this user"), frappe.PermissionError)
+    if doc.docstatus != 1:
+        raise WorkflowProposalError(_("Frappe has not submitted this document"))
+    proof = sha256(json.dumps({
+        "proposal": proposal_name,
+        "doctype": preview["doctype"],
+        "record_name": record_name,
+        "docstatus": 1,
+        "modified": str(doc.modified or ""),
+        "modified_by": str(doc.modified_by or ""),
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {
+        "proposal": proposal_name,
+        "doctype": preview["doctype"],
+        "record_name": record_name,
+        "docstatus": 1,
+        "verified": True,
+        "proof_hash": proof,
+    }
+
+
 def assert_attended_update_revision(
     proposal_name: str, actor: str, record_name: str, expected_revision: str
 ) -> dict[str, Any]:
@@ -780,6 +858,9 @@ def _attended_preview_projection(plan: dict[str, Any], actor: str, proposal) -> 
         record_revision = str(frappe.db.get_value(binding["doctype"], binding["record_name"], "modified") or "")
         if not record_revision:
             raise WorkflowProposalError(_("The reviewed record is no longer available"))
+    submit_requested = operation in {"create", "update"} and _attended_submit_requested(
+        proposal.objective, binding["doctype"]
+    )
     return {
         "proposal": proposal.name,
         "objective": proposal.objective,
@@ -790,6 +871,9 @@ def _attended_preview_projection(plan: dict[str, Any], actor: str, proposal) -> 
         "fields": projected_fields,
         "save_requires_confirmation": True,
         "save_authorized": proposal.status == "Approved",
+        "submit_requested": submit_requested,
+        "submit_requires_confirmation": submit_requested,
+        "submit_authorized": submit_requested and proposal.status == "Approved",
         "executed": False,
     }
 
@@ -1504,10 +1588,6 @@ def _host_attended_browser_plan(
     fields = {field["fieldname"]: field for field in catalog["fields"]}
     labels = [field["label"] for field in catalog["fields"]]
     unknown_fields = sorted(set(values) - set(fields))
-    if unknown_fields:
-        raise WorkflowProposalError(
-            _("Selected form field {0} is unavailable").format(unknown_fields[0])
-        )
 
     def actionable_parent_values(source: dict[str, str]) -> dict[str, str]:
         admitted: dict[str, str] = {}
@@ -1527,8 +1607,41 @@ def _host_attended_browser_plan(
     values = _merge_explicit_attended_values(values, explicit_parent, explicit_children)
     clarified_parent, clarified_children = _clarified_labeled_attended_values(objective, catalog)
     clarified_parent = actionable_parent_values(clarified_parent)
+    if unknown_fields and not (clarified_parent or clarified_children):
+        raise WorkflowProposalError(
+            _("Selected form field {0} is unavailable").format(unknown_fields[0])
+        )
+    values = {fieldname: value for fieldname, value in values.items() if fieldname in fields}
     values = _merge_explicit_attended_values(values, clarified_parent, clarified_children)
-    grounded_table_fields = set(explicit_children) | set(clarified_children)
+    # Resolve the live parent identity before inferring child rows. Otherwise a
+    # sentence that names both an assembly and a component presents two valid
+    # Item links to the child-table resolver, even though one is already the
+    # parent record. This ordering is schema-driven and applies equally to any
+    # Frappe form with parent and child links to the same DocType.
+    structural_values = actionable_parent_values(
+        _host_structural_attended_values(action, catalog, objective)
+    )
+    values.update(structural_values)
+    grounded_parent_values = {**explicit_parent, **clarified_parent, **structural_values}
+    for fieldname, value in values.items():
+        field = fields.get(fieldname)
+        if (
+            field
+            and field.get("fieldtype") == "Link"
+            and field.get("required")
+            and not isinstance(value, (dict, list))
+            and _objective_contains_scalar(objective or "", value)
+        ):
+            grounded_parent_values[fieldname] = value
+    inferred_children = _objective_linked_child_rows(
+        objective or "",
+        catalog,
+        grounded_parent_values,
+    )
+    for table_name, rows in inferred_children.items():
+        if table_name not in explicit_children and table_name not in clarified_children:
+            values[table_name] = rows
+    grounded_table_fields = set(explicit_children) | set(clarified_children) | set(inferred_children)
     # A provider may map a scalar such as "Amount" onto an unrelated table
     # that happens to expose the same label (for example, purchase taxes). A
     # child row is writable only when the user's request or a signed
@@ -1540,8 +1653,6 @@ def _host_attended_browser_plan(
     }
     clarified_values = actionable_parent_values(_clarified_attended_values(objective, catalog))
     values.update(clarified_values)
-    structural_values = actionable_parent_values(_host_structural_attended_values(action, catalog, objective))
-    values.update(structural_values)
     # Provider-selected values are hints, never schema authority. A model may
     # map a child-row label such as Supplier onto a non-existent parent field;
     # retain only fields present in the effective live form before applying
@@ -1611,7 +1722,11 @@ def _host_attended_browser_plan(
                     if child["fieldtype"] not in {"Data", "Small Text", "Text", "Long Text", "Text Editor", "Link", "Date", "Datetime", "Time", "Int", "Float", "Currency", "Percent", "Phone", "Select", "Autocomplete"}:
                         raise WorkflowProposalError(_("A selected child field type is not safely supported"))
                     rendered_child = str(child_value)
-                    child_host_grounded = str(explicit_children.get(fieldname, {}).get(child_name)) == rendered_child
+                    inferred_row = (inferred_children.get(fieldname) or [{}])[0]
+                    child_host_grounded = (
+                        str(explicit_children.get(fieldname, {}).get(child_name)) == rendered_child
+                        or str(inferred_row.get(child_name)) == rendered_child
+                    )
                     if child["fieldtype"] == "Date":
                         normalized_date = _normalize_explicit_attended_value("Date", rendered_child)
                         if normalized_date is None:
@@ -1958,7 +2073,7 @@ def _requested_attended_action(objective: str) -> str | None:
     matches = [
         action for action, pattern in (
             ("create", r"\b(?:add|create|make|new|register)\b"),
-            ("update", r"\b(?:change|edit|modify|rename|set|update)\b"),
+            ("update", r"\b(?:change(?:d)?|edit(?:ed)?|fix(?:ed)?|repair(?:ed)?|correct(?:ed)?|modify|modified|rename|set|update(?:d)?)\b"),
             ("delete", r"\b(?:delete|remove|erase)\b"),
         )
         if re.search(pattern, objective, re.IGNORECASE)
@@ -1988,6 +2103,120 @@ def _objective_contains_scalar(objective: str, value: Any) -> bool:
     objective_words = re.sub(r"[^a-z0-9]+", " ", objective.lower()).strip()
     value_words = re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
     return bool(value_words and f" {value_words} " in f" {objective_words} ")
+
+
+def _objective_linked_child_rows(
+    objective: str, catalog: dict[str, Any], parent_values: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Ground child rows from exact permitted Link records named by the user.
+
+    This is schema-driven rather than DocType-specific: a request such as
+    "using one RAW-PART and the Bending operation" can populate two different
+    live child tables without teaching Muster what a BOM is.  Values already
+    selected as parent Links are excluded, preventing the assembly item from
+    being mistaken for a component row.
+    """
+    excluded = {str(value) for value in parent_values.values() if not isinstance(value, (dict, list))}
+    inferred: dict[str, list[dict[str, Any]]] = {}
+    claimed_links: set[tuple[str, str]] = set()
+    words = [
+        token.rstrip(".")
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.-]*", objective)[:100]
+        if token.rstrip(".")
+    ]
+    objective_candidates: list[str] = []
+    for size in range(1, 5):
+        for index in range(0, len(words) - size + 1):
+            candidate = " ".join(words[index:index + size])
+            if candidate not in objective_candidates:
+                objective_candidates.append(candidate)
+            if len(objective_candidates) >= 300:
+                break
+        if len(objective_candidates) >= 300:
+            break
+    for table in catalog.get("fields") or []:
+        if table.get("fieldtype") not in {"Table", "Table MultiSelect"} or not table.get("writable"):
+            continue
+        row: dict[str, Any] = {}
+        matched_names: list[str] = []
+        linked_sources: list[tuple[str, str]] = []
+        for child in table.get("child_fields") or []:
+            linked_doctype = child.get("options") if child.get("fieldtype") == "Link" else None
+            if not child.get("writable") or not isinstance(linked_doctype, str) or not linked_doctype:
+                continue
+            matches = []
+            for candidate in objective_candidates:
+                if candidate in excluded or (linked_doctype, candidate) in claimed_links:
+                    continue
+                try:
+                    exists = frappe.db.exists(linked_doctype, candidate)
+                    permitted = exists and frappe.has_permission(
+                        linked_doctype, "read", doc=candidate, user=frappe.session.user
+                    )
+                except Exception:
+                    permitted = False
+                if permitted:
+                    matches.append(candidate)
+            matches = list(dict.fromkeys(matches))
+            if len(matches) == 1:
+                row[child["fieldname"]] = matches[0]
+                matched_names.append(matches[0])
+                linked_sources.append((linked_doctype, matches[0]))
+        if not row:
+            continue
+        quantity_fields = [
+            child for child in (table.get("child_fields") or [])
+            if child.get("writable") and child.get("fieldtype") in {"Int", "Float", "Currency"}
+            and re.search(r"(?:^|_)(?:qty|quantity)(?:$|_)", str(child.get("fieldname") or ""), re.IGNORECASE)
+        ]
+        canonical_quantity_fields = [
+            child for child in quantity_fields
+            if str(child.get("fieldname") or "").lower() in {"qty", "quantity"}
+        ]
+        if len(canonical_quantity_fields) == 1:
+            quantity_fields = canonical_quantity_fields
+        if len(quantity_fields) == 1:
+            quantity = None
+            for name in matched_names:
+                match = re.search(
+                    rf"\b(one|two|three|four|five|\d+(?:\.\d+)?)\s+(?:of\s+)?{re.escape(name)}\b",
+                    objective,
+                    re.IGNORECASE,
+                )
+                if match:
+                    words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+                    quantity = words.get(match.group(1).lower(), match.group(1))
+                    break
+            if quantity is not None:
+                row[quantity_fields[0]["fieldname"]] = quantity
+        for child in table.get("child_fields") or []:
+            fieldname = str(child.get("fieldname") or "")
+            if fieldname in row or not child.get("required") or not child.get("writable"):
+                continue
+            derived_values = []
+            for linked_doctype, linked_name in linked_sources:
+                linked_slug = frappe.scrub(linked_doctype)
+                if child.get("fieldtype") == "Data" and fieldname == f"{linked_slug}_code":
+                    derived_values.append(linked_name)
+                    continue
+                try:
+                    source_meta = frappe.get_meta(linked_doctype, cached=False)
+                except Exception:
+                    continue
+                source_names = [
+                    source.fieldname for source in source_meta.fields
+                    if source.fieldname == fieldname or source.fieldname.endswith(f"_{fieldname}")
+                ]
+                for source_name in source_names:
+                    source_value = frappe.db.get_value(linked_doctype, linked_name, source_name)
+                    if not _missing_scalar(source_value):
+                        derived_values.append(source_value)
+            unique = {str(value): value for value in derived_values}
+            if len(unique) == 1:
+                row[fieldname] = next(iter(unique.values()))
+        inferred[table["fieldname"]] = [row]
+        claimed_links.update(linked_sources)
+    return inferred
 
 
 def _host_attended_read_plan(catalog: dict[str, Any]) -> dict[str, Any]:

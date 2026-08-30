@@ -13,7 +13,7 @@ export type TaskKind =
   | "private_analysis"
   | "workflow";
 
-export type ReasoningLevel = "none" | "low" | "medium" | "high";
+export type ReasoningLevel = "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export type ProviderKind =
   | "openai-compatible"
@@ -96,6 +96,20 @@ export interface MusterConfig {
    * migration from the source OpenClaw channel; absent on the default profile.
    */
   readonly identity?: ProfileIdentity;
+  /**
+   * Durable-memory write policy. Enforced in `addMemory` (packages/core/src/memory.ts),
+   * not by prompt text: a persona string can be ignored by a model, a thrown
+   * MemoryPolicyError cannot. Absent means "auto" so existing profiles keep
+   * today's behaviour.
+   */
+  readonly memory?: MemoryPolicyConfig;
+}
+
+/** "auto": write freely. "ask": every write needs a consent receipt. "never": only explicit user requests. */
+export type MemoryWritePolicy = "auto" | "ask" | "never";
+
+export interface MemoryPolicyConfig {
+  readonly policy: MemoryWritePolicy;
 }
 
 export interface AgentsConfig {

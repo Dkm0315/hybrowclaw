@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Agent Audit Trail — Muster</title>
+  <meta name="description" content="Muster derives an AI agent audit trail from the filesystem, not from agent self-report. Head-to-head against Codex: 0 of 5 self-reported edits vs the observer catching the change in 86ms with a deterministic receipt." />
+  <meta name="keywords" content="AI agent audit trail, AI agent live diff, observed file changes, agent edit provenance, self-hosted AI agent, open source AI agent framework" />
+  <meta name="robots" content="index, follow, max-image-preview:large" />
+  <link rel="canonical" href="https://themuster.dev/live-inline-diff.html" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="Muster" />
+  <meta property="og:title" content="AI Agent Audit Trail — Muster" />
+  <meta property="og:description" content="0 of 5 self-reported edits vs an 86ms observed, git-apply-verified diff with a byte-identical receipt hash. The measurement, and how to rerun it." />
+  <meta property="og:url" content="https://themuster.dev/live-inline-diff.html" />
+  <meta property="og:image" content="https://themuster.dev/assets/brand/muster-og.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:image" content="https://themuster.dev/assets/brand/muster-og.png" />
+  <link rel="preconnect" href="https://api.fontshare.com" crossorigin />
+  <link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=clash-display@600,700&f[]=hanken-grotesk@400,500,600,700&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" />
+  <script type="module" src="/src/main.ts"></script>
+  <script type="application/ld+json">
+    {"@context":"https://schema.org","@type":"TechArticle","headline":"AI Agent Audit Trail — Muster","description":"How Muster derives an authoritative file-change stream from filesystem observation, and the live head-to-head measurement against Codex's self-reported patch stream.","url":"https://themuster.dev/live-inline-diff.html","mainEntityOfPage":"https://themuster.dev/live-inline-diff.html","author":{"@type":"Organization","name":"Muster","url":"https://themuster.dev/"},"publisher":{"@type":"Organization","name":"Muster","url":"https://themuster.dev/"},"dateModified":"2026-08-27"}
+  </script>
+</head>
+<body>
+  <div id="scroll-progress" aria-hidden="true"></div>
+  <div id="hero-stage" aria-hidden="true"><canvas id="hero-canvas"></canvas></div>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Muster home"><img src="/assets/brand/muster-logo.png" alt="Muster" /></a>
+    <nav aria-label="Main">
+      <a href="/">Home</a>
+      <a href="/muster-vs-openclaw.html">vs OpenClaw</a>
+      <a href="/docs.html">Docs</a>
+      <a href="/guides.html">Guides</a>
+      <a class="nav-cta" href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+    </nav>
+  </header>
+  <main>
+    <section class="hero">
+      <div class="hero-inner">
+        <p class="kicker hero-step">feature · observed edit truth</p>
+        <h1 class="hero-step">An AI agent audit trail that does not take the agent's word for it.</h1>
+        <p class="sub hero-step">Muster's workspace observer derives every file change from git and the filesystem, hashes the content before and after, and emits a receipt that reproduces on a machine that was never there. Measured live against Codex, the agent's own patch stream reported <strong>0 of 5</strong> real edits.</p>
+        <div class="hero-actions hero-step">
+          <a class="btn-cta" href="https://github.com/Dkm0315/muster" rel="noopener">Read the observer source</a>
+          <a class="btn-ghost" href="/muster-vs-openclaw.html">Compare with other harnesses →</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" data-reveal>
+      <p class="sec-kicker reveal-child">Head to head</p>
+      <h2 class="reveal-child">Codex self-report vs Muster observation, on the same edits.</h2>
+      <p class="sec-sub reveal-child">Two independent live runs on 2026-08-27, plus three earlier protocol probes. Every number below was re-measured in a fresh session rather than copied from a build report.</p>
+      <div class="proof-table cmp reveal-child" role="region" aria-label="Codex self-report compared with Muster observation">
+        <table>
+          <thead>
+            <tr><th>Signal</th><th>Codex app-server (self-report)</th><th>Muster workspace observer</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Edits reported, 5 live runs</td><td>0 of 5</td><td class="muster"><strong>Reported in both runs it was attached to</strong></td></tr>
+            <tr><td><code>item/fileChange/patchUpdated</code></td><td>0</td><td class="muster">n/a — does not use the channel</td></tr>
+            <tr><td><code>turn/diff/updated</code></td><td>0</td><td class="muster">n/a — does not use the channel</td></tr>
+            <tr><td><code>workspace.patch</code> events</td><td>—</td><td class="muster"><strong>1</strong>, diff verified by <code>git apply</code></td></tr>
+            <tr><td>Detection latency</td><td>Never detected</td><td class="muster"><strong>86ms</strong> (earlier run 75ms; budget 1000ms)</td></tr>
+            <tr><td>Source of truth</td><td>What the agent loop says it did</td><td class="muster">git baseline + filesystem, re-derived every cycle</td></tr>
+            <tr><td>Content integrity</td><td>Not hashed</td><td class="muster">sha256 before and after</td></tr>
+            <tr><td>Cross-machine reproducibility</td><td>Not applicable</td><td class="muster"><strong>Byte-identical <code>receiptHash</code></strong>, two processes ~40 min apart</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="proof-link reveal-child"><a href="https://github.com/Dkm0315/muster" rel="noopener">Rerun it yourself — <code>scripts/evidence/workspace-observer-live.mjs</code> →</a></p>
+    </section>
+
+    <section class="band band-alt" data-reveal>
+      <p class="sec-kicker reveal-child">Why the gap exists</p>
+      <h2 class="reveal-child">Coding agents edit through the shell, and the patch channel never sees it.</h2>
+      <div class="prose reveal-child">
+        <p>Every agent harness that records file changes gets them the same way: the coding backend emits a structured notification saying it modified a file, and the harness writes that down. It is the obvious design, and for a while it worked, because early coding agents really did apply edits through a dedicated patch tool.</p>
+        <p>They mostly do not any more. A capable coding agent given a refactoring task will reach for the shell — a <code>python</code> heredoc, <code>sed -i</code>, a generated patch piped into <code>git apply</code>, or a whole script it writes and then runs. From the structured patch channel's point of view, all of that is a single opaque <code>commandExecution</code>. The files change. The notification never fires. The harness's audit log stays empty and, crucially, gives no indication that anything is missing.</p>
+        <p>Muster measured this instead of assuming it. A wire-level probe drives <code>codex app-server</code> through <code>initialize → thread/start → turn/start</code>, timestamps every notification, polls the target file every 5ms so that patch-versus-disk ordering can be established, and lingers past <code>turn/completed</code> to rule out a shutdown race. Across three probes and two full head-to-head runs, <code>item/fileChange/patchUpdated</code> fired zero times while all the edits landed on disk. This finding is version- and model-specific, and Muster's own documentation says it should be re-measured against each Codex release rather than assumed permanent.</p>
+
+        <h3>What the observer does instead</h3>
+        <p>The workspace observer never subscribes to a claim. It runs on four invariants, each of which exists because of a specific failure it was caught by:</p>
+        <ul>
+          <li><strong>Watch events are a trigger, never data.</strong> Every cycle re-derives full state from git and the filesystem from scratch. On macOS, recursive <code>fs.watch</code> reports every change as "rename", coalesces create-then-delete into one event, invents ancestor-directory entries, and can hand back a null filename. Those payloads are unusable as data. Dropping every watch event costs latency, bounded by the poll interval — never correctness.</li>
+          <li><strong><code>git status</code> alone is insufficient.</strong> An agent that runs <code>git commit</code> mid-turn makes its own edits invisible to <code>git status --porcelain</code>. So the observer pins a baseline commit at start and diffs the worktree against it, using status only to discover untracked files and to inherit <code>.gitignore</code>.</li>
+          <li><strong>Strictly read-only.</strong> Never <code>git add</code>, never <code>hash-object -w</code>, never the index lock — <code>--no-optional-locks</code> everywhere. The only writes go to a shadow tree under the system temp directory, deliberately outside the watched root, so the observer can neither trigger itself nor perturb your <code>git status</code>.</li>
+          <li><strong>Only changes since <code>start()</code>.</strong> Start seeds the baseline and never emits. Pre-existing dirty state is the world as the run found it, not something the run caused — which matters on any real branch with staged work in progress.</li>
+        </ul>
+        <p>There is one stated blind spot rather than a papered-over one: a file created and deleted entirely between two detection cycles is invisible, because neither git nor the lossy macOS watch stream can recover it. The window is bounded by the debounce and poll intervals, and a caller that flushes at every tool-call boundary shrinks it to near zero for shell-driven edits.</p>
+
+        <h3>Receipts, not log lines</h3>
+        <p>Detecting the change is half of it. The other half is producing something a person who was not present can check. Each observed change carries a deterministic <code>receiptHash</code> computed from the content hashes and the change set. Two observer processes, running in different temporary directories roughly forty minutes apart on the same logical change, produced byte-identical receipt hashes. That is what turns a log line into citable evidence.</p>
+        <p>The receipts feed an append-only event spine with 21 typed event types, monotonic sequence enforcement, fencing tokens that reject stale writers, idempotency keys that detect conflicting receipts, and a full compensation and cancellation state machine with terminal invariants. One reducer-level rule refuses any payload containing secrets or model chain-of-thought — because an audit log you cannot show an auditor, in case it leaked a key, is not an audit log.</p>
+        <p>At the protocol boundary, <code>source: "observer"</code> is enforced at the type level, so a backend's self-report is structurally incapable of masquerading as observed truth. That is a small detail with a large consequence: the two categories of evidence can never be silently mixed.</p>
+
+        <h3>How it was hardened</h3>
+        <p>The observer and the board it feeds went through adversarial verification before shipping, which found and fixed eight real bugs. The worst were an O(N²) state fold that took a 10,000-event drive from 2073ms down to 224ms once fixed, a planner that proposed assignments the reducer would have rejected, and a work-in-progress saturation case that escalated as <code>no_qualified_model</code> — misreporting transient capacity pressure as a permanent capability gap to whoever read the audit output. Observer stress testing survived a 320-file mutation storm with gapless sequences and correct hash chains.</p>
+
+        <h3>Open flags, stated plainly</h3>
+        <ul>
+          <li>The <code>workspace.patch.diff</code> variant would broadcast raw file content unredacted over the stdio transport. Nothing emits it yet, and a redaction layer has to land before anything does.</li>
+          <li>The live evidence script needs an authenticated Codex CLI, so it is a manual evidence job rather than an unattended CI check.</li>
+          <li>The Codex finding is version-specific. Re-measure it; do not assume it holds forever.</li>
+        </ul>
+        <p class="proof-link"><a href="/muster-vs-openclaw.html">vs OpenClaw →</a> <a href="/muster-vs-hermes-agent.html">vs Hermes Agent →</a> <a href="/muster-vs-qm.html">vs QM →</a> <a href="/docs.html">Docs →</a></p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>© <span id="year">2026</span> Muster — open source, MIT</span>
+      <span class="footer-sep">·</span>
+      <a href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+      <span class="footer-sep">·</span>
+      <a href="/docs.html">Docs</a>
+      <span class="footer-sep">·</span>
+      <a href="/muster-vs-openclaw.html">Comparisons</a>
+    </div>
+  </footer>
+</body>
+</html>

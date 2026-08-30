@@ -7,6 +7,7 @@ import {
   createMusterAutocompleteProvider,
   createMusterChatEditor,
   createMusterChatHarness,
+  formatUserLine,
   isBareCompletionTrigger,
   isClearComposerKey,
   renderMusterComposer,
@@ -69,7 +70,7 @@ const CATALOG: MusterAutocompleteOptions = {
   ],
   models: ({ providerId }) => providerId === "groq"
     ? [{ value: "llama-3.3-70b-versatile", description: "fast cloud route" }]
-    : [{ value: "gpt-5.5", description: "selected" }, { value: "gpt-5.5-medium", description: "deeper" }],
+    : [{ value: "gpt-5.6-sol", description: "selected" }, { value: "gpt-5.6-sol-medium", description: "deeper" }],
   runtimes: () => [{ value: "native" }, { value: "claude-code" }, { value: "codex" }],
   clouds: () => [{ value: "openrouter" }, { value: "anthropic" }, { value: "groq" }],
   speeds: () => [{ value: "fast" }, { value: "session" }, { value: "deep" }],
@@ -130,13 +131,19 @@ async function caseSlashOverlayStable(): Promise<QaPtyTuiCase> {
   await settleAutocomplete();
   for (let index = 0; index < 8; index += 1) harness.input("\x1b[B");
   const screen = stripAnsi(harness.visible(110).join("\n"));
+  const lines = screen.split("\n");
+  const commandRows = lines.filter((line) => /^\s*(?:→\s+|\s{2})\/[a-z]/i.test(line));
+  const composerIndex = lines.findIndex((line) => /^❯/.test(line));
+  const firstCommandIndex = lines.findIndex((line) => commandRows.includes(line));
   const evidence = {
-    suggestionsCount: count(screen, "suggestions"),
-    helpRows: count(screen, "/help"),
+    commandRows: commandRows.length,
+    selectedRows: commandRows.filter((line) => line.trimStart().startsWith("→")).length,
+    composerRows: lines.filter((line) => /^❯/.test(line)).length,
     hasMovedSelection: /\/status|\/sessions|\/resume|\/name|\/history/.test(screen),
-    hasBottomRail: /╰─+╯/.test(screen),
+    popupBorderless: !strayBoxGlyphs(screen),
+    listAboveComposer: firstCommandIndex >= 0 && firstCommandIndex < composerIndex,
   };
-  return makeCase("slash_overlay_stable", evidence.suggestionsCount === 1 && evidence.helpRows <= 1 && evidence.hasMovedSelection && evidence.hasBottomRail, "slash overlay stays one live pane through repeated Down arrows", screen, evidence);
+  return makeCase("slash_overlay_stable", evidence.commandRows === 14 && evidence.selectedRows === 1 && evidence.composerRows === 1 && evidence.hasMovedSelection && evidence.popupBorderless && evidence.listAboveComposer, "slash popup stays one borderless list above the boxed composer through repeated Down arrows", screen, evidence);
 }
 
 async function caseEscapeClosesOverlay(): Promise<QaPtyTuiCase> {
@@ -145,8 +152,8 @@ async function caseEscapeClosesOverlay(): Promise<QaPtyTuiCase> {
   await settleAutocomplete();
   harness.input("\x1b");
   const screen = stripAnsi(harness.visible(100).join("\n"));
-  const evidence = { text: harness.text(), suggestionsCount: count(screen, "suggestions"), hasRails: /╭─ chat/.test(screen) && /╰─+╯/.test(screen) };
-  return makeCase("escape_closes_bare_completion", evidence.text === "" && evidence.suggestionsCount === 0 && evidence.hasRails, "Escape closes bare slash overlay and returns to an empty composer", screen, evidence);
+  const evidence = { text: harness.text(), helpRows: count(screen, "/help"), hasRuledPrompt: /^❯/m.test(screen), strayGlyphs: strayBoxGlyphs(screen) };
+  return makeCase("escape_closes_bare_completion", evidence.text === "" && evidence.helpRows === 0 && evidence.hasRuledPrompt && !evidence.strayGlyphs, "Escape closes bare slash popup and returns to the empty ruled prompt", screen, evidence);
 }
 
 async function caseHistoryNavigation(): Promise<QaPtyTuiCase> {
@@ -187,7 +194,10 @@ async function casePromptVisibleAfterOutput(): Promise<QaPtyTuiCase> {
   const screen = stripAnsi(harness.visible(100).join("\n"));
   const evidence = {
     composerText: harness.text(),
-    promptVisible: screen.includes("› show status"),
+    // Derived from the renderer's own gutter (formatUserLine), never a literal
+    // glyph: the wave-2 transcript restyle moved the user turn from "›" to "> "
+    // and a hard-coded fixture reported that restyle as a product failure.
+    promptVisible: screen.includes(stripAnsi(formatUserLine("show status"))),
     timingsVisible: screen.includes("timings total=120ms"),
     memoryVisible: screen.includes("memory backend=sqlite-fts5"),
     doneVisible: screen.includes("done"),
@@ -202,8 +212,8 @@ async function caseAgentOverlay(): Promise<QaPtyTuiCase> {
   await settleAutocomplete();
   harness.input("\x1b[B");
   const screen = stripAnsi(harness.visible(100).join("\n"));
-  const evidence = { suggestionsCount: count(screen, "suggestions"), reviewVisible: screen.includes("@review"), laterAgentVisible: screen.includes("@research") || screen.includes("@qa") };
-  return makeCase("agent_overlay_navigation", evidence.suggestionsCount === 1 && evidence.reviewVisible && evidence.laterAgentVisible, "@agent overlay is visible and navigable", screen, evidence);
+  const evidence = { reviewRows: count(screen, "@review"), reviewVisible: screen.includes("@review"), laterAgentVisible: screen.includes("@research") || screen.includes("@qa") };
+  return makeCase("agent_overlay_navigation", evidence.reviewRows === 1 && evidence.reviewVisible && evidence.laterAgentVisible, "@agent popup is visible and navigable", screen, evidence);
 }
 
 async function caseLargeOverlayScroll(): Promise<QaPtyTuiCase> {
@@ -219,23 +229,31 @@ async function caseLargeOverlayScroll(): Promise<QaPtyTuiCase> {
   for (let index = 0; index < 20; index += 1) editor.handleInput("\x1b[B");
   const screen = stripAnsi(renderMusterComposer(editor, 110).join("\n"));
   const rows = screen.split("\n").filter((line) => /cmd\d\d/.test(line));
-  const evidence = { rowCount: rows.length, hasScrollIndicator: /\(21\/30\)/.test(screen), firstRow: rows[0], lastRow: rows.at(-1) };
-  return makeCase("large_overlay_scroll_window", rows.length === 16 && evidence.hasScrollIndicator && /cmd13/.test(rows[0] ?? "") && /cmd28/.test(rows.at(-1) ?? ""), "large completion lists stay bounded with a scroll indicator", screen, evidence);
+  const evidence = { rowCount: rows.length, noCountRow: !/^\s*\d+\/\d+\s*$/m.test(screen), firstRow: rows[0], lastRow: rows.at(-1) };
+  return makeCase("large_overlay_scroll_window", rows.length === 14 && evidence.noCountRow && /cmd14/.test(rows[0] ?? "") && /cmd27/.test(rows.at(-1) ?? ""), "large completion lists stay bounded with no count row", screen, evidence);
 }
 
 async function caseSelectedRowContrast(): Promise<QaPtyTuiCase> {
-  const editor = createMusterChatEditor(fakeTui(100, 40));
-  editor.setAutocompleteProvider(createMusterAutocompleteProvider(CATALOG));
-  editor.handleInput("/");
-  await settleAutocomplete();
-  const rendered = renderMusterComposer(editor, 90).join("\n");
-  const selectedLine = rendered.split("\n").find((line) => line.includes("/help")) ?? "";
-  const evidence = {
-    hasBackground: selectedLine.includes("\u001b[48;2;41;211;255m"),
-    hasReadableForeground: selectedLine.includes("\u001b[38;2;255;255;255m") || selectedLine.includes("\u001b[30;1m"),
-    backgroundBeforeText: selectedLine.indexOf("\u001b[48;2;41;211;255m") >= 0 && selectedLine.indexOf("\u001b[48;2;41;211;255m") < selectedLine.indexOf("/help"),
-  };
-  return makeCase("selected_row_contrast", evidence.hasBackground && evidence.hasReadableForeground && evidence.backgroundBeforeText, "selected completion row has full-row background and readable foreground", stripAnsi(rendered), evidence);
+  const priorForceColor = process.env.FORCE_COLOR;
+  process.env.FORCE_COLOR = "1";
+  try {
+    const editor = createMusterChatEditor(fakeTui(100, 40));
+    editor.setAutocompleteProvider(createMusterAutocompleteProvider(CATALOG));
+    editor.handleInput("/");
+    await settleAutocomplete();
+    const rendered = renderMusterComposer(editor, 90).join("\n");
+    const selectedLine = rendered.split("\n").find((line) => line.includes("/help")) ?? "";
+    const evidence = {
+      // The reference's selection identity: the row goes periwinkle, NO band.
+      hasPeriwinkle: selectedLine.includes("\u001b[38;2;176;184;248m"),
+      hasReadableForeground: selectedLine.includes("/help"),
+      noBand: !selectedLine.includes("\u001b[48;2;48;45;43m"),
+    };
+    return makeCase("selected_row_contrast", evidence.hasPeriwinkle && evidence.hasReadableForeground && evidence.noBand, "selected completion row paints periwinkle with no background band", stripAnsi(rendered), evidence);
+  } finally {
+    if (priorForceColor === undefined) delete process.env.FORCE_COLOR;
+    else process.env.FORCE_COLOR = priorForceColor;
+  }
 }
 
 async function caseProviderModelSpeedWorkflow(): Promise<QaPtyTuiCase> {
@@ -259,10 +277,10 @@ async function caseProviderModelSpeedWorkflow(): Promise<QaPtyTuiCase> {
   const speedText = harness.text();
   const screen = [providerScreen, modelScreen, stripAnsi(harness.visible(120).join("\n"))].join("\n---\n");
   const evidence = {
-    providerOverlay: providerScreen.includes("codex") && providerScreen.includes("groq") && count(providerScreen, "suggestions") === 1,
+    providerOverlay: providerScreen.includes("codex") && providerScreen.includes("groq") && count(providerScreen, "codex") >= 1,
     providerApplied: providerText === "/provider groq",
-    modelOverlay: modelScreen.includes("gpt-5.5") && count(modelScreen, "suggestions") === 1,
-    modelApplied: modelText === "/model gpt-5.5",
+    modelOverlay: modelScreen.includes("gpt-5.6-sol"),
+    modelApplied: modelText === "/model gpt-5.6-sol",
     speedApplied: speedText === "/speed session",
   };
   return makeCase(
@@ -276,7 +294,9 @@ async function caseProviderModelSpeedWorkflow(): Promise<QaPtyTuiCase> {
 
 function caseCrampedTranscriptReceipts(): QaPtyTuiCase {
   const rendered = renderTranscriptWindow([
-    "\x1b[38;2;104;245;168m›\x1b[0m Reply with exactly: ok",
+    // The real user row, produced by the renderer, so the pin logic is tested
+    // against the shipped gutter rather than a copy of it.
+    formatUserLine("Reply with exactly: ok"),
     "timings total=8335ms provider=8259ms recall=11ms prompt=5ms persist=56ms planning=2ms",
     "memory backend=sqlite-fts5 recalled=0 candidates=0 scopes=tenant:f2,user:goblin",
     "assistant body line that would otherwise crowd out receipts",
@@ -314,14 +334,14 @@ async function caseResponsiveWidths(): Promise<QaPtyTuiCase> {
     const lines = stripAnsi(harness.visible(width).join("\n")).split("\n");
     checks.push({
       width,
-      hasTopRail: lines.some((line) => line.startsWith("╭─ chat")),
-      hasBottomRail: lines.some((line) => /^╰─+╯$/.test(line)),
-      hasSuggestions: lines.some((line) => line.includes("suggestions")),
+      hasRuledPrompt: lines.some((line) => /^❯/.test(line)),
+      popupBorderless: !strayBoxGlyphs(lines.join("\n")),
+      hasSuggestions: lines.some((line) => line.includes("/help")),
       maxLineWidth: Math.max(...lines.map((line) => line.length)),
     });
   }
-  const passed = checks.every((entry) => entry.hasTopRail && entry.hasBottomRail && entry.hasSuggestions && Number(entry.maxLineWidth) <= Number(entry.width));
-  return makeCase("responsive_widths", passed, "composer rails and suggestions survive 80, 120, and 200 column widths", checks.map((entry) => JSON.stringify(entry)).join("\n"), { checks });
+  const passed = checks.every((entry) => entry.hasRuledPrompt && entry.popupBorderless && entry.hasSuggestions && Number(entry.maxLineWidth) <= Number(entry.width));
+  return makeCase("responsive_widths", passed, "ruled composer and suggestions survive 80, 120, and 200 column widths", checks.map((entry) => JSON.stringify(entry)).join("\n"), { checks });
 }
 
 async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Promise<QaPtyTuiCase> {
@@ -333,13 +353,16 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
   try {
     const version = (await execFileAsync("tmux", ["-V"], { timeout: 5_000 })).stdout.trim();
     evidence.backendVersion = version;
+    const nodeArgs = process.execArgv.map((arg, index, args) => args[index - 1] === "--import" && arg === "tsx" ? import.meta.resolve("tsx") : arg);
     const command = [
       "env",
       `HOME=${shellQuote(workspace)}`,
       "MUSTER_SKIP_ONBOARDING=1",
+      "NO_COLOR=",
+      "FORCE_COLOR=1",
       "TERM=xterm-256color",
       shellQuote(process.execPath),
-      ...process.execArgv.map(shellQuote),
+      ...nodeArgs.map(shellQuote),
       shellQuote(cliEntry),
       "--skip-onboarding",
     ].join(" ");
@@ -348,26 +371,27 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
     evidence.stage = "wait-baseline";
     const baseline = await waitForPtyScreen(session, (screen) => {
       const visible = stripAnsi(screen);
-      return visible.includes("╭─ chat") && visible.includes("│ ›");
+      return /^(?:│ )?❯/m.test(visible);
     });
     screens.push(`baseline\n${stripAnsi(baseline)}`);
 
     evidence.stage = "open-completion";
     await tmux(["send-keys", "-t", session, "-l", "/"]);
-    const overlay = await waitForPtyScreen(session, (screen) => screen.includes("suggestions") && screen.includes("/help"));
+    const overlay = await waitForPtyScreen(session, (screen) => hasSlashCompletionRows(screen) && composerValue(screen) === "/");
     await delay(250);
     const persistentOverlay = await capturePtyScreen(session);
+    const selectedBefore = selectedSuggestion(overlay);
     evidence.stage = "navigate-completion";
     for (let index = 0; index < 5; index += 1) await tmux(["send-keys", "-t", session, "Down"]);
     const navigated = await waitForPtyScreen(session, (screen) => {
       const selected = selectedSuggestion(screen);
-      return Boolean(selected && selected !== "/help");
+      return Boolean(selected && selected !== selectedBefore);
     });
     screens.push(`overlay\n${stripAnsi(overlay)}`, `navigated\n${stripAnsi(navigated)}`);
 
     evidence.stage = "clear-completion";
     await tmux(["send-keys", "-t", session, "C-u"]);
-    await waitForPtyScreen(session, (screen) => !screen.includes("suggestions") && composerValue(screen) === "");
+    await waitForPtyScreen(session, (screen) => !hasSlashCompletionRows(screen) && composerValue(screen) === "");
 
     evidence.stage = "submit-first-history-command";
     await submitPtyText(session, "/name pty-one");
@@ -387,35 +411,35 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
     evidence.stage = "escape-completion";
     await tmux(["send-keys", "-t", session, "C-u"]);
     await tmux(["send-keys", "-t", session, "-l", "/"]);
-    await waitForPtyScreen(session, (screen) => screen.includes("suggestions") && screen.includes("/help"));
+    await waitForPtyScreen(session, (screen) => hasSlashCompletionRows(screen) && composerValue(screen) === "/");
     await tmux(["send-keys", "-t", session, "Escape"]);
-    const escaped = await waitForPtyScreen(session, (screen) => !screen.includes("suggestions") && composerValue(screen) === "");
+    const escaped = await waitForPtyScreen(session, (screen) => !hasSlashCompletionRows(screen) && composerValue(screen) === "");
     await delay(500);
     const afterEscape = await capturePtyScreen(session);
     screens.push(`escaped\n${stripAnsi(afterEscape)}`);
 
     Object.assign(evidence, {
-      overlayCount: count(stripAnsi(persistentOverlay), "suggestions"),
-      overlayPersisted: persistentOverlay.includes("suggestions"),
-      selectedBefore: selectedSuggestion(overlay),
+      overlayCount: slashCompletionRowCount(persistentOverlay),
+      overlayPersisted: hasSlashCompletionRows(persistentOverlay),
+      selectedBefore,
       selectedAfter: selectedSuggestion(navigated),
       escapedComposer: composerValue(escaped),
       historyLatest: composerValue(historyLatest),
       historyOlder: composerValue(historyOlder),
       historyForward: composerValue(historyForward),
-      bottomRailVisible: /╰─+╯/.test(stripAnsi(navigated)),
-      composerAliveAfterEscape: composerValue(afterEscape) === "" && /╰─+╯/.test(stripAnsi(afterEscape)),
+      popupBorderless: !strayBoxGlyphs(navigated),
+      composerAliveAfterEscape: composerValue(afterEscape) === "" && /^(?:│ )?❯/m.test(stripAnsi(afterEscape)),
     });
     const passed = evidence.overlayCount === 1
       && evidence.overlayPersisted === true
-      && evidence.selectedBefore === "/help"
+      && typeof evidence.selectedBefore === "string"
       && typeof evidence.selectedAfter === "string"
-      && evidence.selectedAfter !== "/help"
+      && evidence.selectedAfter !== evidence.selectedBefore
       && evidence.escapedComposer === ""
       && evidence.historyLatest === "/name pty-two"
       && evidence.historyOlder === "/name pty-one"
       && evidence.historyForward === "/name pty-two"
-      && evidence.bottomRailVisible === true
+      && evidence.popupBorderless === true
       && evidence.composerAliveAfterEscape === true;
     return makeCase(
       "real_pty_interaction",
@@ -477,20 +501,31 @@ function composerValue(screen: string): string | undefined {
   const lines = stripAnsi(screen).split("\n");
   let line: string | undefined;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (lines[index].includes("│ ›")) {
+    if (/^(?:│ )?❯/.test(lines[index])) {
       line = lines[index];
       break;
     }
   }
   if (!line) return undefined;
-  const start = line.indexOf("│ ›") + 3;
-  const end = line.lastIndexOf("│");
-  return line.slice(start, end > start ? end : undefined).trim();
+  return line.slice(line.indexOf("❯") + 1).trim();
+}
+
+/** The reference draws NO box glyphs anywhere — any occurrence is stray. */
+function strayBoxGlyphs(screen: string): boolean {
+  return /[╭╮╰╯│]/u.test(stripAnsi(screen));
 }
 
 function selectedSuggestion(screen: string): string | undefined {
-  const selected = screen.split("\n").find((line) => line.includes("\u001b[48;2;41;211;255m"));
+  const selected = screen.split("\n").find((line) => line.includes("\u001b[38;2;176;184;248m") && stripAnsi(line).trimStart().startsWith("→"));
   return stripAnsi(selected ?? "").match(/→\s+(\/[^\s]+)/)?.[1];
+}
+
+function slashCompletionRowCount(screen: string): number {
+  return stripAnsi(screen).split("\n").filter((line) => /^\s*(?:→\s+|\s{2})\/help\b/.test(line)).length;
+}
+
+function hasSlashCompletionRows(screen: string): boolean {
+  return slashCompletionRowCount(screen) > 0;
 }
 
 function shellQuote(value: string): string {

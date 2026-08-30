@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createMusterAutocompleteProvider, createMusterChatEditor, createMusterChatHarness, formatWorkingIndicator, isBareCompletionTrigger, isClearComposerKey, renderHeaderWindow, renderMusterComposer, renderTranscriptWindow } from "../src/chat-tui.js";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createMusterAutocompleteProvider, createMusterChatEditor, createMusterChatHarness, formatWorkingIndicator, isBareCompletionTrigger, isClearComposerKey, renderHeaderWindow, renderMusterComposer, renderTranscriptWindow, TerminalFrameLog, windowTranscript } from "../src/chat-tui.js";
+import { capabilityConfirmationText, encodeCapabilitySelection } from "../src/capabilities-overlay.js";
 
 const commands = [
   { name: "help", usage: "/help", description: "show full chat help", aliases: ["?"] },
@@ -15,10 +19,11 @@ const commands = [
   { name: "integrations", usage: "/integrations [id]", description: "guided channel/plugin/MCP setup workflow", aliases: ["integration"] },
 ] as const;
 
-test("ordinary working status stays alive without exposing elapsed time", () => {
+test("ordinary working status uses the sparkle identity without exposing diagnostic metrics", () => {
   const frames = Array.from({ length: 8 }, (_, index) => formatWorkingIndicator(undefined, index));
-  assert.ok(frames.every((frame) => frame.includes("working")));
-  assert.equal(new Set(frames).size, 4, "the activity indicator still animates");
+  assert.ok(frames.every((frame) => /^✻ (Thinking|Reading|Weighing|Connecting|Shaping|Composing)$/.test(frame)));
+  const rotated = Array.from({ length: 96 }, (_, index) => formatWorkingIndicator(undefined, index));
+  assert.ok(new Set(rotated).size > 1, "the verb rotates so long waits breathe");
   assert.doesNotMatch(frames.join(" "), /\b\d+(?:\.\d+)?(?:ms|s)\b|latency|p50|p95|cache/i);
 });
 
@@ -156,6 +161,74 @@ test("muster TUI completion provider completes toolsets, sessions, and agents", 
   assert.equal(workflowStatus.items.some((item) => item.value === "status"), false);
 });
 
+test("/tools capability selection replaces the command with ready composer text on Enter", async () => {
+  const readyPrompt = "use the documents plugin to ";
+  const provider = createMusterAutocompleteProvider({
+    commands,
+    toolsets: [],
+    recentSessions: () => [],
+    catalog: {
+      complete: (request) => request.kind === "toolset"
+        ? [{ value: encodeCapabilitySelection(readyPrompt), label: "documents", description: "plugin/codex · active" }]
+        : [],
+    },
+    agents: async () => [],
+  });
+  const suggestions = await provider.getSuggestions(["/tools doc"], 0, 10, { signal: new AbortController().signal });
+  assert.ok(suggestions);
+  const applied = provider.applyCompletion(["/tools doc"], 0, 10, suggestions.items[0]!, suggestions.prefix);
+  assert.deepEqual(applied.lines, [readyPrompt]);
+  assert.equal(applied.cursorCol, readyPrompt.length);
+
+  const harness = createMusterChatHarness({
+    commands,
+    toolsets: [],
+    recentSessions: () => [],
+    catalog: { complete: async (request) => request.kind === "toolset" ? [{ value: encodeCapabilitySelection(readyPrompt), label: "documents" }] : [] },
+    agents: async () => [],
+  });
+  harness.type("/tools doc");
+  await settleAutocomplete();
+  harness.input("\r");
+  assert.equal(harness.text(), readyPrompt);
+});
+
+test("escape cancels a staged /tools state-changing command", () => {
+  const harness = createMusterChatHarness({ commands, toolsets: [], recentSessions: () => [], agents: async () => [] });
+  harness.type(capabilityConfirmationText("codex", ["mcp", "enable", "computer-use"]));
+  harness.input("\x1b");
+  assert.equal(harness.text(), "");
+});
+
+test("Ctrl+D is reserved for the live file view and leaves the composer intact", () => {
+  const harness = createMusterChatHarness({ commands, toolsets: [], recentSessions: () => [], agents: async () => [] });
+  harness.type("draft");
+  harness.input("\x04");
+  assert.equal(harness.text(), "draft");
+  assert.match(harness.transcript().at(-1) ?? "", /no files edited this turn/);
+});
+
+test("/tools disabled row needs a selection Enter and a separate submit Enter", async () => {
+  const confirmation = capabilityConfirmationText("codex", ["mcp", "enable", "computer-use"]);
+  const submitted: string[] = [];
+  const harness = createMusterChatHarness({
+    commands,
+    toolsets: [],
+    recentSessions: () => [],
+    catalog: { complete: async (request) => request.kind === "toolset" ? [{ value: encodeCapabilitySelection(confirmation), label: "computer-use" }] : [] },
+    agents: async () => [],
+    onSubmit: async (text) => { submitted.push(text); return true; },
+  });
+  harness.type("/tools computer");
+  await settleAutocomplete();
+  harness.input("\r");
+  assert.equal(harness.text(), confirmation);
+  assert.deepEqual(submitted, [], "selection must not run a state-changing command");
+  harness.input("\r");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(submitted, [confirmation]);
+});
+
 test("muster TUI completion provider can be backed by one catalog service", async () => {
   const seen: string[] = [];
   const provider = createMusterAutocompleteProvider({
@@ -183,16 +256,19 @@ test("muster TUI completion provider can be backed by one catalog service", asyn
   assert.deepEqual(seen, ["provider-model:gpt:openai", "agent:re:"]);
 });
 
-test("muster composer render encloses the actual editor and grows for multiline input", () => {
+test("muster composer is two full-width dim rules with a plain caret, growing for multiline input", () => {
   const editor = createMusterChatEditor(fakeTui(120, 40));
   editor.setText("first line\nsecond line");
   const lines = renderMusterComposer(editor, 80);
+  const stripped = lines.map((line) => stripAnsi(line));
 
-  assert.match(stripAnsi(lines[0]), /^╭─ chat/);
-  assert.match(stripAnsi(lines.at(-1) ?? ""), /^╰/);
-  assert.ok(lines.some((line) => stripAnsi(line).includes("first line")));
-  assert.ok(lines.some((line) => stripAnsi(line).includes("second line")));
-  assert.ok(lines.every((line) => stripAnsi(line).length === 80), "composer lines should stay width-stable");
+  assert.match(stripped[0], /^─+$/, "top rule spans the frame");
+  assert.match(stripped[1], /^❯ first line/);
+  assert.match(stripped[2], /^ {2}second line/);
+  assert.match(stripped.at(-1)!, /^─+$/, "bottom rule spans the frame");
+  assert.doesNotMatch(stripped.join("\n"), /[╭╮╰╯│]/u, "no box glyphs anywhere — the reference has none");
+  assert.doesNotMatch(lines.join("\n"), /217;119;87|224;175;104/, "the caret carries no accent tinge");
+  assert.ok(stripped.every((line) => line.length === 80), "composer lines should stay width-stable");
 });
 
 test("muster composer keeps autocomplete in the same stable render tree", async () => {
@@ -231,9 +307,8 @@ test("muster chat harness keeps one persistent slash overlay through arrow navig
   for (let index = 0; index < 5; index += 1) harness.input("\x1b[B");
   const navigated = stripAnsi(harness.visible(90).join("\n"));
 
-  assert.equal((first.match(/suggestions/g) ?? []).length, 1, "slash should open one suggestions frame");
-  assert.equal((navigated.match(/suggestions/g) ?? []).length, 1, "arrow navigation must update the same overlay, not append panes");
-  assert.equal((navigated.match(/\/help/g) ?? []).length, 1, "list rows should not duplicate while navigating");
+  assert.equal((first.match(/\/help/g) ?? []).length, 1, "slash should open one completion list");
+  assert.equal((navigated.match(/\/help/g) ?? []).length, 1, "arrow navigation must update the same list, not append panes");
   assert.ok(/\/runtime|\/sessions|\/provider/.test(navigated), "selection should move through command rows");
 });
 
@@ -254,28 +329,25 @@ test("muster chat harness opens skill and plugin pickers as interactive composer
   await settleAutocomplete();
   const pluginScreen = stripAnsi(harness.visible(90).join("\n"));
   assert.equal(harness.text(), "/plugins pdf");
-  assert.match(pluginScreen, /suggestions/);
   assert.match(pluginScreen, /artifact-studio/);
+  assert.ok(pluginScreen.indexOf("artifact-studio") < pluginScreen.indexOf("❯"));
 
   harness.openPicker("/skills ux");
   await settleAutocomplete();
   const skillScreen = stripAnsi(harness.visible(90).join("\n"));
   assert.equal(harness.text(), "/skills ux");
-  assert.match(skillScreen, /suggestions/);
   assert.match(skillScreen, /adversarial-ux-test/);
 
   harness.openPicker("/plugins reuse");
   await settleAutocomplete();
   const reuseScreen = stripAnsi(harness.visible(90).join("\n"));
   assert.equal(harness.text(), "/plugins reuse");
-  assert.match(reuseScreen, /suggestions/);
   assert.match(reuseScreen, /codex/);
 
   harness.openPicker("/integrations tel");
   await settleAutocomplete();
   const integrationScreen = stripAnsi(harness.visible(90).join("\n"));
   assert.equal(harness.text(), "/integrations tel");
-  assert.match(integrationScreen, /suggestions/);
   assert.match(integrationScreen, /telegram/);
 });
 
@@ -289,14 +361,14 @@ test("muster chat harness escape closes bare completion and restores normal prom
 
   harness.input("/");
   await settleAutocomplete();
-  assert.match(stripAnsi(harness.visible().join("\n")), /suggestions/);
+  assert.match(stripAnsi(harness.visible().join("\n")), /\/help/);
   harness.input("\x1b");
   const screen = stripAnsi(harness.visible().join("\n"));
 
   assert.equal(harness.text(), "");
-  assert.doesNotMatch(screen, /suggestions/);
-  assert.match(screen, /╭─ chat/);
-  assert.match(screen, /╰─+/);
+  assert.doesNotMatch(screen, /\/help/);
+  assert.match(screen, /^❯/m, "the bare prompt returns between the rules");
+  assert.doesNotMatch(screen, /[╭╮╰╯│]/u, "no box glyphs anywhere");
 });
 
 test("muster chat harness replays prompt history when completion is not open", async () => {
@@ -343,7 +415,7 @@ test("muster chat harness keeps submitted prompt visible after output and clears
   const screen = stripAnsi(harness.visible(100).join("\n"));
 
   assert.equal(harness.text(), "");
-  assert.match(screen, /› show status/);
+  assert.match(screen, /> show status/);
   assert.match(screen, /timings total=120ms/);
   assert.match(screen, /memory backend=sqlite-fts5/);
   assert.match(screen, /done/);
@@ -365,14 +437,14 @@ test("muster chat harness shows and navigates @ agent completions", async () => 
 
   assert.match(first, /@review/);
   assert.match(first, /@research/);
-  assert.equal((second.match(/suggestions/g) ?? []).length, 1);
+  assert.equal((second.match(/@review/g) ?? []).length, 1);
   assert.ok(second.includes("@research") || second.includes("@runner"));
 });
 
 test("muster transcript keeps the latest prompt visible after long output", () => {
   const rendered = renderTranscriptWindow([
     "older setup line",
-    "\x1b[38;2;104;245;168m›\x1b[0m Where do we deploy the Frappe app?",
+    "\x1b[38;2;142;161;181m>\x1b[0m Where do we deploy the Frappe app?",
     "memory backend=sqlite-fts5 recalled=1 candidates=1",
     "This is a deliberately long assistant answer that wraps across several rows and would otherwise push the prompt out of the visible transcript window.",
     "final answer line",
@@ -385,7 +457,7 @@ test("muster transcript keeps the latest prompt visible after long output", () =
 
 test("muster transcript pins timing and retrieval receipts in cramped TUI output", () => {
   const rendered = renderTranscriptWindow([
-    "\x1b[38;2;104;245;168m›\x1b[0m Reply with exactly: ok",
+    "\x1b[38;2;142;161;181m>\x1b[0m Reply with exactly: ok",
     "timings total=8335ms provider=8259ms recall=11ms prompt=5ms persist=56ms planning=2ms",
     "memory backend=sqlite-fts5 recalled=0 candidates=0 scopes=tenant:f2,user:goblin",
     "assistant body line that would otherwise crowd out receipts",
@@ -408,7 +480,7 @@ test("muster header collapses before it starves chat transcript rows", () => {
   assert.ok(rendered.at(-1)?.includes("header line 17"));
 });
 
-test("muster autocomplete overlay has a fixed 16-row centered viewport", async () => {
+test("muster autocomplete popup is borderless above the composer with a 14-row viewport", async () => {
   const editor = createMusterChatEditor(fakeTui(120, 50));
   const manyCommands = Array.from({ length: 30 }, (_, index) => ({
     name: `cmd${String(index + 1).padStart(2, "0")}`,
@@ -428,13 +500,15 @@ test("muster autocomplete overlay has a fixed 16-row centered viewport", async (
   const stripped = renderMusterComposer(editor, 110).map(stripAnsi);
   const commandRows = stripped.filter((line) => /cmd\d\d/.test(line));
 
-  assert.equal(commandRows.length, 16);
-  assert.ok(stripped.some((line) => line.includes("(21/30)")), "scroll indicator should report selected row and total");
-  assert.ok(commandRows[0].includes("cmd13"), "centered viewport should start near selected index, not at top");
-  assert.ok(commandRows.at(-1)?.includes("cmd28"), "centered viewport should stay bounded to max visible rows");
+  assert.equal(commandRows.length, 14);
+  assert.equal(stripped.some((line) => /^\s*\d+\/\d+\s*$/.test(line)), false, "no count row — the reference shows none");
+  assert.ok(commandRows[0].includes("cmd14"), "centered viewport should start near selected index, not at top");
+  assert.ok(commandRows.at(-1)?.includes("cmd27"), "centered viewport should stay bounded to max visible rows");
+  assert.ok(commandRows.every((line) => !/[╭╮╰╯│]/.test(line)), "popup rows have no border box");
+  assert.ok(stripped.findIndex((line) => line.includes("cmd14")) < stripped.findIndex((line) => line.includes("❯")), "suggestions anchor above the composer");
 });
 
-test("muster selected completion row keeps readable full-row contrast", async () => {
+test("muster selected completion row paints periwinkle with no background band", async () => {
   const editor = createMusterChatEditor(fakeTui(100, 40));
   editor.setAutocompleteProvider(createMusterAutocompleteProvider({
     commands,
@@ -449,12 +523,68 @@ test("muster selected completion row keeps readable full-row contrast", async ()
   const selectedLine = rendered.split("\n").find((line) => line.includes("/help"));
 
   assert.ok(selectedLine, "selected /help line should render");
-  const backgroundStart = selectedLine.indexOf("\u001b[48;2;41;211;255m");
-  const frameReset = selectedLine.lastIndexOf("\u001b[0m");
-  const helpText = selectedLine.indexOf("/help");
-  assert.ok(backgroundStart >= 0, "selected row should include cyan background");
-  assert.ok(helpText > backgroundStart, "selected text should be inside selected background");
-  assert.ok(frameReset > helpText, "selected background should last through row padding before reset");
+  assert.ok(selectedLine.includes("\u001b[38;2;176;184;248m"), "selected row goes periwinkle — the reference's selection identity");
+  assert.equal(selectedLine.includes("\u001b[48;2;48;45;43m"), false, "no background band — the reference has none");
+});
+
+test("frame debug log JSON-escapes terminal rows and rotates at five megabytes", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "muster-frames-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  const path = join(root, "logs", "frames.log");
+  const log = new TerminalFrameLog(path);
+  log.append("\u001b[31mleft[\u001b[0m\nright]");
+  const rows = (await readFile(path, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(rows, ["\u001b[31mleft[\u001b[0m", "right]"]);
+  await writeFile(path, "x".repeat(TerminalFrameLog.MAX_BYTES - 2), "utf8");
+  log.append("next frame");
+  assert.equal((await stat(`${path}.1`)).size, TerminalFrameLog.MAX_BYTES - 2);
+  assert.ok((await stat(path)).size <= TerminalFrameLog.MAX_BYTES);
+});
+
+test("muster transcript starts with resumed history before the first submitted turn", () => {
+  const initialLines = ["── history: work · 2 messages (1 user · 1 assistant) ──", "> earlier", "● answer", "── end history ──"];
+  const harness = createMusterChatHarness({
+    commands,
+    toolsets: ["core"],
+    recentSessions: () => [],
+    agents: async () => [],
+    initialLines,
+  });
+
+  assert.deepEqual(harness.transcript(), initialLines);
+});
+
+test("muster Escape interrupts a running turn and preserves partial transcript", async () => {
+  let finishTurn!: () => void;
+  const running = new Promise<void>((resolve) => { finishTurn = resolve; });
+  let interrupts = 0;
+  const harness = createMusterChatHarness({
+    commands,
+    toolsets: ["core"],
+    recentSessions: () => [],
+    agents: async () => [],
+    onSubmit: async (_text, sink) => {
+      sink.appendLine("● partial");
+      await running;
+      return true;
+    },
+    onInterrupt: () => {
+      interrupts += 1;
+      return true;
+    },
+  });
+
+  harness.type("long turn");
+  const submitted = harness.submit();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  harness.input("\x1b");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  finishTurn();
+  await submitted;
+
+  assert.equal(interrupts, 1);
+  assert.ok(harness.transcript().some((line) => line.includes("● partial")));
+  assert.ok(harness.transcript().some((line) => line.includes("⎋ interrupted")));
 });
 
 test("muster escape handling only clears bare completion triggers", () => {
@@ -472,6 +602,24 @@ test("muster composer recognizes Ctrl+U as a line clear key", () => {
   assert.equal(isClearComposerKey("\x1b"), false);
 });
 
+test("muster chat harness lets a pending one-line decision consume enter before the editor", () => {
+  let accepted = 0;
+  const harness = createMusterChatHarness({
+    commands,
+    toolsets: ["core"],
+    recentSessions: () => [],
+    agents: () => [],
+    onDecisionKey(data) {
+      if (data !== "\r") return false;
+      accepted += 1;
+      return true;
+    },
+  });
+  harness.input("\r");
+  assert.equal(accepted, 1);
+  assert.equal(harness.text(), "");
+});
+
 async function settleAutocomplete(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
@@ -486,3 +634,19 @@ function fakeTui(columns: number, rows: number) {
 function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, "");
 }
+
+test("windowTranscript scrolls in-app for the alternate screen and clamps at the top", () => {
+  const rows = Array.from({ length: 100 }, (_, index) => `row ${index}`);
+  const tail = windowTranscript(rows, 20, 0);
+  assert.equal(tail.visible.at(-1), "row 99", "offset 0 follows the tail");
+  assert.equal(tail.visible.length, 20);
+  const lifted = windowTranscript(rows, 20, 30);
+  assert.equal(lifted.visible.at(-1), "row 69", "offset lifts the viewport off the tail");
+  assert.equal(lifted.clamped, 30);
+  const past = windowTranscript(rows, 20, 500);
+  assert.equal(past.clamped, 80, "clamps to the oldest full viewport");
+  assert.equal(past.visible[0], "row 0");
+  const short = windowTranscript(rows.slice(0, 5), 20, 10);
+  assert.equal(short.clamped, 0, "short transcripts never scroll");
+  assert.equal(short.visible.length, 5);
+});

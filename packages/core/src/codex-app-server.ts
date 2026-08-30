@@ -1,14 +1,15 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
+import { tmpdir } from "node:os";
 
 export interface CodexAppServerRunInput {
   readonly prompt: string;
   readonly cwd: string;
   readonly model?: string;
-  readonly reasoning?: "none" | "low" | "medium" | "high";
+  readonly reasoning?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   /** Native app-server developer contract; sent in protocol, never process arguments. */
   readonly developerInstructions?: string;
   /** Fresh host-verified context for this turn; never made sticky on the provider thread. */
@@ -84,6 +85,7 @@ interface CachedSession {
   lastUsedAt: number;
   pendingRuns: number;
   queue: Promise<void>;
+  idleTimer?: NodeJS.Timeout;
 }
 
 interface CreatedSession {
@@ -117,10 +119,37 @@ const SESSION_CREATIONS = new Map<string, SessionCreation>();
 const ACTIVE_CLIENTS = new Map<CodexAppServerClient, ClientMetadata>();
 const DEFAULT_SESSION_CACHE_SIZE = 8;
 const DEFAULT_SESSION_IDLE_MS = 30 * 60_000;
+const DEFAULT_GATEWAY_SESSION_IDLE_MS = 5 * 60_000;
+
+export function gatewayCodexWarmThreadStatePath(pid: number): string {
+  return pathJoin(tmpdir(), `muster-gateway-codex-${pid}.json`);
+}
+
+export function readGatewayCodexWarmThreadCount(pid: number): number {
+  try {
+    const parsed = JSON.parse(readFileSync(gatewayCodexWarmThreadStatePath(pid), "utf8")) as { pid?: unknown; count?: unknown };
+    return parsed.pid === pid && Number.isSafeInteger(parsed.count) && Number(parsed.count) >= 0 ? Number(parsed.count) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function recordGatewayWarmThreadCount(): void {
+  const count = [...SESSION_CACHE.values()].filter((session) => session.transportOwner?.startsWith("gateway:")).length;
+  const path = gatewayCodexWarmThreadStatePath(process.pid);
+  if (count === 0) {
+    try { unlinkSync(path); } catch { /* already absent */ }
+    return;
+  }
+  writeFileSync(path, `${JSON.stringify({ pid: process.pid, count, updatedAt: new Date().toISOString() })}\n`, { mode: 0o600 });
+}
 
 export function clearCodexAppServerSessions(transportOwner?: string): void {
   for (const [key, session] of SESSION_CACHE) {
-    if (transportOwner === undefined || session.transportOwner === transportOwner) SESSION_CACHE.delete(key);
+    if (transportOwner === undefined || session.transportOwner === transportOwner) {
+      if (session.idleTimer) clearTimeout(session.idleTimer);
+      SESSION_CACHE.delete(key);
+    }
   }
   for (const [key, creation] of SESSION_CREATIONS) {
     if (transportOwner === undefined || creation.transportOwner === transportOwner) SESSION_CREATIONS.delete(key);
@@ -128,12 +157,23 @@ export function clearCodexAppServerSessions(transportOwner?: string): void {
   for (const [client, metadata] of ACTIVE_CLIENTS) {
     if (transportOwner === undefined || metadata.transportOwner === transportOwner) client.close();
   }
+  recordGatewayWarmThreadCount();
+}
+
+/** Interrupt the active native Codex turn owned by this host, if there is one. */
+export async function interruptActiveCodexTurn(transportOwner?: string): Promise<boolean> {
+  const attempts = [...ACTIVE_CLIENTS]
+    .filter(([, metadata]) => transportOwner === undefined || metadata.transportOwner === transportOwner)
+    .map(([client]) => client.interruptActiveTurn());
+  if (!attempts.length) return false;
+  return (await Promise.allSettled(attempts)).some((result) => result.status === "fulfilled" && result.value);
 }
 
 /** Drop only one conversation's warm process; other chats keep their cache state. */
 export function clearCodexAppServerConversation(conversationKey: string, transportOwner?: string): void {
   for (const [key, session] of SESSION_CACHE) {
     if (session.conversationKey !== conversationKey || (transportOwner !== undefined && session.transportOwner !== transportOwner)) continue;
+    if (session.idleTimer) clearTimeout(session.idleTimer);
     SESSION_CACHE.delete(key);
   }
   for (const [key, creation] of SESSION_CREATIONS) {
@@ -145,10 +185,16 @@ export function clearCodexAppServerConversation(conversationKey: string, transpo
     if (metadata.conversationKey !== conversationKey || (transportOwner !== undefined && metadata.transportOwner !== transportOwner)) continue;
     if (!metadata.session || metadata.session.pendingRuns === 0) client.close();
   }
+  recordGatewayWarmThreadCount();
 }
 
 export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<CodexAppServerRunResult> {
   if (!input.prompt.trim()) throw new Error("Codex prompt is required.");
+  if (!(input.configOverrides ?? []).some((value) => /^model_reasoning_summary\s*=/.test(value))) {
+    // Request provider-approved summaries for the transcript without changing
+    // ~/.codex/config.toml. Models that emit no summary remain silent.
+    input = { ...input, configOverrides: [...(input.configOverrides ?? []), 'model_reasoning_summary="detailed"'] };
+  }
   const started = Date.now();
   const keepAlive = (input.keepAlive ?? true) && input.cacheKey !== undefined;
   const instructionsHash = await hashInstructions(input.developerInstructions, input.instructionsFile);
@@ -291,6 +337,8 @@ async function acquireSession(input: {
   pruneSessionCache(Date.now(), key);
   const cached = keepAlive ? SESSION_CACHE.get(key) : undefined;
   if (cached?.client.isAlive() && (!input.input.threadId || cached.threadId === input.input.threadId)) {
+    if (cached.idleTimer) clearTimeout(cached.idleTimer);
+    cached.idleTimer = undefined;
     cached.pendingRuns += 1;
     cached.lastUsedAt = Date.now();
     SESSION_CACHE.delete(key);
@@ -346,7 +394,15 @@ async function createSession(
     configOverrides: input.input.configOverrides,
     sandbox: input.input.sandbox,
     env: input.input.env,
-    onClose: () => ACTIVE_CLIENTS.delete(client),
+    onClose: () => {
+      const metadata = ACTIVE_CLIENTS.get(client);
+      if (metadata?.session && SESSION_CACHE.get(metadata.session.cacheKey) === metadata.session) {
+        if (metadata.session.idleTimer) clearTimeout(metadata.session.idleTimer);
+        SESSION_CACHE.delete(metadata.session.cacheKey);
+      }
+      ACTIVE_CLIENTS.delete(client);
+      recordGatewayWarmThreadCount();
+    },
   });
   creation.client = client;
   const metadata: ClientMetadata = { conversationKey: input.input.cacheKey, transportOwner: input.input.transportOwner };
@@ -375,7 +431,10 @@ async function createSession(
       queue: Promise.resolve(),
     };
     metadata.session = session;
-    if (input.keepAlive && makeSessionCacheRoom(input.key)) SESSION_CACHE.set(input.key, session);
+    if (input.keepAlive && makeSessionCacheRoom(input.key)) {
+      SESSION_CACHE.set(input.key, session);
+      recordGatewayWarmThreadCount();
+    }
     return { session, startupMs, threadOpenMs, threadOpenState: input.input.threadId ? "resumed" : "started" };
   } catch (error) {
     client.close();
@@ -398,6 +457,7 @@ async function runExclusive<T>(session: CachedSession, task: (queueMs: number) =
     session.lastUsedAt = Date.now();
     release();
     if (session.pendingRuns === 0 && SESSION_CACHE.get(session.cacheKey) !== session) session.client.close();
+    else if (session.pendingRuns === 0) scheduleIdleClose(session);
   }
 }
 
@@ -424,7 +484,7 @@ function appServerScopeKey(input: CodexAppServerRunInput, command: string, conve
 
 export function buildCodexAppServerArgs(input: {
   readonly model?: string;
-  readonly reasoning?: "none" | "low" | "medium" | "high";
+  readonly reasoning?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   readonly networkAccess?: boolean;
   readonly configOverrides?: readonly string[];
 }): string[] {
@@ -438,13 +498,34 @@ export function buildCodexAppServerArgs(input: {
 
 function closeCachedSession(key: string, session: CachedSession): void {
   if (session.pendingRuns > 0) return;
+  if (session.idleTimer) clearTimeout(session.idleTimer);
   SESSION_CACHE.delete(key);
   session.client.close();
+  recordGatewayWarmThreadCount();
 }
 
 function invalidateCachedSession(key: string, session: CachedSession): void {
+  if (session.idleTimer) clearTimeout(session.idleTimer);
   SESSION_CACHE.delete(key);
   if (session.pendingRuns === 0) session.client.close();
+  recordGatewayWarmThreadCount();
+}
+
+function sessionIdleMs(session: Pick<CachedSession, "transportOwner">): number {
+  return session.transportOwner?.startsWith("gateway:")
+    ? positiveIntegerEnv("MUSTER_GATEWAY_CODEX_IDLE_MS", DEFAULT_GATEWAY_SESSION_IDLE_MS, 1_000, 24 * 60 * 60_000)
+    : positiveIntegerEnv("MUSTER_NATIVE_SESSION_IDLE_MS", DEFAULT_SESSION_IDLE_MS, 1_000, 24 * 60 * 60_000);
+}
+
+function scheduleIdleClose(session: CachedSession): void {
+  if (session.idleTimer) clearTimeout(session.idleTimer);
+  const idleMs = sessionIdleMs(session);
+  session.idleTimer = setTimeout(() => {
+    if (session.pendingRuns === 0 && Date.now() - session.lastUsedAt >= idleMs && SESSION_CACHE.get(session.cacheKey) === session) {
+      closeCachedSession(session.cacheKey, session);
+    }
+  }, idleMs);
+  session.idleTimer.unref?.();
 }
 
 function closeSupersededSessions(scopeKey: string, protectedKey: string): void {
@@ -464,11 +545,10 @@ function makeSessionCacheRoom(protectedKey: string): boolean {
 }
 
 function pruneSessionCache(now: number, protectedKey: string): void {
-  const idleMs = positiveIntegerEnv("MUSTER_NATIVE_SESSION_IDLE_MS", DEFAULT_SESSION_IDLE_MS, 1_000, 24 * 60 * 60_000);
   for (const [key, session] of SESSION_CACHE) {
     if (key === protectedKey) continue;
     if (!session.client.isAlive()) invalidateCachedSession(key, session);
-    else if (now - session.lastUsedAt >= idleMs) closeCachedSession(key, session);
+    else if (now - session.lastUsedAt >= sessionIdleMs(session)) closeCachedSession(key, session);
   }
   makeSessionCacheRoom(protectedKey);
 }
@@ -490,13 +570,14 @@ class CodexAppServerClient {
   private readonly notifications: Record<string, unknown>[] = [];
   private readonly waiters: Array<(message: Record<string, unknown>) => void> = [];
   private readonly stderrLines: string[] = [];
+  private activeTurn?: { readonly threadId: string; readonly turnId: string };
   private closed = false;
 
   constructor(input: {
     readonly command: string;
     readonly cwd: string;
     readonly model?: string;
-    readonly reasoning?: "none" | "low" | "medium" | "high";
+    readonly reasoning?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
     readonly developerInstructions?: string;
     readonly sandbox?: "read-only" | "workspace-write" | "danger-full-access";
     readonly networkAccess?: boolean;
@@ -571,6 +652,13 @@ class CodexAppServerClient {
     return resumedId;
   }
 
+  async interruptActiveTurn(): Promise<boolean> {
+    const active = this.activeTurn;
+    if (!active || !this.isAlive()) return false;
+    await this.request("turn/interrupt", active, 15_000);
+    return true;
+  }
+
   async runTurn(input: {
     readonly threadId: string;
     readonly prompt: string;
@@ -604,62 +692,78 @@ class CodexAppServerClient {
         : {}),
     }, 15_000);
     const turnId = stringValue(asRecord(turnStart.turn).id);
+    if (turnId) this.activeTurn = { threadId: input.threadId, turnId };
     let finalMessage = "";
     let firstDeltaMs: number | undefined;
     let tokenUsage: CodexAppServerRunResult["tokenUsage"] | undefined;
 
-    while (Date.now() - started < input.timeoutMs) {
-      if (!this.isAlive()) throw new Error(this.formatError("codex app-server exited during turn"));
-      const message = await this.takeNotification(250);
-      if (!message) continue;
-      const method = stringValue(message.method) ?? "";
-      const params = asRecord(message.params);
-      if (method.startsWith("item/")) input.onActivity?.();
-      if (method.endsWith("/request")) {
-        this.respond(message.id, { decision: "decline", action: "decline", content: null, _meta: null });
-        continue;
-      }
-      if (method === "item/agentMessage/delta") {
-        const delta = stringValue(params.delta) ?? "";
-        if (delta) {
-          firstDeltaMs ??= Date.now() - started;
-          input.onDelta?.(delta);
+    // timeoutMs is an IDLE budget, not a wall-clock one: a turn that is still
+    // sending notifications must never be killed mid-stream (a 7-word prompt
+    // over a 45-turn resumed thread legitimately outlives a "simple" budget).
+    // A hung provider still dies after timeoutMs of silence, and an absolute
+    // ceiling guards against a notification-spamming runaway turn.
+    const absoluteCeilingMs = Math.max(input.timeoutMs * 8, 15 * 60_000);
+    let lastNotificationAt = Date.now();
+    try {
+      while (Date.now() - lastNotificationAt < input.timeoutMs) {
+        if (Date.now() - started >= absoluteCeilingMs) {
+          throw new Error(this.formatError(`codex app-server turn exceeded the absolute ceiling of ${absoluteCeilingMs}ms`));
         }
-        continue;
-      }
-      if (method === "item/reasoning/summaryTextDelta") {
-        const delta = stringValue(params.delta) ?? "";
-        if (delta) input.onReasoningDelta?.(delta);
-        continue;
-      }
-      if (method === "item/completed") {
-        const item = asRecord(params.item);
-        if (item.type === "agentMessage") {
-          finalMessage = stringValue(item.text) ?? finalMessage;
+        if (!this.isAlive()) throw new Error(this.formatError("codex app-server exited during turn"));
+        const message = await this.takeNotification(250);
+        if (!message) continue;
+        lastNotificationAt = Date.now();
+        const method = stringValue(message.method) ?? "";
+        const params = asRecord(message.params);
+        if (method.startsWith("item/")) input.onActivity?.();
+        if (method.endsWith("/request")) {
+          this.respond(message.id, { decision: "decline", action: "decline", content: null, _meta: null });
+          continue;
         }
-        continue;
-      }
-      if (method === "thread/tokenUsage/updated") {
-        const last = asRecord(asRecord(params.tokenUsage).last);
-        tokenUsage = {
-          inputTokens: numberValue(last.inputTokens),
-          cachedInputTokens: numberValue(last.cachedInputTokens),
-          outputTokens: numberValue(last.outputTokens),
-        };
-        continue;
-      }
-      if (method === "turn/completed") {
-        const turn = asRecord(params.turn);
-        const error = asRecord(turn.error);
-        const status = stringValue(turn.status);
-        if (status && status !== "completed" && status !== "interrupted") {
-          return { finalMessage, firstDeltaMs, errorMessage: stringValue(error.message) ?? `codex turn ended with status ${status}`, tokenUsage };
+        if (method === "item/agentMessage/delta") {
+          const delta = stringValue(params.delta) ?? "";
+          if (delta) {
+            firstDeltaMs ??= Date.now() - started;
+            input.onDelta?.(delta);
+          }
+          continue;
         }
-        if (turnId && stringValue(turn.id) && stringValue(turn.id) !== turnId) continue;
-        return { finalMessage, firstDeltaMs, tokenUsage };
+        if (method === "item/reasoning/summaryTextDelta") {
+          const delta = stringValue(params.delta) ?? "";
+          if (delta) input.onReasoningDelta?.(delta);
+          continue;
+        }
+        if (method === "item/completed") {
+          const item = asRecord(params.item);
+          if (item.type === "agentMessage") {
+            finalMessage = stringValue(item.text) ?? finalMessage;
+          }
+          continue;
+        }
+        if (method === "thread/tokenUsage/updated") {
+          const last = asRecord(asRecord(params.tokenUsage).last);
+          tokenUsage = {
+            inputTokens: numberValue(last.inputTokens),
+            cachedInputTokens: numberValue(last.cachedInputTokens),
+            outputTokens: numberValue(last.outputTokens),
+          };
+          continue;
+        }
+        if (method === "turn/completed") {
+          const turn = asRecord(params.turn);
+          const error = asRecord(turn.error);
+          const status = stringValue(turn.status);
+          if (status && status !== "completed" && status !== "interrupted") {
+            return { finalMessage, firstDeltaMs, errorMessage: stringValue(error.message) ?? `codex turn ended with status ${status}`, tokenUsage };
+          }
+          if (turnId && stringValue(turn.id) && stringValue(turn.id) !== turnId) continue;
+          return { finalMessage, firstDeltaMs, tokenUsage };
+        }
       }
+      throw new Error(this.formatError(`codex app-server turn timed out: silent for ${input.timeoutMs}ms with no notifications`));
+    } finally {
+      if (this.activeTurn?.threadId === input.threadId && this.activeTurn.turnId === turnId) this.activeTurn = undefined;
     }
-    throw new Error(this.formatError(`codex app-server turn timed out after ${input.timeoutMs}ms`));
   }
 
   private request(method: string, params: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {

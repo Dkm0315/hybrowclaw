@@ -1,0 +1,26 @@
+{
+  "scenario_id": "authorized-customization-repair",
+  "title": "Repair a customization under role-bound approval",
+  "prompt": "why is this not saving? drawing B is already approved. please check and fix it",
+  "started_at": "2026-08-16T17:03:55.774Z",
+  "finished_at": "2026-08-16T17:06:33.479Z",
+  "browser": {
+    "base_url": "https://mono-lamb-effects-watches.trycloudflare.com",
+    "route": "/desk/control-plan",
+    "viewport": {
+      "width": 1440,
+      "height": 900
+    }
+  },
+  "visible_evidence": null,
+  "artifacts": {
+    "video": "recording.webm",
+    "screenshot": "final.png",
+    "trace": "trace.zip",
+    "video_bytes": 10338759,
+    "screenshot_bytes": 249293,
+    "trace_bytes": 32827308
+  },
+  "result": "fail",
+  "failure": "locator.click: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('[data-muster-approve], [data-attended-approve], [data-attended-save], [data-lineage-approve], .modal.show .btn-primary').first()\u001b[22m\n\u001b[2m    - locator resolved to <button type=\"button\" data-repair-apply=\"\" data-muster-approve=\"\" class=\"btn btn-sm btn-primary\">Approve exact repair</button>\u001b[22m\n\u001b[2m  - attempting click action\u001b[22m\n\u001b[2m    2 × waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m      - element is visible, enabled and stable\u001b[22m\n\u001b[2m      - scrolling into view if needed\u001b[22m\n\u001b[2m      - done scrolling\u001b[22m\n\u001b[2m      - <div class=\"control-input\">…</div> from <div class=\"main-section\">…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m    - retrying click action\u001b[22m\n\u001b[2m    - waiting 20ms\u001b[22m\n\u001b[2m    2 × waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m      - element is visible, enabled and stable\u001b[22m\n\u001b[2m      - scrolling into view if needed\u001b[22m\n\u001b[2m      - done scrolling\u001b[22m\n\u001b[2m      - <div class=\"control-input\">…</div> from <div class=\"main-section\">…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m    - retrying click action\u001b[22m\n\u001b[2m      - waiting 100ms\u001b[22m\n\u001b[2m    55 × waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m       - element is visible, enabled and stable\u001b[22m\n\u001b[2m       - scrolling into view if needed\u001b[22m\n\u001b[2m       - done scrolling\u001b[22m\n\u001b[2m       - <div class=\"control-input\">…</div> from <div class=\"main-section\">…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m     - retrying click action\u001b[22m\n\u001b[2m       - waiting 500ms\u001b[22m\n\n    at humanClick (/Users/dhairya/Documents/Codex/2026-04-23-openclaw-docs-live-users-pavankumarmarwaha-codex/muster/scripts/evidence/vinman-live-recorder.mjs:129:16)\n    at async captureVisibleScenario (/Users/dhairya/Documents/Codex/2026-04-23-openclaw-docs-live-users-pavankumarmarwaha-codex/muster/scripts/evidence/vinman-live-recorder.mjs:304:9)\n    at async recordScenario (/Users/dhairya/Documents/Codex/2026-04-23-openclaw-docs-live-users-pavankumarmarwaha-codex/muster/scripts/evidence/vinman-live-recorder.mjs:425:19)\n    at async main (/Users/dhairya/Documents/Codex/2026-04-23-openclaw-docs-live-users-pavankumarmarwaha-codex/muster/scripts/evidence/vinman-live-recorder.mjs:494:18)"
+}

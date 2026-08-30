@@ -27,6 +27,38 @@
   <main>
     <section class="hero"><div class="hero-inner"><p class="kicker hero-step">MCP · tools · OAuth</p><h1 class="hero-step">Govern MCP tools before agents call them.</h1><p class="sub hero-step">Muster treats MCP as a capability surface: installable servers, setup guidance, OAuth hints, include/exclude policy, result caps, circuit breakers, and token-ledger evidence.</p><div class="hero-actions hero-step"><a class="btn-cta" href="/docs.html#capability-packs">See MCP docs</a><a class="btn-ghost" href="https://github.com/Dkm0315/muster" rel="noopener">GitHub -></a></div></div></section>
     <section class="band" data-reveal><p class="sec-kicker reveal-child">MCP controls</p><h2 class="reveal-child">Useful tools still need boundaries.</h2><div class="capability-board reveal-child"><article class="capability-panel"><span class="cap-label">setup</span><h3>Install and auth checks</h3><p>Expose setup commands and OAuth steps inside the CLI instead of assuming every user knows how to wire a server.</p></article><article class="capability-panel"><span class="cap-label">policy</span><h3>Include/exclude rules</h3><p>Keep tool access deliberate with configured allowlists, result-size limits, and circuit breakers.</p></article><article class="capability-panel"><span class="cap-label">evidence</span><h3>Memory and token receipts</h3><p>MCP results flow through the same scoped memory and token ledger as normal agent turns.</p></article><article class="capability-panel"><span class="cap-label">examples</span><h3>Everyday MCPs</h3><p>GitHub, Notion, Google Drive, Postgres, browser, web search, and custom stdio/http servers fit this model.</p></article></div></section>
+
+    <section class="band band-alt" data-reveal>
+      <p class="sec-kicker reveal-child">In practice</p>
+      <h2 class="reveal-child">What goes wrong with MCP, and what the policy layer is for.</h2>
+      <div class="prose reveal-child">
+        <p>MCP solved the plumbing problem. Any server can now expose tools to any client without a bespoke integration, which is why MCP servers appeared faster than anyone's ability to review them. The problems that replaced the plumbing problem are operational, and they show up in a predictable order.</p>
+        <h3>Setup is where most MCP deployments actually fail</h3>
+        <p>The first failure is not dramatic. A server needs an API key, an OAuth grant, or a config path, the person wiring it up does not have one of those, and the tool silently returns errors that the model interprets as "this data does not exist." Muster's answer is to make setup a first-class part of the capability description: a server declares what it needs, the CLI surfaces the setup commands and OAuth steps, and a readiness check tells you which of your configured servers are actually usable before a run depends on one.</p>
+        <h3>Result size is a cost problem disguised as a correctness problem</h3>
+        <p>The second failure is expensive. An MCP tool returns a 400KB JSON document, it goes into the context window, and it stays there for every subsequent turn of the conversation. Nobody notices until the invoice arrives, because the waste is spread across hundreds of turns rather than concentrated in one bad call. Result caps bound the single response; the token ledger makes the accumulated cost visible, including a replay-waste flag when a run resends far more history than the task needed. Muster's benchmark measures the general version of this effect: 875.8k tokens naive versus 355.2k across five scenarios and 170 turns, a 59.4% reduction, deterministic and with no model calls involved.</p>
+        <h3>Allowlists beat instructions</h3>
+        <p>The third failure is a governance one. Telling a model in its prompt not to use a destructive tool is a request, not a control. Include and exclude rules decide which tools exist from the agent's point of view at all, which is a different kind of guarantee. Circuit breakers cover the remaining case: a server that has started failing or returning garbage should stop being called rather than being retried into a rate limit.</p>
+        <h3>The results are evidence, not just output</h3>
+        <p>MCP results flow through the same scoped memory lanes and the same token ledger as any other turn, which means a tool call is attributable after the fact: which scope it ran in, what it cost, and what it returned. If the run also touched a repository, the file changes are derived from git and the filesystem rather than from the agent's report &mdash; a distinction that matters more than it sounds, since a live measurement against Codex found the self-reported patch channel firing zero times across five runs while the edits landed on disk.</p>
+        <p>Practically, this covers the servers most teams reach for first: GitHub, Notion, Google Drive, Postgres, browser control, web search, and whatever custom stdio or HTTP server your own systems expose.</p>
+        <p class="proof-link"><a href="/guide-mcp-agent-harness.html">Guide: MCP with token visibility -&gt;</a> <a href="/live-inline-diff.html">How file changes are observed -&gt;</a> <a href="/docs.html#capability-packs">Capability pack docs -&gt;</a></p>
+      </div>
+    </section>
   </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>&copy; <span id="year">2026</span> Muster &mdash; open source, MIT</span>
+      <span class="footer-sep">&middot;</span>
+      <a href="https://github.com/Dkm0315/muster" rel="noopener">GitHub</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/docs.html">Docs</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/live-inline-diff.html">Audit trail</a>
+      <span class="footer-sep">&middot;</span>
+      <a href="/muster-vs-openclaw.html">Comparisons</a>
+    </div>
+  </footer>
 </body>
 </html>

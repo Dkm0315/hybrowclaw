@@ -1,0 +1,8 @@
+MUSTER · 5.6 Sol · Medium · kb-pty (0 here · 0 total) · /private/tmp/muster-kb-pty…
+> /tasks board
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ ›                                                                            │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+PTY: esc returned task view → board; esc returned board → the intact chat.
+SGR mouse mode was disabled on board exit.

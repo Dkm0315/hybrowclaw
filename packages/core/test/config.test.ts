@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { addCodexCliProvider, addOpenAICompatibleProvider, ensureDefaultConfig, loadConfig, setRuntimeProvider } from "../src/index.js";
+import { addCodexCliProvider, addOpenAICompatibleProvider, DEFAULT_CODEX_MODEL, ensureDefaultConfig, loadConfig, setRuntimeProvider } from "../src/index.js";
 
 test("default config uses Codex CLI and does not seed a local model route", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "muster-config-"));
@@ -11,10 +11,12 @@ test("default config uses Codex CLI and does not seed a local model route", asyn
 
   const config = await loadConfig(cwd);
   assert.equal(config.providers.codex?.kind, "codex-cli");
-  assert.equal(config.providers.codex?.defaultModel, "gpt-5.5");
+  assert.equal(config.providers.codex?.defaultModel, DEFAULT_CODEX_MODEL);
+  assert.equal(DEFAULT_CODEX_MODEL, "gpt-5.6-sol", "the seeded model is the one the local codex CLI runs and the one modelHintsForProvider offers");
+  assert.equal(config.memory?.policy, "auto", "a fresh profile writes memory freely until onboarding says otherwise");
   assert.equal(config.runtimes.native?.provider, "codex");
   assert.equal(config.runtimes.native?.routes.simple_qa?.provider, "codex");
-  assert.equal(config.runtimes.native?.routes.simple_qa?.model, "gpt-5.5");
+  assert.equal(config.runtimes.native?.routes.simple_qa?.model, DEFAULT_CODEX_MODEL);
   assert.equal(config.routing.preferLocalForSensitive, false);
   assert.equal(config.providers.local, undefined);
   assert.doesNotMatch(JSON.stringify(config), /"local"/);
@@ -62,7 +64,7 @@ test("legacy local model configs are normalized back to Codex on load", async ()
   assert.equal(config.providers.codex?.kind, "codex-cli");
   assert.equal(config.runtimes.native.provider, "codex");
   assert.equal(config.runtimes.native.routes.simple_qa.provider, "codex");
-  assert.equal(config.runtimes.native.routes.simple_qa.model, "gpt-5.5");
+  assert.equal(config.runtimes.native.routes.simple_qa.model, DEFAULT_CODEX_MODEL);
   assert.equal(config.routing.preferLocalForSensitive, false);
 });
 

@@ -1,6 +1,8 @@
 import {
   Editor,
   ProcessTerminal,
+  SelectList,
+  SettingsList,
   TUI,
   matchesKey,
   truncateToWidth,
@@ -9,7 +11,31 @@ import {
   type AutocompleteProvider,
   type Component,
   type EditorTheme,
+  type OverlayHandle,
+  type SelectItem,
+  type SelectListTheme,
+  type SettingsListTheme,
+  type Terminal,
 } from "@earendil-works/pi-tui";
+import { appendFileSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { createCoalescer } from "@musterhq/core";
+import type { BoardView, MessageRow } from "@musterhq/core";
+import { effortDisplayLabel, modelDisplayLabel, modelProvider, type ComposerPickerSelection, type ComposerPickerState, type EffortValue } from "./model-catalog.js";
+import { decodeCapabilitySelection, isCapabilityConfirmationText } from "./capabilities-overlay.js";
+import { LiveFileOverlay, LiveFileTurnAccumulator, renderLiveFilePlain } from "./live-file-view.js";
+import { BoardScreen, parseSgrMouseSequence, stripMouseSequences, type SgrMouseEvent } from "./board-screen.js";
+import { openFileWithEditorGuard, TaskView } from "./task-view.js";
+import {
+  bandUserRow,
+  missionStatusGlyph as sharedMissionStatusGlyph,
+  renderChip,
+  renderActionBullet,
+  renderMissionStatusGlyph,
+  renderProse,
+  renderReasoningLine,
+} from "./prose-renderer.js";
 
 export interface MusterChatCommand {
   readonly name: string;
@@ -33,6 +59,7 @@ export interface MusterAutocompleteOptions {
   readonly plugins?: () => readonly PickerOption[] | Promise<readonly PickerOption[]>;
   readonly pluginReuseProviders?: () => readonly PickerOption[] | Promise<readonly PickerOption[]>;
   readonly mcpServers?: () => readonly PickerOption[] | Promise<readonly PickerOption[]>;
+  readonly mcpTargets?: () => readonly PickerOption[] | Promise<readonly PickerOption[]>;
   readonly integrations?: () => readonly PickerOption[] | Promise<readonly PickerOption[]>;
   readonly integrationWorkflows?: () => readonly PickerOption[] | Promise<readonly PickerOption[]>;
   readonly agents: () => readonly string[] | Promise<readonly string[]>;
@@ -53,8 +80,10 @@ export type MusterCompletionKind =
   | "plugin"
   | "plugin-reuse-provider"
   | "mcp"
+  | "mcp-target"
   | "integration"
   | "integration-workflow"
+  | "reasoning"
   | "agent";
 
 export interface MusterCompletionRequest {
@@ -81,12 +110,43 @@ export interface MusterChatSink {
   setStatus(status: string): void;
   clearStatus(): void;
   openPicker(command: string): void;
+  selectComposerSetting(state: ComposerPickerState): Promise<ComposerPickerSelection | undefined>;
+  /** Arrow-driven list anchored at the composer; resolves the picked value, undefined on Esc. */
+  selectFromList(title: string, options: readonly PickerOption[]): Promise<string | undefined>;
+  /** Replace the Canvas data source at the start of a model turn. */
+  setLiveDiffTurn(turn: LiveFileTurnAccumulator): void;
+  /** Repaint an open Canvas after an observer patch. */
+  updateLiveDiff(turn: LiveFileTurnAccumulator): void;
+  /** Ctrl+D and /diff share this exact toggle. */
+  toggleLiveDiff(): void;
+  /** Replace chat with the full-screen task board. Returns false when no board is available. */
+  openBoard(force?: boolean): Promise<boolean>;
+}
+
+export interface BoardModeController {
+  readonly cwd: string;
+  loadView(): BoardView | Promise<BoardView>;
+  loadMessages(sessionId: string): readonly MessageRow[] | Promise<readonly MessageRow[]>;
+  diff(taskId: string): LiveFileTurnAccumulator;
+  comment(taskId: string, text: string, anchor?: { readonly path: string; readonly line: number }): void | Promise<void>;
+  approve(taskId: string): void | Promise<void>;
+  retry(taskId: string): void | Promise<void>;
+  cancel(taskId: string): void | Promise<void>;
 }
 
 export interface RunMusterChatTuiOptions extends MusterAutocompleteOptions {
   readonly headerLines?: readonly string[];
+  /** Transcript rows present before the first frame, including resumed history. */
+  readonly initialLines?: readonly string[];
   readonly statusLine: () => string | Promise<string>;
   readonly onSubmit: (text: string, sink: MusterChatSink) => Promise<boolean>;
+  /** Interrupt the provider turn currently owned by onSubmit. */
+  readonly onInterrupt?: () => boolean | Promise<boolean>;
+  /** Consume a raw key while index.ts owns a one-line pending decision. */
+  readonly onDecisionKey?: (data: string, sink: MusterChatSink) => boolean;
+  /** Printed to stdout after teardown when the session exits via /exit. */
+  readonly farewell?: string;
+  readonly board?: BoardModeController;
 }
 
 export interface MusterChatHarness {
@@ -97,21 +157,630 @@ export interface MusterChatHarness {
   text(): string;
   transcript(): readonly string[];
   openPicker(command: string): void;
+  /** True once an exit command (/exit, /quit, /q) has been routed. */
+  exited(): boolean;
+  /** The single status row the spinner owns; never part of the transcript. */
+  status(): string;
 }
-
-const WORKING_FRAMES = ["|", "/", "-", "\\"] as const;
 
 export function formatWorkingIndicator(agentId: string | undefined, frame: number): string {
-  const label = agentId ? `@${agentId} working` : "working";
-  return `${WORKING_FRAMES[Math.abs(frame) % WORKING_FRAMES.length]} ${label}`;
+  // A verb, alive — never a bare clock. Rotates slowly so long waits breathe.
+  const verb = WORKING_VERBS[Math.floor(Math.abs(frame) / 16) % WORKING_VERBS.length]!;
+  const label = agentId ? `@${agentId} ${verb}` : verb;
+  return `${STATUS_SPINNER_FRAMES[Math.abs(frame) % STATUS_SPINNER_FRAMES.length]} ${label}`;
 }
 
+const WORKING_VERBS = ["Thinking", "Reading", "Weighing", "Connecting", "Shaping", "Composing"] as const;
+
 const RESET = "\x1b[0m";
-const ACCENT_RGB = "41;211;255";
-const HIGHLIGHT_RGB = "104;245;168";
-const MUTED_RGB = "142;161;181";
+// Claude Code-calibre restraint: ONE warm coral accent (Anthropic book-cloth
+// tone), warm amber for highlights, warm neutral grays for chrome. The old
+// cyan/lime arcade palette was the reported "old blue" problem — cold colors
+// belong nowhere in the chat surface.
+const ACCENT_RGB = "217;119;87";
+const HIGHLIGHT_RGB = "224;175;104";
+const MUTED_RGB = "148;144;140";
 const RED_RGB = "255;107;122";
-const SELECTION_BG_RGB = "41;211;255";
+const SELECTION_BG_RGB = "48;45;43";
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * TUI render model (docs/PRODUCT_MODES.md, "Parent-model streaming").
+ *
+ * The transcript renders TYPED EVENTS only. Anything the engine happens to
+ * print — a run-record JSON line, a memory-recall diagnostic, a spinner
+ * repaint — is classified before it can reach the screen: chips go to the
+ * transcript, raw diagnostics go to a session log, spinner frames go to the
+ * single status row. `routeEngineLine` is the one gate, so a new print site
+ * anywhere in the engine cannot re-open defect #1 or #2.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+/** The subset of a `TokenRecord` (core `tokens.ts`) the cost chip renders. */
+export interface CostChipRecord {
+  readonly runId?: string;
+  readonly provider?: string;
+  readonly model?: string;
+  readonly inputTokens?: number;
+  readonly cachedInputTokens?: number;
+  readonly outputTokens?: number;
+  readonly estimated?: boolean;
+  readonly costUsd?: number;
+  readonly durationMs?: number;
+}
+
+export type EngineLineRoute =
+  /** Model/tool content: paint it. */
+  | { readonly kind: "transcript"; readonly line: string }
+  /** A spinner frame: it belongs to the status row, never to scrollback. */
+  | { readonly kind: "status"; readonly line: string }
+  /** A run record: transcript gets `chip`, the log file gets `log`. */
+  | { readonly kind: "cost"; readonly chip: string; readonly log: string; readonly runId?: string }
+  /** Debug output: `chip` (when present) is the only thing a human sees. */
+  | { readonly kind: "diagnostic"; readonly chip?: string; readonly log: string };
+
+/**
+ * Classify one engine-emitted line for a TTY session. Non-TTY callers must NOT
+ * use this: scripts keep the raw JSON/diagnostic lines they parse today.
+ */
+export function routeEngineLine(line: string): EngineLineRoute {
+  const clean = stripAnsi(line);
+  const trimmed = clean.trim();
+  if (isWorkingStatusLine(trimmed)) return { kind: "status", line: trimmed };
+  const record = parseRunRecordLine(trimmed);
+  if (record) return { kind: "cost", chip: formatCostChip(record), log: trimmed, runId: record.runId };
+  if (trimmed.startsWith("memory backend=")) {
+    return { kind: "diagnostic", chip: formatRecallChip(trimmed), log: trimmed };
+  }
+  if (trimmed.startsWith("timings total=")) {
+    return { kind: "diagnostic", chip: formatTimingsChip(trimmed), log: trimmed };
+  }
+  if (isRecallReceiptDetailLine(trimmed)) return { kind: "diagnostic", log: trimmed };
+  // Provider stderr fragments (Rust tracing lines, module paths) belong in the
+  // session log, never the transcript — a truncated "codex_core::session: faile"
+  // above an error card was observed live and reads as breakage.
+  if (/^\d{4}-\d{2}-\d{2}T[\d:.]+Z?\s+(ERROR|WARN|INFO|DEBUG)\b/.test(trimmed) || /^[a-z_]+(?:::[a-z_]+)+:/.test(trimmed)) {
+    return { kind: "diagnostic", log: trimmed };
+  }
+  return { kind: "transcript", line };
+}
+
+/** A spinner frame — `✻ Verb` / `✻ @agent Verb` (legacy `working` included). */
+const WORKING_STATUS_RE = new RegExp(
+  `^(?:✻|[|/\\\\-])\\s+(?:@[A-Za-z0-9_.:-]+\\s+)?(?:working|${WORKING_VERBS.join("|")})$`,
+);
+export function isWorkingStatusLine(line: string): boolean {
+  return WORKING_STATUS_RE.test(stripAnsi(line).trim());
+}
+
+function isRecallReceiptDetailLine(line: string): boolean {
+  return /^\S+\s+score=\d+(?:\.\d+)?\s+\S/.test(line);
+}
+
+/**
+ * Parse a raw run-record JSON line. Deliberately strict: a line only counts as
+ * a run record when it carries a runId AND both token counts, so a model that
+ * legitimately answers with JSON is never swallowed.
+ */
+export function parseRunRecordLine(line: string): CostChipRecord | undefined {
+  const trimmed = stripAnsi(line).trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.runId !== "string") return undefined;
+  if (typeof record.inputTokens !== "number" || typeof record.outputTokens !== "number") return undefined;
+  return record as CostChipRecord;
+}
+
+/** `▸ gpt-5.6 · 25.1k in · 3.0k cached · 512 out · $0.0337 · 12.4s` */
+export function formatCostChip(record: CostChipRecord): string {
+  const estimated = record.estimated ? "~" : "";
+  const parts: string[] = [record.model ?? record.provider ?? "model"];
+  if (typeof record.inputTokens === "number") parts.push(`${compactCount(record.inputTokens)}${estimated} in`);
+  if (typeof record.cachedInputTokens === "number" && record.cachedInputTokens > 0) {
+    parts.push(`${compactCount(record.cachedInputTokens)} cached`);
+  }
+  if (typeof record.outputTokens === "number") parts.push(`${compactCount(record.outputTokens)}${estimated} out`);
+  if (typeof record.costUsd === "number") parts.push(`$${record.costUsd.toFixed(4)}`);
+  if (typeof record.durationMs === "number") parts.push(formatDuration(record.durationMs));
+  return renderChip(`▸ ${parts.join(" · ")}`);
+}
+
+/** `memory backend=… recalled=2 …` → `▸ recalled 2 memories`; nothing when 0. */
+export function formatRecallChip(line: string): string | undefined {
+  const recalled = Number(stripAnsi(line).match(/\brecalled=(\d+)/)?.[1] ?? Number.NaN);
+  if (!Number.isFinite(recalled) || recalled <= 0) return undefined;
+  return renderChip(`▸ recalled ${recalled} ${recalled === 1 ? "memory" : "memories"}`);
+}
+
+/** `timings total=8335ms provider=8259ms …` → `▸ 8.3s total · 8.3s provider`. */
+export function formatTimingsChip(line: string): string | undefined {
+  const clean = stripAnsi(line);
+  const total = Number(clean.match(/\btotal=(\d+)ms/)?.[1] ?? Number.NaN);
+  if (!Number.isFinite(total)) return undefined;
+  const parts = [`${formatDuration(total)} total`];
+  const provider = Number(clean.match(/\bprovider=(\d+)ms/)?.[1] ?? Number.NaN);
+  if (Number.isFinite(provider)) parts.push(`${formatDuration(provider)} provider`);
+  const firstToken = Number(clean.match(/\bfirst_token_ms=(\d+)/)?.[1] ?? Number.NaN);
+  if (Number.isFinite(firstToken)) parts.push(`first token ${formatDuration(firstToken)}`);
+  return renderChip(`▸ ${parts.join(" · ")}`);
+}
+
+export function compactCount(value: number): string {
+  if (!Number.isFinite(value)) return "0";
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (abs >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return String(Math.round(value));
+}
+
+export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "0ms";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const minutes = Math.floor(ms / 60_000);
+  const seconds = Math.round((ms % 60_000) / 1000);
+  return `${minutes}m ${seconds}s`;
+}
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * TRANSCRIPT IDIOM (owner verdict 2026-08-27: "functional but noisy").
+ *
+ * The transcript is styling and hierarchy ONLY — every fact that reached the
+ * screen before still reaches it. What changes is the frame:
+ *
+ *   > restyle the transcript                     ← user turn, dim "> " gutter
+ *
+ *   ● Reading the gateway config to find where   ← assistant prose, one bullet
+ *     the ingress spool is flushed.                per block, continuations
+ *                                                  align under the bullet
+ *   ⏺ Edit(server.js)                            ← an action is a headline
+ *     ⎿ +12 −2 · 86ms · receipt d3b9c1a2…        ← its result is a dim elbow
+ *       @@ -1,4 +1,5 @@                            with the detail indented
+ *       … +7 lines
+ *
+ * No box frames: whitespace and gutters do the separating. The composer is a
+ * bare `❯ ` prompt; only transient suggestion overlays keep their own frame.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+/** The dim gutter a user turn wears in scrollback (the composer keeps "›"). */
+export const USER_PREFIX = "> ";
+/** One bullet per assistant message block; continuations align beneath it. */
+export const ASSISTANT_BULLET = "●";
+/** An action headline: `⏺ Edit(server.js)`. */
+export const TOOL_BULLET = "⏺";
+/** The result elbow hanging under an action. */
+export const RESULT_ELBOW = "⎿";
+/** Result detail beyond this many rows collapses to a "… +n lines" count. */
+export const TOOL_RESULT_MAX_LINES = 6;
+/** Spinner frames for the single status row (never the transcript). */
+export const STATUS_SPINNER_FRAMES = ["✻"] as const;
+
+/** `> deploy the limiter` — the gutter is dim, the user's own words are not. */
+export function formatUserLine(text: string): string {
+  return `${dim(">")} ${text}`;
+}
+
+/**
+ * True for a user turn in scrollback. Assistant prose can legitimately contain
+ * a markdown blockquote, so the test is anchored at column 0 — every assistant
+ * row carries a "● "/"  " gutter and therefore can never be mistaken for one.
+ */
+export function isUserTranscriptLine(line: string): boolean {
+  return stripAnsi(line).startsWith(USER_PREFIX);
+}
+
+/**
+ * One assistant message block: `● first line`, continuations indented two so
+ * the prose reads as a single column. `continued` keeps a streaming block open
+ * — deltas paint into the SAME bullet instead of sprouting one per chunk.
+ */
+export function formatAssistantBlock(text: string, options: { readonly continued?: boolean } = {}): string[] {
+  // Owner-ruled: the transcript is near-monochrome like the reference —
+  // the assistant marker is DEFAULT foreground, never accent-colored.
+  return renderProse(text, {
+    firstPrefix: `${ASSISTANT_BULLET} `,
+    continuationPrefix: "  ",
+    continued: options.continued,
+  });
+}
+
+/** `⏺ Edit(server.js)` — the action, on its own line, above its result. */
+export function formatToolLine(name: string, target?: string, status: "pending" | "success" | "failure" = "pending"): string {
+  const label = target ? `${name}(${target})` : name;
+  return `${renderActionBullet(status)} ${label}`;
+}
+
+export interface ToolResultOptions {
+  /** Raw result rows (diff hunks, stdout, table rows). Never reordered. */
+  readonly detail?: readonly string[];
+  /** Rows shown before collapsing. Default TOOL_RESULT_MAX_LINES. */
+  readonly maxLines?: number;
+  /**
+   * Hint appended to the collapse counter, e.g. "ctrl+o expands". Set it ONLY
+   * where an expand hook actually exists: the chat screen has none today, so a
+   * long result truncates with an honest count instead of promising a keypress
+   * that does nothing.
+   */
+  readonly expandHint?: string;
+}
+
+/**
+ * `  ⎿ +12 −2 · 86ms` plus indented detail, collapsed past `maxLines`. Returns
+ * lines, never prints — same purity rule as live-diff.ts.
+ */
+export function formatToolResultLines(summary: string, options: ToolResultOptions = {}): string[] {
+  const lines = [`  ${dim(`${RESULT_ELBOW} ${summary}`)}`];
+  const detail = options.detail ?? [];
+  const maxLines = Math.max(1, options.maxLines ?? TOOL_RESULT_MAX_LINES);
+  for (const row of detail.slice(0, maxLines)) lines.push(`    ${row}`);
+  const hidden = detail.length - Math.min(detail.length, maxLines);
+  if (hidden > 0) lines.push(`    ${dim(`… +${hidden} lines${options.expandHint ? ` (${options.expandHint})` : ""}`)}`);
+  return lines;
+}
+
+export interface ToolBlockOptions extends ToolResultOptions {
+  readonly name: string;
+  readonly target?: string;
+  readonly summary: string;
+}
+
+/** The whole ⏺/⎿ frame for one action. */
+export function renderToolBlock(options: ToolBlockOptions): string[] {
+  return [formatToolLine(options.name, options.target, "success"), ...formatToolResultLines(options.summary, options)];
+}
+
+export interface ToolSummaryParts {
+  readonly additions?: number;
+  readonly deletions?: number;
+  readonly durationMs?: number;
+  /** Content-addressed receipt; rendered short (`d3b9c1a2…`), never dropped. */
+  readonly receipt?: string;
+  /** Anything else worth one segment (e.g. "binary", "3 matches"). */
+  readonly extra?: readonly string[];
+}
+
+/** `+12 −2 · 86ms · receipt d3b9c1a2…` — the dim one-liner under an action. */
+export function formatToolSummary(parts: ToolSummaryParts): string {
+  const segments: string[] = [];
+  if (parts.additions !== undefined || parts.deletions !== undefined) {
+    segments.push(`+${parts.additions ?? 0} −${parts.deletions ?? 0}`);
+  }
+  for (const extra of parts.extra ?? []) segments.push(extra);
+  if (parts.durationMs !== undefined && Number.isFinite(parts.durationMs)) {
+    segments.push(formatDuration(Math.max(0, parts.durationMs)));
+  }
+  if (parts.receipt) segments.push(`receipt ${shortReceipt(parts.receipt)}`);
+  return segments.join(" · ");
+}
+
+/** `sha256:d3b9c1a2f0…` → `d3b9c1a2…`; anything shorter passes through. */
+export function shortReceipt(receipt: string): string {
+  const value = receipt.includes(":") ? receipt.slice(receipt.lastIndexOf(":") + 1) : receipt;
+  return value.length > 8 ? `${value.slice(0, 8)}…` : value;
+}
+
+export interface StatusLineInfo {
+  readonly model: string;
+  readonly session: string;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly costUsd?: number;
+  readonly elapsedMs?: number;
+  /** Routed turn: `@review` rides at the left with the spinner. */
+  readonly agentId?: string;
+  /** Live working verb ("Thinking") — shimmered, never `@`-prefixed. */
+  readonly verb?: string;
+  /** Present ⇒ working; the spinner paints at the left edge of THIS row. */
+  readonly frame?: number;
+  /** Extra trailing segments (scopes, tool counts) the header no longer shows. */
+  readonly extra?: readonly string[];
+}
+
+/**
+ * The single bottom row that replaces the scattered chrome:
+ * `⠙ @review · gpt-5.6-sol · main · 25.1k in / 512 out · $0.0337 · 12.4s`.
+ * The spinner lives HERE and only here — a frame in the transcript is defect #4.
+ */
+export function formatStatusLine(info: StatusLineInfo): string {
+  const segments: string[] = [];
+  if (info.agentId) segments.push(`@${info.agentId}`);
+  segments.push(info.model);
+  segments.push(info.session);
+  if (info.inputTokens !== undefined || info.outputTokens !== undefined) {
+    segments.push(`${compactCount(info.inputTokens ?? 0)} in / ${compactCount(info.outputTokens ?? 0)} out`);
+  }
+  if (info.costUsd !== undefined && Number.isFinite(info.costUsd)) segments.push(`$${info.costUsd.toFixed(4)}`);
+  if (info.elapsedMs !== undefined && Number.isFinite(info.elapsedMs)) segments.push(formatDuration(Math.max(0, info.elapsedMs)));
+  for (const extra of info.extra ?? []) segments.push(extra);
+  const body = segments.join(" · ");
+  if (info.frame === undefined) return dim(body);
+  const tick = Math.abs(Math.trunc(info.frame));
+  const spinner = STATUS_SPINNER_FRAMES[tick % STATUS_SPINNER_FRAMES.length]!;
+  const verb = info.verb ? `${shimmerText(info.verb, tick)}${dim(" · ")}` : "";
+  return `${accent(spinner)} ${verb}${dim(body)}`;
+}
+
+/**
+ * THE SHIMMER: a warm 3-char bright window sweeps the verb letter-by-letter,
+ * one position per spinner tick, running off both edges so the glow breathes.
+ */
+export function shimmerText(text: string, tick: number): string {
+  const chars = [...text];
+  if (!chars.length) return text;
+  const span = chars.length + 4;
+  const pos = (((tick % span) + span) % span) - 2;
+  return chars
+    .map((ch, index) => {
+      const distance = Math.abs(index - pos);
+      if (distance === 0) return `\x1b[38;2;255;246;238m${ch}\x1b[0m`;
+      if (distance === 1) return `\x1b[38;2;224;196;178m${ch}\x1b[0m`;
+      return dim(ch);
+    })
+    .join("");
+}
+
+/** Repaint a `✻ Verb` status row with the shimmer for the current tick. */
+export function paintWorkingRow(row: string, tick: number): string {
+  const plain = stripAnsi(row).trim();
+  const match = /^([✻|/\\-])\s+(.*)$/.exec(plain);
+  if (!match) return row;
+  return `${accent(match[1]!)} ${shimmerText(match[2]!, tick)}`;
+}
+
+/** The status row's live verb — rotates every ~4s of spinner frames. */
+export function workingVerbForFrame(frame: number): string {
+  return WORKING_VERBS[Math.floor(Math.abs(frame) / 16) % WORKING_VERBS.length]!;
+}
+
+/** Task statuses collapse to three glyphs: pending, live, ended. */
+export const missionStatusGlyph = sharedMissionStatusGlyph;
+
+export interface MissionCardRow {
+  readonly id: string;
+  readonly title: string;
+  readonly status: string;
+  /** Model or agent driving the task. */
+  readonly agent?: string;
+  /** The task's own latest narration line (already truncated by the caller). */
+  readonly detail?: string;
+  readonly tokens?: number;
+  readonly elapsedMs?: number;
+}
+
+export interface MissionCard {
+  readonly title: string;
+  readonly rows: readonly MissionCardRow[];
+  readonly costUsd?: number;
+  readonly agents?: number;
+}
+
+/**
+ * Task cards wear the same ⏺/⎿ frame as any other action, with columns aligned
+ * so a three-agent task run reads as a table, not a list.
+ */
+export function renderMissionCard(card: MissionCard): string[] {
+  const summary: string[] = [`${card.rows.length} task${card.rows.length === 1 ? "" : "s"}`];
+  if (card.agents !== undefined) summary.push(`${card.agents} agent${card.agents === 1 ? "" : "s"}`);
+  const live = card.rows.filter((row) => missionStatusGlyph(row.status) === "◔").length;
+  if (live > 0) summary.push(`${live} running`);
+  if (card.costUsd !== undefined && Number.isFinite(card.costUsd)) summary.push(`$${card.costUsd.toFixed(2)}`);
+
+  const columns = card.rows.map((row) => [
+    row.id,
+    row.title,
+    row.agent ?? "—",
+    row.detail ?? "—",
+    missionRowMetrics(row),
+  ]);
+  const widths = [0, 1, 2, 3].map((index) => Math.max(...columns.map((cells) => visibleWidth(cells[index] ?? "")), 0));
+  const detail = columns.map((cells, index) => {
+    const glyph = renderMissionStatusGlyph(card.rows[index]!.status);
+    const body = cells.slice(0, 4).map((cell, column) => padPlain(cell ?? "", widths[column] ?? 0)).join("  ");
+    const metrics = cells[4] ?? "";
+    // Trim BEFORE tinting: padding hidden inside an escape sequence would
+    // stretch every short row to the width of the longest one.
+    return metrics ? `${glyph} ${body}  ${dim(metrics)}` : `${glyph} ${body}`.trimEnd();
+  });
+  return renderToolBlock({
+    name: "Tasks",
+    target: card.title,
+    summary: summary.join(" · "),
+    detail,
+    maxLines: Math.max(TOOL_RESULT_MAX_LINES, detail.length),
+  });
+}
+
+function missionRowMetrics(row: MissionCardRow): string {
+  const parts: string[] = [];
+  if (row.elapsedMs !== undefined && Number.isFinite(row.elapsedMs)) parts.push(formatDuration(Math.max(0, row.elapsedMs)));
+  if (row.tokens !== undefined && Number.isFinite(row.tokens)) parts.push(`${compactCount(row.tokens)} tok`);
+  return parts.join(" · ");
+}
+
+function padPlain(value: string, width: number): string {
+  return value + " ".repeat(Math.max(0, width - visibleWidth(value)));
+}
+
+/**
+ * Streamed narration painter — the fix for the 66s silent spinner.
+ *
+ * Deltas from `onDelta`/`onReasoningDelta` are coalesced by the core
+ * fence-aware Coalescer (`stream.ts`), so a markdown code block never splits
+ * mid-fence, and each emitted block is painted into the transcript the moment
+ * it lands. Reasoning summaries use their own buffer and are flushed BEFORE
+ * the next message block so they always render above the message they explain.
+ */
+export type ReasoningMode = "compact" | "full";
+
+export interface NarrationPainterOptions {
+  readonly emit: (line: string) => void;
+  /** Do not paint a block below this size unless flushed. Default 48. */
+  readonly minChars?: number;
+  /** Force a (fence-aware) split above this size. Default 320. */
+  readonly maxChars?: number;
+  readonly now?: () => number;
+  /**
+   * false ⇒ emit raw text (non-TTY / plain streaming). Default true: deltas
+   * paint into ONE `●` block per message instead of one bullet per chunk.
+   */
+  readonly bullets?: boolean;
+  /** "compact" (default) collapses each reasoning summary to a single row. */
+  readonly reasoningMode?: ReasoningMode;
+}
+
+export interface NarrationPainter {
+  /** Feed an assistant-message delta. */
+  delta(text: string): void;
+  /** Feed a provider-approved reasoning summary delta. */
+  reasoning(text: string): void;
+  /** Flush both buffers at end of turn. */
+  finish(): void;
+  /** Characters of assistant narration painted so far. */
+  readonly painted: number;
+}
+
+export function createNarrationPainter(options: NarrationPainterOptions): NarrationPainter {
+  const minChars = options.minChars ?? 48;
+  const maxChars = Math.max(options.maxChars ?? 320, minChars);
+  const bullets = options.bullets ?? true;
+  const reasoningMode = options.reasoningMode ?? "compact";
+  const message = createCoalescer({ minChars, maxChars, breakPreference: "newline", now: options.now });
+  const reasoning = createCoalescer({ minChars, maxChars, breakPreference: "newline", now: options.now });
+  let painted = 0;
+  let lastDelta = "";
+  /** True while a `●` block is open, so the next delta continues it. */
+  let blockOpen = false;
+
+  const paintMessage = (text: string): void => {
+    if (!text.trim()) return;
+    painted += text.length;
+    if (!bullets) {
+      options.emit(text);
+      return;
+    }
+    const lines = formatAssistantBlock(text, { continued: blockOpen });
+    if (!lines.length) return;
+    for (const line of lines) options.emit(line);
+    blockOpen = true;
+  };
+  const paintReasoning = (text: string): void => {
+    if (!text.trim()) return;
+    // Reasoning explains the block BELOW it, so a summary always closes the
+    // open bullet: the next message delta starts its own `●`.
+    blockOpen = false;
+    if (reasoningMode === "full") {
+      for (const part of text.split(/\r?\n/)) {
+        if (part.trim()) options.emit(formatReasoningLine(part));
+      }
+      return;
+    }
+    options.emit(formatReasoningLine(collapseToOneLine(text)));
+  };
+  const drainReasoning = (): void => {
+    for (const event of reasoning.flush("message_end")) {
+      if (event.type === "block") paintReasoning(event.text);
+    }
+  };
+
+  return {
+    delta(text) {
+      if (!text) return;
+      if (reasoning.pending) drainReasoning();
+      // Provider item boundaries occasionally arrive without their separating
+      // whitespace (ledger #9: "now.Tests"). This is intentionally a narrow
+      // heuristic: terminal punctuation followed immediately by an uppercase
+      // sentence start becomes a paragraph boundary. It runs before the
+      // fence-aware coalescer, which still owns all fence splitting.
+      const joined = /[.!?]["')\]]?$/.test(lastDelta) && /^[A-Z]/.test(text) ? `\n\n${text}` : text;
+      lastDelta = text;
+      for (const event of message.push(joined)) {
+        if (event.type === "block") paintMessage(event.text);
+      }
+    },
+    reasoning(text) {
+      if (!text) return;
+      for (const event of reasoning.push(text)) {
+        if (event.type === "block") paintReasoning(event.text);
+      }
+    },
+    finish() {
+      drainReasoning();
+      for (const event of message.flush("message_end")) {
+        if (event.type === "block") paintMessage(event.text);
+      }
+      blockOpen = false;
+    },
+    get painted() {
+      return painted;
+    },
+  };
+}
+
+/** Reasoning summaries render violet + italic so they never read as the answer. */
+export function formatReasoningLine(text: string): string {
+  return renderReasoningLine(text);
+}
+
+/** Longest single-row reasoning summary before "…" (compact mode). */
+export const REASONING_COMPACT_WIDTH = 96;
+
+/**
+ * Compact reasoning: the whole summary block on ONE dim row. The full text is
+ * one `/reasoning full` away — the default must not out-shout the answer.
+ */
+export function collapseToOneLine(text: string, width = REASONING_COMPACT_WIDTH): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (flat.length <= width) return flat;
+  const cut = flat.slice(0, width);
+  const space = cut.lastIndexOf(" ");
+  return `${(space > width * 0.6 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+
+export interface CompactHeaderInfo {
+  readonly session: string;
+  readonly cwd: string;
+  readonly scopes: string;
+  readonly model: string;
+  readonly provider: string;
+  readonly runtime: string;
+  readonly speed: string;
+  readonly backends?: string;
+}
+
+/**
+ * Compact launch header (defect #6): four lines instead of a ~20-line table.
+ * `/header full` restores the full panel.
+ */
+export function buildCompactHeaderLines(info: CompactHeaderInfo): string[] {
+  // ONE line of idle chrome — the Claude Code bar. Model appears here and
+  // nowhere else while idle (the status row exists only during a turn), so
+  // nothing is ever stated twice on screen.
+  return [
+    `${accent("MUSTER")} ${dim(`· ${info.model} · ${info.session} · ${shortenPathForHeader(info.cwd)} · /help`)}`,
+  ];
+}
+
+/** `~` for home; long foreign paths keep first and last segments around an ellipsis. */
+export function shortenPathForHeader(cwd: string, max = 48): string {
+  const home = process.env.HOME;
+  const tilded = home && cwd.startsWith(home) ? `~${cwd.slice(home.length)}` : cwd;
+  if (tilded.length <= max) return tilded;
+  const parts = tilded.split("/").filter(Boolean);
+  if (parts.length <= 2) return `…${tilded.slice(-max + 1)}`;
+  const tail = parts.slice(-2).join("/");
+  const head = tilded.startsWith("~") ? "~" : `/${parts[0]}`;
+  const short = `${head}/…/${tail}`;
+  return short.length <= max ? short : `…/${parts[parts.length - 1]}`.slice(0, max);
+}
 
 export function createMusterAutocompleteProvider(options: MusterAutocompleteOptions): AutocompleteProvider {
   const catalog = options.catalog ?? createCallbackCompletionCatalog(options);
@@ -164,25 +833,49 @@ export function createMusterAutocompleteProvider(options: MusterAutocompleteOpti
 }
 
 export function createMusterChatEditor(tui: Pick<TUI, "terminal" | "requestRender">): Editor {
-  const editor = new Editor(tui as TUI, musterEditorTheme(), { autocompleteMaxVisible: 16 });
+  const editor = new Editor(tui as TUI, musterEditorTheme(), { autocompleteMaxVisible: 14 });
   editor.setPaddingX(0);
   return editor;
 }
 
+/**
+ * Alt-screen viewport math: the reference scrolls IN-APP (PgUp/PgDn/wheel)
+ * because the alternate screen has no native scrollback. `scrollOffset`
+ * counts rows lifted off the tail; the clamp keeps it inside the content.
+ */
+export function windowTranscript(rows: readonly string[], viewportRows: number, scrollOffset: number): { visible: readonly string[]; clamped: number } {
+  const clamped = Math.max(0, Math.min(scrollOffset, Math.max(0, rows.length - viewportRows)));
+  const end = rows.length - clamped;
+  return { visible: rows.slice(Math.max(0, end - viewportRows), end), clamped };
+}
+
 export function createMusterChatHarness(options: MusterAutocompleteOptions & {
   readonly onSubmit?: (text: string, sink: MusterChatSink) => Promise<boolean>;
+  readonly onInterrupt?: () => boolean | Promise<boolean>;
+  readonly initialLines?: readonly string[];
+  readonly onDecisionKey?: (data: string, sink: MusterChatSink) => boolean;
   readonly width?: number;
   readonly rows?: number;
 }): MusterChatHarness {
   const tui = fakeHarnessTui(options.width ?? 120, options.rows ?? 40);
   const editor = createMusterChatEditor(tui);
-  const sink = new HarnessSink(editor, options.onSubmit);
+  const sink = new HarnessSink(editor, options.onSubmit, options.onInterrupt, options.initialLines);
   editor.setAutocompleteProvider(createMusterAutocompleteProvider(options));
   editor.onSubmit = (text) => {
     void sink.submit(text);
   };
   return {
     input(data) {
+      if (options.onDecisionKey?.(data, sink)) return;
+      if (data === "\x04") {
+        sink.toggleLiveDiff();
+        return;
+      }
+      if (data === "\x1b" && sink.interruptTurn()) return;
+      if ((matchesKey(data, "enter") || matchesKey(data, "return")) && isToolsOverlayInput(editor.getText())) {
+        editor.handleInput("\t");
+        return;
+      }
       if (isClearComposerKey(data)) {
         editor.handleInput("\x1b");
         editor.setText("");
@@ -190,6 +883,10 @@ export function createMusterChatHarness(options: MusterAutocompleteOptions & {
       }
       if (data === "\x1b" && isBareCompletionTrigger(editor.getText())) {
         editor.handleInput(data);
+        editor.setText("");
+        return;
+      }
+      if (data === "\x1b" && isCapabilityConfirmationText(editor.getText())) {
         editor.setText("");
         return;
       }
@@ -215,13 +912,18 @@ export function createMusterChatHarness(options: MusterAutocompleteOptions & {
     openPicker(command) {
       sink.openPicker(command);
     },
+    exited() {
+      return sink.exited;
+    },
+    status() {
+      return sink.statusRow;
+    },
   };
 }
 
 export function renderMusterComposer(editor: Editor, width: number): string[] {
   const frameWidth = Math.max(32, Math.floor(width));
-  const innerWidth = frameWidth - 4;
-  const editorWidth = Math.max(8, innerWidth - 2);
+  const editorWidth = Math.max(8, frameWidth - 2);
   const rawLines = editor.render(editorWidth);
   const borderIndexes = rawLines
     .map((line, index) => ({ line: stripAnsi(line).trim(), index }))
@@ -231,33 +933,188 @@ export function renderMusterComposer(editor: Editor, width: number): string[] {
   const secondBorder = borderIndexes.find((index) => index > firstBorder) ?? rawLines.length;
   const inputLines = rawLines.slice(firstBorder + 1, secondBorder);
   const completionLines = rawLines.slice(secondBorder + 1);
-  const result = [accent(`╭─ chat ${"─".repeat(Math.max(1, frameWidth - 9))}╮`)];
-
-  if (!inputLines.length) {
-    result.push(frameLine(`${highlight("›")} `, innerWidth));
-  } else {
-    inputLines.forEach((line, index) => {
-      const prefix = index === 0 ? `${highlight("›")} ` : "  ";
-      result.push(frameLine(prefix + line, innerWidth));
-    });
-  }
+  const result: string[] = [];
 
   if (completionLines.length) {
-    result.push(accent(`├─ suggestions ${"─".repeat(Math.max(1, frameWidth - 16))}┤`));
-    for (const line of completionLines) {
-      result.push(frameLine(line, innerWidth));
+    for (const rawLine of completionLines) {
+      const plain = stripAnsi(rawLine).trim();
+      const count = /^\(?(\d+\/\d+)\)?$/.exec(plain)?.[1];
+      if (count) continue; // the reference shows no count row
+      result.push(truncateToWidth(rawLine, frameWidth, ""));
     }
   }
 
-  result.push(accent(`╰${"─".repeat(frameWidth - 2)}╯`));
+  // The typing area, matched to the reference frame (owner, 2026-08-30):
+  // a full-width dim rule above and below, a PLAIN default-color ❯ inside —
+  // no box, no corners, no accent caret.
+  result.push(dim("─".repeat(frameWidth)));
+  if (!inputLines.length) {
+    result.push("❯ ");
+  } else {
+    inputLines.forEach((line, index) => {
+      result.push((index === 0 ? "❯ " : "  ") + line);
+    });
+  }
+  result.push(dim("─".repeat(frameWidth)));
+
   return result.map((line) => padAnsi(line, frameWidth));
 }
 
+// Claude Code's picker palette, MEASURED live from its /model picker
+// (2026-08-29): caret + selected label = palette index 153 (the theme-mapped
+// blue-violet), current-value ✓ = index 114 (soft green), everything else
+// gray. INDEXED codes on purpose — the owner's terminal theme remaps them
+// exactly as it does for Claude Code, so the two are identical by construction.
+function pickerSel(text: string): string {
+  return process.env.NO_COLOR && !process.env.FORCE_COLOR ? text : `\x1b[38;2;176;184;248m${text}${RESET}`;
+}
+export function pickerOk(text: string): string {
+  return process.env.NO_COLOR && !process.env.FORCE_COLOR ? text : `\x1b[38;5;114m${text}${RESET}`;
+}
+
+function composerPickerTheme(): { settings: SettingsListTheme; select: SelectListTheme } {
+  return {
+    settings: {
+      label: (text, selected) => selected ? pickerSel(text) : text,
+      value: (text, selected) => selected ? pickerSel(text) : dim(text),
+      description: dim,
+      cursor: pickerSel("› "),
+      hint: dim,
+    },
+    select: {
+      selectedPrefix: pickerSel,
+      selectedText: pickerSel,
+      description: dim,
+      scrollInfo: dim,
+      noMatch: dim,
+    },
+  };
+}
+
+function groupedModelSubmenu(
+  state: ComposerPickerState,
+  theme: SelectListTheme,
+  onSelect: (value: string) => void,
+  onCancel: () => void,
+): SelectList {
+  let previousProvider: string | undefined;
+  const items: SelectItem[] = state.catalog.models.map((model) => {
+    const startsGroup = model.provider !== previousProvider;
+    previousProvider = model.provider;
+    return {
+      value: model.value,
+      label: `${startsGroup ? model.provider.padEnd(8) : "".padEnd(8)}${model.label}${model.value === state.activeModel ? `  ${pickerOk("✓")}` : ""}`,
+      description: startsGroup ? `${model.provider} models` : undefined,
+    };
+  });
+  return selectSubmenu(items, items.findIndex((item) => item.value === state.activeModel), theme, onSelect, onCancel);
+}
+
+function selectSubmenu(
+  items: SelectItem[],
+  selectedIndex: number,
+  theme: SelectListTheme,
+  onSelect: (value: string) => void,
+  onCancel: () => void,
+): SelectList {
+  const list = new SelectList(items, 12, theme, { minPrimaryColumnWidth: 24, maxPrimaryColumnWidth: 44 });
+  if (selectedIndex >= 0) list.setSelectedIndex(selectedIndex);
+  list.onSelect = (item) => onSelect(item.value);
+  list.onCancel = onCancel;
+  return list;
+}
+
+class SuspendableProcessTerminal implements Terminal {
+  private readonly inner = new ProcessTerminal();
+  private readonly frameLog = process.env.MUSTER_DEBUG_FRAMES === "1" ? new TerminalFrameLog() : undefined;
+  private onInput: ((data: string) => void) | undefined;
+  private onResize: (() => void) | undefined;
+  private suspended = false;
+  get columns(): number { return this.inner.columns; }
+  get rows(): number { return this.inner.rows; }
+  get kittyProtocolActive(): boolean { return this.inner.kittyProtocolActive; }
+  start(onInput: (data: string) => void, onResize: () => void): void {
+    this.onInput = onInput;
+    this.onResize = onResize;
+    this.suspended = false;
+    // The reference's page semantics (owner, 2026-08-30): the chat opens on
+    // the terminal's ALTERNATE SCREEN — a fresh page, the shell's prior
+    // commands untouched underneath — and any exit (including Ctrl+C)
+    // restores the shell with only the invocation line remaining.
+    if (process.stdout.isTTY) process.stdout.write("\x1b[?1049h\x1b[H");
+    this.inner.start(onInput, onResize);
+  }
+  stop(): void {
+    this.suspended = false;
+    this.inner.stop();
+    if (process.stdout.isTTY) process.stdout.write("\x1b[?1049l");
+  }
+  async drainInput(maxMs?: number, idleMs?: number): Promise<void> { await this.inner.drainInput(maxMs, idleMs); }
+  write(data: string): void { if (!this.suspended) { this.frameLog?.append(data); this.inner.write(data); } }
+  moveBy(lines: number): void { if (!this.suspended) this.inner.moveBy(lines); }
+  hideCursor(): void { if (!this.suspended) this.inner.hideCursor(); }
+  showCursor(): void { if (!this.suspended) this.inner.showCursor(); }
+  clearLine(): void { if (!this.suspended) this.inner.clearLine(); }
+  clearFromCursor(): void { if (!this.suspended) this.inner.clearFromCursor(); }
+  clearScreen(): void { if (!this.suspended) this.inner.clearScreen(); }
+  setTitle(title: string): void { if (!this.suspended) this.inner.setTitle(title); }
+  setProgress(active: boolean): void { if (!this.suspended) this.inner.setProgress(active); }
+  suspend(): void {
+    if (this.suspended) return;
+    this.inner.stop();
+    // External programs (editors) run on the NORMAL screen; re-enter on resume.
+    if (process.stdout.isTTY) process.stdout.write("\x1b[?1049l");
+    this.suspended = true;
+  }
+  resume(): void {
+    if (!this.suspended || !this.onInput || !this.onResize) return;
+    this.suspended = false;
+    if (process.stdout.isTTY) process.stdout.write("\x1b[?1049h\x1b[H");
+    this.inner.start(this.onInput, this.onResize);
+  }
+}
+
+export class TerminalFrameLog {
+  static readonly MAX_BYTES = 5 * 1024 * 1024;
+  readonly path: string;
+  constructor(path = join(homedir(), ".muster", "logs", "frames.log")) {
+    this.path = path;
+    mkdirSync(dirname(path), { recursive: true });
+  }
+  append(data: string): void {
+    const encoded = data.split("\n").map((row) => `${JSON.stringify(row)}\n`);
+    let payload = encoded.join("");
+    const payloadBytes = Buffer.byteLength(payload);
+    if (payloadBytes > TerminalFrameLog.MAX_BYTES) {
+      let bytes = 0;
+      const kept: string[] = [];
+      for (let index = encoded.length - 1; index >= 0; index -= 1) {
+        const row = encoded[index]!;
+        const size = Buffer.byteLength(row);
+        if (bytes + size > TerminalFrameLog.MAX_BYTES) break;
+        kept.unshift(row);
+        bytes += size;
+      }
+      payload = kept.join("");
+    }
+    let current = 0;
+    try { current = statSync(this.path).size; } catch { /* first frame */ }
+    if (current + Buffer.byteLength(payload) > TerminalFrameLog.MAX_BYTES) {
+      const rotated = `${this.path}.1`;
+      try { unlinkSync(rotated); } catch { /* no prior rotation */ }
+      try { renameSync(this.path, rotated); } catch { /* no current log */ }
+    }
+    if (payload) appendFileSync(this.path, payload, "utf8");
+  }
+}
+
 export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promise<void> {
-  const terminal = new ProcessTerminal();
+  const terminal = new SuspendableProcessTerminal();
   const tui = new TUI(terminal, true);
   const editor = createMusterChatEditor(tui);
-  const screen = new MusterChatScreen(tui, editor, options.statusLine, options.headerLines ?? []);
+  const screen = new MusterChatScreen(tui, editor, options.statusLine, options.headerLines ?? [], options.initialLines ?? [], options.onInterrupt);
+  const boardMode = options.board ? new BoardModeHost(tui, terminal, screen, editor, options.board) : undefined;
+  screen.onOpenBoard = (force) => boardMode?.open(force) ?? Promise.resolve(false);
   editor.setAutocompleteProvider(createMusterAutocompleteProvider(options));
   editor.onSubmit = (text) => {
     void screen.submit(text, options.onSubmit);
@@ -265,13 +1122,44 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
   tui.addChild(screen);
   tui.setFocus(editor);
   tui.addInputListener((data) => {
-    if (data === "\x03" || data === "\x04") {
+    const mouse = parseSgrMouseSequence(data);
+    if (mouse && boardMode?.handleMouse(mouse)) return { consume: true };
+    const stripped = stripMouseSequences(data);
+    if (!stripped) return { consume: true };
+    if (stripped !== data) return { data: stripped };
+    if (boardMode?.active) return undefined;
+    if (mouse && !mouse.release && (mouse.button === 64 || mouse.button === 65)) {
+      if (screen.scrollTranscript(mouse.button === 64 ? 3 : -3)) return { consume: true };
+    }
+    if (matchesKey(stripped, "pageUp") && screen.scrollPage(1)) return { consume: true };
+    if (matchesKey(stripped, "pageDown") && screen.scrollPage(-1)) return { consume: true };
+    if (matchesKey(stripped, "f3")) {
+      void screen.openBoard(false);
+      return { consume: true };
+    }
+    if (options.onDecisionKey?.(data, screen)) {
+      editor.setText("");
+      tui.requestRender(true);
+      return { consume: true };
+    }
+    if (data === "\x04") {
+      screen.toggleLiveDiff();
+      return { consume: true };
+    }
+    if (data === "\x03") {
       screen.stop();
       return { consume: true };
     }
+    if (matchesKey(data, "escape") && screen.closeLiveDiff(true)) return { consume: true };
+    if (matchesKey(data, "escape") && screen.interruptTurn()) return { consume: true };
     if (isClearComposerKey(data)) {
       editor.handleInput("\x1b");
       editor.setText("");
+      tui.requestRender(true);
+      return { consume: true };
+    }
+    if ((matchesKey(data, "enter") || matchesKey(data, "return")) && isToolsOverlayInput(editor.getText())) {
+      editor.handleInput("\t");
       tui.requestRender(true);
       return { consume: true };
     }
@@ -286,11 +1174,20 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
       editor.setText("");
       return { consume: true };
     }
+    if (matchesKey(data, "escape") && isCapabilityConfirmationText(editor.getText())) {
+      editor.setText("");
+      tui.requestRender(true);
+      return { consume: true };
+    }
     return undefined;
   });
   await screen.refreshStatusLine();
   const rawEscapeHandler = (chunk: Buffer | string): void => {
     const data = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+    if (boardMode?.active || parseSgrMouseSequence(data)) return;
+    if (data === "\x1b" && screen.consumeLiveDiffEscapeSuppression()) return;
+    if (data === "\x1b" && screen.closeLiveDiff()) return;
+    if (data === "\x1b" && screen.interruptTurn()) return;
     if (data === "\x1b" && isBareCompletionTrigger(editor.getText())) {
       editor.handleInput(data);
       editor.setText("");
@@ -304,37 +1201,174 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
     tui.requestRender(true);
   });
   process.stdin.off("data", rawEscapeHandler);
+  boardMode?.dispose();
   tui.stop();
   await terminal.drainInput(150, 25).catch(() => {});
+  // Printed AFTER the TUI tears down: anything written into the transcript at
+  // exit time is erased with the alternate screen.
+  if (screen.exited) process.stdout.write(`${dim(options.farewell ?? "bye")}\n`);
+}
+
+class BoardModeHost {
+  private view: BoardView = { columns: { backlog: [], ready: [], running: [], review: [], done: [] }, cards: {} };
+  private messages: readonly MessageRow[] = [];
+  private board: BoardScreen | undefined;
+  private task: TaskView | undefined;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private refreshing = false;
+  get active(): boolean { return Boolean(this.board || this.task); }
+  constructor(
+    private readonly tui: TUI,
+    private readonly terminal: SuspendableProcessTerminal,
+    private readonly chat: MusterChatScreen,
+    private readonly editor: Editor,
+    private readonly controller: BoardModeController,
+  ) {}
+  async open(force = false): Promise<boolean> {
+    this.view = await this.controller.loadView();
+    if (!force && Object.keys(this.view.cards).length === 0) return false;
+    if (this.active) return true;
+    this.tui.removeChild(this.chat);
+    this.board = new BoardScreen({
+      view: () => this.view,
+      rows: () => this.tui.terminal.rows,
+      requestRender: () => this.tui.requestRender(),
+      openTask: (taskId) => { void this.openTask(taskId); },
+      close: () => this.close(),
+    });
+    this.tui.addChild(this.board);
+    this.tui.setFocus(this.board);
+    this.tui.terminal.write("\x1b[?1002h\x1b[?1006h");
+    this.board.start();
+    this.timer = setInterval(() => { void this.refresh(); }, 250);
+    this.tui.requestRender(true);
+    return true;
+  }
+  handleMouse(event: SgrMouseEvent): boolean {
+    return this.board?.handleMouse(event) ?? Boolean(this.task);
+  }
+  dispose(): void { this.stopTimer(); this.board?.stop(); if (this.active) this.tui.terminal.write("\x1b[?1002l\x1b[?1006l"); }
+  private async refresh(): Promise<void> {
+    if (this.refreshing || !this.active) return;
+    this.refreshing = true;
+    try {
+      this.view = await this.controller.loadView();
+      const card = this.taskCard();
+      if (card?.sessionId) this.messages = await this.controller.loadMessages(card.sessionId);
+      this.tui.requestRender();
+    } finally { this.refreshing = false; }
+  }
+  private taskId: string | undefined;
+  private taskCard() { return this.taskId ? this.view.cards[this.taskId] : undefined; }
+  private async openTask(taskId: string): Promise<void> {
+    const card = this.view.cards[taskId];
+    if (!card) return;
+    this.taskId = taskId;
+    this.messages = card.sessionId ? await this.controller.loadMessages(card.sessionId) : [];
+    if (this.board) { this.board.stop(); this.tui.removeChild(this.board); }
+    this.task = new TaskView({
+      card: () => this.view.cards[taskId] ?? card,
+      messages: () => this.messages,
+      diff: () => this.controller.diff(taskId),
+      rows: () => this.tui.terminal.rows,
+      cwd: this.controller.cwd,
+      requestRender: (force) => this.tui.requestRender(force),
+      close: () => this.closeTask(),
+      comment: (text, anchor) => this.controller.comment(taskId, text, anchor),
+      approve: () => this.controller.approve(taskId),
+      retry: () => this.controller.retry(taskId),
+      cancel: () => this.controller.cancel(taskId),
+      openEditor: async (path, line) => {
+        this.tui.terminal.write("\x1b[?1002l\x1b[?1006l\x1b[?25h");
+        this.terminal.suspend();
+        try {
+          await openFileWithEditorGuard(path, { cwd: this.controller.cwd, line, setRawMode: () => {}, write: () => {} });
+        } finally {
+          this.terminal.resume();
+          this.tui.terminal.write("\x1b[?1002h\x1b[?1006h\x1b[?25l");
+          this.tui.requestRender(true);
+        }
+      },
+    });
+    this.tui.addChild(this.task);
+    this.tui.setFocus(this.task);
+    this.tui.requestRender(true);
+  }
+  private closeTask(): void {
+    if (!this.task || !this.board) return;
+    this.tui.removeChild(this.task);
+    this.task = undefined;
+    this.taskId = undefined;
+    this.tui.addChild(this.board);
+    this.board.start();
+    this.tui.setFocus(this.board);
+    this.tui.requestRender(true);
+  }
+  private close(): void {
+    this.stopTimer();
+    this.board?.stop();
+    if (this.task) this.tui.removeChild(this.task);
+    if (this.board) this.tui.removeChild(this.board);
+    this.task = undefined; this.board = undefined; this.taskId = undefined;
+    this.tui.terminal.write("\x1b[?1002l\x1b[?1006l");
+    this.tui.addChild(this.chat);
+    this.tui.setFocus(this.editor);
+    this.tui.requestRender(true);
+  }
+  private stopTimer(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
 }
 
 class MusterChatScreen implements Component, MusterChatSink {
-  private readonly lines: string[] = [];
+  private readonly lines: string[];
   private status = "";
+  private statusTick = 0;
   private stopped = false;
+  private turnRunning = false;
+  private interruptRequested = false;
+  private pickerOpen = false;
+  private liveDiffTurn = new LiveFileTurnAccumulator();
+  private liveDiffOverlay: LiveFileOverlay | undefined;
+  private liveDiffHandle: OverlayHandle | undefined;
+  private suppressRawLiveDiffEscape = false;
+  exited = false;
   onStop?: () => void;
+  onOpenBoard?: (force?: boolean) => Promise<boolean>;
 
   constructor(
     private readonly tui: TUI,
     private readonly editor: Editor,
     private readonly statusLine: () => string | Promise<string>,
     private headerLines: readonly string[],
-  ) {}
+    initialLines: readonly string[],
+    private readonly onInterrupt?: () => boolean | Promise<boolean>,
+  ) {
+    this.lines = [...initialLines];
+  }
 
   async refreshStatusLine(): Promise<void> {
     this.status = await this.statusLine();
   }
 
   appendLine(line: string): void {
+    // Defect #4: a spinner frame owns the status row and nothing else. Even if
+    // one reaches a transcript sink it is redirected, never appended.
+    if (isWorkingStatusLine(line)) {
+      this.setStatus(line);
+      return;
+    }
     for (const part of String(line).split(/\r?\n/)) {
       this.lines.push(part);
     }
     this.trimTranscript();
+    this.scrollOffset = 0; // new output always snaps the viewport back to live
     this.tui.requestRender();
   }
 
   appendUser(text: string): void {
-    this.appendLine(`${highlight("›")} ${text}`);
+    // Breathing room, the Claude Code rhythm: one blank row before each user
+    // turn so blocks read as blocks, never as a stacked log.
+    if (this.lines.length && stripAnsi(this.lines[this.lines.length - 1] ?? "").trim() !== "") this.appendLine("");
+    this.appendLine(formatUserLine(text));
   }
 
   clearTranscript(): void {
@@ -348,6 +1382,7 @@ class MusterChatScreen implements Component, MusterChatSink {
   }
 
   setStatus(status: string): void {
+    if (isWorkingStatusLine(status)) status = paintWorkingRow(status, this.statusTick += 1);
     this.status = status;
     this.tui.requestRender();
   }
@@ -362,10 +1397,186 @@ class MusterChatScreen implements Component, MusterChatSink {
     this.tui.requestRender(true);
   }
 
+  selectFromList(_title: string, options: readonly PickerOption[]): Promise<string | undefined> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let handle: ReturnType<TUI["showOverlay"]> | undefined;
+      const finish = (value?: string): void => {
+        if (settled) return;
+        settled = true;
+        this.pickerOpen = false;
+        handle?.hide();
+        this.tui.setFocus(this.editor);
+        this.tui.requestRender(true);
+        resolve(value);
+      };
+      const theme = composerPickerTheme();
+      this.pickerOpen = true;
+      const list = selectSubmenu(
+        options.map((option) => ({ value: option.value, label: option.label ?? option.value, description: option.description })),
+        0,
+        theme.select,
+        (value) => finish(value),
+        () => finish(),
+      );
+      // The Codex app's placement: flush-left, DIRECTLY above the input box —
+      // never centered in the void, never painting over the composer's frame.
+      handle = this.tui.showOverlay(list, {
+        anchor: "bottom-left",
+        offsetY: -3,
+        // Full width: overlay rows must be OPAQUE across the terminal so the
+        // transcript can never bleed through beside them (owner-reported).
+        width: Math.max(72, this.tui.terminal.columns - 1),
+        maxHeight: 22,
+        margin: { left: 0, right: 1 },
+      });
+      this.tui.requestRender(true);
+    });
+  }
+
+  selectComposerSetting(state: ComposerPickerState): Promise<ComposerPickerSelection | undefined> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let handle: ReturnType<TUI["showOverlay"]> | undefined;
+      const finish = (selection?: ComposerPickerSelection): void => {
+        if (settled) return;
+        settled = true;
+        this.pickerOpen = false;
+        handle?.hide();
+        this.tui.setFocus(this.editor);
+        this.tui.requestRender(true);
+        resolve(selection);
+      };
+      const pickerTheme = composerPickerTheme();
+      this.pickerOpen = true;
+      const settings = new SettingsList([
+        {
+          id: "model",
+          label: "Model",
+          currentValue: modelDisplayLabel(state.activeModel),
+          description: `Current source: ${state.modelSource}`,
+          submenu: () => groupedModelSubmenu(state, pickerTheme.select, (value) => finish({ kind: "model", value }), () => finish()),
+        },
+        modelProvider(state.activeModel) === "claude"
+          ? {
+              id: "extended-thinking",
+              label: "Effort",
+              currentValue: "Extended thinking — managed by the model",
+              description: "Claude CLI exposes no verified thinking tier flag for these models.",
+            }
+          : {
+              id: "effort",
+              label: "Effort",
+              currentValue: effortDisplayLabel(state.effort),
+              description: `Current source: ${state.effortSource}`,
+              submenu: () => selectSubmenu(
+                state.catalog.efforts.map((option) => ({
+                  value: option.value,
+                  label: `${option.label}${option.value === state.effort ? `  ${pickerOk("✓")}` : ""}`,
+                  description: option.hint,
+                })),
+                state.catalog.efforts.findIndex((option) => option.value === state.effort),
+                pickerTheme.select,
+                (value) => finish({ kind: "effort", value: value as EffortValue }),
+                () => finish(),
+              ),
+            },
+        {
+          id: "speed",
+          label: "Speed",
+          currentValue: state.speed,
+          description: state.speed === "fast" ? "Warm native session with ambient recall off" : "Full memory and skill context",
+          values: state.speed === "fast" ? ["fast", "session"] : ["session", "fast"],
+        },
+      ], 6, pickerTheme.settings, (id, value) => {
+        if (id === "speed") finish({ kind: "speed", value: value as "session" | "fast" });
+      }, () => finish());
+      // The Codex app's placement: flush-left, DIRECTLY above the input box —
+      // never centered in the void, never painting over the composer's frame.
+      handle = this.tui.showOverlay(settings, {
+        anchor: "bottom-left",
+        offsetY: -3,
+        // Full width for opacity — the transcript must never bleed through.
+        width: Math.max(72, this.tui.terminal.columns - 1),
+        maxHeight: 22,
+        margin: { left: 0, right: 1 },
+      });
+      this.tui.requestRender(true);
+    });
+  }
+
+  setLiveDiffTurn(turn: LiveFileTurnAccumulator): void {
+    this.liveDiffTurn = turn;
+    this.liveDiffOverlay?.update(turn);
+  }
+
+  updateLiveDiff(turn: LiveFileTurnAccumulator): void {
+    this.liveDiffTurn = turn;
+    this.liveDiffOverlay?.update(turn);
+  }
+
+  toggleLiveDiff(): void {
+    if (this.liveDiffHandle) {
+      this.closeLiveDiff();
+      return;
+    }
+    // pi-tui cannot give a useful full-file viewport this small. Keep the
+    // command honest and readable by appending the cumulative plain delta.
+    if (this.tui.terminal.rows < 20 || !process.stdout.isTTY) {
+      for (const line of renderLiveFilePlain(this.liveDiffTurn)) this.appendLine(line);
+      return;
+    }
+    const overlay = new LiveFileOverlay(this.liveDiffTurn, {
+      terminalRows: () => this.tui.terminal.rows,
+      requestRender: () => this.tui.requestRender(true),
+      close: () => { this.closeLiveDiff(); },
+    });
+    this.liveDiffOverlay = overlay;
+    this.liveDiffHandle = this.tui.showOverlay(overlay, {
+      width: "90%",
+      maxHeight: "85%",
+      anchor: "center",
+      margin: 1,
+    });
+    this.tui.requestRender(true);
+  }
+
+  openBoard(force = false): Promise<boolean> {
+    return this.onOpenBoard?.(force) ?? Promise.resolve(false);
+  }
+
+  closeLiveDiff(suppressRawEscape = false): boolean {
+    if (!this.liveDiffHandle) return false;
+    this.suppressRawLiveDiffEscape = suppressRawEscape;
+    this.liveDiffHandle.hide();
+    this.liveDiffHandle = undefined;
+    this.liveDiffOverlay = undefined;
+    this.tui.setFocus(this.editor);
+    this.tui.requestRender(true);
+    return true;
+  }
+
+  consumeLiveDiffEscapeSuppression(): boolean {
+    if (!this.suppressRawLiveDiffEscape) return false;
+    this.suppressRawLiveDiffEscape = false;
+    return true;
+  }
+
   async submit(text: string, onSubmit: (text: string, sink: MusterChatSink) => Promise<boolean>): Promise<void> {
     const value = text.trim();
     if (!value || this.stopped) return;
+    // Defect #5: /exit is routed by the TUI itself. Routing it through the
+    // command handler worked only in the plain REPL — in TUI mode the farewell
+    // landed in a transcript that the teardown then erased.
+    if (isExitCommand(value)) {
+      this.appendUser(value);
+      this.exited = true;
+      this.stop();
+      return;
+    }
     this.editor.disableSubmit = true;
+    this.turnRunning = true;
+    this.interruptRequested = false;
     this.editor.addToHistory(value);
     this.appendUser(value);
     try {
@@ -374,9 +1585,20 @@ class MusterChatScreen implements Component, MusterChatSink {
     } catch (error) {
       this.appendLine(red(error instanceof Error ? error.message : String(error)));
     } finally {
+      this.turnRunning = false;
       this.editor.disableSubmit = false;
       this.clearStatus();
     }
+  }
+
+  interruptTurn(): boolean {
+    if (this.pickerOpen || !this.turnRunning || this.interruptRequested || !this.onInterrupt) return false;
+    this.interruptRequested = true;
+    void Promise.resolve(this.onInterrupt()).then((interrupted) => {
+      if (interrupted) this.appendLine(dim("⎋ interrupted"));
+      else this.interruptRequested = false;
+    }).catch(() => { this.interruptRequested = false; });
+    return true;
   }
 
   stop(): void {
@@ -392,42 +1614,128 @@ class MusterChatScreen implements Component, MusterChatSink {
   render(width: number): string[] {
     const frameWidth = Math.max(40, Math.min(width, 240));
     const composer = renderMusterComposer(this.editor, frameWidth);
-    const rows = Math.max(12, this.tui.terminal.rows);
-    const status = this.status ? [dim(truncateToWidth(this.status, frameWidth, ""))] : [];
+    // The status row arrives pre-styled (formatStatusLine owns spinner + dim);
+    // re-wrapping it in dim() would reset the color half-way through the row.
+    const status = this.status ? [truncateToWidth(this.status, frameWidth, "")] : [];
     const fittedHeader = fitLines(this.headerLines, frameWidth);
-    const freeRows = Math.max(0, rows - composer.length - status.length - 1);
-    const reserveTranscriptRows = Math.min(6, Math.max(1, Math.floor(freeRows * 0.45)));
-    const headerBudget = Math.max(0, freeRows - reserveTranscriptRows);
-    const header = renderHeaderWindow(fittedHeader, headerBudget);
-    const transcriptBudget = Math.max(1, rows - header.length - composer.length - status.length - 1);
-    const transcript = renderTranscriptWindow(this.lines, frameWidth, transcriptBudget);
-    return [...header, ...transcript, ...status, ...composer].map((line) => padAnsi(line, frameWidth));
+    // FLOW MODE — the Claude Code contract. The full transcript is handed to
+    // pi-tui, whose differ repaints only the visible viewport and lets earlier
+    // lines flow into the terminal's NATIVE scrollback: the user can scroll up
+    // through the whole session. Windowing/truncation here (the old
+    // renderTranscriptWindow budget) is what made running history vanish; it
+    // must never come back. renderTranscriptWindow remains exported for
+    // cramped non-interactive surfaces only.
+    // Pad to the FULL terminal width, not the capped frame: on ultra-wide
+    // terminals, cells beyond the frame otherwise keep stale glyphs from
+    // earlier wide paints (observed as phantom "["/"]" at screen edges).
+    const padTo = Math.max(frameWidth, this.tui.terminal.columns || frameWidth);
+    const transcript = this.wrappedTranscript(frameWidth, padTo);
+    // THE LAYOUT LAW: content and input travel together, composer at the
+    // bottom. On the ALTERNATE SCREEN there is no native scrollback, so the
+    // transcript renders through a viewport window scrolled in-app
+    // (PgUp/PgDn/wheel), exactly like the reference.
+    const termRows = Math.max(8, this.tui.terminal.rows || 24);
+    const statusArea = this.scrollOffset > 0
+      ? [dim(`… ${this.scrollOffset} rows below · PgDn to follow`)]
+      : status;
+    const chromeRows = fittedHeader.length + statusArea.length + composer.length;
+    const viewportRows = Math.max(1, termRows - chromeRows - 1);
+    const windowed = windowTranscript(transcript, viewportRows, this.scrollOffset);
+    this.scrollOffset = windowed.clamped;
+    const filler = Array.from({ length: Math.max(0, termRows - chromeRows - windowed.visible.length - 1) }, () => "");
+    const rows = [...fittedHeader, ...windowed.visible, ...filler, ...statusArea, ...composer].map((line) => padAnsi(line, padTo));
+    this.lastRenderedRows = rows.length;
+    return rows;
+  }
+
+  /** Total content rows from the last paint — the composer sits at the tail. */
+  private lastRenderedRows = 0;
+  /** Rows lifted off the tail by PgUp/wheel; 0 = following live output. */
+  private scrollOffset = 0;
+
+  /** Returns false when an overlay owns paging keys (canvas, picker). */
+  scrollTranscript(delta: number): boolean {
+    if (this.pickerOpen || this.liveDiffOverlay) return false;
+    const next = Math.max(0, this.scrollOffset + delta);
+    if (next === this.scrollOffset) return delta > 0;
+    this.scrollOffset = next;
+    this.tui.requestRender(true);
+    return true;
+  }
+
+  scrollPage(direction: 1 | -1): boolean {
+    return this.scrollTranscript(direction * Math.max(1, (this.tui.terminal.rows || 24) - 8));
   }
 
   handleInput(data: string): void {
     this.editor.handleInput(data);
   }
 
+  /**
+   * Incremental wrap cache: transcripts are append-only, so each source line
+   * wraps exactly once per width. This is what makes UNLIMITED scrollback
+   * (owner-ruled 2026-08-30 — no row cap, the entire session reachable)
+   * affordable: a repaint costs O(viewport), not O(session).
+   */
+  private wrapCache = { width: -1, padTo: -1, consumed: 0, rows: [] as string[], bandOpen: false };
+
+  private wrappedTranscript(frameWidth: number, padTo: number): readonly string[] {
+    const cache = this.wrapCache;
+    if (cache.width !== frameWidth || cache.padTo !== padTo || cache.consumed > this.lines.length) {
+      cache.width = frameWidth;
+      cache.padTo = padTo;
+      cache.consumed = 0;
+      cache.rows = [];
+      cache.bandOpen = false;
+    }
+    while (cache.consumed < this.lines.length) {
+      const line = this.lines[cache.consumed]!;
+      const plain = stripAnsi(line);
+      const wasUser = cache.bandOpen;
+      if (isUserTranscriptLine(line)) cache.bandOpen = true;
+      else if (!plain.startsWith("  ")) cache.bandOpen = false;
+      const rows = wrapLine(line, frameWidth).map((row) => cache.bandOpen ? bandUserRow(row, padTo) : row);
+      // THE GAP, enforced at the renderer so no append site can regress it.
+      if (wasUser && !cache.bandOpen && plain.trim() !== "") rows.unshift("");
+      cache.rows.push(...rows);
+      cache.consumed += 1;
+    }
+    return cache.rows;
+  }
+
   private trimTranscript(): void {
-    if (this.lines.length > 500) this.lines.splice(0, this.lines.length - 500);
+    // Owner-ruled: NO cap — the entire session stays scrollable. The wrap
+    // cache keeps repaints O(viewport) regardless of session length.
   }
 }
 
 class HarnessSink implements MusterChatSink {
   readonly transcriptLines: string[] = [];
-  private status = "";
+  exited = false;
+  statusRow = "";
+  private turnRunning = false;
+  private interruptRequested = false;
+  private liveDiffTurn = new LiveFileTurnAccumulator();
 
   constructor(
     private readonly editor: Editor,
     private readonly onSubmit?: (text: string, sink: MusterChatSink) => Promise<boolean>,
-  ) {}
+    private readonly onInterrupt?: () => boolean | Promise<boolean>,
+    initialLines: readonly string[] = [],
+  ) {
+    this.transcriptLines.push(...initialLines);
+  }
 
   appendLine(line: string): void {
+    if (isWorkingStatusLine(line)) {
+      this.setStatus(line);
+      return;
+    }
     for (const part of String(line).split(/\r?\n/)) this.transcriptLines.push(part);
   }
 
   appendUser(text: string): void {
-    this.appendLine(`${highlight("›")} ${text}`);
+    this.appendLine(formatUserLine(text));
   }
 
   clearTranscript(): void {
@@ -437,11 +1745,11 @@ class HarnessSink implements MusterChatSink {
   setHeaderLines(_lines: readonly string[]): void {}
 
   setStatus(status: string): void {
-    this.status = status;
+    this.statusRow = status;
   }
 
   clearStatus(): void {
-    this.status = "";
+    this.statusRow = "";
   }
 
   openPicker(command: string): void {
@@ -449,15 +1757,55 @@ class HarnessSink implements MusterChatSink {
     for (const char of command) this.editor.handleInput(char);
   }
 
+  async selectComposerSetting(_state: ComposerPickerState): Promise<ComposerPickerSelection | undefined> {
+    return undefined;
+  }
+
+  async selectFromList(_title: string, _options: readonly PickerOption[]): Promise<string | undefined> {
+    return undefined;
+  }
+
+  setLiveDiffTurn(turn: LiveFileTurnAccumulator): void {
+    this.liveDiffTurn = turn;
+  }
+
+  updateLiveDiff(turn: LiveFileTurnAccumulator): void {
+    this.liveDiffTurn = turn;
+  }
+
+  toggleLiveDiff(): void {
+    for (const line of renderLiveFilePlain(this.liveDiffTurn)) this.appendLine(line);
+  }
+
+  openBoard(): Promise<boolean> { return Promise.resolve(false); }
+
   async submit(text: string): Promise<boolean> {
     const value = text.trim();
     if (!value) return true;
     this.editor.addToHistory(value);
     this.appendUser(value);
-    const keepGoing = await (this.onSubmit?.(value, this) ?? Promise.resolve(true));
-    this.clearStatus();
-    void this.status;
-    return keepGoing;
+    if (isExitCommand(value)) {
+      this.exited = true;
+      return false;
+    }
+    this.turnRunning = true;
+    this.interruptRequested = false;
+    try {
+      return await (this.onSubmit?.(value, this) ?? Promise.resolve(true));
+    } finally {
+      this.turnRunning = false;
+      this.clearStatus();
+    }
+  }
+
+  interruptTurn(): boolean {
+    if (!this.turnRunning || this.interruptRequested || !this.onInterrupt) return false;
+    this.interruptRequested = true;
+    void Promise.resolve(this.onInterrupt()).then((interrupted) => {
+      if (interrupted) this.appendLine(dim("⎋ interrupted"));
+      else this.interruptRequested = false;
+    }).catch(() => { this.interruptRequested = false; });
+    return true;
   }
 }
 
@@ -481,11 +1829,17 @@ export function renderTranscriptWindow(lines: readonly string[], width: number, 
 
   const userLine = turn[0] ?? wrapLine(lines[latestUserIndex] ?? "", width)[0] ?? "";
   if (budget === 1) return [userLine];
-  const pinned = turn.slice(1).filter(isPinnedReceiptLine);
-  if (budget >= 3 && pinned.length) {
-    const pinnedBudget = Math.min(pinned.length, budget - 2);
-    const tailBudget = budget - 1 - pinnedBudget;
-    return [userLine, ...pinned.slice(0, pinnedBudget), ...turn.slice(-tailBudget)].slice(0, budget);
+  const groups = pinnedGroups(turn);
+  if (budget >= 3 && groups.length) {
+    // Two passes: the first sizes the tail, the second drops any group the tail
+    // already shows, so a squeezed turn never prints the same receipt twice.
+    const firstPass = takePinnedGroups(groups, budget - 2);
+    const visibleFrom = turn.length - (budget - 1 - firstPass.length);
+    const pinned = takePinnedGroups(groups.filter((group) => group.lastIndex < visibleFrom), budget - 2);
+    if (pinned.length) {
+      const tailBudget = budget - 1 - pinned.length;
+      return [userLine, ...pinned, ...turn.slice(-tailBudget)].slice(0, budget);
+    }
   }
   return [userLine, ...turn.slice(-(budget - 1))].slice(0, budget);
 }
@@ -496,7 +1850,52 @@ export function isClearComposerKey(data: string): boolean {
 
 function isPinnedReceiptLine(line: string): boolean {
   const clean = stripAnsi(line).trimStart();
-  return clean.startsWith("memory backend=") || clean.startsWith("timings total=");
+  // Raw receipts (non-TTY shape), their TTY chips, and the dim `⎿` result rows
+  // under an action all stay visible when a long turn overflows the budget.
+  return clean.startsWith("memory backend=")
+    || clean.startsWith("timings total=")
+    || clean.startsWith("▸ ")
+    || clean.startsWith(`${RESULT_ELBOW} `);
+}
+
+/** `⏺ Edit(server.js)` — the headline an indented result hangs beneath. */
+function isActionHeadline(line: string): boolean {
+  return stripAnsi(line).startsWith(`${TOOL_BULLET} `);
+}
+
+interface PinnedGroup {
+  /** The rows this pin occupies, headline first when it has one. */
+  readonly lines: readonly string[];
+  /** Index of the last row in the turn, used to detect tail overlap. */
+  readonly lastIndex: number;
+}
+
+/**
+ * Receipts worth pinning when a turn overflows, each carried WITH the action
+ * that owns it. Pinning a bare `⎿ +12 −2 · receipt d3b9…` was a quiet data
+ * loss: the numbers survived but the file they belonged to did not, so the row
+ * read as an orphan. A result and its `⏺` headline are one unit or neither.
+ */
+function pinnedGroups(turn: readonly string[]): PinnedGroup[] {
+  const groups: PinnedGroup[] = [];
+  for (let index = 1; index < turn.length; index += 1) {
+    const line = turn[index] ?? "";
+    if (!isPinnedReceiptLine(line)) continue;
+    const owner = turn[index - 1] ?? "";
+    const withOwner = index - 1 >= 1 && isActionHeadline(owner);
+    groups.push({ lines: withOwner ? [owner, line] : [line], lastIndex: index });
+  }
+  return groups;
+}
+
+/** Whole groups only, in order, until the next one would not fit. */
+function takePinnedGroups(groups: readonly PinnedGroup[], budget: number): string[] {
+  const rows: string[] = [];
+  for (const group of groups) {
+    if (rows.length + group.lines.length > budget) break;
+    rows.push(...group.lines);
+  }
+  return rows;
 }
 
 export function renderHeaderWindow(lines: readonly string[], budget: number): string[] {
@@ -516,7 +1915,7 @@ export function renderHeaderWindow(lines: readonly string[], budget: number): st
 
 function findLatestUserLine(lines: readonly string[]): number {
   for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (stripAnsi(lines[index] ?? "").trimStart().startsWith("› ")) return index;
+    if (isUserTranscriptLine(lines[index] ?? "")) return index;
   }
   return -1;
 }
@@ -536,8 +1935,10 @@ function slashCompletionContext(trimmed: string):
   | { kind: "plugin"; fragment: string; prefix: string }
   | { kind: "plugin-reuse-provider"; fragment: string; prefix: string }
   | { kind: "mcp"; fragment: string; prefix: string }
+  | { kind: "mcp-target"; fragment: string; prefix: string }
   | { kind: "integration"; fragment: string; prefix: string }
   | { kind: "integration-workflow"; fragment: string; prefix: string }
+  | { kind: "reasoning"; fragment: string; prefix: string }
   | undefined {
   switch (trimmed.toLowerCase()) {
     case "/tools":
@@ -568,6 +1969,8 @@ function slashCompletionContext(trimmed: string):
       return { kind: "plugin", fragment: "", prefix: trimmed };
     case "/mcp":
       return { kind: "mcp", fragment: "", prefix: trimmed };
+    case "/reasoning":
+      return { kind: "reasoning", fragment: "", prefix: trimmed };
     case "/integration":
     case "/integrations":
       return { kind: "integration", fragment: "", prefix: trimmed };
@@ -600,6 +2003,8 @@ function slashCompletionContext(trimmed: string):
   if (cloudMatch) return { kind: "cloud", fragment: cloudMatch[1] ?? "", prefix: trimmed };
   const speedMatch = trimmed.match(/^\/speed\s+([^\s]*)$/i);
   if (speedMatch) return { kind: "speed", fragment: speedMatch[1] ?? "", prefix: trimmed };
+  const reasoningMatch = trimmed.match(/^\/reasoning\s+([^\s]*)$/i);
+  if (reasoningMatch) return { kind: "reasoning", fragment: reasoningMatch[1] ?? "", prefix: trimmed };
   const capabilityMatch = trimmed.match(/^\/(?:capabilities|capability|caps)\s+([^\s]*)$/i);
   if (capabilityMatch) return { kind: "capability", fragment: capabilityMatch[1] ?? "", prefix: trimmed };
   const skillMatch = trimmed.match(/^\/skills?\s+([^\s]*)$/i);
@@ -608,6 +2013,8 @@ function slashCompletionContext(trimmed: string):
   if (pluginReuseMatch) return { kind: "plugin-reuse-provider", fragment: pluginReuseMatch[1] ?? "", prefix: trimmed };
   const pluginMatch = trimmed.match(/^\/plugins?\s+([^\s]*)$/i);
   if (pluginMatch) return { kind: "plugin", fragment: pluginMatch[1] ?? "", prefix: trimmed };
+  const mcpTargetMatch = trimmed.match(/^\/mcp\s+(?:login|remove|rm|test|install)\s+([^\s]*)$/i);
+  if (mcpTargetMatch) return { kind: "mcp-target", fragment: mcpTargetMatch[1] ?? "", prefix: trimmed };
   const mcpMatch = trimmed.match(/^\/mcp\s+([^\s]*)$/i);
   if (mcpMatch) return { kind: "mcp", fragment: mcpMatch[1] ?? "", prefix: trimmed };
   const integrationWorkflowMatch = trimmed.match(/^\/integrations?\s+(?:workflow|setup|verify|enable|sample)\s+([^\s]*)$/i);
@@ -647,7 +2054,7 @@ function pickerOptionsToItems(options: readonly PickerOption[]): AutocompleteIte
   return options.map((option) => ({
     value: option.value,
     label: option.label ?? option.value,
-    description: option.description,
+    description: option.description ? dim(option.description) : undefined,
   }));
 }
 
@@ -658,7 +2065,7 @@ function createCallbackCompletionCatalog(options: MusterAutocompleteOptions): Mu
         case "command":
           return options.commands
             .filter((command) => command.name.startsWith(request.fragment.toLowerCase()) || command.aliases?.some((alias) => alias.startsWith(request.fragment.toLowerCase())))
-            .map((command) => ({ value: `/${command.name}`, label: command.usage, description: command.description }));
+            .map((command) => ({ value: `/${command.name}`, label: pickerSel(command.usage), description: dim(command.description) }));
         case "toolset":
           return filterPickerOptions(options.toolsets.map((toolset) => ({ value: toolset, label: toolset, description: "toolset" })), request.fragment);
         case "session":
@@ -675,6 +2082,17 @@ function createCallbackCompletionCatalog(options: MusterAutocompleteOptions): Mu
           return filterPickerOptions(await options.clouds?.() ?? [], request.fragment);
         case "speed":
           return filterPickerOptions(await options.speeds?.() ?? [], request.fragment);
+        case "reasoning":
+          return filterPickerOptions([
+            { value: "low", label: "Light", description: "Codex Effort" },
+            { value: "medium", label: "Medium", description: "Codex Effort" },
+            { value: "high", label: "High", description: "Codex Effort" },
+            { value: "xhigh", label: "Extra High", description: "Codex Effort" },
+            { value: "max", label: "Max", description: "Codex Effort" },
+            { value: "ultra", label: "Ultra", description: "Consumes usage limits faster" },
+            { value: "compact", label: "summaries: brief", description: "one dim line above each answer" },
+            { value: "full", label: "summaries: full", description: "every provider-approved summary line" },
+          ], request.fragment);
         case "capability": {
           const capabilities = await options.capabilities?.();
           return filterPickerOptions(capabilities ?? [
@@ -691,6 +2109,8 @@ function createCallbackCompletionCatalog(options: MusterAutocompleteOptions): Mu
           return filterPickerOptions(await options.pluginReuseProviders?.() ?? [], request.fragment);
         case "mcp":
           return filterPickerOptions(await options.mcpServers?.() ?? [], request.fragment);
+        case "mcp-target":
+          return filterPickerOptions(await options.mcpTargets?.() ?? await options.mcpServers?.() ?? [], request.fragment);
         case "integration":
           return filterPickerOptions(await options.integrations?.() ?? [], request.fragment);
         case "integration-workflow":
@@ -713,6 +2133,8 @@ function agentCompletionFragment(trimmed: string): string | undefined {
 
 function completionReplacement(beforeCursor: string, item: AutocompleteItem, prefix: string): string {
   const trimmed = beforeCursor.trimStart();
+  const capabilitySelection = decodeCapabilitySelection(item.value);
+  if (/^\/tools(?:\s+\S*)?$/i.test(trimmed) && capabilitySelection !== undefined) return capabilitySelection;
   switch (trimmed.toLowerCase()) {
     case "/tools":
       return `/tools ${item.value}`;
@@ -776,6 +2198,8 @@ function completionReplacement(beforeCursor: string, item: AutocompleteItem, pre
   if (/^\/skills?\s+/i.test(trimmed)) return `/skills ${item.value}`;
   if (/^\/plugins?\s+reuse(?:\s+.*)?$/i.test(trimmed)) return `/plugins reuse ${item.value}`;
   if (/^\/plugins?\s+/i.test(trimmed)) return `/plugins ${item.value}`;
+  const mcpTarget = trimmed.match(/^\/mcp\s+(login|remove|rm|test|install)\b/i);
+  if (mcpTarget) return `/mcp ${mcpTarget[1]} ${item.value}`;
   if (/^\/mcp\s+/i.test(trimmed)) return `/mcp ${item.value}`;
   const integrationAction = trimmed.match(/^\/integrations?\s+(workflow|setup|verify|enable|sample)\s+/i);
   if (integrationAction) return `/integrations ${integrationAction[1]?.toLowerCase()} ${item.value}`;
@@ -788,18 +2212,24 @@ export function isBareCompletionTrigger(text: string): boolean {
   return trimmed === "/" || trimmed === "@";
 }
 
-function isExitCommand(text: string): boolean {
+export function isToolsOverlayInput(text: string): boolean {
+  return /^\/tools(?:\s+\S*)?$/i.test(text.trimStart());
+}
+
+export function isExitCommand(text: string): boolean {
   return /^\/(?:exit|quit|q)\s*$/i.test(text.trim());
 }
 
 function musterEditorTheme(): EditorTheme {
+  // The reference's popup: NO background band — the selected row simply goes
+  // periwinkle; everything structural is dim.
   return {
-    borderColor: accent,
+    borderColor: dim,
     selectList: {
-      selectedPrefix: highlight,
-      selectedText: (text) => `\x1b[48;2;${SELECTION_BG_RGB}m\x1b[30;1m${text}`,
+      selectedPrefix: pickerSel,
+      selectedText: pickerSel,
       description: dim,
-      scrollInfo: accent,
+      scrollInfo: dim,
       noMatch: dim,
     },
   };
@@ -807,22 +2237,100 @@ function musterEditorTheme(): EditorTheme {
 
 function frameLine(content: string, innerWidth: number): string {
   const padded = padAnsi(content, innerWidth);
-  return `${accent("│ ")}${padded}${RESET}${accent(" │")}`;
+  return `${dim("│ ")}${padded}${RESET}${dim(" │")}`;
 }
 
+/**
+ * Wrap one transcript row losslessly. `truncateToWidth` appends a reset
+ * sequence, so slicing the remainder by the returned string's RAW length used
+ * to eat four characters per wrap — a streamed sentence silently lost a word
+ * every 78 columns. The chunk is stripped before it is used as a cursor, and
+ * every character of the input ends up in exactly one chunk.
+ */
 function wrapLine(line: string, width: number): string[] {
   const cleanWidth = Math.max(10, width - 2);
   if (visibleWidth(line) <= cleanWidth) return [line];
-  const chunks: string[] = [];
   const plain = stripAnsi(line);
-  let rest = plain;
-  while (visibleWidth(rest) > cleanWidth) {
-    const chunk = truncateToWidth(rest, cleanWidth, "");
-    chunks.push(chunk);
-    rest = rest.slice(chunk.length);
+  const indent = hangingIndent(plain, cleanWidth);
+  const chunks: string[] = [];
+  let cursor = 0;
+  for (;;) {
+    const rest = plain.slice(cursor);
+    // Continuations keep the row's own gutter column, so a wrapped `●` block
+    // still reads as ONE block instead of restarting at column zero.
+    const prefix = chunks.length ? indent : "";
+    const limit = Math.max(1, cleanWidth - prefix.length);
+    if (visibleWidth(rest) <= limit) {
+      if (rest) chunks.push(prefix + sliceAnsiRange(line, cursor, plain.length));
+      break;
+    }
+    const fitted = stripAnsi(truncateToWidth(rest, limit, ""));
+    // A zero-width fit would loop forever; take one character and move on.
+    const take = fitted.length > 0 ? wrapBreakPoint(rest, fitted.length) : 1;
+    chunks.push(prefix + sliceAnsiRange(line, cursor, cursor + take));
+    cursor += take;
   }
-  if (rest) chunks.push(rest);
-  return chunks;
+  return chunks.length ? chunks : [line];
+}
+
+/**
+ * Slice by plain-text offsets while replaying the SGR state active at the
+ * slice boundary. Semantic paint used to disappear as soon as prose wrapped;
+ * keeping this here makes terminal width a layout concern, never a style gate.
+ */
+function sliceAnsiRange(value: string, start: number, end: number): string {
+  const sgr = /\u001b\[[0-9;]*m/g;
+  let plainAt = 0;
+  let rawAt = 0;
+  let active: string[] = [];
+  let output = "";
+  let started = false;
+  for (;;) {
+    sgr.lastIndex = rawAt;
+    const match = sgr.exec(value);
+    const nextEscape = match?.index ?? value.length;
+    const text = value.slice(rawAt, nextEscape);
+    const textStart = plainAt;
+    const textEnd = plainAt + text.length;
+    if (textEnd > start && textStart < end) {
+      if (!started) { output += active.join(""); started = true; }
+      output += text.slice(Math.max(0, start - textStart), Math.min(text.length, end - textStart));
+    }
+    plainAt = textEnd;
+    if (!match || plainAt >= end) break;
+    const code = match[0];
+    if (code === RESET || code === "\x1b[m") active = [];
+    else active.push(code);
+    if (plainAt >= start && plainAt < end) {
+      if (!started) { output += active.join(""); started = true; }
+      else output += code;
+    }
+    rawAt = nextEscape + code.length;
+  }
+  return process.env.NO_COLOR || !output ? output : `${output}${RESET}`;
+}
+
+/**
+ * The column a wrapped row resumes at: its own leading whitespace plus the
+ * width of a gutter glyph (`●`, `⏺`, `⎿`, `>`, `✻`) when it wears one. Clamped
+ * so a deeply indented row can never wrap itself down to a one-character
+ * column.
+ */
+function hangingIndent(clean: string, cleanWidth: number): string {
+  const match = clean.match(/^( *)(?:([●⏺⎿>✻]) )?/u);
+  const leading = match?.[1]?.length ?? 0;
+  const glyph = match?.[2] ? 2 : 0;
+  return " ".repeat(Math.max(0, Math.min(leading + glyph, cleanWidth - 10)));
+}
+
+/** Prefer the last space in the final quarter of the chunk so prose breaks between words. */
+function wrapBreakPoint(text: string, limit: number): number {
+  if (limit >= text.length) return limit;
+  const space = text.lastIndexOf(" ", limit);
+  // Prefer a word boundary whenever one exists in the latter 60% of the row —
+  // a mid-word "wri/te" break is worse than a slightly ragged edge. Only a
+  // genuinely over-long token gets hard-broken.
+  return space > limit * 0.4 ? space + 1 : limit;
 }
 
 function fitLines(lines: readonly string[], width: number): string[] {

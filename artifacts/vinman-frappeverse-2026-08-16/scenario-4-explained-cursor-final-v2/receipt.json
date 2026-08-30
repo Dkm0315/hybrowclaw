@@ -1,0 +1,52 @@
+{
+  "scenario_id": "v16-migration",
+  "title": "Escalate a v15 to v16 migration failure",
+  "prompt": "this report stopped working after the update. please check what happened and send it to support",
+  "started_at": "2026-08-16T17:45:22.806Z",
+  "finished_at": "2026-08-16T17:46:30.312Z",
+  "browser": {
+    "base_url": "https://mono-lamb-effects-watches.trycloudflare.com",
+    "route": "/desk",
+    "viewport": {
+      "width": 1440,
+      "height": 900
+    }
+  },
+  "visible_evidence": {
+    "assistantMessages": [],
+    "scenarioEvidence": [
+      "MUSTER\nReview the support ticket\n\nReview the ticket summary and evidence preview below. Approval is bound to this complete sanitized payload; nothing has been sent yet.\n\nField\tValue\nSubject\tIssue from MUSTER-DEMO-V16-ENGINEERING-READINESS: this report stopped working after the update. please check what happened and send it to s…\nEvidence preview\t### Reported by Administrator ### Source site https://mono-lamb-effects-watches.trycloudflare.com ### Current context MUSTER-DEMO-V16-ENGINEERING-READINESS ### Request this report stopped working after the update. please check what happened and send it to support ### Request reference MUSTER-00ee1eea-0ec6-43af-b964-da5b31793599 ### Permission-filtered evidence No record summary was supplied by the source site. ### Reproduction 1. Open the affected page at query-report/MUSTER-DEMO-V16-ENGIN\nCustomer\tVinman Engineering Private Limited\nApprove & send to support\nCancel ticket"
+    ],
+    "takeover": {
+      "visible": true,
+      "waiting": true,
+      "text": "MUSTER\nReview the support ticket\n\nReview the ticket summary and evidence preview below. Approval is bound to this complete sanitized payload; nothing has been sent yet.\n\nField\tValue\nSubject\tIssue from MUSTER-DEMO-V16-ENGINEERING-READINESS: this report stopped working after the update. please check what happened and send it to s…\nEvidence preview\t### Reported by Administrator ### Source site https://mono-lamb-effects-watches.trycloudflare.com ### Current context MUSTER-DEMO-V16-ENGINEERING-READINESS ### Request this report stopped working after the update. please check what happened and send it to support ### Request reference MUSTER-00ee1eea-0ec6-43af-b964-da5b31793599 ### Permission-filtered evidence No record summary was supplied by the source site. ### Reproduction 1. Open the affected page at query-report/MUSTER-DEMO-V16-ENGIN\nCustomer\tVinman Engineering Private Limited\nApprove & send to support\nCancel ticket"
+    },
+    "takeoverSamples": [
+      "MUSTER\nReview the support ticket\n\nReview the ticket summary and evidence preview below. Approval is bound to this complete sanitized payload; nothing has been sent yet.\n\nField\tValue\nSubject\tIssue from MUSTER-DEMO-V16-ENGINEERING-READINESS: this report stopped working after the update. please check what happened and send it to s…\nEvidence preview\t### Reported by Administrator ### Source site https://mono-lamb-effects-watches.trycloudflare.com ### Current context MUSTER-DEMO-V16-ENGINEERING-READINESS ### Request this report stopped working after the update. please check what happened and send it to support ### Request reference MUSTER-00ee1eea-0ec6-43af-b964-da5b31793599 ### Permission-filtered evidence No record summary was supplied by the source site. ### Reproduction 1. Open the affected page at query-report/MUSTER-DEMO-V16-ENGIN\nCustomer\tVinman Engineering Private Limited\nApprove & send to support\nCancel ticket"
+    ],
+    "launchClicked": false,
+    "approvalClicked": true,
+    "receipt": {
+      "visible": true,
+      "id": "1500",
+      "status": "verified",
+      "scenario": "v16-migration",
+      "text": "MUSTER\nSent to support\n\nThe support destination created the ticket, reread it, and confirmed the approved evidence was saved.\n\nTicket\tOpen\n1500\thttps://support.hybrowlabs.com/app/hd-ticket/1500"
+    },
+    "repairReceipt": null,
+    "restorationReceipt": null,
+    "businessRetestCompleted": false,
+    "forbiddenRequests": [],
+    "followUpVisible": false
+  },
+  "artifacts": {
+    "video": "recording.webm",
+    "screenshot": "final.png",
+    "trace": "trace.zip",
+    "video_bytes": 2696941,
+    "screenshot_bytes": 188795,
+    "trace_bytes": 21303672
+  },
+  "result": "pass"
+}

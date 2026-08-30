@@ -16,10 +16,29 @@ export interface TrustedFrappeContext {
   readonly installedApps?: readonly string[];
   /** Permission-filtered context assembled inside Frappe for this one turn. */
   readonly summary?: string;
+  /** Structured, permission-filtered investigation evidence for a support handoff. */
+  readonly supportEvidence?: TrustedFrappeSupportEvidence;
   /** Deterministic Frappe answer that can bypass the provider. */
   readonly fastReply?: SurfaceReply;
   /** Host-classified Ask outcomes. This selects a lane but grants no capability. */
   readonly ask?: TrustedFrappeAskContext;
+}
+
+export interface TrustedFrappeSupportEvidence {
+  readonly expected?: string;
+  readonly observed?: string;
+  readonly businessImpact?: string;
+  readonly likelyLocations?: readonly string[];
+  readonly affectedRecords?: readonly {
+    readonly label: string;
+    readonly doctype: string;
+    readonly name: string;
+  }[];
+  readonly appVersions?: Readonly<Record<string, string>>;
+  readonly reproduction?: readonly string[];
+  readonly validation?: readonly string[];
+  readonly errorEvidence?: readonly string[];
+  readonly evidenceIds?: readonly string[];
 }
 
 export interface TrustedFrappeAskContext {
@@ -84,16 +103,20 @@ export function parseTrustedFrappeIngress(value: unknown): TrustedFrappeIngress 
   const ask = askRecord ? {
     schemaVersion: askRecord.schemaVersion,
     requestId: boundedString(askRecord.requestId, "context.ask.requestId", 140),
-    requestedOutcomes: stringArray(askRecord.requestedOutcomes, "context.ask.requestedOutcomes", 7, 40),
+    requestedOutcomes: stringArray(askRecord.requestedOutcomes, "context.ask.requestedOutcomes", 8, 40),
   } : undefined;
-  const askOutcomes = new Set(["answer", "live_read", "artifact", "governed_change", "durable_workflow", "attended_browser", "development_workflow"]);
+  const askOutcomes = new Set(["answer", "live_read", "artifact", "governed_change", "durable_workflow", "attended_browser", "development_workflow", "lineage_remediation", "customization_repair"]);
   if (ask && (ask.schemaVersion !== 1 || !ask.requestedOutcomes.length || ask.requestedOutcomes.some((outcome) => !askOutcomes.has(outcome)))) {
     throw new Error("Trusted Frappe context.ask is invalid.");
   }
+  const supportEvidence = contextRecord.supportEvidence === undefined
+    ? undefined
+    : parseSupportEvidence(contextRecord.supportEvidence);
   const context: TrustedFrappeContext = {
     ...optionalFields(contextRecord, ["route", "pageType", "pageName", "doctype", "docname", "locale", "timezone"], 500),
     ...(contextRecord.installedApps === undefined ? {} : { installedApps: stringArray(contextRecord.installedApps, "context.installedApps", 100, 180) }),
     ...(contextRecord.summary === undefined ? {} : { summary: boundedString(contextRecord.summary, "context.summary", 32_000) }),
+    ...(supportEvidence ? { supportEvidence } : {}),
     ...(fastText ? { fastReply: { text: fastText } } : {}),
     ...(ask ? { ask: { schemaVersion: 1, requestId: ask.requestId, requestedOutcomes: ask.requestedOutcomes } } : {}),
   };
@@ -298,4 +321,57 @@ function stringArray(value: unknown, field: string, maxItems: number, maxChars: 
   if (value.length > maxItems) throw new Error(`Trusted Frappe ${field} exceeds ${maxItems} items.`);
   const rows = value.map((item, index) => boundedString(item, `${field}[${index}]`, maxChars));
   return [...new Set(rows)];
+}
+
+function parseSupportEvidence(value: unknown): TrustedFrappeSupportEvidence {
+  const evidence = record(value, "context.supportEvidence must be an object.");
+  const allowed = new Set([
+    "expected", "observed", "businessImpact", "likelyLocations", "affectedRecords",
+    "appVersions", "reproduction", "validation", "errorEvidence", "evidenceIds",
+  ]);
+  if (Object.keys(evidence).some((key) => !allowed.has(key))) {
+    throw new Error("Trusted Frappe context.supportEvidence contains an unknown field.");
+  }
+  const affectedRecords = evidence.affectedRecords === undefined
+    ? undefined
+    : parseAffectedRecords(evidence.affectedRecords);
+  const appVersions = evidence.appVersions === undefined
+    ? undefined
+    : parseAppVersions(evidence.appVersions);
+  return Object.freeze({
+    ...optionalFields(evidence, ["expected", "observed", "businessImpact"], 12_000),
+    ...(evidence.likelyLocations === undefined ? {} : { likelyLocations: stringArray(evidence.likelyLocations, "context.supportEvidence.likelyLocations", 100, 500) }),
+    ...(affectedRecords ? { affectedRecords } : {}),
+    ...(appVersions ? { appVersions } : {}),
+    ...(evidence.reproduction === undefined ? {} : { reproduction: stringArray(evidence.reproduction, "context.supportEvidence.reproduction", 100, 1_000) }),
+    ...(evidence.validation === undefined ? {} : { validation: stringArray(evidence.validation, "context.supportEvidence.validation", 100, 1_000) }),
+    ...(evidence.errorEvidence === undefined ? {} : { errorEvidence: stringArray(evidence.errorEvidence, "context.supportEvidence.errorEvidence", 100, 1_000) }),
+    ...(evidence.evidenceIds === undefined ? {} : { evidenceIds: stringArray(evidence.evidenceIds, "context.supportEvidence.evidenceIds", 100, 256) }),
+  });
+}
+
+function parseAffectedRecords(value: unknown): readonly NonNullable<TrustedFrappeSupportEvidence["affectedRecords"]>[number][] {
+  if (!Array.isArray(value)) throw new Error("Trusted Frappe context.supportEvidence.affectedRecords must be an array.");
+  if (value.length > 100) throw new Error("Trusted Frappe context.supportEvidence.affectedRecords exceeds 100 items.");
+  return Object.freeze(value.map((item, index) => {
+    const entry = record(item, `context.supportEvidence.affectedRecords[${index}] must be an object.`);
+    if (Object.keys(entry).some((key) => !["label", "doctype", "name"].includes(key))) {
+      throw new Error(`Trusted Frappe context.supportEvidence.affectedRecords[${index}] contains an unknown field.`);
+    }
+    return Object.freeze({
+      label: boundedString(entry.label, `context.supportEvidence.affectedRecords[${index}].label`, 500),
+      doctype: boundedString(entry.doctype, `context.supportEvidence.affectedRecords[${index}].doctype`, 180),
+      name: boundedString(entry.name, `context.supportEvidence.affectedRecords[${index}].name`, 500),
+    });
+  }));
+}
+
+function parseAppVersions(value: unknown): Readonly<Record<string, string>> {
+  const versions = record(value, "context.supportEvidence.appVersions must be an object.");
+  const entries = Object.entries(versions);
+  if (entries.length > 100) throw new Error("Trusted Frappe context.supportEvidence.appVersions exceeds 100 entries.");
+  return Object.freeze(Object.fromEntries(entries.map(([app, version]) => [
+    boundedString(app, "context.supportEvidence.appVersions key", 180),
+    boundedString(version, `context.supportEvidence.appVersions.${app}`, 500),
+  ])));
 }

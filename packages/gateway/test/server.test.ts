@@ -442,7 +442,7 @@ test("WhatsApp POST webhooks require and verify Meta app-secret signatures", asy
   const init = await initGatewayConfig(cwd);
   const gateway: GatewayConfig = {
     ...init.config,
-    whatsapp: {
+    "whatsapp-cloud": {
       accessToken: "ACCESS",
       verifyToken: "VERIFY",
       phoneNumberId: "PHONE",
@@ -456,15 +456,15 @@ test("WhatsApp POST webhooks require and verify Meta app-secret signatures", asy
     entry: [{ changes: [{ field: "messages", value: { metadata: { phone_number_id: "PHONE" }, messages: [{ from: "919999999999", id: "m1", type: "text", text: { body: "hi" } }] } }] }],
   });
   try {
-    const unsigned = await fetch(`http://127.0.0.1:${running.port}/v1/adapters/whatsapp`, {
+    const unsigned = await fetch(`http://127.0.0.1:${running.port}/v1/adapters/whatsapp-cloud`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body,
     });
     assert.equal(unsigned.status, 401);
 
-    const signature = `sha256=${createHmac("sha256", gateway.whatsapp!.appSecret!).update(body).digest("hex")}`;
-    const signed = await fetch(`http://127.0.0.1:${running.port}/v1/adapters/whatsapp`, {
+    const signature = `sha256=${createHmac("sha256", gateway["whatsapp-cloud"]!.appSecret!).update(body).digest("hex")}`;
+    const signed = await fetch(`http://127.0.0.1:${running.port}/v1/adapters/whatsapp-cloud`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-hub-signature-256": signature },
       body,

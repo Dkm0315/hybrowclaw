@@ -3,9 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Frappe AI Agent Harness — Muster for ERPNext and Frappe Automation</title>
-  <meta name="description" content="Muster brings governed Frappe AI and ERPNext automation to production systems with DocType context, scoped memory, token ledger, MCP capabilities, browser automation, and permission-aware setup." />
-  <meta name="keywords" content="Frappe AI, ERPNext AI, Frappe agent, ERPNext agent, Frappe automation, ERPNext automation, Frappe MCP, Frappe AI assistant, Muster Frappe, governed agent harness" />
+  <title>ERPNext AI Agent — Muster</title>
+  <meta name="description" content="An ERPNext AI agent that reads DocTypes, fields, workflows, roles and permissions before it answers or acts — self-hosted, with scoped memory, a token ledger, and an observed audit trail." />
+  <meta name="keywords" content="ERPNext AI agent, Frappe AI agent, ERPNext AI, Frappe AI, ERPNext automation, DocType aware retrieval, self-hosted AI agent, ERPNext MCP" />
   <meta name="robots" content="index, follow, max-image-preview:large" />
   <link rel="canonical" href="https://themuster.dev/frappe-ai.html" />
   <meta name="theme-color" content="#F0EEE9" />
@@ -22,13 +22,13 @@
   </script>
   <meta property="og:type" content="website" />
   <meta property="og:site_name" content="Muster" />
-  <meta property="og:title" content="Frappe AI Agent Harness — Muster for ERPNext and Frappe" />
-  <meta property="og:description" content="Build Frappe AI and ERPNext automation with governed memory, token visibility, DocType context, MCP capabilities, and permission-aware setup." />
+  <meta property="og:title" content="ERPNext AI Agent — Muster" />
+  <meta property="og:description" content="An ERPNext AI agent with DocType context, scoped memory, token visibility, MCP capabilities, and permission-aware setup." />
   <meta property="og:url" content="https://themuster.dev/frappe-ai.html" />
   <meta property="og:image" content="https://themuster.dev/assets/demo/frappe-context-card.png" />
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="Frappe AI Agent Harness — Muster" />
-  <meta name="twitter:description" content="Governed Frappe AI and ERPNext automation with scoped memory, DocType context, token ledger, MCP, and browser automation." />
+  <meta name="twitter:title" content="ERPNext AI Agent — Muster" />
+  <meta name="twitter:description" content="An ERPNext AI agent with scoped memory, DocType context, a token ledger, MCP, and browser automation." />
   <meta name="twitter:image" content="https://themuster.dev/assets/demo/frappe-context-card.png" />
   <link rel="preconnect" href="https://api.fontshare.com" crossorigin />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -46,13 +46,13 @@
       "operatingSystem": "macOS, Linux, Windows",
       "url": "https://themuster.dev/frappe-ai.html",
       "codeRepository": "https://github.com/Dkm0315/muster",
-      "description": "Governed Frappe AI and ERPNext automation using scoped memory, token ledger, DocType context, MCP capabilities, browser automation, and permission-aware setup.",
+      "description": "An ERPNext AI agent using scoped memory, a token ledger, DocType context, MCP capabilities, browser automation, and permission-aware setup.",
       "publisher": {
         "@type": "Organization",
         "name": "Muster",
         "url": "https://themuster.dev/"
       },
-      "keywords": "Frappe AI, ERPNext AI, Frappe automation, ERPNext automation, agent harness, MCP, scoped memory"
+      "keywords": "ERPNext AI agent, Frappe AI agent, ERPNext AI, Frappe AI, ERPNext automation, DocType aware retrieval, MCP, scoped memory"
     }
   </script>
 </head>
@@ -77,8 +77,8 @@
   <main>
     <section class="hero">
       <div class="hero-inner">
-        <p class="kicker hero-step">Frappe AI · ERPNext AI · governed automation</p>
-        <h1 class="hero-step">Frappe AI that understands <em>DocTypes, fields, workflows, and permissions.</em></h1>
+        <p class="kicker hero-step">ERPNext AI agent · Frappe AI · governed automation</p>
+        <h1 class="hero-step">An ERPNext AI agent that understands <em>DocTypes, fields, workflows, and permissions.</em></h1>
         <p class="sub hero-step">
           Muster gives Frappe and ERPNext teams an agent harness that can build context from sites, installed apps, modules, DocTypes, reports, scripts, and workflows before it acts.
         </p>
@@ -166,6 +166,25 @@
           <h3>Permissioned actions</h3>
           <p>Create or update records only through explicit tools, setup checks, and user-bound permission context.</p>
         </article>
+      </div>
+    </section>
+
+    <section class="band band-alt" data-reveal>
+      <p class="sec-kicker reveal-child">In practice</p>
+      <h2 class="reveal-child">Why a general-purpose agent fails on ERPNext.</h2>
+      <div class="prose reveal-child">
+        <p>Point a generic coding agent at an ERPNext instance and the failure is consistent: it answers about ERPNext-the-open-source-project rather than about your site. It suggests a field that exists in the upstream DocType and not in your customised one. It writes a query against a table name it inferred from a doctype label. It proposes a workflow transition that your workflow does not have. None of this is a reasoning failure. It is a retrieval failure, and it happens because the context an ERP agent needs is not in the model's weights and is not in the files on disk either.</p>
+        <h3>The context an ERPNext AI agent actually needs</h3>
+        <p>ERP context is relational, permissioned, and constantly customised, which makes it a genuinely harder retrieval problem than a codebase. Before answering or acting, an agent needs to know which site it is on, which apps are installed and at what versions, which DocTypes exist and how they link, which fields are on those DocTypes today including custom fields, which workflows are defined and what states and transitions they permit, which reports and scripts already exist, and — critically — which roles and permissions apply to the person asking.</p>
+        <p>That last one is where most ERP assistant projects quietly go wrong. An agent that retrieves across everything and then answers for whoever is asking has become a permission bypass with a chat interface. The retrieval boundary has to be the permission boundary, not a filter applied afterwards to the answer.</p>
+        <h3>A pack, not a bigger core</h3>
+        <p>Muster keeps the site-specific part in the Frappe / ERPNext capability pack rather than in the harness. The core stays a run loop with memory scoping, tool policy, and a token ledger; the pack knows about DocTypes, fields, modules, reports, scripts, workflows, and the setup checks that tell you when a connection is misconfigured before a run depends on it. This is deliberate on both sides: the harness does not accumulate ERP knowledge it cannot test, and the pack can evolve at the speed of the ERP rather than the speed of the framework.</p>
+        <p>It is also, honestly, the one place Muster's integration is deep rather than declared. Of 34 capability packs, only two are substantial — and this is one of them. Anywhere else on this site that Muster claims integration breadth, treat it as thinner than it sounds.</p>
+        <h3>Memory scoped the way an ERP is scoped</h3>
+        <p>Multi-tenant ERP deployments are the case scoped memory was designed for. Facts learned while working one company's books must not surface while working another's, and inside a single company, what a finance role saw should not become retrievable by a warehouse role. Muster's lanes — tenant, workspace, user, role, session — are filtered at retrieval time by what the current run is entitled to see, with tests whose specific job is to try to make one lane leak into another.</p>
+        <h3>Changes to an ERP need an audit trail</h3>
+        <p>An agent that edits client scripts, server scripts, or custom fields is changing a system of record. Muster derives the file-change set from git and the filesystem rather than from the agent's own report of what it did — measured live against Codex across five runs, that self-report channel reported zero of the real edits while all of them landed on disk. The observer caught the equivalent edit in 86ms with a diff verified by <code>git apply</code>, and emitted a receipt hash that reproduces byte-identically on a machine that was never there. For a system an auditor will eventually look at, that is the difference between a log and evidence.</p>
+        <p class="proof-link"><a href="/guide-frappe-ai.html">Guide: DocType-aware retrieval -&gt;</a> <a href="/live-inline-diff.html">How file changes are observed -&gt;</a> <a href="/guide-governed-memory.html">How memory scoping works -&gt;</a></p>
       </div>
     </section>
 

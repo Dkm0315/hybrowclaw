@@ -988,6 +988,41 @@ html.supports-lg-refract .glass-card {
   .proof-table th:nth-child(2), .proof-table td:nth-child(2) { display: none; }
 }
 
+/* Comparison variant (the /muster-vs-* pages). Cells hold prose, not numerals,
+   so: sans font, left aligned, top aligned. On narrow screens the Token Waste
+   Index drops its second column — a comparison table must NOT, because column 2
+   is the competitor. Scroll horizontally inside the card instead. */
+.proof-table.cmp { overflow-x: auto; overflow-y: hidden; }
+.proof-table.cmp table { min-width: 620px; }
+.proof-table.cmp th, .proof-table.cmp td {
+  text-align: left;
+  vertical-align: top;
+  font-family: var(--sans);
+  line-height: 1.5;
+}
+.proof-table.cmp thead th { text-transform: none; font-size: var(--t-sm); letter-spacing: 0; }
+.proof-table.cmp td:first-child { font-weight: 600; }
+.proof-table.cmp td.muster { color: var(--ink); }
+.proof-table.cmp td.muster strong { color: var(--primary-deep); }
+@media (max-width: 600px) {
+  .proof-table.cmp { font-size: var(--t-sm); }
+  .proof-table.cmp th:nth-child(2), .proof-table.cmp td:nth-child(2) { display: table-cell; }
+}
+
+/* Long-form prose blocks on the comparison / feature pages. `.band` centers its
+   text; comparison arguments read better ragged-right at a measure. */
+.prose { max-width: 78ch; margin: 0 auto; text-align: left; }
+.prose h3 {
+  font-family: var(--display);
+  font-size: var(--t-h3);
+  margin: 34px 0 10px;
+  color: var(--ink);
+}
+.prose p { margin: 0 0 14px; color: var(--ink-dim); font-size: var(--t-body); line-height: 1.65; }
+.prose ul { margin: 0 0 14px; padding-left: 20px; color: var(--ink-dim); font-size: var(--t-body); line-height: 1.65; }
+.prose li { margin-bottom: 7px; }
+.prose strong { color: var(--ink); }
+
 /* ============================================================
    TERMINAL REPLICA — pixel-accurate macOS Terminal on a glass tray
    ============================================================ */
