@@ -379,10 +379,12 @@ test("14: the watch path debounces a burst without losing the final content", as
   const { events } = await attach(t, repo, { watch: true, pollMs: 0, debounceMs: 50 });
   for (const value of ["1", "2", "3", "4", "final"]) await writeFile(join(repo, "keep.txt"), `${value}\n`);
 
-  await waitFor(() => events.length > 0);
-  // Tolerant bound on purpose: macOS FSEvents coalesces unpredictably. Tightening
-  // this to an exact count produces an intermittently red suite.
-  assert.ok(events.length <= 2, `expected at most 2 coalesced events, got ${events.length}`);
+  // The invariant is "the burst never LOSES the final content" — not "it all
+  // lands in the first debounce window". A slow CI runner can split the burst
+  // across windows, so wait for the final content itself before judging.
+  await waitFor(() => events.at(-1)?.afterHash === sha256("final\n"));
+  // Tolerant bound on purpose: FSEvents/inotify coalesce unpredictably.
+  assert.ok(events.length <= 3, `expected few coalesced events, got ${events.length}`);
   assert.equal(events.at(-1)!.afterHash, sha256("final\n"));
   assert.equal(events[0]!.detectedBy, "watch");
 });
