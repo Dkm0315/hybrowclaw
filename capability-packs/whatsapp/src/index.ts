@@ -4,7 +4,7 @@ interface ChannelContext {
 
 interface GatewayLike {
   readonly port?: number;
-  readonly whatsapp?: {
+  readonly "whatsapp-cloud"?: {
     readonly accessToken?: string;
     readonly verifyToken?: string;
     readonly phoneNumberId?: string;
@@ -13,7 +13,7 @@ interface GatewayLike {
   } | null;
 }
 
-const ROUTE = "/v1/adapters/whatsapp";
+const ROUTE = "/v1/adapters/whatsapp-cloud";
 const SETUP_URLS = [
   "https://developers.facebook.com/docs/whatsapp/cloud-api/get-started",
   "https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks",
@@ -38,19 +38,19 @@ function publicBase(args: Record<string, unknown>, gateway?: GatewayLike): strin
 }
 
 function hasAccessToken(gateway: GatewayLike | undefined, context: ChannelContext): boolean {
-  return Boolean(gateway?.whatsapp?.accessToken || context.config.WHATSAPP_ACCESS_TOKEN);
+  return Boolean(gateway?.["whatsapp-cloud"]?.accessToken || context.config.WHATSAPP_ACCESS_TOKEN);
 }
 
 function hasVerifyToken(gateway: GatewayLike | undefined, context: ChannelContext): boolean {
-  return Boolean(gateway?.whatsapp?.verifyToken || context.config.WHATSAPP_VERIFY_TOKEN);
+  return Boolean(gateway?.["whatsapp-cloud"]?.verifyToken || context.config.WHATSAPP_VERIFY_TOKEN);
 }
 
 function hasPhoneNumberId(gateway: GatewayLike | undefined, context: ChannelContext): boolean {
-  return Boolean(gateway?.whatsapp?.phoneNumberId || context.config.WHATSAPP_PHONE_NUMBER_ID);
+  return Boolean(gateway?.["whatsapp-cloud"]?.phoneNumberId || context.config.WHATSAPP_PHONE_NUMBER_ID);
 }
 
 function hasAppSecret(gateway: GatewayLike | undefined, context: ChannelContext): boolean {
-  return Boolean(gateway?.whatsapp?.appSecret || context.config.WHATSAPP_APP_SECRET);
+  return Boolean(gateway?.["whatsapp-cloud"]?.appSecret || context.config.WHATSAPP_APP_SECRET);
 }
 
 function ready(gateway: GatewayLike | undefined, context: ChannelContext): boolean {
@@ -60,10 +60,10 @@ function ready(gateway: GatewayLike | undefined, context: ChannelContext): boole
 export async function whatsapp_setup_plan(args: Record<string, unknown>, context: ChannelContext) {
   const gateway = gatewayArg(args);
   const base = publicBase(args, gateway);
-  const apiVersion = stringArg(args, "apiVersion") ?? gateway?.whatsapp?.apiVersion ?? "v19.0";
+  const apiVersion = stringArg(args, "apiVersion") ?? gateway?.["whatsapp-cloud"]?.apiVersion ?? "v19.0";
   return {
-    channel: "whatsapp",
-    label: "WhatsApp Cloud API",
+    channel: "whatsapp-cloud",
+    label: "WhatsApp Cloud API (business · 1:1)",
     ready: ready(gateway, context),
     webhookUrl: `${base}${ROUTE}`,
     verifyUrl: `${base}${ROUTE}?hub.mode=subscribe&hub.verify_token=<verify-token>&hub.challenge=<challenge>`,
@@ -79,13 +79,13 @@ export async function whatsapp_setup_plan(args: Record<string, unknown>, context
     ],
     commands: [
       "muster gateway init",
-      `muster channels ready whatsapp --access-token-env WHATSAPP_ACCESS_TOKEN --verify-token-env WHATSAPP_VERIFY_TOKEN --phone-number-id-env WHATSAPP_PHONE_NUMBER_ID --app-secret-env WHATSAPP_APP_SECRET --api-version ${apiVersion} --public-url ${base}`,
-      "muster channels status whatsapp",
+      `muster channels ready whatsapp-cloud --access-token-env WHATSAPP_ACCESS_TOKEN --verify-token-env WHATSAPP_VERIFY_TOKEN --phone-number-id-env WHATSAPP_PHONE_NUMBER_ID --app-secret-env WHATSAPP_APP_SECRET --api-version ${apiVersion} --public-url ${base}`,
+      "muster channels status whatsapp-cloud",
       "muster gateway daemon start --port 7460",
     ],
     notes: [
       "Muster uses Meta's Cloud API webhook handshake and replies through the Graph /messages endpoint.",
-      "OpenClaw also supports WhatsApp Web socket workflows; this pack is intentionally Cloud API only because that is Muster's current gateway adapter.",
+      "The personal linked-device adapter is the separate whatsapp channel; this pack remains Cloud API only.",
       "Pairing policy still applies before replies reach a real conversation.",
     ],
   };
@@ -98,7 +98,7 @@ export async function whatsapp_gateway_check(args: Record<string, unknown>, cont
   const phone = hasPhoneNumberId(gateway, context);
   const appSecret = hasAppSecret(gateway, context);
   return {
-    channel: "whatsapp",
+    channel: "whatsapp-cloud",
     ready: token && verify && phone && appSecret,
     checks: [
       { id: "access_token", ok: token, detail: token ? "access token configured" : "Set WHATSAPP_ACCESS_TOKEN and run channels ready." },
@@ -107,7 +107,7 @@ export async function whatsapp_gateway_check(args: Record<string, unknown>, cont
       { id: "app_secret", ok: appSecret, detail: appSecret ? "app secret configured for POST signature checks" : "Set WHATSAPP_APP_SECRET and run channels ready." },
       { id: "public_https_url", ok: Boolean(stringArg(args, "publicUrl")?.startsWith("https://")), detail: "Meta webhooks require a public HTTPS callback URL in production." },
     ],
-    next: token && verify && phone && appSecret ? "Start the gateway daemon and paste the callback URL plus verify token into Meta webhook configuration." : "Run muster channels ready whatsapp with access-token, verify-token, phone-number-id, and app-secret env vars.",
+    next: token && verify && phone && appSecret ? "Start the gateway daemon and paste the callback URL plus verify token into Meta webhook configuration." : "Run muster channels ready whatsapp-cloud with access-token, verify-token, phone-number-id, and app-secret env vars.",
   };
 }
 

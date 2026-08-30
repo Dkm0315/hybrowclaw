@@ -122,7 +122,7 @@ test("built-in plugin catalog declares honest actionability levels", () => {
   for (const plugin of plugins) {
     assert.ok(plugin.actionability, `plugin ${plugin.id} must declare actionability`);
     if (plugin.setup?.channels?.length) {
-      const expected = plugin.packPath ? "runtime_adapter" : "setup_plan";
+      const expected = plugin.packPath || plugin.id === "whatsapp" ? "runtime_adapter" : "setup_plan";
       assert.equal(plugin.actionability, expected, `channel plugin ${plugin.id} must distinguish bundled adapters from setup-only guides`);
     }
     if (plugin.actionability === "mcp_installable") {

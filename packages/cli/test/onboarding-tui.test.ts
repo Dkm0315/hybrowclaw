@@ -161,7 +161,8 @@ test("the setup surface names runnable commands and never fakes an input field",
   const screen = renderOnboarding(state, 130, false);
   assert.match(screen, /configure later: muster channels setup slack --bot-token-env/);
   assert.match(screen, /SLACK_BOT_TOKEN/);
-  assert.match(screen, /WHATSAPP_ACCESS_TOKEN/);
+  assert.match(screen, /muster channels login whatsapp/);
+  assert.match(screen, /Meta ToS gray zone/);
   assert.doesNotMatch(screen, /Bot token\/env:/, "credential fields that could not be typed into are gone");
   assert.doesNotMatch(screen, /Access token\/env:/);
 });

@@ -234,19 +234,26 @@ async function caseLargeOverlayScroll(): Promise<QaPtyTuiCase> {
 }
 
 async function caseSelectedRowContrast(): Promise<QaPtyTuiCase> {
-  const editor = createMusterChatEditor(fakeTui(100, 40));
-  editor.setAutocompleteProvider(createMusterAutocompleteProvider(CATALOG));
-  editor.handleInput("/");
-  await settleAutocomplete();
-  const rendered = renderMusterComposer(editor, 90).join("\n");
-  const selectedLine = rendered.split("\n").find((line) => line.includes("/help")) ?? "";
-  const evidence = {
-    // The reference's selection identity: the row goes periwinkle, NO band.
-    hasPeriwinkle: selectedLine.includes("\u001b[38;2;176;184;248m"),
-    hasReadableForeground: selectedLine.includes("/help"),
-    noBand: !selectedLine.includes("\u001b[48;2;48;45;43m"),
-  };
-  return makeCase("selected_row_contrast", evidence.hasPeriwinkle && evidence.hasReadableForeground && evidence.noBand, "selected completion row paints periwinkle with no background band", stripAnsi(rendered), evidence);
+  const priorForceColor = process.env.FORCE_COLOR;
+  process.env.FORCE_COLOR = "1";
+  try {
+    const editor = createMusterChatEditor(fakeTui(100, 40));
+    editor.setAutocompleteProvider(createMusterAutocompleteProvider(CATALOG));
+    editor.handleInput("/");
+    await settleAutocomplete();
+    const rendered = renderMusterComposer(editor, 90).join("\n");
+    const selectedLine = rendered.split("\n").find((line) => line.includes("/help")) ?? "";
+    const evidence = {
+      // The reference's selection identity: the row goes periwinkle, NO band.
+      hasPeriwinkle: selectedLine.includes("\u001b[38;2;176;184;248m"),
+      hasReadableForeground: selectedLine.includes("/help"),
+      noBand: !selectedLine.includes("\u001b[48;2;48;45;43m"),
+    };
+    return makeCase("selected_row_contrast", evidence.hasPeriwinkle && evidence.hasReadableForeground && evidence.noBand, "selected completion row paints periwinkle with no background band", stripAnsi(rendered), evidence);
+  } finally {
+    if (priorForceColor === undefined) delete process.env.FORCE_COLOR;
+    else process.env.FORCE_COLOR = priorForceColor;
+  }
 }
 
 async function caseProviderModelSpeedWorkflow(): Promise<QaPtyTuiCase> {
@@ -351,6 +358,8 @@ async function caseRealPtyInteraction(artifactDir: string, cliEntry: string): Pr
       "env",
       `HOME=${shellQuote(workspace)}`,
       "MUSTER_SKIP_ONBOARDING=1",
+      "NO_COLOR=",
+      "FORCE_COLOR=1",
       "TERM=xterm-256color",
       shellQuote(process.execPath),
       ...nodeArgs.map(shellQuote),

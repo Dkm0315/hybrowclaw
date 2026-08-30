@@ -267,6 +267,7 @@ import {
   FrappeOAuthCoordinator,
   FrappeSiteBindingCoordinator,
   inspectFrappeOAuthConnection,
+  doctorWhatsApp,
   gchatEventToSurfaceMessage,
   googleChatAudienceIsValid,
   gatewayConfigPath,
@@ -276,13 +277,17 @@ import {
   openSqliteGatewayEnterpriseRuntime,
   pollSlackSocket,
   pollTelegram,
+  pollWhatsApp,
   saveGatewayConfig,
   slackEventToSurfaceMessage,
   startGatewayServer,
   teamsActivityToSurfaceMessage,
   telegramUpdateToSurfaceMessage,
+  whatsAppWebMessageToSurfaceMessage,
+  whatsappSessionDir,
   whatsAppWebhookToSurfaceMessages
 } from "@musterhq/gateway";
+import { runWhatsAppLoginCommand } from "./whatsapp-login.js";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { execFile, spawn } from "node:child_process";
 import { access, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
@@ -657,8 +662,8 @@ Usage:
   muster flow runs | show <run-id> | approve <run-id> | reject <run-id>
   muster gateway init
   muster gateway status              # readiness without printing bearer tokens
-  muster gateway start [--port 7460] [--with-telegram-poll] [--with-slack-socket]
-  muster gateway daemon start|stop|status|restart [--with-telegram-poll] [--with-slack-socket]
+  muster gateway start [--port 7460] [--with-telegram-poll] [--with-slack-socket] [--with-whatsapp]
+  muster gateway daemon start|stop|status|restart [--with-telegram-poll] [--with-slack-socket] [--with-whatsapp]
   muster gateway webhook telegram --public-url https://your-domain.example
   muster gateway poll                 # local Telegram long-poll fallback; daemonize with gateway daemon start --with-telegram-poll
   muster pairing list | approve <code> [--frappe-site URL --frappe-token-env ENV | --frappe-user USER] [--employee EMP --role ROLE]
@@ -10167,7 +10172,7 @@ function channelOperatorQaCases(): Array<{ readonly id: string; readonly status:
     channelReplyMode("slack", config) === "direct_post" &&
     slackMissing.includes("slack.botToken") &&
     slackMissing.includes("slack.appToken");
-  const simulations = (["telegram", "slack", "gchat", "discord", "whatsapp", "teams", "web"] as const).map((channel) => {
+  const simulations = (["telegram", "slack", "gchat", "discord", "whatsapp", "whatsapp-cloud", "teams", "web"] as const).map((channel) => {
     const simulated = simulateChannelInbound(channel, "qa local simulation");
     return {
       channel,
@@ -11373,7 +11378,7 @@ async function gatewayCommand(commandArgs: string[]): Promise<void> {
     const workers: Promise<void>[] = [];
     try {
       running = await startGatewayServer({ config, gateway, registry, enterprise, frappeOAuth, cwd: process.cwd(), log: (line) => console.log(line) }, port);
-      console.log("routes: GET /v1/health | POST /v1/messages | POST /v1/flows/<run>/approve|reject | POST /v1/adapters/telegram|slack|discord|whatsapp|gchat|teams");
+      console.log("routes: GET /v1/health | POST /v1/messages | POST /v1/flows/<run>/approve|reject | POST /v1/adapters/telegram|slack|discord|whatsapp-cloud|gchat|teams");
       if (commandArgs.includes("--with-telegram-poll")) {
         workers.push(pollTelegram({ config, gateway, registry, enterprise, frappeOAuth, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) }).catch((error) => {
           console.error(`telegram poll failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -11385,6 +11390,12 @@ async function gatewayCommand(commandArgs: string[]): Promise<void> {
           console.error(`slack socket failed: ${error instanceof Error ? error.message : String(error)}`);
         }));
         console.log("slack_socket=background_in_process");
+      }
+      if (commandArgs.includes("--with-whatsapp")) {
+        workers.push(pollWhatsApp({ config, gateway, registry, enterprise, frappeOAuth, cwd: process.cwd(), signal: controller.signal, log: (line) => console.log(line) }).catch((error) => {
+          console.error(`whatsapp connection failed: ${error instanceof Error ? error.message : String(error)}`);
+        }));
+        console.log("whatsapp=background_in_process");
       }
       console.log("stop with Ctrl-C");
       if (!controller.signal.aborted) {
@@ -11444,7 +11455,7 @@ async function gatewayCommand(commandArgs: string[]): Promise<void> {
     }
     return;
   }
-  throw new Error("Usage: muster gateway <init|status|start [--port 7460] [--with-telegram-poll] [--with-slack-socket]|daemon start|stop|status|restart [--with-telegram-poll] [--with-slack-socket]|webhook telegram --public-url URL|poll>");
+  throw new Error("Usage: muster gateway <init|status|start [--port 7460] [--with-telegram-poll] [--with-slack-socket] [--with-whatsapp]|daemon start|stop|status|restart [worker flags]|webhook telegram --public-url URL|poll>");
 }
 
 function gatewayPidPath(cwd = process.cwd()): string {
@@ -11543,6 +11554,7 @@ async function gatewayDaemonCommand(args: string[]): Promise<void> {
     const childArgs = [...process.execArgv, process.argv[1], "gateway", "start", "--port", String(port)];
     if (args.includes("--with-telegram-poll")) childArgs.push("--with-telegram-poll");
     if (args.includes("--with-slack-socket")) childArgs.push("--with-slack-socket");
+    if (args.includes("--with-whatsapp")) childArgs.push("--with-whatsapp");
     const out = openSync(logPath, "a", 0o600);
     const child = spawn(process.execPath, childArgs, {
       cwd: process.cwd(),
@@ -11568,7 +11580,7 @@ async function gatewayDaemonCommand(args: string[]): Promise<void> {
     console.log(`health=http://127.0.0.1:${port}/v1/health`);
     return;
   }
-  throw new Error("Usage: muster gateway daemon start|stop|status|restart [--with-telegram-poll] [--with-slack-socket] [--port 7460]");
+  throw new Error("Usage: muster gateway daemon start|stop|status|restart [--with-telegram-poll] [--with-slack-socket] [--with-whatsapp] [--port 7460]");
 }
 
 async function waitForGatewayDaemonHealth(port: number, pid: number, timeoutMs = 8000): Promise<boolean> {
@@ -11625,7 +11637,7 @@ async function gatewayWebhookCommand(args: string[]): Promise<void> {
   console.log(`next=muster gateway daemon start --port ${gateway.port ?? DEFAULT_GATEWAY_PORT}`);
 }
 
-type ChannelId = "telegram" | "slack" | "gchat" | "discord" | "whatsapp" | "teams" | "web";
+type ChannelId = "telegram" | "slack" | "gchat" | "discord" | "whatsapp" | "whatsapp-cloud" | "teams" | "web";
 
 interface ChannelSetupSpec {
   readonly id: ChannelId;
@@ -11680,8 +11692,16 @@ const CHANNEL_SETUP_SPECS: readonly ChannelSetupSpec[] = [
   },
   {
     id: "whatsapp",
-    label: "WhatsApp Cloud API",
-    route: "/v1/adapters/whatsapp",
+    label: "WhatsApp (personal · groups)",
+    setupUrls: ["https://docs.openclaw.ai/whatsapp", "https://github.com/WhiskeySockets/Baileys"],
+    requiredEnvFlags: [],
+    optionalEnvFlags: ["--account", "--activation", "--groups", "--group-allow-from", "--session-dir"],
+    notes: ["Unofficial protocol; Meta ToS gray zone; the linked number can be banned — recommend a dedicated number.", "Groups are blocked until --groups contains exact group JIDs or *. Mention activation is the default."],
+  },
+  {
+    id: "whatsapp-cloud",
+    label: "WhatsApp Cloud API (business · 1:1)",
+    route: "/v1/adapters/whatsapp-cloud",
     setupUrls: ["https://developers.facebook.com/docs/whatsapp/cloud-api/get-started", "https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks"],
     requiredEnvFlags: ["--access-token-env", "--verify-token-env", "--phone-number-id-env", "--app-secret-env"],
     optionalEnvFlags: ["--access-token", "--verify-token", "--phone-number-id", "--app-secret", "--api-version"],
@@ -11726,6 +11746,11 @@ async function channelsCommand(commandArgs: string[]): Promise<void> {
     for (const spec of CHANNEL_SETUP_SPECS) printChannelStatus(spec, gateway.config);
     return;
   }
+  if (action === "login" && channel === "whatsapp") {
+    const gateway = await loadOrInitGatewayConfig();
+    await runWhatsAppLoginCommand({ gateway, isTTY: Boolean(process.stdout.isTTY), output: (line) => console.log(line) });
+    return;
+  }
   if (action === "plan" && channel) {
     const spec = requireChannelSpec(channel);
     const config = await loadGatewayConfig().catch(() => ({ port: DEFAULT_GATEWAY_PORT }) as GatewayConfig);
@@ -11766,7 +11791,7 @@ async function channelsCommand(commandArgs: string[]): Promise<void> {
     printChannelSetup(spec, updated, commandArgs, { friendly: action === "connect" });
     return;
   }
-  throw new Error("Usage: muster channels list | status [channel] | plan <channel> | simulate <channel> [--message TEXT] | doctor [telegram|slack|gchat|discord|whatsapp|teams|web] [--live] | setup|connect|ready <telegram|slack|gchat|discord|whatsapp|teams|web> [--public-url URL] [secret flags]");
+  throw new Error("Usage: muster channels list | status [channel] | login whatsapp | plan <channel> | simulate <channel> [--message TEXT] | doctor [telegram|slack|gchat|discord|whatsapp|whatsapp-cloud|teams|web] [--live] | setup|connect|ready <telegram|slack|gchat|discord|whatsapp|whatsapp-cloud|teams|web> [setup flags]");
 }
 
 async function runChannelReady(spec: ChannelSetupSpec, args: readonly string[]): Promise<void> {
@@ -11801,13 +11826,14 @@ async function runChannelReady(spec: ChannelSetupSpec, args: readonly string[]):
     console.log(`webhook_registration=skipped next="muster gateway webhook telegram --public-url ${publicUrl}"`);
   }
   if (noStart) {
-    const pollFlag = spec.id === "telegram" && !publicUrl ? " --with-telegram-poll" : "";
+    const pollFlag = spec.id === "telegram" && !publicUrl ? " --with-telegram-poll" : spec.id === "whatsapp" ? " --with-whatsapp" : "";
     const slackSocketFlag = spec.id === "slack" && slackMode(updated) === "socket" ? " --with-slack-socket" : "";
     console.log(`daemon=skipped start="muster gateway daemon start${pollFlag}${slackSocketFlag} --port ${updated.port ?? DEFAULT_GATEWAY_PORT}"`);
   } else {
     const daemonArgs = ["start", "--port", String(updated.port ?? DEFAULT_GATEWAY_PORT)];
     if (spec.id === "telegram" && !publicUrl) daemonArgs.push("--with-telegram-poll");
     if (spec.id === "slack" && slackMode(updated) === "socket") daemonArgs.push("--with-slack-socket");
+    if (spec.id === "whatsapp") daemonArgs.push("--with-whatsapp");
     await gatewayDaemonCommand(daemonArgs);
   }
   printChannelSimulation(spec, readFlag([...args], "--message") ?? "hello from Muster channel ready check");
@@ -11815,10 +11841,10 @@ async function runChannelReady(spec: ChannelSetupSpec, args: readonly string[]):
 }
 
 function printChannelCatalog(): void {
-  console.log("channel\tconfigured_by\tsetup");
+  console.log("channel\tlabel\tconfigured_by\tsetup");
   for (const spec of CHANNEL_SETUP_SPECS) {
     const auth = spec.requiredEnvFlags.length ? spec.requiredEnvFlags.join(",") : spec.optionalEnvFlags?.length ? spec.optionalEnvFlags.join(",") : "gateway token";
-    console.log(`${spec.id}\t${auth}\tmuster channels ready ${spec.id}`);
+    console.log(`${spec.id}\t${spec.label}\t${auth}\tmuster channels ready ${spec.id}`);
   }
 }
 
@@ -11829,7 +11855,8 @@ function printChannelStatus(spec: ChannelSetupSpec, config: GatewayConfig): void
   if (spec.id === "slack") console.log(`  mode=${slackMode(config)} bot_token=${configured(Boolean(config.slack?.botToken))} app_token=${configured(Boolean(config.slack?.appToken))} signing_secret=${configured(Boolean(config.slack?.signingSecret))} stream=${config.slack?.stream ?? "off"} status=${config.slack?.status ?? "message"} thinking=${config.slack?.thinking ?? "off"} busy=${config.slack?.busy ?? "queue"}`);
   if (spec.id === "gchat") console.log(`  auth=${config.gchat?.verification?.mode ?? (config.gchat?.verificationToken ? "legacy_token" : "missing")} audience=${config.gchat?.verification?.audience ?? "-"} verification_token=${configured(Boolean(config.gchat?.verificationToken))}`);
   if (spec.id === "discord") console.log(`  bot_token=${configured(Boolean(config.discord?.botToken))} public_key=${configured(Boolean(config.discord?.publicKey))}`);
-  if (spec.id === "whatsapp") console.log(`  access_token=${configured(Boolean(config.whatsapp?.accessToken))} verify_token=${configured(Boolean(config.whatsapp?.verifyToken))} phone_number_id=${configured(Boolean(config.whatsapp?.phoneNumberId))} app_secret=${configured(Boolean(config.whatsapp?.appSecret))}`);
+  if (spec.id === "whatsapp") console.log(`  account=${config.whatsapp?.account ?? "default"} activation=${config.whatsapp?.activation ?? "mention"} groups=${config.whatsapp?.groups?.join(",") || "-"} session=${configured(existsSync(join(whatsappSessionDir(config.whatsapp), "creds.json")))}`);
+  if (spec.id === "whatsapp-cloud") console.log(`  access_token=${configured(Boolean(config["whatsapp-cloud"]?.accessToken))} verify_token=${configured(Boolean(config["whatsapp-cloud"]?.verifyToken))} phone_number_id=${configured(Boolean(config["whatsapp-cloud"]?.phoneNumberId))} app_secret=${configured(Boolean(config["whatsapp-cloud"]?.appSecret))}`);
   if (spec.id === "teams") console.log(`  hmac_secret=${configured(Boolean(config.teams?.hmacSecret))}`);
   if (spec.id === "web") console.log(`  bearer_token=${configured(Boolean(config.token))}`);
 }
@@ -11852,9 +11879,9 @@ function printChannelOperatorPlan(spec: ChannelSetupSpec, config: GatewayConfig,
   }
   console.log(`operator_contract=inbound_normalize -> scoped_memory_recall -> policy_gate -> draft_or_reply -> token_ledger`);
   console.log(`local_simulation=muster channels simulate ${spec.id} --message "hello"`);
-  console.log(`setup_command=muster channels ready ${spec.id}${spec.id === "slack" && requestedSlackMode ? ` --mode ${requestedSlackMode}` : ""}${publicUrl ? ` --public-url ${publicUrl}` : ""}`);
+  console.log(`setup_command=${spec.id === "whatsapp" ? "muster channels setup whatsapp --account default && muster channels login whatsapp" : `muster channels ready ${spec.id}${spec.id === "slack" && requestedSlackMode ? ` --mode ${requestedSlackMode}` : ""}${publicUrl ? ` --public-url ${publicUrl}` : ""}`}`);
   console.log(`doctor_command=muster channels doctor ${spec.id}${channelHasLiveDoctor(spec.id) ? " --live" : ""}`);
-  const socketFlag = spec.id === "slack" && slackMode(config, requestedSlackMode) === "socket" ? " --with-slack-socket" : "";
+  const socketFlag = spec.id === "slack" && slackMode(config, requestedSlackMode) === "socket" ? " --with-slack-socket" : spec.id === "whatsapp" ? " --with-whatsapp" : "";
   console.log(`start_command=muster gateway daemon start${socketFlag} --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
   if (spec.id === "telegram" && publicUrl) console.log(`webhook_command=muster gateway webhook telegram --public-url ${publicUrl}`);
   else if (spec.id === "telegram") console.log("optional_webhook=muster gateway webhook telegram --public-url https://your-domain.example");
@@ -11919,11 +11946,18 @@ function simulateChannelInbound(channel: ChannelId, message: string): { readonly
     return inbound.kind === "message" ? simulationFromSurface(inbound.message) : { ok: false, reason: inbound.kind };
   }
   if (channel === "whatsapp") {
+    const mapped = whatsAppWebMessageToSurfaceMessage({
+      key: { id: "LOCAL", remoteJid: "919999999999@s.whatsapp.net", fromMe: false },
+      message: { conversation: message },
+    }, { account: "default" });
+    return mapped ? simulationFromSurface(mapped) : { ok: false, reason: "whatsapp mapper returned no message" };
+  }
+  if (channel === "whatsapp-cloud") {
     const messages = whatsAppWebhookToSurfaceMessages({
       object: "whatsapp_business_account",
       entry: [{ id: "WABA", changes: [{ field: "messages", value: { messaging_product: "whatsapp", metadata: { phone_number_id: "PNLOCAL" }, messages: [{ from: "919999999999", id: "wamid.LOCAL", type: "text", text: { body: message } }] } }] }],
     });
-    return messages[0] ? simulationFromSurface(messages[0]) : { ok: false, reason: "whatsapp mapper returned no message" };
+    return messages[0] ? simulationFromSurface(messages[0]) : { ok: false, reason: "whatsapp-cloud mapper returned no message" };
   }
   if (channel === "teams") {
     const inbound = teamsActivityToSurfaceMessage({
@@ -11968,7 +12002,8 @@ function channelMissingSetup(channel: ChannelId, config: GatewayConfig, override
   }
   if (channel === "gchat") return [googleChatAudienceIsValid(config.gchat?.verification?.audience) || config.gchat?.verificationToken ? "" : "gchat.verification.audience"].filter(Boolean);
   if (channel === "discord") return [config.discord?.botToken ? "" : "discord.botToken", config.discord?.publicKey ? "" : "discord.publicKey"].filter(Boolean);
-  if (channel === "whatsapp") return [config.whatsapp?.accessToken ? "" : "whatsapp.accessToken", config.whatsapp?.verifyToken ? "" : "whatsapp.verifyToken", config.whatsapp?.phoneNumberId ? "" : "whatsapp.phoneNumberId", config.whatsapp?.appSecret ? "" : "whatsapp.appSecret"].filter(Boolean);
+  if (channel === "whatsapp") return [existsSync(join(whatsappSessionDir(config.whatsapp), "creds.json")) ? "" : "whatsapp.session"].filter(Boolean);
+  if (channel === "whatsapp-cloud") return [config["whatsapp-cloud"]?.accessToken ? "" : "whatsapp-cloud.accessToken", config["whatsapp-cloud"]?.verifyToken ? "" : "whatsapp-cloud.verifyToken", config["whatsapp-cloud"]?.phoneNumberId ? "" : "whatsapp-cloud.phoneNumberId", config["whatsapp-cloud"]?.appSecret ? "" : "whatsapp-cloud.appSecret"].filter(Boolean);
   if (channel === "teams") return [config.teams?.hmacSecret ? "" : "teams.hmacSecret"].filter(Boolean);
   return [config.token ? "" : "gateway.token"].filter(Boolean);
 }
@@ -11977,7 +12012,8 @@ function channelAuthMode(channel: ChannelId): string {
   if (channel === "telegram") return "secret-token-header-recommended";
   if (channel === "slack") return "slack-socket-app-token";
   if (channel === "discord") return "ed25519-public-key-recommended";
-  if (channel === "whatsapp") return "verify-token-and-graph-token";
+  if (channel === "whatsapp") return "linked-device";
+  if (channel === "whatsapp-cloud") return "verify-token-and-graph-token";
   if (channel === "gchat") return "google-signed-oidc-or-jwt";
   if (channel === "teams") return "hmac-secret-required";
   return "bearer-token";
@@ -11992,7 +12028,8 @@ function channelReplyMode(channel: ChannelId, config: GatewayConfig): string {
   if (channel === "telegram") return config.telegram?.stream === "draft" ? "draft_stream" : "direct_send";
   if (channel === "slack") return config.slack?.stream === "draft" ? "draft_stream" : "direct_post";
   if (channel === "discord" || channel === "gchat" || channel === "teams") return "synchronous_response";
-  if (channel === "whatsapp") return "graph_api_send";
+  if (channel === "whatsapp") return "linked-device-send";
+  if (channel === "whatsapp-cloud") return "graph_api_send";
   return "http_response";
 }
 
@@ -12014,6 +12051,7 @@ function slackMode(config: GatewayConfig, override?: "socket" | "http"): "socket
 function channelIngressMode(channel: ChannelId, config: GatewayConfig, options: { readonly publicUrl?: string; readonly slackMode?: "socket" | "http" } = {}): string {
   if (channel === "telegram") return options.publicUrl ? "webhook" : "background_long_poll";
   if (channel === "slack") return slackMode(config, options.slackMode) === "socket" ? "socket_mode" : "http_events";
+  if (channel === "whatsapp") return "linked_device";
   if (channel === "web") return "gateway_http";
   return "webhook";
 }
@@ -12022,6 +12060,7 @@ function channelStartCommand(channel: ChannelId, config: GatewayConfig, options:
   const port = config.port ?? DEFAULT_GATEWAY_PORT;
   if (channel === "telegram" && !options.publicUrl) return `muster gateway daemon start --with-telegram-poll --port ${port}`;
   if (channel === "slack" && slackMode(config, options.slackMode) === "socket") return `muster gateway daemon start --with-slack-socket --port ${port}`;
+  if (channel === "whatsapp") return `muster gateway daemon start --with-whatsapp --port ${port}`;
   return `muster gateway daemon start --port ${port}`;
 }
 
@@ -12046,7 +12085,7 @@ function printChannelDoctorSummary(config: GatewayConfig, options: { readonly in
       ? "muster gateway init"
       : row.ready
       ? row.warnings.length ? `muster channels doctor ${row.spec.id}${channelHasLiveDoctor(row.spec.id) ? " --live" : ""}` : `muster gateway daemon start${row.spec.id === "slack" && slackMode(config) === "socket" ? " --with-slack-socket" : ""} --port ${config.port ?? DEFAULT_GATEWAY_PORT}`
-      : `muster channels ready ${row.spec.id}`;
+      : row.spec.id === "whatsapp" ? "muster channels login whatsapp" : `muster channels ready ${row.spec.id}`;
     console.log(`  channel=${row.spec.id} status=${channelStatus} missing=${missing} warnings=${warnings} auth=${channelAuthModeForConfig(row.spec.id, config)} reply=${channelReplyMode(row.spec.id, config)} next="${next}"`);
   }
   console.log("guardrails=signature_or_token_check,draft_first_when_supported,no_secret_echo,scoped_memory,token_ledger");
@@ -12074,6 +12113,9 @@ function channelDoctorWarnings(channel: ChannelId, config: GatewayConfig): strin
   if (channel === "gchat" && config.gchat?.verification?.audience) {
     return ["gchat.live_unsigned_rejection_check_available"];
   }
+  if (channel === "whatsapp") {
+    return existsSync(join(whatsappSessionDir(config.whatsapp), "creds.json")) ? [] : ["whatsapp.login_required"];
+  }
   return [];
 }
 
@@ -12089,7 +12131,7 @@ async function printChannelDoctor(
   const ready = channelReady(spec.id, config);
   const checks: Array<{ name: string; status: "passed" | "needs_setup" | "warning"; detail: string }> = [];
   checks.push({ name: "gateway_config", status: config.token ? "passed" : "needs_setup", detail: config.token ? "gateway bearer token exists" : "run muster gateway init" });
-  checks.push({ name: "channel_config", status: ready ? "passed" : "needs_setup", detail: ready ? `${spec.id} has required local credentials` : `run muster channels ready ${spec.id}` });
+  checks.push({ name: "channel_config", status: ready ? "passed" : "needs_setup", detail: ready ? `${spec.id} has required local credentials` : spec.id === "whatsapp" ? "run muster channels login whatsapp" : `run muster channels ready ${spec.id}` });
   if (spec.route) checks.push({ name: "webhook_route", status: "passed", detail: spec.route });
   if (spec.id === "telegram") {
     checks.push({
@@ -12141,6 +12183,11 @@ async function printChannelDoctor(
     });
     if (options.live) checks.push(await gchatLiveDoctor(audience));
     else if (audience) checks.push({ name: "gchat_endpoint", status: "warning", detail: "not run; add --live to verify the endpoint rejects unsigned requests" });
+  } else if (spec.id === "whatsapp") {
+    const doctor = await doctorWhatsApp(config.whatsapp);
+    checks.push({ name: "session_present", status: doctor.sessionPresent ? "passed" : "needs_setup", detail: doctor.sessionPresent ? doctor.sessionDir : doctor.detail });
+    checks.push({ name: "creds_age", status: doctor.credsAgeMs === undefined ? "needs_setup" : "passed", detail: doctor.credsAgeMs === undefined ? "credentials are not present" : `${Math.floor(doctor.credsAgeMs / 1000)} seconds` });
+    checks.push({ name: "connection_state", status: doctor.connection === "open" ? "passed" : "warning", detail: doctor.detail });
   } else if (options.live) {
     checks.push({ name: "live_check", status: "warning", detail: `no safe live doctor is implemented for ${spec.id}; local configuration checks only` });
   }
@@ -12150,7 +12197,7 @@ async function printChannelDoctor(
   console.log(`channel_doctor=${spec.id} status=${status}`);
   for (const check of checks) console.log(`check=${check.name} status=${check.status} detail="${check.detail.replace(/"/g, "'")}"`);
   const next = failed
-    ? `muster channels ready ${spec.id}`
+    ? spec.id === "whatsapp" ? "muster channels login whatsapp" : `muster channels ready ${spec.id}`
     : spec.id === "slack" && checks.some((check) => check.name === "slack_file_upload" && check.status !== "passed")
       ? "Add Slack bot scope files:write, reinstall the Slack app, then run muster channels doctor slack --live"
     : warnings && spec.id === "telegram" && !options.live
@@ -12159,7 +12206,7 @@ async function printChannelDoctor(
         ? "muster channels doctor slack --live"
     : warnings && spec.id === "gchat" && !options.live
         ? "muster channels doctor gchat --live"
-      : `muster gateway daemon start${spec.id === "slack" && slackMode(config) === "socket" ? " --with-slack-socket" : ""} --port ${config.port ?? DEFAULT_GATEWAY_PORT}`;
+      : `muster gateway daemon start${spec.id === "slack" && slackMode(config) === "socket" ? " --with-slack-socket" : spec.id === "whatsapp" ? " --with-whatsapp" : ""} --port ${config.port ?? DEFAULT_GATEWAY_PORT}`;
   console.log(`next=${next}`);
 }
 
@@ -12286,6 +12333,7 @@ function printChannelSetup(spec: ChannelSetupSpec, config: GatewayConfig, args: 
   if (spec.route && !(spec.id === "telegram" && !publicUrl) && !(spec.id === "slack" && slackMode(config) === "socket")) console.log(`webhook_url=${base}${spec.route}`);
   if (spec.id === "telegram" && !publicUrl) console.log("ingress=background_long_poll");
   if (spec.id === "slack" && slackMode(config) === "socket") console.log("ingress=socket_mode");
+  if (spec.id === "whatsapp") console.log("ingress=linked_device");
   for (const url of spec.setupUrls) console.log(`setup_url=${url}`);
   if (spec.requiredEnvFlags.length) console.log(`required_env_flags=${spec.requiredEnvFlags.join(",")}`);
   if (spec.optionalEnvFlags?.length) console.log(`optional_env_flags=${spec.optionalEnvFlags.join(",")}`);
@@ -12294,6 +12342,7 @@ function printChannelSetup(spec: ChannelSetupSpec, config: GatewayConfig, args: 
   if (spec.id === "telegram" && publicUrl) console.log(`webhook=muster gateway webhook telegram --public-url ${publicUrl}`);
   if (spec.id === "telegram" && !publicUrl) console.log(`start=muster gateway daemon start --with-telegram-poll --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
   else if (spec.id === "slack" && slackMode(config) === "socket") console.log(`start=muster gateway daemon start --with-slack-socket --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
+  else if (spec.id === "whatsapp") console.log(`start=muster gateway daemon start --with-whatsapp --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
   else if (spec.id !== "web") console.log(`start=muster gateway daemon start --port ${config.port ?? DEFAULT_GATEWAY_PORT}`);
   if (options.friendly) console.log(`verify=muster channels doctor ${spec.id}${channelHasLiveDoctor(spec.id) ? " --live" : ""}`);
 }
@@ -12393,19 +12442,39 @@ function applyChannelSetup(channel: ChannelId, config: GatewayConfig, args: read
     return { ...config, discord: { botToken: botToken ?? config.discord?.botToken ?? "", publicKey: publicKey ?? config.discord?.publicKey } };
   }
   if (channel === "whatsapp") {
+    const account = readFlag([...args], "--account");
+    const activation = readFlag([...args], "--activation");
+    if (activation && activation !== "mention" && activation !== "always") throw new Error("--activation must be mention or always.");
+    const groupsFlag = readFlag([...args], "--groups");
+    const groupAllowFromFlag = readFlag([...args], "--group-allow-from");
+    const sessionDir = readFlag([...args], "--session-dir");
+    const groups = groupsFlag === undefined ? config.whatsapp?.groups ?? [] : groupsFlag.split(",").map((value) => value.trim()).filter(Boolean);
+    const groupAllowFrom = groupAllowFromFlag === undefined ? config.whatsapp?.groupAllowFrom ?? [] : groupAllowFromFlag.split(",").map((value) => value.trim()).filter(Boolean);
+    return {
+      ...config,
+      whatsapp: {
+        account: account ?? config.whatsapp?.account ?? "default",
+        activation: (activation as "mention" | "always" | undefined) ?? config.whatsapp?.activation ?? "mention",
+        groups,
+        groupAllowFrom,
+        sessionDir: sessionDir ?? config.whatsapp?.sessionDir,
+      },
+    };
+  }
+  if (channel === "whatsapp-cloud") {
     const accessToken = readSecretFlag(args, "--access-token", "--access-token-env");
     const verifyToken = readSecretFlag(args, "--verify-token", "--verify-token-env");
     const phoneNumberId = readSecretFlag(args, "--phone-number-id", "--phone-number-id-env");
     const appSecret = readSecretFlag(args, "--app-secret", "--app-secret-env");
-    const apiVersion = readFlag([...args], "--api-version") ?? config.whatsapp?.apiVersion;
+    const apiVersion = readFlag([...args], "--api-version") ?? config["whatsapp-cloud"]?.apiVersion;
     if (!accessToken && !verifyToken && !phoneNumberId && !appSecret && !apiVersion) return config;
     return {
       ...config,
-      whatsapp: {
-        accessToken: accessToken ?? config.whatsapp?.accessToken ?? "",
-        verifyToken: verifyToken ?? config.whatsapp?.verifyToken ?? "",
-        phoneNumberId: phoneNumberId ?? config.whatsapp?.phoneNumberId ?? "",
-        appSecret: appSecret ?? config.whatsapp?.appSecret,
+      "whatsapp-cloud": {
+        accessToken: accessToken ?? config["whatsapp-cloud"]?.accessToken ?? "",
+        verifyToken: verifyToken ?? config["whatsapp-cloud"]?.verifyToken ?? "",
+        phoneNumberId: phoneNumberId ?? config["whatsapp-cloud"]?.phoneNumberId ?? "",
+        appSecret: appSecret ?? config["whatsapp-cloud"]?.appSecret,
         apiVersion,
       },
     };
@@ -12433,7 +12502,8 @@ function channelReady(channel: ChannelId, config: GatewayConfig): boolean {
   if (channel === "slack") return Boolean(config.slack?.botToken && (slackMode(config) === "socket" ? config.slack.appToken : config.slack.signingSecret));
   if (channel === "gchat") return Boolean(googleChatAudienceIsValid(config.gchat?.verification?.audience) || config.gchat?.verificationToken);
   if (channel === "discord") return Boolean(config.discord?.botToken && config.discord.publicKey);
-  if (channel === "whatsapp") return Boolean(config.whatsapp?.accessToken && config.whatsapp.verifyToken && config.whatsapp.phoneNumberId && config.whatsapp.appSecret);
+  if (channel === "whatsapp") return existsSync(join(whatsappSessionDir(config.whatsapp), "creds.json"));
+  if (channel === "whatsapp-cloud") return Boolean(config["whatsapp-cloud"]?.accessToken && config["whatsapp-cloud"].verifyToken && config["whatsapp-cloud"].phoneNumberId && config["whatsapp-cloud"].appSecret);
   if (channel === "teams") return Boolean(config.teams?.hmacSecret);
   return Boolean(config.token);
 }
@@ -12841,7 +12911,8 @@ function channelReadySetupCommand(channel: ChannelId): string {
   if (channel === "slack") return "muster channels ready slack --bot-token <xoxb-token> --app-token <xapp-token>";
   if (channel === "gchat") return "muster channels ready gchat --audience https://your-domain.example/v1/adapters/gchat";
   if (channel === "discord") return "muster channels ready discord --bot-token <bot-token> --public-key <application-public-key>";
-  if (channel === "whatsapp") return "muster channels ready whatsapp --access-token <access-token> --verify-token <verify-token> --phone-number-id <phone-number-id> --app-secret <app-secret>";
+  if (channel === "whatsapp") return "muster channels setup whatsapp --account default && muster channels login whatsapp";
+  if (channel === "whatsapp-cloud") return "muster channels ready whatsapp-cloud --access-token <access-token> --verify-token <verify-token> --phone-number-id <phone-number-id> --app-secret <app-secret>";
   if (channel === "teams") return "muster channels ready teams --hmac-secret <hmac-secret>";
   return "muster channels ready web";
 }

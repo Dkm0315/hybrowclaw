@@ -205,7 +205,7 @@ const CHANNELS: readonly ChannelHarness[] = [
   },
   {
     name: "WhatsApp",
-    surfaceId: "whatsapp:phone-1",
+    surfaceId: "whatsapp-cloud:phone-1",
     conversationId: "919999999999",
     actorId: "919999999999",
     render(actions, clock) {
@@ -218,7 +218,7 @@ const CHANNELS: readonly ChannelHarness[] = [
       return whatsAppWebhookToSurfaceMessages({
         object: "whatsapp_business_account",
         entry: [{ changes: [{ field: "messages", value: {
-          metadata: { phone_number_id: this.surfaceId.slice("whatsapp:".length) },
+          metadata: { phone_number_id: this.surfaceId.slice("whatsapp-cloud:".length) },
           messages: [{ from: actorId, id: "wamid.1", type: "interactive", interactive: { button_reply: { id: token, title: "Approve" } } }],
         } }] }],
       }, { approvalActions: actions })[0];

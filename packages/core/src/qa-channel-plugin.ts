@@ -184,7 +184,7 @@ function caseCatalogActionabilityEvidence(plugins: readonly BuiltinPluginCatalog
     if (plugin.actionability === "metadata") return true;
     if (plugin.actionability === "setup_plan") return !(hasSetupUrl && hasSetupNote);
     if (plugin.actionability === "local_tool" || plugin.actionability === "end_to_end_workflow") return !(hasPack || hasMcp);
-    if (plugin.actionability === "runtime_adapter") return !(hasPack && hasChannel);
+    if (plugin.actionability === "runtime_adapter") return !((hasPack || (hasSetupUrl && hasSetupNote)) && hasChannel);
     if (plugin.actionability === "mcp_installable") return !(hasMcp || hasPack || hasSetupUrl);
     return !(hasPack || hasSetupUrl || hasSetupNote || hasMcp || hasChannel || hasEnv);
   }).map((plugin) => ({
@@ -211,7 +211,7 @@ function caseCatalogActionabilityEvidence(plugins: readonly BuiltinPluginCatalog
 function caseEverydayCapabilityBreadth(plugins: readonly BuiltinPluginCatalogEntry[]): QaChannelPluginSetupCase {
   const pluginIds = new Set(plugins.flatMap((plugin) => [plugin.id, ...(plugin.aliases ?? [])]));
   const required = {
-    channels: ["telegram", "slack", "google-chat", "discord", "whatsapp", "teams"],
+    channels: ["telegram", "slack", "google-chat", "discord", "whatsapp", "whatsapp-cloud", "teams"],
     personalOps: ["daily-ops", "google-workspace", "notion", "obsidian"],
     officeArtifacts: ["artifact-studio"],
     developerOps: ["developer-tools", "web-frameworks", "github", "browser"],

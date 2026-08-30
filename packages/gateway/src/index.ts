@@ -33,6 +33,7 @@ export * from "./adapters/telegram.js";
 export * from "./adapters/slack.js";
 export * from "./adapters/discord.js";
 export * from "./adapters/whatsapp.js";
+export * from "./adapters/whatsapp-cloud.js";
 export * from "./adapters/gchat.js";
 export * from "./google-chat-verifier.js";
 export * from "./adapters/teams.js";

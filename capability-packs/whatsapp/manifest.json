@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "id": "whatsapp",
+  "id": "whatsapp-cloud",
   "name": "Muster WhatsApp Cloud API",
   "version": "0.1.0",
   "kind": "channel",
-  "slot": "channel-whatsapp",
+  "slot": "channel-whatsapp-cloud",
   "entrypoint": "src/index.ts",
   "description": "WhatsApp Cloud API setup, readiness, and webhook debugging helpers for the Muster gateway.",
   "permissions": [
@@ -24,7 +24,7 @@
     "whatsapp_gateway_check",
     "whatsapp_webhook_summary"
   ],
-  "status": "v0: setup and diagnostics for Meta WhatsApp Cloud API webhooks; OpenClaw-style WhatsApp Web socket runtime remains a separate future channel.",
+  "status": "v0: setup and diagnostics for the secondary Meta WhatsApp Cloud API business channel.",
   "readiness": {
     "level": "setup_plan",
     "status": "experimental",
@@ -49,7 +49,7 @@
       "credentialStorage": "env"
     },
     "diagnostics": {
-      "doctorCommand": "muster plugins check whatsapp",
+      "doctorCommand": "muster plugins check whatsapp-cloud",
       "smokeCommand": "muster capability inspect capability-packs/whatsapp",
       "latencyBudgetMs": 1000,
       "requiresLiveCredentials": true

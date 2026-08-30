@@ -158,6 +158,15 @@ export interface GatewayConfig {
     readonly publicKey?: string;
   };
   readonly whatsapp?: {
+    readonly account?: string;
+    readonly activation?: "mention" | "always";
+    /** Empty blocks all groups; "*" admits every group. */
+    readonly groups?: readonly string[];
+    /** Empty admits every member after the group allowlist passes. */
+    readonly groupAllowFrom?: readonly string[];
+    readonly sessionDir?: string;
+  };
+  readonly "whatsapp-cloud"?: {
     readonly accessToken: string;
     readonly verifyToken: string;
     readonly phoneNumberId: string;

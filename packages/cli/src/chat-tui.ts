@@ -966,10 +966,10 @@ export function renderMusterComposer(editor: Editor, width: number): string[] {
 // gray. INDEXED codes on purpose — the owner's terminal theme remaps them
 // exactly as it does for Claude Code, so the two are identical by construction.
 function pickerSel(text: string): string {
-  return process.env.NO_COLOR ? text : `\x1b[38;2;176;184;248m${text}${RESET}`;
+  return process.env.NO_COLOR && !process.env.FORCE_COLOR ? text : `\x1b[38;2;176;184;248m${text}${RESET}`;
 }
 export function pickerOk(text: string): string {
-  return process.env.NO_COLOR ? text : `\x1b[38;5;114m${text}${RESET}`;
+  return process.env.NO_COLOR && !process.env.FORCE_COLOR ? text : `\x1b[38;5;114m${text}${RESET}`;
 }
 
 function composerPickerTheme(): { settings: SettingsListTheme; select: SelectListTheme } {

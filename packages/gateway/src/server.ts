@@ -50,7 +50,8 @@ import { surfaceReplyToTelegramSend, telegramCallbackQueryId, telegramUpdateToSu
 import type { TelegramSendMessagePayload } from "./adapters/telegram.js";
 import { slackDeliveryId, slackEventToSurfaceMessage, slackSignatureIsValid, surfaceReplyToSlackPost } from "./adapters/slack.js";
 import { DISCORD_PONG, discordInteractionToInbound, discordSignatureIsValid, surfaceReplyToDiscordInteractionResponse } from "./adapters/discord.js";
-import { surfaceReplyToWhatsAppSend, whatsAppMessageIds, whatsAppVerifyChallenge, whatsAppWebhookToSurfaceMessages } from "./adapters/whatsapp.js";
+import { runWhatsAppConnection } from "./adapters/whatsapp.js";
+import { surfaceReplyToWhatsAppSend, whatsAppMessageIds, whatsAppVerifyChallenge, whatsAppWebhookToSurfaceMessages } from "./adapters/whatsapp-cloud.js";
 import { gchatActor, gchatDeliveryId, gchatEventToken, gchatEventToSurfaceMessage, surfaceReplyToGchatResponse } from "./adapters/gchat.js";
 import type { GchatRequestVerifier } from "./adapters/gchat.js";
 import { createGoogleChatRequestVerifier } from "./google-chat-verifier.js";
@@ -1409,10 +1410,12 @@ export async function handleSurfaceMessage(
     readonly trustedFrappe?: TrustedFrappeContext;
     /** Host-classified artifact permission. False also suppresses artifact discovery/persistence. */
     readonly allowArtifacts?: boolean;
+    /** Internal channel authorization already proven before the envelope reaches the gateway. */
+    readonly pairingOverride?: PairedSender;
   },
 ): Promise<SurfaceReply | PairingChallenge> {
   const cwd = options.cwd ?? process.cwd();
-  const resolvedPairing = await resolvePairing(message.surfaceId, message.senderId, cwd);
+  const resolvedPairing = options.pairingOverride ?? await resolvePairing(message.surfaceId, message.senderId, cwd);
   if (!resolvedPairing) {
     const pending = await requestPairing(message.surfaceId, message.senderId, cwd);
     return { status: "pairing_required", code: pending.code };
@@ -3334,6 +3337,50 @@ export async function pollSlackSocket(options: SlackSocketOptions): Promise<void
   log("slack socket-mode stopped");
 }
 
+export interface WhatsAppSocketOptions extends GatewayServerOptions {
+  readonly signal?: AbortSignal;
+}
+
+/** Linked-device WhatsApp worker; Baileys owns the socket, Muster owns policy and the governed envelope. */
+export async function pollWhatsApp(options: WhatsAppSocketOptions): Promise<void> {
+  const whatsapp = options.gateway.whatsapp;
+  if (!whatsapp) throw new Error("WhatsApp is not configured. Run: muster channels setup whatsapp");
+  const cwd = options.cwd ?? process.cwd();
+  const log = options.log ?? ((line: string) => console.log(line));
+  const ownsApprovalStore = options.approvalStore === undefined;
+  const approvalStore = options.approvalStore ?? new SqliteApprovalActionStore(join(dataDir(cwd), "enterprise-control-plane.db"));
+  const approvalActions = options.approvalActions ?? createApprovalActionCodec({
+    secret: createHash("sha256").update(`muster-approval:${options.gateway.token}`).digest(),
+    store: approvalStore,
+  });
+  const ownsEnterpriseRuntime = options.enterprise === undefined;
+  const enterprise = options.enterprise ?? openSqliteGatewayEnterpriseRuntime(cwd);
+  const queue = createOutboundQueue();
+  const context = effectiveAdapterContext({ ...options, enterprise, approvalActions, approvalStore }, {}, queue, cwd, true);
+  try {
+    await runWhatsAppConnection({
+      config: whatsapp,
+      cwd,
+      signal: options.signal,
+      log,
+      onMessage: (message) => handleSurfaceMessage(message, {
+        ...context,
+        ...(message.conversationId.endsWith("@g.us") ? {
+          pairingOverride: {
+            pairingId: `pair_whatsapp_group_${createHash("sha256").update(`${message.surfaceId}\0${message.senderId}`).digest("hex").slice(0, 12)}`,
+            surfaceId: message.surfaceId,
+            senderId: message.senderId,
+            approvedAt: new Date(0).toISOString(),
+          },
+        } : {}),
+      }),
+    });
+  } finally {
+    if (ownsApprovalStore) approvalStore.close();
+    if (ownsEnterpriseRuntime) await enterprise.close?.();
+  }
+}
+
 /**
  * Discord interactions webhook: PING (type 1) is answered with PONG (type 1)
  * for endpoint verification; slash commands run through the governed entry
@@ -3377,9 +3424,9 @@ async function handleDiscordWebhook(body: string, context: AdapterContext): Prom
  * The GET hub.challenge verification handshake is handled separately in route().
  */
 async function handleWhatsAppWebhook(body: string, context: AdapterContext): Promise<unknown> {
-  const whatsapp = context.gateway.whatsapp;
+  const whatsapp = context.gateway["whatsapp-cloud"];
   if (!whatsapp?.accessToken || !whatsapp.phoneNumberId) {
-    throw new Error("WhatsApp adapter not configured. Add whatsapp.{accessToken,verifyToken,phoneNumberId} to .muster/gateway.json.");
+    throw new Error("WhatsApp Cloud API adapter not configured. Add whatsapp-cloud.{accessToken,verifyToken,phoneNumberId} to .muster/gateway.json.");
   }
   if (whatsapp.appSecret && !context.platformVerified) {
     const signature = context.headers["x-hub-signature-256"];
@@ -3387,7 +3434,7 @@ async function handleWhatsAppWebhook(body: string, context: AdapterContext): Pro
       throw new GatewayHttpError(401, "WhatsApp signature verification failed.");
     }
   }
-  const deliveryKey = adapterDeliveryKey("whatsapp", body);
+  const deliveryKey = adapterDeliveryKey("whatsapp-cloud", body);
   const cached = deliveryLookup(deliveryKey);
   if (cached !== undefined) return cached;
   const messages = whatsAppWebhookToSurfaceMessages(JSON.parse(body), { approvalActions: context.approvalActions });
@@ -3523,7 +3570,7 @@ const adapterRoutes: Record<string, AdapterHandler> = {
   telegram: handleTelegramWebhook,
   slack: handleSlackWebhook,
   discord: handleDiscordWebhook,
-  whatsapp: handleWhatsAppWebhook,
+  "whatsapp-cloud": handleWhatsAppWebhook,
   gchat: handleGchatWebhook,
   teams: handleTeamsWebhook,
 };
@@ -3547,9 +3594,9 @@ function adapterDeliveryKey(adapterId: string, body: string): string | undefined
     const id = typeof payload === "object" && payload !== null ? (payload as { id?: unknown }).id : undefined;
     return typeof id === "string" && id ? `discord:${id}` : undefined;
   }
-  if (adapterId === "whatsapp") {
+  if (adapterId === "whatsapp-cloud") {
     const ids = whatsAppMessageIds(payload);
-    return ids.length ? `whatsapp:${ids.join(",")}` : undefined;
+    return ids.length ? `whatsapp-cloud:${ids.join(",")}` : undefined;
   }
   if (adapterId === "gchat") {
     const message = typeof payload === "object" && payload !== null ? (payload as { message?: { name?: unknown } }).message : undefined;
@@ -3641,9 +3688,9 @@ async function verifyAdapterPlatformRequest(
       throw new GatewayHttpError(401, "Discord ed25519 signature verification failed.");
     }
   }
-  if (adapterId === "whatsapp" && options.gateway.whatsapp?.appSecret) {
+  if (adapterId === "whatsapp-cloud" && options.gateway["whatsapp-cloud"]?.appSecret) {
     const signature = headers["x-hub-signature-256"];
-    if (!whatsAppSignatureIsValid(body, typeof signature === "string" ? signature : undefined, options.gateway.whatsapp.appSecret)) {
+    if (!whatsAppSignatureIsValid(body, typeof signature === "string" ? signature : undefined, options.gateway["whatsapp-cloud"].appSecret)) {
       throw new GatewayHttpError(401, "WhatsApp signature verification failed.");
     }
   }
@@ -3671,7 +3718,7 @@ async function verifyAdapterPlatformRequest(
 }
 
 function adapterRunsAfterAcknowledgement(adapterId: string, body: string, ingress: GatewayIngressIdentity | undefined): boolean {
-  if (!ingress || !["telegram", "slack", "whatsapp"].includes(adapterId)) return false;
+  if (!ingress || !["telegram", "slack", "whatsapp-cloud"].includes(adapterId)) return false;
   if (adapterId === "slack") {
     const payload = parseSlackWebhookBody(body) as { type?: unknown };
     if (payload?.type === "url_verification") return false;
@@ -3680,7 +3727,7 @@ function adapterRunsAfterAcknowledgement(adapterId: string, body: string, ingres
 }
 
 function isAsyncAdapterId(adapterId: string): adapterId is GatewayAsyncAdapterId {
-  return adapterId === "telegram" || adapterId === "slack" || adapterId === "whatsapp";
+  return adapterId === "telegram" || adapterId === "slack" || adapterId === "whatsapp-cloud";
 }
 
 class PostDeliveryPersistenceError extends Error {
@@ -3757,13 +3804,13 @@ async function notifyBackgroundFailure(adapterId: string, body: string, context:
     }
     return;
   }
-  if (adapterId === "whatsapp" && context.gateway.whatsapp?.accessToken && context.gateway.whatsapp.phoneNumberId) {
+  if (adapterId === "whatsapp-cloud" && context.gateway["whatsapp-cloud"]?.accessToken && context.gateway["whatsapp-cloud"].phoneNumberId) {
     const message = whatsAppWebhookToSurfaceMessages(JSON.parse(body))[0];
     if (!message) return;
-    const version = context.gateway.whatsapp.apiVersion ?? "v19.0";
-    await context.fetcher(`https://graph.facebook.com/${version}/${context.gateway.whatsapp.phoneNumberId}/messages`, {
+    const version = context.gateway["whatsapp-cloud"].apiVersion ?? "v19.0";
+    await context.fetcher(`https://graph.facebook.com/${version}/${context.gateway["whatsapp-cloud"].phoneNumberId}/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${context.gateway.whatsapp.accessToken}` },
+      headers: { "content-type": "application/json", authorization: `Bearer ${context.gateway["whatsapp-cloud"].accessToken}` },
       body: JSON.stringify(surfaceReplyToWhatsAppSend({ text }, message.conversationId)),
     });
   }
@@ -4026,7 +4073,7 @@ async function deliverPreparedAdapter(
     }
     return;
   }
-  const whatsapp = context.gateway.whatsapp;
+  const whatsapp = context.gateway["whatsapp-cloud"];
   if (!whatsapp?.accessToken || !whatsapp.phoneNumberId) {
     throw new Error("WhatsApp credentials are unavailable during durable delivery recovery.");
   }
@@ -4390,8 +4437,8 @@ async function route(
   }
 
   // WhatsApp Cloud API GET verification handshake (hub.challenge echo).
-  if (request.method === "GET" && url.pathname === "/v1/adapters/whatsapp") {
-    const verifyToken = options.gateway.whatsapp?.verifyToken;
+  if (request.method === "GET" && url.pathname === "/v1/adapters/whatsapp-cloud") {
+    const verifyToken = options.gateway["whatsapp-cloud"]?.verifyToken;
     if (!verifyToken) {
       sendJson(response, 500, { error: "WhatsApp adapter not configured. Add whatsapp.verifyToken to .muster/gateway.json." });
       return;
@@ -5045,8 +5092,8 @@ function adapterHasPlatformAuth(adapterId: string, gateway: GatewayConfig): bool
       return Boolean(gateway.gchat?.verificationToken || googleChatAudienceIsValid(gateway.gchat?.verification?.audience));
     case "teams":
       return Boolean(gateway.teams?.hmacSecret);
-    case "whatsapp":
-      return Boolean(gateway.whatsapp?.appSecret);
+    case "whatsapp-cloud":
+      return Boolean(gateway["whatsapp-cloud"]?.appSecret);
     default:
       return false;
   }
@@ -5327,7 +5374,7 @@ export function gatewayStartupErrors(gateway: GatewayConfig): readonly string[] 
     if (mode === "http" && !gateway.slack.signingSecret) errors.push("Slack HTTP signingSecret is required");
   }
   if (gateway.discord?.botToken && !gateway.discord.publicKey) errors.push("Discord publicKey is required");
-  if (gateway.whatsapp && (!gateway.whatsapp.appSecret || !gateway.whatsapp.verifyToken)) errors.push("WhatsApp appSecret and verifyToken are required");
+  if (gateway["whatsapp-cloud"] && (!gateway["whatsapp-cloud"].appSecret || !gateway["whatsapp-cloud"].verifyToken)) errors.push("WhatsApp Cloud API appSecret and verifyToken are required");
   if (gateway.gchat) {
     const modern = gateway.gchat.verification?.mode === "bearer" && googleChatAudienceIsValid(gateway.gchat.verification.audience);
     const allowedLegacy = gateway.security.allowLegacyGchatToken && Boolean(gateway.gchat.verificationToken);

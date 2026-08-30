@@ -201,7 +201,7 @@ test("whatsapp hub.challenge verification echoes only on matching verify token",
 test("whatsapp notification maps entry[].changes[].value.messages[] to SurfaceMessages", () => {
   const messages = whatsAppWebhookToSurfaceMessages(whatsAppNotification);
   assert.equal(messages.length, 1);
-  assert.equal(messages[0].surfaceId, "whatsapp:106540352242922");
+  assert.equal(messages[0].surfaceId, "whatsapp-cloud:106540352242922");
   assert.equal(messages[0].conversationId, "919812345678");
   assert.equal(messages[0].senderId, "919812345678");
   assert.equal(messages[0].text, "summarize today's episodes");
@@ -425,14 +425,14 @@ test("discord webhook with publicKey configured verifies signed requests and 401
 
 test("whatsapp webhook: GET verification handshake echoes hub.challenge as plain text", async () => {
   const gw = await startGatewayWith({
-    whatsapp: { accessToken: "EAAG-token", verifyToken: "secret-verify", phoneNumberId: "106540352242922" },
+    "whatsapp-cloud": { accessToken: "EAAG-token", verifyToken: "secret-verify", phoneNumberId: "106540352242922" },
   }, "unused");
   try {
-    const ok = await fetch(`http://127.0.0.1:${gw.port}/v1/adapters/whatsapp?hub.mode=subscribe&hub.verify_token=secret-verify&hub.challenge=1158201444`);
+    const ok = await fetch(`http://127.0.0.1:${gw.port}/v1/adapters/whatsapp-cloud?hub.mode=subscribe&hub.verify_token=secret-verify&hub.challenge=1158201444`);
     assert.equal(ok.status, 200);
     assert.equal(await ok.text(), "1158201444");
 
-    const bad = await fetch(`http://127.0.0.1:${gw.port}/v1/adapters/whatsapp?hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=1158201444`);
+    const bad = await fetch(`http://127.0.0.1:${gw.port}/v1/adapters/whatsapp-cloud?hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=1158201444`);
     assert.equal(bad.status, 403);
   } finally {
     await gw.close();
@@ -448,11 +448,11 @@ test("whatsapp webhook posts governed reply to graph.facebook.com via injected f
     return new Response(JSON.stringify({ messages: [{ id: "wamid.OUT" }] }), { status: 200 });
   }) as typeof fetch;
   const gw = await startGatewayWith({
-    whatsapp: { accessToken: "EAAG-token", verifyToken: "secret-verify", phoneNumberId: "106540352242922" },
+    "whatsapp-cloud": { accessToken: "EAAG-token", verifyToken: "secret-verify", phoneNumberId: "106540352242922" },
   }, "12 episodes today", fetcher);
   try {
-    await requestPairing("whatsapp:106540352242922", "919812345678", gw.cwd).then((pending) => approvePairing(pending.code, gw.cwd));
-    const response = await fetch(`http://127.0.0.1:${gw.port}/v1/adapters/whatsapp`, {
+    await requestPairing("whatsapp-cloud:106540352242922", "919812345678", gw.cwd).then((pending) => approvePairing(pending.code, gw.cwd));
+    const response = await fetch(`http://127.0.0.1:${gw.port}/v1/adapters/whatsapp-cloud`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: "Bearer test-token" },
       body: JSON.stringify(whatsAppNotification),
@@ -466,7 +466,7 @@ test("whatsapp webhook posts governed reply to graph.facebook.com via injected f
     assert.equal(body.to, "919812345678");
     assert.equal(body.text.body, "12 episodes today");
 
-    const retry = await fetch(`http://127.0.0.1:${gw.port}/v1/adapters/whatsapp`, {
+    const retry = await fetch(`http://127.0.0.1:${gw.port}/v1/adapters/whatsapp-cloud`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: "Bearer test-token" },
       body: JSON.stringify(whatsAppNotification),
@@ -489,7 +489,7 @@ test("whatsapp Graph rejection is retryable and never records a false delivered 
     return new Response(JSON.stringify({ messages: [{ id: `wamid.OUT.${outbound.length}` }] }), { status: 200 });
   }) as typeof fetch;
   const gw = await startGatewayWith({
-    whatsapp: { accessToken: "EAAG-token", verifyToken: "secret-verify", phoneNumberId: "106540352242922" },
+    "whatsapp-cloud": { accessToken: "EAAG-token", verifyToken: "secret-verify", phoneNumberId: "106540352242922" },
   }, "retry-safe WhatsApp answer", fetcher);
   const payload = JSON.stringify({
     ...whatsAppNotification,
@@ -505,8 +505,8 @@ test("whatsapp Graph rejection is retryable and never records a false delivered 
     }],
   });
   try {
-    await requestPairing("whatsapp:106540352242922", "919812345678", gw.cwd).then((pending) => approvePairing(pending.code, gw.cwd));
-    const post = () => fetch(`http://127.0.0.1:${gw.port}/v1/adapters/whatsapp`, {
+    await requestPairing("whatsapp-cloud:106540352242922", "919812345678", gw.cwd).then((pending) => approvePairing(pending.code, gw.cwd));
+    const post = () => fetch(`http://127.0.0.1:${gw.port}/v1/adapters/whatsapp-cloud`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: "Bearer test-token" },
       body: payload,

@@ -1015,15 +1015,15 @@ test("channel packs produce setup plans, readiness checks, and safe payload summ
   assert.deepEqual(telegramSummary, { updateId: 42, chatId: "123", chatType: "private", user: "ada", text: "/start" });
 
   const whatsappPlan = await whatsapp_setup_plan(
-    { publicUrl: "https://wa.example.test", gatewayConfig: { whatsapp: { accessToken: "token", verifyToken: "verify", phoneNumberId: "pnid", appSecret: "app-secret", apiVersion: "v20.0" } } },
+    { publicUrl: "https://wa.example.test", gatewayConfig: { "whatsapp-cloud": { accessToken: "token", verifyToken: "verify", phoneNumberId: "pnid", appSecret: "app-secret", apiVersion: "v20.0" } } },
     { config: {} },
   );
   assert.equal(whatsappPlan.ready, true);
-  assert.equal(whatsappPlan.webhookUrl, "https://wa.example.test/v1/adapters/whatsapp");
+  assert.equal(whatsappPlan.webhookUrl, "https://wa.example.test/v1/adapters/whatsapp-cloud");
   assert.equal(whatsappPlan.graphMessagesUrl, "https://graph.facebook.com/v20.0/<phone-number-id>/messages");
   assert.match(whatsappPlan.notes.join(" "), /Cloud API only/);
 
-  const whatsappCheck = await whatsapp_gateway_check({ gatewayConfig: { whatsapp: { accessToken: "token" } } }, { config: {} });
+  const whatsappCheck = await whatsapp_gateway_check({ gatewayConfig: { "whatsapp-cloud": { accessToken: "token" } } }, { config: {} });
   assert.equal(whatsappCheck.ready, false);
   assert.deepEqual(whatsappCheck.checks.map((check) => check.id), ["access_token", "verify_token", "phone_number_id", "app_secret", "public_https_url"]);
   assert.equal(whatsappCheck.checks[1].ok, false);
@@ -1391,7 +1391,7 @@ test("new integration packs load through the capability loader", async () => {
   assert.deepEqual(slack.toolNames.sort(), ["slack__slack_event_summary", "slack__slack_gateway_check", "slack__slack_setup_plan"]);
   assert.deepEqual(telegram.toolNames.sort(), ["telegram__telegram_gateway_check", "telegram__telegram_setup_plan", "telegram__telegram_update_summary"]);
   assert.deepEqual(teams.toolNames.sort(), ["teams__teams_activity_summary", "teams__teams_gateway_check", "teams__teams_setup_plan"]);
-  assert.deepEqual(whatsapp.toolNames.sort(), ["whatsapp__whatsapp_gateway_check", "whatsapp__whatsapp_setup_plan", "whatsapp__whatsapp_webhook_summary"]);
+  assert.deepEqual(whatsapp.toolNames.sort(), ["whatsapp-cloud__whatsapp_gateway_check", "whatsapp-cloud__whatsapp_setup_plan", "whatsapp-cloud__whatsapp_webhook_summary"]);
   assert.deepEqual(webFrameworks.toolNames.sort(), ["web-frameworks__web_frameworks_detect", "web-frameworks__web_frameworks_framework_guide", "web-frameworks__web_frameworks_local_commands", "web-frameworks__web_frameworks_production_check", "web-frameworks__web_frameworks_workflow_plan"]);
   assert.deepEqual(developerTools.toolNames.sort(), ["developer-tools__developer_tools_command_policy", "developer-tools__developer_tools_release_check", "developer-tools__developer_tools_repo_workflow", "developer-tools__developer_tools_surface_plan"]);
   assert.deepEqual(browser.toolNames.sort(), ["browser__browser_mcp_readiness", "browser__browser_setup_plan", "browser__browser_smoke_plan", "browser__browser_task_policy"]);
@@ -1418,7 +1418,7 @@ test("new integration packs load through the capability loader", async () => {
   assert.equal(typeof registry["slack__slack_gateway_check"], "function");
   assert.equal(typeof registry["telegram__telegram_update_summary"], "function");
   assert.equal(typeof registry["teams__teams_activity_summary"], "function");
-  assert.equal(typeof registry["whatsapp__whatsapp_webhook_summary"], "function");
+  assert.equal(typeof registry["whatsapp-cloud__whatsapp_webhook_summary"], "function");
   assert.equal(typeof registry["web-frameworks__web_frameworks_detect"], "function");
   assert.equal(typeof registry["web-frameworks__web_frameworks_framework_guide"], "function");
   assert.equal(typeof registry["web-frameworks__web_frameworks_workflow_plan"], "function");

@@ -81,7 +81,7 @@ test("gateway init redacts bearer token unless explicitly requested", async () =
   const coldStatus = await runCli(["gateway", "status"], cwd);
   assert.match(coldStatus.stdout, /gateway_status=missing/);
   assert.match(coldStatus.stdout, /token=missing/);
-  assert.match(coldStatus.stdout, /channels_ready=0\/7/);
+  assert.match(coldStatus.stdout, /channels_ready=0\/8/);
   assert.match(coldStatus.stdout, /next="muster gateway init"/);
 
   const redacted = await runCli(["gateway", "init"], cwd);
@@ -93,7 +93,7 @@ test("gateway init redacts bearer token unless explicitly requested", async () =
   const initializedStatus = await runCli(["gateway", "status"], cwd);
   assert.match(initializedStatus.stdout, /gateway_status=configured/);
   assert.match(initializedStatus.stdout, /token=configured/);
-  assert.match(initializedStatus.stdout, /channels_ready=1\/7/);
+  assert.match(initializedStatus.stdout, /channels_ready=1\/8/);
   assert.match(initializedStatus.stdout, /next="muster gateway daemon start --port 7460"/);
   assert.doesNotMatch(initializedStatus.stdout, /token=[0-9a-f]{48}/);
 
@@ -150,7 +150,8 @@ test("CLI onboarding preview exposes setup controls, impacts, and separate chann
   assert.match(channels, /Slack/);
   assert.match(channels, /WhatsApp/);
   assert.match(channels, /SLACK_BOT_TOKEN/);
-  assert.match(channels, /WHATSAPP_ACCESS_TOKEN/);
+  assert.match(channels, /muster channels login whatsapp/);
+  assert.match(channels, /Meta ToS gray zone/);
   assert.match(channels, /Draft-first keeps humans in control/);
   // Honest fields: every credential is named inside a runnable command, never
   // as a field that looks typeable on a screen with no text input.
@@ -1020,7 +1021,8 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(pluginCatalog.stdout, /slack\s+openclaw.*channels=slack/);
   assert.match(pluginCatalog.stdout, /google-chat\s+openclaw.*channels=gchat.*aliases=gchat/);
   assert.match(pluginCatalog.stdout, /discord\s+openclaw.*pack=yes.*channels=discord/);
-  assert.match(pluginCatalog.stdout, /whatsapp\s+openclaw.*pack=yes.*channels=whatsapp/);
+  assert.match(pluginCatalog.stdout, /whatsapp\s+openclaw.*pack=no.*channels=whatsapp/);
+  assert.match(pluginCatalog.stdout, /whatsapp-cloud\s+openclaw.*pack=yes.*channels=whatsapp-cloud/);
   assert.match(pluginCatalog.stdout, /teams\s+openclaw.*pack=yes.*channels=teams/);
   assert.match(pluginCatalog.stdout, /mcp-bridge\s+openclaw.*pack=yes.*mcps=filesystem,git,browser,postgres,sqlite,github,google-drive,notion,figma,linear,n8n,data-analytics-widgets,openai-api-key-local-confirmation/);
 
@@ -1081,16 +1083,23 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   const whatsappPluginSetup = await runCli(["plugins", "setup", "whatsapp"], cwd);
   assert.match(whatsappPluginSetup.stdout, /plugin=whatsapp source=openclaw risk=high/);
   assert.match(whatsappPluginSetup.stdout, /channel=whatsapp status=needs_setup command="muster channels ready whatsapp"/);
-  assert.match(whatsappPluginSetup.stdout, /Meta app setup/);
+  assert.match(whatsappPluginSetup.stdout, /Unofficial protocol; Meta ToS gray zone/);
 
   const whatsappPluginCheck = await runCli(["plugins", "check", "whatsapp"], cwd);
   assert.match(whatsappPluginCheck.stdout, /plugin=whatsapp source=openclaw risk=high enabled=false/);
-  assert.match(whatsappPluginCheck.stdout, /pack=capability-packs\/whatsapp status=ready tools=3/);
+  assert.match(whatsappPluginCheck.stdout, /action=runtime_adapter/);
   assert.match(whatsappPluginCheck.stdout, /plugin_env=ready/);
 
   const enabledWhatsappPlugin = await runCli(["plugins", "enable", "whatsapp", "--allow-high-risk"], cwd);
   assert.match(enabledWhatsappPlugin.stdout, /enabled plugin=whatsapp/);
   assert.match(enabledWhatsappPlugin.stdout, /available_channels=whatsapp/);
+
+  const whatsappCloudPluginCheck = await runCli(["plugins", "check", "whatsapp-cloud"], cwd);
+  assert.match(whatsappCloudPluginCheck.stdout, /plugin=whatsapp-cloud source=openclaw risk=high enabled=false/);
+  assert.match(whatsappCloudPluginCheck.stdout, /pack=capability-packs\/whatsapp status=ready tools=3/);
+  const enabledWhatsappCloudPlugin = await runCli(["plugins", "enable", "whatsapp-cloud", "--allow-high-risk"], cwd);
+  assert.match(enabledWhatsappCloudPlugin.stdout, /enabled plugin=whatsapp-cloud/);
+  assert.match(enabledWhatsappCloudPlugin.stdout, /available_channels=whatsapp-cloud/);
 
   const teamsPluginSetup = await runCli(["plugins", "setup", "teams"], cwd);
   assert.match(teamsPluginSetup.stdout, /plugin=teams source=openclaw risk=high/);
@@ -1520,6 +1529,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(listedPlugins.stdout, /entry=google-chat enabled=true/);
   assert.match(listedPlugins.stdout, /entry=discord enabled=true/);
   assert.match(listedPlugins.stdout, /entry=whatsapp enabled=true/);
+  assert.match(listedPlugins.stdout, /entry=whatsapp-cloud enabled=true/);
   assert.match(listedPlugins.stdout, /entry=telegram enabled=true/);
   assert.match(listedPlugins.stdout, /entry=teams enabled=true/);
   assert.match(listedPlugins.stdout, /web-search/);
@@ -1597,6 +1607,8 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(disabledDiscordPlugin.stdout, /disabled plugin=discord/);
   const disabledWhatsappPlugin = await runCli(["plugins", "disable", "whatsapp"], cwd);
   assert.match(disabledWhatsappPlugin.stdout, /disabled plugin=whatsapp/);
+  const disabledWhatsappCloudPlugin = await runCli(["plugins", "disable", "whatsapp-cloud"], cwd);
+  assert.match(disabledWhatsappCloudPlugin.stdout, /disabled plugin=whatsapp-cloud/);
   const disabledTelegramPlugin = await runCli(["plugins", "disable", "telegram"], cwd);
   assert.match(disabledTelegramPlugin.stdout, /disabled plugin=telegram/);
   const disabledTeamsPlugin = await runCli(["plugins", "disable", "teams"], cwd);
@@ -1609,7 +1621,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   const dashboard = await runCli(["dashboard", "status"], cwd);
   assert.match(dashboard.stdout, /profile=default/);
   assert.match(dashboard.stdout, /configured=true/);
-  assert.match(dashboard.stdout, /personal_agent packs_enabled=\d+\/6 channels_ready=\d+\/7 mcps_configured=\d+\/4/);
+  assert.match(dashboard.stdout, /personal_agent packs_enabled=\d+\/6 channels_ready=\d+\/8 mcps_configured=\d+\/4/);
   assert.match(dashboard.stdout, /memory=backend=.* jsonl_objects=\d+ index_objects=\d+ scopes=\d+ fresh=/);
   assert.match(dashboard.stdout, /token_ledger=records=\d+ today_in=\d+ today_out=\d+ today_cost_usd=\d+\.\d{4}/);
   assert.match(dashboard.stdout, /sessions=backend=sqlite-(fts5|like) recent=\d+ latest=/);
@@ -1619,9 +1631,9 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(dashboard.stdout, /start=muster dashboard start --port 7461/);
 
   const channelCatalog = await runCli(["channels", "list"], cwd);
-  assert.match(channelCatalog.stdout, /telegram\t--bot-token-env\tmuster channels ready telegram/);
-  assert.match(channelCatalog.stdout, /slack\t--bot-token-env,--app-token-env\tmuster channels ready slack/);
-  assert.match(channelCatalog.stdout, /gchat\t--audience\tmuster channels ready gchat/);
+  assert.match(channelCatalog.stdout, /telegram\tTelegram Bot\t--bot-token-env\tmuster channels ready telegram/);
+  assert.match(channelCatalog.stdout, /slack\tSlack App\t--bot-token-env,--app-token-env\tmuster channels ready slack/);
+  assert.match(channelCatalog.stdout, /gchat\tGoogle Chat App\t--audience\tmuster channels ready gchat/);
 
   const coldChannelStatus = await runCli(["channels", "status"], cwd);
   assert.match(coldChannelStatus.stdout, /gateway_config=missing next="muster gateway init"/);
@@ -1633,7 +1645,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(coldTelegramStatus.stdout, /channel=telegram ready=false/);
 
   const coldChannelDoctor = await runCli(["channels", "doctor"], cwd);
-  assert.match(coldChannelDoctor.stdout, /channel_doctor=all status=needs_setup ready=0\/7/);
+  assert.match(coldChannelDoctor.stdout, /channel_doctor=all status=needs_setup ready=0\/8/);
   assert.match(coldChannelDoctor.stdout, /gateway_config=missing/);
   assert.match(coldChannelDoctor.stdout, /operator_matrix/);
   assert.match(coldChannelDoctor.stdout, /channel=web status=needs_setup missing=gateway\.token .* next="muster gateway init"/);
@@ -1643,7 +1655,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.match(gatewayInitForChannels.stdout, /gateway_config=/);
 
   const channelDoctorBeforeSetup = await runCli(["channels", "doctor"], cwd);
-  assert.match(channelDoctorBeforeSetup.stdout, /channel_doctor=all status=needs_setup ready=1\/7/);
+  assert.match(channelDoctorBeforeSetup.stdout, /channel_doctor=all status=needs_setup ready=1\/8/);
   assert.match(channelDoctorBeforeSetup.stdout, /gateway_config=configured/);
   assert.match(channelDoctorBeforeSetup.stdout, /operator_matrix/);
   assert.match(channelDoctorBeforeSetup.stdout, /channel=telegram status=needs_setup missing=telegram\.botToken/);
@@ -1671,8 +1683,8 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
 
   const whatsappSimulation = await runCli(["channels", "simulate", "whatsapp", "--message", "show my payroll approvals"], cwd);
   assert.match(whatsappSimulation.stdout, /channel_simulation=whatsapp normalized=true/);
-  assert.match(whatsappSimulation.stdout, /surface=whatsapp:PNLOCAL/);
-  assert.match(whatsappSimulation.stdout, /sender=919999999999/);
+  assert.match(whatsappSimulation.stdout, /surface=whatsapp:default/);
+  assert.match(whatsappSimulation.stdout, /sender=919999999999@s\.whatsapp\.net/);
   assert.match(whatsappSimulation.stdout, /next=run gateway handler, apply pairing\/policy, record tokens, then draft or send reply/);
 
   const telegramDoctorBeforeSetup = await runCli(["channels", "doctor", "telegram"], cwd);
@@ -1773,7 +1785,7 @@ test("CLI exposes plugin, MCP, and dashboard management surfaces", async () => {
   assert.doesNotMatch(slackPlanAfterSetup.stdout, /xoxb-secret|xapp-secret/);
 
   const channelDoctorAfterSetup = await runCli(["channels", "doctor"], cwd);
-  assert.match(channelDoctorAfterSetup.stdout, /channel_doctor=all status=needs_setup ready=3\/7/);
+  assert.match(channelDoctorAfterSetup.stdout, /channel_doctor=all status=needs_setup ready=3\/8/);
   assert.match(channelDoctorAfterSetup.stdout, /channel=telegram status=warning missing=- warnings=telegram\.live_check_available auth=secret-token-header-recommended reply=draft_stream next="muster channels doctor telegram --live"/);
   assert.match(channelDoctorAfterSetup.stdout, /channel=slack status=warning missing=- warnings=slack\.live_check_available,slack\.files_write_live_check_available auth=slack-socket-app-token reply=draft_stream next="muster channels doctor slack --live"/);
   assert.match(channelDoctorAfterSetup.stdout, /channel=gchat status=needs_setup missing=gchat\.verification\.audience/);
