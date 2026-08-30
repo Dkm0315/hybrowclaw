@@ -17,15 +17,16 @@ add_to_apps_screen = [
 ]
 
 app_include_css = [
-    "/assets/muster/css/muster.css?v=20260808-5",
+    "/assets/muster/css/muster.css?v=20260816-2",
     "/assets/muster/css/studio.css",
 ]
 app_include_js = [
     "/assets/muster/js/workflow_graph.js",
     "/assets/muster/js/surface_adapters.js?v=20260808-27",
     "/assets/muster/js/native_customization_session.js?v=20260720-5",
-    "/assets/muster/js/live_work_session.js?v=20260808-9",
-    "/assets/muster/js/activity_dock.js?v=20260808-10",
+    "/assets/muster/js/customization_repair_session.js?v=20260816-1",
+    "/assets/muster/js/live_work_session.js?v=20260816-1",
+    "/assets/muster/js/activity_dock.js?v=20260816-2",
 ]
 
 # Muster's site-level registry detects standalone Vue/React surfaces and loads

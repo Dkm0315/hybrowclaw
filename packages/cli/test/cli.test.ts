@@ -3598,8 +3598,12 @@ test("CLI codex doctor and QA scorecard expose runtime maturity without false po
     assert.equal(ptyManifest.status, "passed");
     assert.ok(ptyManifest.caseCount >= 12);
     const ptyScreen = await readFile(join(ptyRunArtifact, "screens", "slash_overlay_stable.txt"), "utf8");
-    assert.match(ptyScreen, /suggestions/);
-    assert.match(ptyScreen, /╰─+╯/);
+    assert.match(ptyScreen, /→ \/memory <query>/);
+    assert.doesNotMatch(ptyScreen, /^\s*\d+\/\d+\s*$/m, "no count row — the reference shows none");
+    assert.doesNotMatch(ptyScreen, /suggestions/u);
+    // The reference draws NO box glyphs anywhere.
+    assert.doesNotMatch(ptyScreen, /[╭╮╰╯│]/u, "no box glyphs — the ruled composer has none");
+    assert.ok(ptyScreen.indexOf("/memory <query>") < ptyScreen.indexOf("❯ /"));
     const partialScorecard = await runCliAllowFailure(["qa", "scorecard", "--codex-command", codex, "--latest-version", "0.1.0", "--evidence", ptyEvidencePath], cwd);
     assert.equal(partialScorecard.code, 1);
     assert.match(partialScorecard.stdout, /passed\s+qa\.pty_tui\s+PTY\/TUI hostile interaction checks passed/);

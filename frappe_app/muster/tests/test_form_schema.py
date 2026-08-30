@@ -47,6 +47,7 @@ class TestEffectiveFormSchema(FrappeTestCase):
             patch.object(frappe.db, "get_value", return_value="2026-07-19"),
             patch.object(frappe, "has_permission", return_value=True),
             patch.object(frappe, "get_meta", return_value=meta),
+            patch.object(frappe, "new_doc", return_value=frappe._dict()),
             patch.object(frappe, "get_roles", return_value=["Sales User"]),
             patch.object(frappe, "get_all", side_effect=get_all),
         ):
@@ -100,6 +101,7 @@ class TestEffectiveFormSchema(FrappeTestCase):
             patch.object(frappe.db, "get_value", return_value="2026-07-20"),
             patch.object(frappe, "has_permission", side_effect=permission),
             patch.object(frappe, "get_meta", return_value=meta),
+            patch.object(frappe, "new_doc", return_value=frappe._dict()),
             patch.object(frappe, "get_roles", return_value=["Intake User"]),
             patch.object(frappe, "get_all", return_value=[]),
         ):
@@ -136,6 +138,7 @@ class TestEffectiveFormSchema(FrappeTestCase):
             patch.object(frappe.db, "get_value", return_value="2026-07-20"),
             patch.object(frappe, "has_permission", return_value=True),
             patch.object(frappe, "get_meta", return_value=meta),
+            patch.object(frappe, "new_doc", return_value=frappe._dict()),
             patch.object(frappe, "get_roles", return_value=["Sales User"]),
             patch.object(frappe, "get_all", side_effect=get_all),
         ):

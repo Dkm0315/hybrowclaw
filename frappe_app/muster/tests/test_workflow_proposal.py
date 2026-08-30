@@ -34,12 +34,16 @@ from muster.orchestration.workflow_proposal import _attended_form_catalogs
 from muster.orchestration.workflow_proposal import _attended_preview_projection
 from muster.orchestration.workflow_proposal import assert_attended_update_revision
 from muster.orchestration.workflow_proposal import preflight_attended_proposal_save
+from muster.orchestration.workflow_proposal import preflight_attended_proposal_submit
 from muster.orchestration.workflow_proposal import verify_attended_proposal_record
+from muster.orchestration.workflow_proposal import verify_attended_proposal_submit
+from muster.orchestration.workflow_proposal import _attended_submit_requested
 from muster.orchestration.workflow_proposal import assert_attended_delete_revision
 from muster.orchestration.workflow_proposal import assert_destructive_reviewer
 from muster.orchestration.workflow_proposal import assert_attended_reviewer
 from muster.orchestration.workflow_proposal import _destructive_proof_value
 from muster.orchestration.workflow_proposal import _canonical_requested_scope
+from muster.orchestration.workflow_proposal import _objective_linked_child_rows
 
 
 def descriptor():
@@ -528,6 +532,82 @@ class TestWorkflowProposalValidation(IntegrationTestCase):
                 preflight_attended_proposal_save(
                     "MST-WFP-UPDATE", "maker@example.test", "ACME", update["record_revision"],
                 )
+
+    def test_submit_request_is_explicit_non_negated_and_schema_bound(self):
+        with patch("muster.orchestration.workflow_proposal.frappe.get_meta", return_value=Mock(is_submittable=True)):
+            self.assertTrue(_attended_submit_requested("Save and submit this after I approve", "BOM"))
+            self.assertFalse(_attended_submit_requested("Save this but do not submit it", "BOM"))
+            self.assertFalse(_attended_submit_requested("Prepare a draft", "BOM"))
+        with patch("muster.orchestration.workflow_proposal.frappe.get_meta", return_value=Mock(is_submittable=False)):
+            self.assertFalse(_attended_submit_requested("Submit this", "ToDo"))
+
+    def test_plain_language_link_mentions_ground_live_child_rows(self):
+        catalog = {"fields": [
+            {"fieldname": "components", "fieldtype": "Table", "writable": True, "child_fields": [
+                {"fieldname": "part", "fieldtype": "Link", "options": "Item", "writable": True},
+                {"fieldname": "qty", "fieldtype": "Float", "writable": True},
+                {"fieldname": "custom_required_qty", "fieldtype": "Float", "writable": True},
+            ]},
+            {"fieldname": "steps", "fieldtype": "Table", "writable": True, "child_fields": [
+                {"fieldname": "operation", "fieldtype": "Link", "options": "Operation", "writable": True},
+            ]},
+        ]}
+        rows = {
+            "Item": [{"name": "MUSTER-DEMO-ASSEMBLY"}, {"name": "MUSTER-DEMO-COMPONENT"}],
+            "Operation": [{"name": "Bending"}, {"name": "Cutting"}],
+        }
+        def exists(doctype, name):
+            return any(row["name"] == name for row in rows.get(doctype, []))
+
+        with (
+            patch("muster.orchestration.workflow_proposal.frappe.db.exists", side_effect=exists),
+            patch("muster.orchestration.workflow_proposal.frappe.has_permission", return_value=True),
+        ):
+            inferred = _objective_linked_child_rows(
+                "Create it using one MUSTER-DEMO-COMPONENT and the approved Bending operation.",
+                catalog,
+                {"item": "MUSTER-DEMO-ASSEMBLY"},
+            )
+        self.assertEqual(inferred["components"], [{"part": "MUSTER-DEMO-COMPONENT", "qty": 1}])
+        self.assertEqual(inferred["steps"], [{"operation": "Bending"}])
+
+    def test_attended_submit_preflight_and_verification_are_separate(self):
+        preview = {
+            "proposal": "MST-WFP-SUBMIT", "operation": "create", "doctype": "BOM",
+            "record_name": None, "save_authorized": True, "submit_requested": True,
+            "submit_authorized": True, "fields": [],
+        }
+        doc = frappe._dict(
+            doctype="BOM", name="BOM-DEMO", docstatus=0,
+            modified="2026-08-16 12:00:00.000000", modified_by="maker@example.test",
+        )
+        doc.has_permission = Mock(return_value=True)
+        with (
+            patch("muster.orchestration.workflow_proposal.attended_proposal_preview", return_value=preview),
+            patch("muster.orchestration.workflow_proposal.verify_attended_proposal_record", return_value={"verified": True}),
+            patch("muster.orchestration.workflow_proposal.frappe.get_doc", return_value=doc),
+        ):
+            preflight = preflight_attended_proposal_submit(
+                "MST-WFP-SUBMIT", "maker@example.test", "BOM-DEMO", doc.modified,
+            )
+            self.assertTrue(preflight["current"])
+            self.assertFalse(preflight["executed"])
+            self.assertEqual(preflight["docstatus"], 0)
+            with self.assertRaisesRegex(WorkflowProposalError, "changed after review"):
+                preflight_attended_proposal_submit(
+                    "MST-WFP-SUBMIT", "maker@example.test", "BOM-DEMO", "stale",
+                )
+            with self.assertRaisesRegex(WorkflowProposalError, "has not submitted"):
+                verify_attended_proposal_submit(
+                    "MST-WFP-SUBMIT", "maker@example.test", "BOM-DEMO",
+                )
+            doc.docstatus = 1
+            verified = verify_attended_proposal_submit(
+                "MST-WFP-SUBMIT", "maker@example.test", "BOM-DEMO",
+            )
+            self.assertTrue(verified["verified"])
+            self.assertEqual(verified["docstatus"], 1)
+            self.assertEqual(len(verified["proof_hash"]), 64)
 
     def test_attended_verifier_compares_text_editor_semantics_but_keeps_data_exact(self):
         preview = {
@@ -1182,9 +1262,12 @@ class TestWorkflowProposalValidation(IntegrationTestCase):
                 return False
             return True
 
+        def meta(doctype, cached=False):
+            return parent_meta if doctype == "CRM Lead" else linked_meta
+
         with (
             patch("muster.orchestration.workflow_proposal.frappe.db.exists", side_effect=exists),
-            patch("muster.orchestration.workflow_proposal.frappe.get_meta", side_effect=[parent_meta, linked_meta, parent_meta, linked_meta]),
+            patch("muster.orchestration.workflow_proposal.frappe.get_meta", side_effect=meta),
             patch("muster.orchestration.workflow_proposal.frappe.get_list", return_value=[frappe._dict(name="New")]) as listed,
         ):
             _admitted, compiled = _materialize_attended_crud_bundle(

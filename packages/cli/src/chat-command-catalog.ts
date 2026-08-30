@@ -6,6 +6,10 @@ export interface ChatCommandDef {
   readonly description: string;
   readonly aliases?: readonly string[];
   readonly plugin?: InheritedPlugin;
+  /** Bare submission opens choices instead of printing syntax. */
+  readonly bareBehavior?: "picker";
+  /** Argument prefixes that are bare at the name/id boundary. Empty means the command itself. */
+  readonly pickerInvocations?: readonly string[];
 }
 
 /** User outcomes only: this text is shown in every slash-command surface. */
@@ -15,20 +19,20 @@ export const CHAT_COMMANDS: readonly ChatCommandDef[] = [
   { name: "shortcuts", usage: "/shortcuts", description: "see keyboard shortcuts", aliases: ["keys"] },
   { name: "status", usage: "/status", description: "see this conversation and its usage" },
   { name: "providers", usage: "/providers", description: "see available AI providers and models", aliases: ["provider-list"] },
-  { name: "provider", usage: "/provider <id> [model]", description: "switch AI provider for this conversation", aliases: ["use-provider"] },
+  { name: "provider", usage: "/provider <id> [model]", description: "switch AI provider for this conversation", aliases: ["use-provider"], bareBehavior: "picker", pickerInvocations: [""] },
   { name: "cloud", usage: "/cloud [preset]", description: "choose or add a cloud AI provider" },
   { name: "model", usage: "/model [name]", description: "choose the model, effort, and speed" },
   { name: "runtime", usage: "/runtime [id]", description: "choose which local AI app runs turns" },
   { name: "speed", usage: "/speed [session|fast]", description: "choose full context or faster replies" },
   { name: "live-diff", usage: "/live-diff [on|off]", description: "show file changes while they happen", aliases: ["livediff", "diffs"] },
   { name: "diff", usage: "/diff", description: "open or close this turn's file changes" },
-  { name: "tasks", usage: "/tasks [board | \"<goal>\" | why <taskId> | assign <taskId> <cardId>]", description: "open your task board or plan work across agents" },
+  { name: "tasks", usage: "/tasks [board | \"<goal>\" | why <taskId> | assign <taskId> <cardId>]", description: "open your task board or plan work across agents", bareBehavior: "picker", pickerInvocations: ["why", "assign"] },
   { name: "reasoning", usage: "/reasoning [auto|low|medium|high|compact|full]", description: "choose thinking effort or summary detail", aliases: ["think"] },
   { name: "senses", usage: "/senses", description: "see available screen and browser access" },
   { name: "sessions", usage: "/sessions [limit]", description: "see recent conversations", aliases: ["ls"] },
-  { name: "resume", usage: "/resume <name|id>", description: "continue an earlier conversation", aliases: ["use"] },
-  { name: "codex", usage: "/codex sessions [limit] | /codex resume <id-prefix>", description: "continue a conversation from Codex" },
-  { name: "name", usage: "/name <name>", description: "rename this conversation" },
+  { name: "resume", usage: "/resume <name|id>", description: "continue an earlier conversation", aliases: ["use"], bareBehavior: "picker", pickerInvocations: [""] },
+  { name: "codex", usage: "/codex sessions [limit] | /codex resume <id-prefix>", description: "continue a conversation from Codex", bareBehavior: "picker", pickerInvocations: [""] },
+  { name: "name", usage: "/name <name>", description: "rename this conversation", bareBehavior: "picker", pickerInvocations: [""] },
   { name: "history", usage: "/history [limit]", description: "see earlier messages here" },
   { name: "memory", usage: "/memory <query>", description: "find something saved from earlier work" },
   { name: "scope", usage: "/scope <kind:id...|add kind:id|clear>", description: "choose which saved context can be recalled" },
@@ -56,6 +60,10 @@ export const CHAT_COMMANDS: readonly ChatCommandDef[] = [
   { name: "clear", usage: "/clear", description: "clear the terminal", aliases: ["cls"] },
   { name: "exit", usage: "/exit", description: "leave chat", aliases: ["quit", "q"] },
 ] as const;
+
+export function pickerClassInvocations(commands: readonly ChatCommandDef[] = CHAT_COMMANDS): readonly string[] {
+  return commands.flatMap((command) => (command.pickerInvocations ?? []).map((args) => `/${command.name}${args ? ` ${args}` : ""}`));
+}
 
 export function pluginCommandName(plugin: InheritedPlugin): string | undefined {
   const name = plugin.id.split("@")[0]?.trim().toLowerCase();

@@ -178,6 +178,40 @@
     let intent = "ask";
     let conversationId = conversationKey();
     let conversationDoctype = "";
+    let recentUiError = null;
+    const ownInformationTitle = /^(?:AI runtime is not connected|Workflow proposal ready|Workflow could not be prepared)$/i;
+    const errorLanguage = /\b(?:error|failed|failure|invalid|validation|required|missing|blocked|not\s+(?:allowed|permitted|found|available)|cannot|could not|unable)\b/i;
+    const rememberUiError = (rawMessage, rawTitle, indicator = "") => {
+      const container = document.createElement("div");
+      container.innerHTML = String(rawMessage || "");
+      const message = String(container.textContent || "").replace(/\s+/g, " ").trim().slice(0, 500);
+      const title = String(rawTitle || __("Validation message")).replace(/\s+/g, " ").trim().slice(0, 120);
+      const severity = String(indicator || "").toLowerCase();
+      if (!message || ownInformationTitle.test(title)) return;
+      if (!["red", "orange"].includes(severity) && !errorLanguage.test(`${title} ${message}`)) return;
+      recentUiError = {title, message, observed_at: new Date().toISOString()};
+    };
+    const originalMsgprint = frappe.msgprint.bind(frappe);
+    frappe.msgprint = function musterAwareMsgprint(value, ...args) {
+      const options = value && typeof value === "object" && !Array.isArray(value) ? value : null;
+      const indicator = String(options?.indicator || "").toLowerCase();
+      const rawMessage = options?.message ?? value;
+      const rawTitle = options?.title ?? args[0] ?? __("Validation message");
+      rememberUiError(rawMessage, rawTitle, indicator);
+      return originalMsgprint(value, ...args);
+    };
+    const dialogObserver = new MutationObserver(() => {
+      const dialogs = [...document.querySelectorAll(".msgprint-dialog, .modal.show")];
+      const dialog = dialogs.at(-1);
+      if (!dialog) return;
+      const body = dialog.querySelector(".modal-body, .msgprint")?.innerHTML || "";
+      const title = dialog.querySelector(".modal-title")?.textContent || __("Validation message");
+      const indicator = dialog.querySelector(".indicator-pill.red, .indicator-pill.orange, .text-danger")
+        ? "red"
+        : "";
+      rememberUiError(body, title, indicator);
+    });
+    dialogObserver.observe(document.body, {childList: true, subtree: true, attributes: true, attributeFilter: ["class"]});
     let pendingClarification = null;
     let pendingTrainingTarget = "";
     const offeredTrainingTargets = new Set();
@@ -278,7 +312,9 @@
     function currentScope() {
       const route = typeof frappe.get_route === "function" ? frappe.get_route() : [];
       const routeString = typeof frappe.get_route_str === "function" ? frappe.get_route_str() : "/app";
-      return model.continuationScope(model.scope(route, routeString), conversationDoctype);
+      const scope = model.continuationScope(model.scope(route, routeString), conversationDoctype);
+      if (!recentUiError || Date.now() - Date.parse(recentUiError.observed_at) > 2 * 60_000) return scope;
+      return {...scope, recent_ui_error: recentUiError};
     }
 
     async function loadCatalog() {
@@ -330,10 +366,93 @@
     function appendMessage(kind, text, artifacts = []) {
       const item = document.createElement("article");
       item.className = `muster-chat-message is-${kind}`;
+      item.dataset.musterMessage = "true";
+      item.dataset.musterRole = kind;
       const label = kind === "user" ? __("You") : __("Muster");
       item.innerHTML = `<small>${label}</small><div class="muster-rich-text">${model.richText(text)}</div>${artifacts.map((artifact) => `<a href="${frappe.utils.escape_html(artifact.download_url)}" target="_blank" rel="noopener">↧ ${frappe.utils.escape_html(artifact.name)}</a>`).join("")}`;
       chat.appendChild(item);
       if (kind === "assistant" && String(text || "").length > 180) setReadingMode(true);
+      chat.scrollTop = chat.scrollHeight;
+      return item;
+    }
+
+    function presentationActions(presentation) {
+      return [
+        ...(presentation.drilldowns || []),
+        ...(presentation.actions || []),
+      ];
+    }
+
+    function supportEvidenceCallout(presentation) {
+      if (presentation?.title !== "Review the support ticket") return "";
+      const preview = presentation.tables?.find((table) => table.id === "request-preview")
+        ?.rows?.find((row) => row?.[0] === "Evidence preview")?.[1];
+      if (typeof preview !== "string" || !preview.trim()) return "";
+      const section = (label) => {
+        const marker = `### ${label}\n`;
+        const offset = preview.indexOf(marker);
+        if (offset < 0) return "";
+        const remaining = preview.slice(offset + marker.length);
+        const next = remaining.indexOf("\n\n### ");
+        return (next >= 0 ? remaining.slice(0, next) : remaining).trim();
+      };
+      const observed = section("Observed state");
+      const location = section("Likely customization locations").replace(/^[-*]\s*/gm, "").trim();
+      const error = section("Sanitized error evidence").replace(/^[-*]\s*/gm, "").trim();
+      if (!observed && !location && !error) return "";
+      const escape = (value) => frappe.utils.escape_html(String(value || ""));
+      return `<aside class="muster-support-evidence-highlight" data-muster-support-highlight="true"><header><small>${__("Verified diagnosis")}</small><strong>${__("What failed")}</strong></header>${observed ? `<p>${escape(observed)}</p>` : ""}${location ? `<div><small>${__("Customization location")}</small><code>${escape(location)}</code></div>` : ""}${error ? `<details open><summary>${__("Captured error evidence")}</summary><pre>${escape(error)}</pre></details>` : ""}</aside>`;
+    }
+
+    function appendPresentation(presentation, fallbackText, artifacts = []) {
+      if (!presentation || typeof presentation !== "object") return appendMessage("assistant", fallbackText, artifacts);
+      const item = document.createElement("article");
+      item.className = `muster-chat-presentation is-${presentation.kind || "status"}`;
+      item.dataset.musterPresentation = presentation.kind || "status";
+      const supportReview = presentation.title === "Review the support ticket";
+      const supportReceipt = presentation.title === "Sent to support";
+      if (supportReview) {
+        item.dataset.musterTakeover = "true";
+        item.dataset.musterTakeoverState = "waiting";
+        item.dataset.musterEvidence = "true";
+        item.dataset.musterScenario = "v16-migration";
+      }
+      if (supportReceipt) {
+        const ticket = presentation.tables?.find((table) => table.id === "created-record")?.rows?.[0]?.[0];
+        item.dataset.musterReceipt = "true";
+        item.dataset.musterScenario = "v16-migration";
+        item.dataset.musterReceiptStatus = "verified";
+        item.dataset.musterReceiptId = String(ticket || "support-ticket-verified");
+      }
+      const escape = (value) => frappe.utils.escape_html(String(value || ""));
+      const kpis = (presentation.kpis || []).map((kpi) => `<div data-tone="${escape(kpi.tone || "neutral")}"><small>${escape(kpi.label)}</small><strong>${escape(kpi.value)}</strong>${kpi.detail ? `<span>${escape(kpi.detail)}</span>` : ""}</div>`).join("");
+      const filters = (presentation.filters || []).map((filter) => {
+        const options = (filter.options || []).map((option) => `<option value="${escape(option.value)}"${option.value === filter.selected ? " selected" : ""}>${escape(option.label)}</option>`).join("");
+        return `<label class="muster-presentation-filter"><span>${escape(filter.label)}</span><select class="form-control input-xs" data-filter-command="${escape(filter.action.command)}">${options}</select></label>`;
+      }).join("");
+      const tables = (presentation.tables || []).map((table) => {
+        const rows = (table.rows || []).map((row) => `<tr>${table.columns.map((_, index) => `<td>${escape(row[index] || "")}</td>`).join("")}</tr>`).join("");
+        const page = table.pagination ? `<small>${__("Page {0} · {1} rows", [table.pagination.page, table.pagination.totalRows])}</small>` : "";
+        return `<section class="muster-presentation-table">${table.title ? `<h4>${escape(table.title)}</h4>` : ""}<div><table><thead><tr>${table.columns.map((column) => `<th>${escape(column)}</th>`).join("")}</tr></thead><tbody>${rows || `<tr><td colspan="${table.columns.length}">${__("No matching records")}</td></tr>`}</tbody></table></div>${page}</section>`;
+      }).join("");
+      const work = presentation.work ? `<div class="muster-presentation-work" data-state="${escape(presentation.work.state)}"><i></i><div><strong>${escape(presentation.work.label)}</strong>${presentation.work.detail ? `<span>${escape(presentation.work.detail)}</span>` : ""}</div></div>` : "";
+      const supportHighlight = supportEvidenceCallout(presentation);
+      const actions = presentationActions(presentation).map((action) => `<button type="button" class="btn btn-xs${action.style === "primary" ? " btn-primary" : action.style === "danger" ? " btn-danger" : " btn-default"}" data-presentation-command="${escape(action.command)}"${action.detail ? ` title="${escape(action.detail)}"` : ""}>${escape(action.label)}</button>`).join("");
+      item.innerHTML = `<header><small>${__("Muster")}</small><h3>${escape(presentation.title)}</h3><p>${escape(presentation.summary)}</p></header>${work}${supportHighlight}${kpis ? `<div class="muster-presentation-kpis">${kpis}</div>` : ""}${filters ? `<div class="muster-presentation-filters">${filters}</div>` : ""}${tables}${presentation.notice ? `<p class="muster-presentation-notice">${escape(presentation.notice)}</p>` : ""}${presentation.privacy?.note ? `<details class="muster-presentation-privacy"><summary>${__("Evidence and privacy")}</summary><p>${escape(presentation.privacy.note)}</p></details>` : ""}${actions ? `<footer>${actions}</footer>` : ""}${artifacts.map((artifact) => `<a class="muster-presentation-artifact" href="${escape(artifact.download_url)}" target="_blank" rel="noopener">↧ ${escape(artifact.name)}</a>`).join("")}`;
+      item.addEventListener("change", (event) => {
+        const select = event.target.closest("[data-filter-command]");
+        if (!select) return;
+        const command = select.dataset.filterCommand.replaceAll("{value}", select.value);
+        submitPrompt(command);
+      });
+      item.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-presentation-command]");
+        if (!button) return;
+        button.disabled = true;
+        submitPrompt(button.dataset.presentationCommand).finally(() => { button.disabled = false; });
+      });
+      chat.appendChild(item);
+      setReadingMode(true);
       chat.scrollTop = chat.scrollHeight;
       return item;
     }
@@ -391,6 +510,7 @@
         const button = document.createElement("button");
         button.type = "button";
         button.className = "btn btn-xs";
+        button.dataset.musterHandoffKind = handoff.kind;
         button.textContent = handoff.label || __("Prepare reviewed plan");
         button.addEventListener("click", () => {
           const accept = async (extra = {}) => {
@@ -423,6 +543,34 @@
                 appendMessage("assistant", __("Reply with only the missing details. I’ll show the complete merged request before continuing."));
                 prompt.placeholder = __("Add the missing detail for the request above…");
                 prompt.focus();
+                return;
+              }
+              if (handoff.kind === "customization_repair") {
+                const launch = response.message?.customization_repair_launch;
+                if (!launch || launch.schema_version !== 1
+                  || typeof launch.client_script !== "string" || !launch.client_script.trim() || launch.client_script.length > 140
+                  || typeof launch.version !== "string" || !launch.version.trim() || launch.version.length > 140
+                  || typeof launch.business_reason !== "string" || !launch.business_reason.trim()
+                  || !/^[a-f0-9]{64}$/.test(launch.live_hash || "")
+                  || !/^[a-f0-9]{64}$/.test(launch.proposed_hash || "")
+                  || !window.musterCustomizationRepair?.diagnosePrevious) {
+                  throw new Error("customization-repair-launch-unavailable");
+                }
+                actions.innerHTML = `<span class="text-muted" role="status">${__("Opening the exact customization evidence…")}</span>`;
+                await window.musterCustomizationRepair.diagnosePrevious({
+                  clientScript: launch.client_script,
+                  version: launch.version,
+                  businessReason: launch.business_reason,
+                });
+                actions.innerHTML = `<span class="text-muted" role="status">${__("The customization repair is open for your review.")}</span>`;
+                return;
+              }
+              if (handoff.kind === "lineage_remediation") {
+                const lineagePlan = response.message?.lineage_plan;
+                if (!lineagePlan || !window.musterLineagePreview?.start) throw new Error("lineage-preview-unavailable");
+                actions.innerHTML = `<span class="text-muted" role="status">${__("Opening the affected records in review order…")}</span>`;
+                await window.musterLineagePreview.start(lineagePlan);
+                actions.innerHTML = `<span class="text-muted" role="status">${__("The affected records are open for one reviewed correction.")}</span>`;
                 return;
               }
               const acceptedProposal = response.message?.proposal;
@@ -475,7 +623,7 @@
             ], (values) => accept(values), __("Bind this proposal to reviewed source"), __("Create inert proposal"));
             return;
           }
-          if (handoff.kind === "attended_browser") {
+          if (["attended_browser", "lineage_remediation"].includes(handoff.kind)) {
             accept();
             return;
           }
@@ -485,7 +633,7 @@
           );
         });
         actions.appendChild(button);
-        if (handoff.kind === "attended_browser") {
+        if (["attended_browser", "lineage_remediation"].includes(handoff.kind)) {
           button.hidden = true;
           actions.insertAdjacentHTML("beforeend", `<span class="text-muted" role="status">${__("Opening the form with your details…")}</span>`);
           window.queueMicrotask(() => button.click());
@@ -509,7 +657,8 @@
         const state = response.message;
         if (state.status === "completed") {
           answerItem.remove();
-          appendMessage("assistant", state.answer, state.artifacts || []);
+          if (state.presentation) appendPresentation(state.presentation, state.answer, state.artifacts || []);
+          else appendMessage("assistant", state.answer, state.artifacts || []);
           appendToolCalls(state.tool_calls || []);
           appendTrainingContinuation(state.context_target?.doctype || conversationDoctype);
           return;
@@ -524,8 +673,8 @@
       answerItem.querySelector("div").textContent = __("This is taking longer than expected. You can ask again safely.");
     }
 
-    async function submitPrompt() {
-      const text = prompt.value.trim();
+    async function submitPrompt(command) {
+      const text = typeof command === "string" ? command.trim() : prompt.value.trim();
       if (!text) {
         frappe.show_alert({message: __("Type a question or describe the workflow you want."), indicator: "orange"});
         prompt.focus();
@@ -567,7 +716,7 @@
           return;
         }
         appendMessage("user", text);
-        prompt.value = "";
+        if (typeof command !== "string") prompt.value = "";
         const answerItem = appendMessage("assistant", __("Thinking with your permitted site context…"));
         pendingAnswer = answerItem;
         const clarification = pendingClarification;

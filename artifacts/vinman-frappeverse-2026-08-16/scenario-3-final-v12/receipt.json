@@ -1,0 +1,69 @@
+{
+  "scenario_id": "authorized-customization-repair",
+  "title": "Repair a customization under role-bound approval",
+  "prompt": "why is this not saving? drawing B is already approved. please check and fix it",
+  "started_at": "2026-08-16T17:23:58.891Z",
+  "finished_at": "2026-08-16T17:25:22.844Z",
+  "browser": {
+    "base_url": "https://mono-lamb-effects-watches.trycloudflare.com",
+    "route": "/desk/control-plan",
+    "viewport": {
+      "width": 1440,
+      "height": 900
+    }
+  },
+  "visible_evidence": {
+    "assistantMessages": [
+      "MUSTER\n\nI found one customization attached to this screen whose current browser rule matches a recorded Frappe Version. I can show the business impact, the exact difference, and a reversible repair for your approval. Nothing has changed yet."
+    ],
+    "scenarioEvidence": [
+      "Customization diagnosis\nMUSTER-DEMO-VALIDATE-REVISED-OPERATION · Control Plan\nRESTORED\nOriginal Client Script restored and independently verified.\nObserved restored version\n6b333b504d0c926cb594f9bc682f516f894ad5dcce8c02e8d0d79cdfac8b9e2e\nRollback receipt\n34d1d5eeabe5c888462dedbc7145d292fed89cea3d3fb98e8857020839462359\nDone"
+    ],
+    "takeover": {
+      "visible": true,
+      "waiting": true,
+      "text": "Customization diagnosis\nMUSTER-DEMO-VALIDATE-REVISED-OPERATION · Control Plan\nREVIEW\nWhat is happening in the business flow\n\nThe current Control Plan workflow is blocked by the reported customization behavior. User report: why is this not saving? drawing B is already approved. please check and fix it\n\nThis reviewed repair changes the browser behavior of the Control Plan form without changing its database schema. It takes effect for users only after the Client Script is saved and their form assets are refreshed.\n\nCurrent version\n6b333b504d0c926cb594f9bc682f516f894ad5dcce8c02e8d0d79cdfac8b9e2e\nReviewed repair\na208f1cf73de6c2ec43cb6cce0a41c384c4fc178a98fa54508733ce292eb6e25\nLive form schema\n1703caf381f7382458d53fbc69af0a1ec52a882d1d16dea439bb0538badd56d2\nAffected screen\nControl Plan · Form\nExact reviewed diff\n--- current Client Script\n+++ reviewed Client Script\n@@ -1,7 +1,7 @@\n frappe.ui.form.on(\"Control Plan\", {\n   validate(frm) {\n     if (frm.doc.drawing_rev_no === \"B\") {\n-      frappe.throw(__(\"Only revision A is permitted for this operation.\"));\n+      frappe.show_alert({ message: __(\"Revision B is ready for review.\"), indicator: \"green\" });\n     }\n   }\n });\n\nNothing has changed yet. Apply is bound to these exact hashes, this user, this site, the live permissions, and the current form schema.\n\nCancel\nApprove exact repair\nCustomization diagnosis\nMUSTER-DEMO-VALIDATE-REVISED-OPERATION · Control Plan\nAPPLYING\nWhat is happening in the business flow\n\nThe current Control Plan workflow is blocked by the reported customization behavior. User report: why is this not saving? drawing B is already approved. please check and fix it\n\nThis reviewed repair changes the browser behavior of the Control Plan form without changing its database schema. It takes effect for users only after the Client Script is saved and their form assets are refreshed.\n\nCurrent version\n6b333b504d0c926cb594f9bc682f516f894ad5dcce8c02e8d0d79cdfac8b9e2e\nReviewed repair\na208f1cf73de6c2ec43cb6cce0a41c384c4fc178a98fa54508733ce292eb6e25\nLive form schema\n1703caf381f7382458d53fbc69af0a1ec52a882d1d16dea439bb0538badd56d2\nAffected screen\nControl Plan · Form\nExact reviewed diff\n--- current Client Script\n+++ reviewed Client Script\n@@ -1,7 +1,7 @@\n frappe.ui.form.on(\"Control Plan\", {\n   validate(frm) {\n     if (frm.doc.drawing_rev_no === \"B\") {\n-      frappe.throw(__(\"Only revision A is permitted for this operation.\"));\n+      frappe.show_alert({ message: __(\"Revision B is ready for review.\"), indicator: \"green\" });\n     }\n   }\n });\n\nNothing has changed yet. Apply is bound to these exact hashes, this user, this site, the live permissions, and the current form schema.\n\nApplying the exact reviewed source, then rereading the saved Client Script…\nCustomization diagnosis\nMUSTER-DEMO-VALIDATE-REVISED-OPERATION · Control Plan\nVERIFIED\nThe approved Client Script repair was applied and independently verified.\nObserved version\na208f1cf73de6c2ec43cb6cce0a41c384c4fc178a98fa54508733ce292eb6e25\nEvidence receipt\nefe1ed27f544acd4e5f0d5894d3d622fab98e46385ced3fc7614361d1770332a\n\nUsers should refresh the affected form to load the reviewed browser behavior.\n\nDone\nReview restoration\nCustomization diagnosis\nMUSTER-DEMO-VALIDATE-REVISED-OPERATION · Control Plan\nRESTORING\nRestoration plan\n\nThe current Control Plan workflow is blocked by the reported customization behavior. User report: why is this not saving? drawing B is already approved. please check and fix it\n\nThis restores the exact Client Script version captured before the repair. Any later administrator change blocks automatic restoration.\n\nCurrent repaired version\na208f1cf73de6c2ec43cb6cce0a41c384c4fc178a98fa54508733ce292eb6e25\nVersion to restore\n6b333b504d0c926cb594f9bc682f516f894ad5dcce8c02e8d0d79cdfac8b9e2e\nLive form schema\n1703caf381f7382458d53fbc69af0a1ec52a882d1d16dea439bb0538badd56d2\nAffected screen\nControl Plan · Form\nExact rollback diff\n--- current Client Script\n+++ reviewed Client Script\n@@ -1,7 +1,7 @@\n frappe.ui.form.on(\"Control Plan\", {\n   validate(frm) {\n     if (frm.doc.drawing_rev_no === \"B\") {\n-      frappe.show_alert({ message: __(\"Revision B is ready for review.\"), indicator: \"green\" });\n+      frappe.throw(__(\"Only revision A is permitted for this operation.\"));\n     }\n   }\n });\n\nRollback also requires explicit approval and an independent server reread.\n\nRestoring the exact original source, then rereading it from Frappe…\nCustomization diagnosis\nMUSTER-DEMO-VALIDATE-REVISED-OPERATION · Control Plan\nRESTORED\nOriginal Client Script restored and independently verified.\nObserved restored version\n6b333b504d0c926cb594f9bc682f516f894ad5dcce8c02e8d0d79cdfac8b9e2e\nRollback receipt\n34d1d5eeabe5c888462dedbc7145d292fed89cea3d3fb98e8857020839462359\nDone"
+    },
+    "takeoverSamples": [
+      "Customization diagnosis\nMUSTER-DEMO-VALIDATE-REVISED-OPERATION · Control Plan\nREVIEW\nWhat is happening in the business flow\n\nThe current Control Plan workflow is blocked by the reported customization behavior. User report: why is this not saving? drawing B is already approved. please check and fix it\n\nThis reviewed repair changes the browser behavior of the Control Plan form without changing its database schema. It takes effect for users only after the Client Script is saved and their form assets are refreshed.\n\nCurrent version\n6b333b504d0c926cb594f9bc682f516f894ad5dcce8c02e8d0d79cdfac8b9e2e\nReviewed repair\na208f1cf73de6c2ec43cb6cce0a41c384c4fc178a98fa54508733ce292eb6e25\nLive form schema\n1703caf381f7382458d53fbc69af0a1ec52a882d1d16dea439bb0538badd56d2\nAffected screen\nControl Plan · Form\nExact reviewed diff\n--- current Client Script\n+++ reviewed Client Script\n@@ -1,7 +1,7 @@\n frappe.ui.form.on(\"Control Plan\", {\n   validate(frm) {\n     if (frm.doc.drawing_rev_no === \"B\") {\n-      frappe.throw(__(\"Only revision A is permitted for this operation.\"));\n+      frappe.show_alert({ message: __(\"Revision B is ready for review.\"), indicator: \"green\" });\n     }\n   }\n });\n\nNothing has changed yet. Apply is bound to these exact hashes, this user, this site, the live permissions, and the current form schema.\n\nCancel\nApprove exact repair",
+      "Customization diagnosis\nMUSTER-DEMO-VALIDATE-REVISED-OPERATION · Control Plan\nAPPLYING\nWhat is happening in the business flow\n\nThe current Control Plan workflow is blocked by the reported customization behavior. User report: why is this not saving? drawing B is already approved. please check and fix it\n\nThis reviewed repair changes the browser behavior of the Control Plan form without changing its database schema. It takes effect for users only after the Client Script is saved and their form assets are refreshed.\n\nCurrent version\n6b333b504d0c926cb594f9bc682f516f894ad5dcce8c02e8d0d79cdfac8b9e2e\nReviewed repair\na208f1cf73de6c2ec43cb6cce0a41c384c4fc178a98fa54508733ce292eb6e25\nLive form schema\n1703caf381f7382458d53fbc69af0a1ec52a882d1d16dea439bb0538badd56d2\nAffected screen\nControl Plan · Form\nExact reviewed diff\n--- current Client Script\n+++ reviewed Client Script\n@@ -1,7 +1,7 @@\n frappe.ui.form.on(\"Control Plan\", {\n   validate(frm) {\n     if (frm.doc.drawing_rev_no === \"B\") {\n-      frappe.throw(__(\"Only revision A is permitted for this operation.\"));\n+      frappe.show_alert({ message: __(\"Revision B is ready for review.\"), indicator: \"green\" });\n     }\n   }\n });\n\nNothing has changed yet. Apply is bound to these exact hashes, this user, this site, the live permissions, and the current form schema.\n\nApplying the exact reviewed source, then rereading the saved Client Script…",
+      "Customization diagnosis\nMUSTER-DEMO-VALIDATE-REVISED-OPERATION · Control Plan\nVERIFIED\nThe approved Client Script repair was applied and independently verified.\nObserved version\na208f1cf73de6c2ec43cb6cce0a41c384c4fc178a98fa54508733ce292eb6e25\nEvidence receipt\nefe1ed27f544acd4e5f0d5894d3d622fab98e46385ced3fc7614361d1770332a\n\nUsers should refresh the affected form to load the reviewed browser behavior.\n\nDone\nReview restoration",
+      "Customization diagnosis\nMUSTER-DEMO-VALIDATE-REVISED-OPERATION · Control Plan\nRESTORING\nRestoration plan\n\nThe current Control Plan workflow is blocked by the reported customization behavior. User report: why is this not saving? drawing B is already approved. please check and fix it\n\nThis restores the exact Client Script version captured before the repair. Any later administrator change blocks automatic restoration.\n\nCurrent repaired version\na208f1cf73de6c2ec43cb6cce0a41c384c4fc178a98fa54508733ce292eb6e25\nVersion to restore\n6b333b504d0c926cb594f9bc682f516f894ad5dcce8c02e8d0d79cdfac8b9e2e\nLive form schema\n1703caf381f7382458d53fbc69af0a1ec52a882d1d16dea439bb0538badd56d2\nAffected screen\nControl Plan · Form\nExact rollback diff\n--- current Client Script\n+++ reviewed Client Script\n@@ -1,7 +1,7 @@\n frappe.ui.form.on(\"Control Plan\", {\n   validate(frm) {\n     if (frm.doc.drawing_rev_no === \"B\") {\n-      frappe.show_alert({ message: __(\"Revision B is ready for review.\"), indicator: \"green\" });\n+      frappe.throw(__(\"Only revision A is permitted for this operation.\"));\n     }\n   }\n });\n\nRollback also requires explicit approval and an independent server reread.\n\nRestoring the exact original source, then rereading it from Frappe…",
+      "Customization diagnosis\nMUSTER-DEMO-VALIDATE-REVISED-OPERATION · Control Plan\nRESTORED\nOriginal Client Script restored and independently verified.\nObserved restored version\n6b333b504d0c926cb594f9bc682f516f894ad5dcce8c02e8d0d79cdfac8b9e2e\nRollback receipt\n34d1d5eeabe5c888462dedbc7145d292fed89cea3d3fb98e8857020839462359\nDone"
+    ],
+    "launchClicked": true,
+    "approvalClicked": true,
+    "receipt": {
+      "visible": true,
+      "id": "34d1d5eeabe5c888462dedbc7145d292fed89cea3d3fb98e8857020839462359",
+      "status": "restored",
+      "scenario": "authorized-customization-repair",
+      "text": "Original Client Script restored and independently verified."
+    },
+    "repairReceipt": {
+      "visible": true,
+      "id": "efe1ed27f544acd4e5f0d5894d3d622fab98e46385ced3fc7614361d1770332a",
+      "status": "verified",
+      "scenario": "authorized-customization-repair",
+      "text": "The approved Client Script repair was applied and independently verified."
+    },
+    "restorationReceipt": {
+      "visible": true,
+      "id": "34d1d5eeabe5c888462dedbc7145d292fed89cea3d3fb98e8857020839462359",
+      "status": "restored",
+      "scenario": "authorized-customization-repair",
+      "text": "Original Client Script restored and independently verified."
+    },
+    "forbiddenRequests": [],
+    "followUpVisible": false
+  },
+  "artifacts": {
+    "video": "recording.webm",
+    "screenshot": "final.png",
+    "trace": "trace.zip",
+    "video_bytes": 7331863,
+    "screenshot_bytes": 184628,
+    "trace_bytes": 32691681
+  },
+  "result": "pass"
+}

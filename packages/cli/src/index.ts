@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { printBanner, renderBanner } from "./banner.js";
-import { buildCompactHeaderLines, createMusterAutocompleteProvider, createNarrationPainter, formatAssistantBlock, formatCostChip, formatStatusLine, formatToolLine, formatUserLine, formatWorkingIndicator, routeEngineLine, runMusterChatTui, type BoardModeController, type MusterChatSink, type MusterCompletionCatalog, type PickerOption, type ReasoningMode } from "./chat-tui.js";
+import { buildCompactHeaderLines, createMusterAutocompleteProvider, createNarrationPainter, formatAssistantBlock, formatCostChip, formatStatusLine, formatToolLine, formatUserLine, formatWorkingIndicator, routeEngineLine, runMusterChatTui, workingVerbForFrame, type BoardModeController, type MusterChatSink, type MusterCompletionCatalog, type PickerOption, type ReasoningMode } from "./chat-tui.js";
 import { startLiveDiffFeed } from "./live-diff.js";
 import { LiveFileTurnAccumulator, renderLiveFilePlain } from "./live-file-view.js";
 import {
@@ -30,7 +30,6 @@ import { CHAT_COMMANDS, directPluginCommand, dynamicPluginCommands, type ChatCom
 import { unknownShellCommandMessage, unknownSlashCommandMessage } from "./command-suggestion.js";
 import { threadConflictCure } from "./thread-conflict.js";
 import { composerPrefillForCapabilityMention, intentfulCapabilityMentions } from "./capability-mention.js";
-import { formatEarlierHistoryLine, pruneHistory } from "./prose-renderer.js";
 import { runPtyTuiQa } from "./qa-pty-tui.js";
 import {
   buildComposerCatalog,
@@ -250,6 +249,8 @@ import {
   parseReasoningPreference,
   withReasoningEconomy,
   projectBoardView,
+  sessionPreview,
+  MODEL_CARD_SEED,
   type ReasoningPreference,
 } from "@musterhq/core";
 import {
@@ -285,7 +286,7 @@ import {
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { execFile, spawn } from "node:child_process";
 import { access, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { randomBytes, createHash } from "node:crypto";
@@ -1283,6 +1284,7 @@ interface ChatSessionUsage {
 const DEFAULT_CHAT_SESSION = "main";
 type ChatMenu =
   | { readonly kind: "commands" | "agents"; readonly options: readonly string[] }
+  | { readonly kind: "codex-sessions"; readonly options: readonly string[]; readonly includeAll: boolean }
   | { readonly kind: "parallel-tasks"; readonly prompt: string }
   | { readonly kind: "workspace-mismatch"; readonly sessionName: string; readonly workspaceCwd: string };
 interface ChatSuggestion {
@@ -1479,7 +1481,9 @@ async function interactiveChat(state: ChatState): Promise<void> {
   await ensureDefaultConfig();
   await initializeChatComposerState(state);
   const headerLines = await buildChatHeaderLines(state);
-  const initialLines = state.initialTranscriptLines ?? namedChatHistoryLines(state.sessionName);
+  // Owner-ruled 2026-08-30: launch is CLEAN like the reference — history
+  // replays only when explicitly invoked (/resume, /codex resume, /history).
+  const initialLines = state.initialTranscriptLines ?? [];
   state.initialTranscriptLines = undefined;
   try {
     await runMusterChatTui({
@@ -1511,6 +1515,9 @@ async function interactiveChat(state: ChatState): Promise<void> {
     });
   } finally {
     clearCodexAppServerSessions();
+    // Session boundary: chats from several projects share one terminal's
+    // scrollback (owner-observed); the close stamp keeps them tellable apart.
+    console.log(color(`── session ${state.sessionName} · ${basename(chatWorkspaceCwd(state))} · closed ──`, "dim"));
   }
 }
 
@@ -1652,9 +1659,18 @@ function applyChatEffort(
   // Ask the existing helper to ensure the classified task has a concrete route,
   // then replace its legacy three-tier decision with the app's session value.
   // With no override, remove route reasoning so Codex reads the user's config.
-  const prepared = state.effortOverride
-    ? withReasoningEconomy(config, { prompt, runtimeId: state.runtime, preference: "low" }).config
-    : config;
+  // Auto is a POLICY, not a shrug: no override -> classify the prompt and set
+  // the tier (simple -> low). Deferring to the config default made a one-line
+  // question run Medium (6.0s first token, measured live).
+  // The economy helper only knows three tiers; the app's wider effort scale is
+  // applied verbatim to the route below, so here an override merely needs a
+  // legal clamp (xhigh/max/ultra economize like "high").
+  const economyPreference = state.effortOverride === undefined
+    ? ("auto" as const)
+    : state.effortOverride === "low" || state.effortOverride === "medium" || state.effortOverride === "high"
+      ? state.effortOverride
+      : ("high" as const);
+  const prepared = withReasoningEconomy(config, { prompt, runtimeId: state.runtime, preference: economyPreference }).config;
   const runtimes = Object.fromEntries(Object.entries(prepared.runtimes).map(([id, runtime]) => [
     id,
     {
@@ -1951,7 +1967,7 @@ function chatFrameWidth(): number {
 function printChatInputFrame(): void {
   const width = chatFrameWidth();
   console.log(color(`╭─ chat ${"─".repeat(Math.max(1, width - 9))}╮`, "accent"));
-  console.log(color("│ ", "accent") + visiblePadEnd(color("type / for commands, @ for agents, Tab completes", "dim"), width - 4) + color(" │", "accent"));
+  console.log(color("│ ", "dim") + visiblePadEnd(color("type / for commands, @ for agents, Tab completes", "dim"), width - 4) + color(" │", "dim"));
   console.log(color("│ ", "accent") + visiblePadEnd("", width - 4) + color(" │", "accent"));
   console.log(color(`╰${"─".repeat(width - 2)}╯`, "accent"));
   if (process.stdout.isTTY) output.write("\x1b[2A\r");
@@ -2084,6 +2100,10 @@ async function handleChatInput(text: string, state: ChatState): Promise<boolean>
 async function handlePendingChatMenu(text: string, state: ChatState): Promise<boolean | undefined> {
   const menu = state.pendingMenu;
   if (!menu || menu.kind === "parallel-tasks" || menu.kind === "workspace-mismatch") return undefined;
+  if (menu.kind === "codex-sessions" && text.trim().toLowerCase() === "a") {
+    await openCodexSessionPicker(state, !menu.includeAll);
+    return true;
+  }
   const index = Number(text);
   if (!Number.isInteger(index) || index < 1 || index > menu.options.length) {
     if (text.startsWith("/") || text.startsWith("@")) {
@@ -2095,7 +2115,7 @@ async function handlePendingChatMenu(text: string, state: ChatState): Promise<bo
   }
   state.pendingMenu = undefined;
   const selected = menu.options[index - 1];
-  if (menu.kind === "commands") return handleChatCommand(`/${selected}`, state);
+  if (menu.kind === "commands" || menu.kind === "codex-sessions") return handleChatCommand(`/${selected}`, state);
   console.log(color(`selected @${selected}. Type @${selected} <task> to route a turn.`, "dim"));
   return true;
 }
@@ -2159,6 +2179,15 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
     case "assign": {
       // The kanban engine's only user surface: orchestration is invoked from the
       // conversation, and every card it prints comes back out of the event log.
+      const taskParts = args.trim().split(/\s+/).filter(Boolean);
+      if (name === "tasks" && taskParts[0] === "why" && taskParts.length === 1) {
+        await openTaskArgumentPicker(state, "why");
+        return true;
+      }
+      if (name === "tasks" && taskParts[0] === "assign" && taskParts.length <= 2) {
+        await openTaskArgumentPicker(state, "assign", taskParts[1]);
+        return true;
+      }
       if (state.statusSink && name === "tasks" && (!args.trim() || args.trim() === "board")) {
         const opened = await state.statusSink.openBoard(args.trim() === "board");
         if (opened) {
@@ -2186,7 +2215,7 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
       return true;
     case "resume":
       if (!args) {
-        console.log(color("Usage: /resume <name|session-id>", "yellow"));
+        openNamedSessionPicker(state, "resume");
         return true;
       }
       selectChatSessionForResume(args, state);
@@ -2194,23 +2223,11 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
     case "codex": {
       const [sub, ...restArgs] = args.split(/\s+/).filter(Boolean);
       if (!sub) {
-        // No human remembers a thread id. Bare /codex IS the picker: recent
-        // threads as readable rows (this directory's first), pick by number.
-        try {
-          const scan = await discoverCodexSessions({ limit: 60 });
-          const here = scan.sessions.filter((item) => item.cwd === process.cwd());
-          const rows = [...here, ...scan.sessions.filter((item) => item.cwd !== process.cwd())].slice(0, 8);
-          if (!rows.length) {
-            console.log(color("No Codex threads found on this machine.", "dim"));
-            return true;
-          }
-          printChatPanel("Continue a Codex conversation", rows.map((item, index) =>
-            `${color(`${index + 1}.`, "accent")} ${codexProjectLabel(item).padEnd(22)} ${color(formatCodexAge(item.lastActivityAt).padEnd(6), "dim")} ${color((item.firstUserMessage ?? "").replace(/\s+/g, " ").slice(0, 56), "dim")}`));
-          console.log(color("Type a number to continue that conversation here.", "dim"));
-          state.pendingMenu = { kind: "commands", options: rows.map((item) => `codex resume ${item.threadId.slice(0, 12)}`) };
-        } catch (error) {
-          console.log(color(error instanceof Error ? error.message : String(error), "yellow"));
-        }
+        await openCodexSessionPicker(state, false);
+        return true;
+      }
+      if (sub === "--all" || sub === "all") {
+        await openCodexSessionPicker(state, true);
         return true;
       }
       if (sub === "sessions" || sub === "list") {
@@ -2221,15 +2238,25 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
         try {
           const forked = restArgs.includes("--fork");
           const { session, imported } = await importCodexThreadByPrefix(restArgs[0], restArgs.slice(1));
-          state.sessionName = safeChatSessionName(`codex-${session.threadId.slice(0, 8)}`);
+          // FULL thread id: codex ids are UUIDv7, so an 8-char prefix is a
+          // ~65-second TIMESTAMP window — threads created in the same minute
+          // collided into one muster session (the owner's fluence chats
+          // appearing under redis-automation). Identity must never truncate.
+          state.sessionName = safeChatSessionName(`codex-${session.threadId}`);
           state.resumeThreadId = forked ? undefined : session.threadId;
           state.importedFromCodex = true;
           state.sessionWorkspaceCwd = session.cwd || process.cwd();
+          // The native thread edits ITS OWN repo regardless of where muster
+          // runs — the diff observer must watch there by default, or resumed
+          // threads' code changes are invisible (owner-reported). The banner's
+          // "[c] continue here" still overrides.
+          state.workspaceCwd = session.cwd || process.cwd();
           const workspace = session.cwd && session.cwd !== process.cwd() ? session.cwd : undefined;
           ensureNamedChatSession(state.sessionName, workspace ?? process.cwd());
-          console.log(color(`codex thread ${session.threadId} → session ${state.sessionName}`, "green"));
+          console.log("");
+          console.log(color(`codex: ${session.threadName ?? session.threadId} → session ${state.sessionName}`, "green"));
           console.log(color(`imported ${imported.appended} new message(s); your next message continues the native thread`, "dim"));
-          appendImportedHistory(state.statusSink, imported.sessionId, `codex ${session.threadId.slice(0, 8)}`);
+          appendImportedHistory(state.statusSink, imported.sessionId, session.threadName ?? `codex ${session.threadId}`);
           if (workspace) {
             state.pendingMenu = { kind: "workspace-mismatch", sessionName: state.sessionName, workspaceCwd: workspace };
             console.log(color(formatWorkspaceMismatchBanner(workspace), "dim"));
@@ -2244,7 +2271,7 @@ async function handleChatCommand(text: string, state: ChatState): Promise<boolea
     }
     case "name":
       if (!args) {
-        console.log(color("Usage: /name <reference-name>", "yellow"));
+        openNamedSessionPicker(state, "name");
         return true;
       }
       state.sessionName = safeChatSessionName(args);
@@ -2739,7 +2766,7 @@ function isBareContextualPickerCommand(trimmed: string): boolean {
 
 function renderSuggestionPanel(width: number, suggestions: readonly ChatSuggestion[], selectedIndex: number): string {
   const lines = [
-    color(`╭─ suggestions ${"─".repeat(Math.max(1, width - 15))}╮`, "accent"),
+    color(`╭─ suggestions ${"─".repeat(Math.max(1, width - 15))}╮`, "dim"),
     ...suggestions.map((suggestion, index) => {
       const marker = index === selectedIndex ? color("› ", "highlight") : "  ";
       const row = `${marker}${suggestion.label}`;
@@ -3413,7 +3440,7 @@ function startTuiWorkingStatus(sink: MusterChatSink, info: Parameters<typeof for
   let frame = 0;
   const startedAt = Date.now();
   const render = (): void => {
-    sink.setStatus(formatStatusLine({ ...info, frame, elapsedMs: Date.now() - startedAt }));
+    sink.setStatus(formatStatusLine({ ...info, verb: workingVerbForFrame(frame), frame, elapsedMs: Date.now() - startedAt }));
     frame += 1;
   };
   render();
@@ -3656,13 +3683,141 @@ function printChatSessions(limit: number, includeAll = false): void {
       console.log(includeAll ? "No named chat sessions yet." : "No chat sessions in this directory. Use /sessions --all to list everything.");
       return;
     }
-    console.log(color("name\tupdated\tmessages\tusage", "cyan"));
+    console.log(color("name · when · messages · last human line", "dim"));
     for (const session of sessions) {
-      const messages = store.loadActiveMessages(session.id).length;
-      console.log(`${session.peer}\t${session.createdAt.slice(0, 16)}\t${messages}\tin=${session.tokensIn} out=${session.tokensOut}`);
+      const messages = store.loadActiveMessages(session.id);
+      const preview = sessionPreview([...messages].reverse(), 72);
+      const when = messages.at(-1)?.createdAt ?? session.createdAt;
+      console.log(`${color(session.peer, "accent")} · ${color(formatCodexAge(when), "dim")} · ${messages.length} messages · ${color(preview, "dim")}`);
     }
   } finally {
     store.close();
+  }
+}
+
+function openNamedSessionPicker(state: ChatState, command: "resume" | "name"): void {
+  const store = openSessionStore();
+  try {
+    const result = store.search({ limit: 5000 });
+    const all = result.shape === "browse" ? result.sessions.filter((session) => session.channel === "cli-chat") : [];
+    const ordered = [
+      ...all.filter((session) => session.workspaceCwd === process.cwd()),
+      ...all.filter((session) => session.workspaceCwd !== process.cwd()),
+    ].slice(0, 15);
+    if (!ordered.length) {
+      console.log("No named chat sessions yet.");
+      return;
+    }
+    const options: string[] = [];
+    ordered.forEach((session, index) => {
+      const messages = store.loadActiveMessages(session.id);
+      const preview = sessionPreview([...messages].reverse(), 72);
+      const when = messages.at(-1)?.createdAt ?? session.createdAt;
+      console.log(`${color(`${index + 1}.`, "accent")} ${color(session.peer, "accent")} · ${color(formatCodexAge(when), "dim")} · ${messages.length} messages · ${color(preview, "dim")}`);
+      options.push(`${command} ${session.peer}`);
+    });
+    state.pendingMenu = { kind: "commands", options };
+  } finally {
+    store.close();
+  }
+}
+
+async function openTaskArgumentPicker(state: ChatState, action: "why" | "assign", taskId?: string): Promise<void> {
+  if (taskId) {
+    const cards = MODEL_CARD_SEED.filter((card) => !card.retired);
+    cards.forEach((card, index) => console.log(
+      `${color(`${index + 1}.`, "accent")} ${color(card.id, "accent")} · ${color(`${card.provider} · ${card.model} · ${card.costTier}`, "dim")}`,
+    ));
+    state.pendingMenu = { kind: "commands", options: cards.map((card) => `tasks assign ${taskId} ${card.id}`) };
+    return;
+  }
+  const view = projectBoardView(await readBoardEvents(state.sessionName, chatWorkspaceCwd(state)));
+  const tasks = Object.values(view.cards);
+  if (!tasks.length) {
+    console.log("No tasks yet. Use /tasks \"<goal>\" to create them.");
+    return;
+  }
+  tasks.forEach((task, index) => console.log(
+    `${color(`${index + 1}.`, "accent")} ${color(task.taskId, "accent")} · ${color(`${task.status} · ${task.title}`, "dim")}`,
+  ));
+  state.pendingMenu = { kind: "commands", options: tasks.map((task) => `tasks ${action} ${task.taskId}`) };
+}
+
+async function openCodexSessionPicker(state: ChatState, includeAll: boolean): Promise<void> {
+  try {
+    const scan = await discoverCodexSessions({
+      limit: 60,
+      includeSubagents: includeAll,
+      includeExecNoise: includeAll,
+    });
+    const now = Date.now();
+    const isLive = (item: CodexSessionSummary): boolean => now - Date.parse(item.lastActivityAt) < 120_000;
+    const isTrivial = (item: CodexSessionSummary): boolean => item.turnCount <= 1 && item.messageCount <= 4;
+    // Substance ranks the list: live threads, then real conversations (this
+    // directory first), then one-line probes, then automated noise. Recency
+    // orders within a bucket — a "hey" probe must never outrank the thread the
+    // owner actually has context in.
+    const bucket = (item: CodexSessionSummary): number =>
+      item.execNoise ? 3 : isLive(item) ? 0 : isTrivial(item) ? 2 : 1;
+    const rows = [...scan.sessions].sort((a, b) =>
+      bucket(a) - bucket(b)
+      || (a.cwd === process.cwd() ? 0 : 1) - (b.cwd === process.cwd() ? 0 : 1)
+      || Date.parse(b.lastActivityAt) - Date.parse(a.lastActivityAt)).slice(0, 14);
+    if (!rows.length) {
+      console.log(color("No Codex threads found on this machine.", "dim"));
+      return;
+    }
+    const hidden = scan.execNoiseHidden + scan.subagentsHidden;
+    const describe = (item: CodexSessionSummary): string => {
+      const size = item.sizeBytes >= 1_048_576
+        ? `${(item.sizeBytes / 1_048_576).toFixed(1)}MB`
+        : `${Math.max(1, Math.round(item.sizeBytes / 1024))}KB`;
+      const facts = `${codexProjectLabel(item)} · ${formatCodexAge(item.lastActivityAt)} · ${item.turnCount} turn${item.turnCount === 1 ? "" : "s"} · ${size}`;
+      return `${isLive(item) ? "● live · " : ""}${facts} · ${item.preview.slice(0, 44)}`;
+    };
+    const sink = state.statusSink;
+    if (sink) {
+      const toggle = includeAll
+        ? [{ value: "__toggle", label: "Hide automated runs", description: "collapse worker-lane and exec rollouts" }]
+        : hidden
+          ? [{ value: "__toggle", label: `Show ${hidden} automated run${hidden === 1 ? "" : "s"}`, description: "worker-lane and exec rollouts" }]
+          : [];
+      // The Codex app's OWN thread name leads; the project label is only the
+      // fallback for unnamed threads. Duplicates get numbers, the app's habit.
+      const labelCounts = new Map<string, number>();
+      const numberedLabel = (item: CodexSessionSummary): string => {
+        const base = item.threadName ?? codexProjectLabel(item);
+        const seen = (labelCounts.get(base) ?? 0) + 1;
+        labelCounts.set(base, seen);
+        return seen === 1 ? base : `${base} · ${seen}`;
+      };
+      const picked = await sink.selectFromList("Continue a Codex conversation", [
+        ...rows.map((item) => ({
+          value: `codex resume ${item.threadId}`,
+          label: `${isLive(item) ? "● " : ""}${numberedLabel(item)}`,
+          description: describe(item),
+        })),
+        ...toggle,
+      ]);
+      if (picked === "__toggle") return openCodexSessionPicker(state, !includeAll);
+      if (picked) await handleChatCommand(`/${picked}`, state);
+      return;
+    }
+    printChatPanel("Continue a Codex conversation", rows.map((item, index) =>
+      `${color(`${index + 1}.`, "accent")} ${codexProjectLabel(item).padEnd(22)} ${color(describe(item), "dim")}`));
+    console.log(color(
+      includeAll
+        ? "Type a number to continue · a hides automated runs"
+        : `Type a number to continue${hidden ? ` · a shows ${hidden} automated run${hidden === 1 ? "" : "s"}` : ""}`,
+      "dim",
+    ));
+    state.pendingMenu = {
+      kind: "codex-sessions",
+      options: rows.map((item) => `codex resume ${item.threadId}`),
+      includeAll,
+    };
+  } catch (error) {
+    console.log(color(error instanceof Error ? error.message : String(error), "yellow"));
   }
 }
 
@@ -4214,7 +4369,7 @@ async function printChatPlugins(selection: string | undefined, state: ChatState)
     const provider = parsed.rest[0];
     if (!provider) {
       printChatPanel("Plugins", [
-        color("Usage: /plugins reuse <provider>", "yellow"),
+        color("Choose a provider to reuse.", "dim"),
         "Reuse authenticated provider apps, plugins, skills, and MCP manifests without copying secrets.",
         `${color("Known", "accent")} ${(await chatReuseProviderOptions()).map((option) => option.value).join(" · ")}`,
         `${color("Custom", "accent")} set MUSTER_<PROVIDER>_PLUGIN_CACHE or MUSTER_PROVIDER_PLUGIN_CACHE`,
@@ -4319,10 +4474,9 @@ async function printChatMcp(selection: string | undefined, state: ChatState): Pr
     const target = parsed.rest[0];
     if (!target) {
       printChatPanel("MCP", [
-        color("Usage: /mcp login <name>", "yellow"),
-        "Pick a configured OAuth MCP server, then submit /mcp login <name>.",
+        "Pick a configured OAuth MCP server.",
       ]);
-      openNextPicker(state, "/mcp");
+      openNextPicker(state, "/mcp login ");
       return;
     }
     await printMcpOauthSetup(target, rawParts.slice(2));
@@ -4332,10 +4486,9 @@ async function printChatMcp(selection: string | undefined, state: ChatState): Pr
     const target = parsed.rest[0];
     if (!target) {
       printChatPanel("MCP", [
-        color("Usage: /mcp remove <name>", "yellow"),
         "Remove only the Muster MCP config entry. Provider/cache credentials are not touched.",
       ]);
-      openNextPicker(state, "/mcp");
+      openNextPicker(state, "/mcp remove ");
       return;
     }
     const config = await loadConfig();
@@ -4367,10 +4520,9 @@ async function printChatMcp(selection: string | undefined, state: ChatState): Pr
     const target = parsed.rest[0];
     if (!target) {
       printChatPanel("MCP", [
-        color("Usage: /mcp test <id>", "yellow"),
-        "Pick a configured MCP server from the next picker, then submit /mcp test <id>.",
+        "Pick a configured MCP server to test.",
       ]);
-      openNextPicker(state, "/mcp");
+      openNextPicker(state, "/mcp test ");
       return;
     }
     await printMcpTest(target, { setExitCode: false });
@@ -4398,10 +4550,9 @@ async function printChatMcp(selection: string | undefined, state: ChatState): Pr
     const target = parsed.rest[0];
     if (!target) {
       printChatPanel("MCP", [
-        color("Usage: /mcp install <id>", "yellow"),
-        "Pick an MCP server from the next picker, then submit /mcp install <id>.",
+        "Pick an MCP server to install.",
       ]);
-      openNextPicker(state, "/mcp");
+      openNextPicker(state, "/mcp install ");
       return;
     }
     await printChatMcp(target, state);
@@ -4490,8 +4641,7 @@ async function printChatIntegrations(selection: string | undefined, state: ChatS
     const target = parts[1];
     if (!target) {
       printChatPanel("Integrations", [
-        color(`Usage: /integrations ${action} <channel|plugin|mcp>`, "yellow"),
-        `Pick from the next list, then submit /integrations ${action} <id>.`,
+        `Pick an integration to ${action}.`,
       ]);
       openNextPicker(state, `/integrations ${action}`);
       return;
@@ -4507,9 +4657,9 @@ async function printChatIntegrations(selection: string | undefined, state: ChatS
   const target = action === "workflow" ? parts[1] : parts[0];
   if (!target) {
     printChatPanel("Integrations", [
-      color("Usage: /integrations <channel|plugin|mcp>", "yellow"),
-      "Example: /integrations telegram · /integrations github · /integrations parallel-search",
+      "Pick a channel, plugin, or MCP integration.",
     ]);
+    openNextPicker(state, "/integrations workflow ");
     return;
   }
   const workflowLines = await captureConsoleLines(() => printIntegrationWorkflow(target));
@@ -4793,7 +4943,7 @@ function createChatCompletionCatalog(state: ChatState): MusterCompletionCatalog 
           // by typing. 47 undifferentiated rows was the reported noise.
           return chatCommandsDailyFirst(state)
             .filter((command) => command.name.startsWith(fragment) || command.aliases?.some((alias) => alias.startsWith(fragment)))
-            .map((command) => ({ value: `/${command.name}`, label: command.usage, description: command.description }));
+            .map((command) => ({ value: `/${command.name}`, label: color(command.usage, "periwinkle"), description: color(command.description, "dim") }));
         }
         case "reasoning":
           if (!request.fragment) return [];
@@ -4838,6 +4988,10 @@ function createChatCompletionCatalog(state: ChatState): MusterCompletionCatalog 
           return filterPickerOptions(await chatReuseProviderOptions(), request.fragment);
         case "mcp":
           return filterPickerOptions(await chatMcpOptions(), request.fragment);
+        case "mcp-target": {
+          const actions = new Set(CHAT_MCP_ACTION_OPTIONS.map((option) => option.value));
+          return filterPickerOptions((await chatMcpOptions()).filter((option) => !actions.has(option.value)), request.fragment);
+        }
         case "integration":
           return filterPickerOptions(chatIntegrationOptions(), request.fragment);
         case "integration-workflow":
@@ -9345,6 +9499,7 @@ interface CodexScanFlags {
   readonly since?: string;
   readonly cwd?: string;
   readonly includeSubagents: boolean;
+  readonly includeExecNoise: boolean;
 }
 
 function readCodexScanFlags(args: string[], defaultLimit: number): CodexScanFlags {
@@ -9356,6 +9511,7 @@ function readCodexScanFlags(args: string[], defaultLimit: number): CodexScanFlag
     ...(since ? { since } : {}),
     ...(args.includes("--here") ? { cwd: process.cwd() } : {}),
     includeSubagents: args.includes("--all"),
+    includeExecNoise: args.includes("--all"),
   };
 }
 
@@ -9394,12 +9550,13 @@ async function codexSessionsCommand(args: string[]): Promise<void> {
       formatCodexAge(session.startedAt).padStart(4),
       formatCodexAge(session.lastActivityAt).padStart(6),
       `${session.turnCount}${session.turnCountExact ? "" : "+"}`.padStart(6),
-      trimToWidth(summarizeCodexPrompt(session.firstUserMessage, 60), 60),
+      trimToWidth(session.preview, 60),
     ].join(" "));
   }
   const notes = [
     `${result.sessions.length} of ${result.candidates} rollouts`,
     ...(result.subagentsHidden ? [`${result.subagentsHidden} subagent hidden (--all)`] : []),
+    ...(result.execNoiseHidden ? [`${result.execNoiseHidden} automated run hidden (--all)`] : []),
     ...(result.skipped.length ? [`${result.skipped.length} unreadable`] : []),
   ];
   console.log(color(notes.join(" · "), "dim"));
@@ -9438,18 +9595,20 @@ function importedHistoryLines(storeSessionId: string, title: string): string[] {
   try {
     const all = store.loadActiveMessages(storeSessionId);
     if (!all.length) return [];
-    const history = pruneHistory(all, 12);
-    const users = history.rows.filter((row) => row.role === "user").length;
-    const assistants = history.rows.filter((row) => row.role === "assistant").length;
-    const lines = [color(`── history: ${title} · ${history.rows.length} messages (${users} user · ${assistants} assistant) ──`, "dim")];
-    if (history.earlier > 0) lines.push(color(formatEarlierHistoryLine(history.earlier), "dim"));
-    if (history.trivial > 0) lines.push(color(`… ${history.trivial} brief ${history.trivial === 1 ? "message" : "messages"} collapsed`, "dim"));
-    for (const row of history.rows) {
+    // Owner-ratified 2026-08-29: history replays IN FULL — every message, no
+    // "… N earlier" cap, no brief-message collapsing. Flow mode owns native
+    // scrollback; the whole conversation belongs there.
+    const users = all.filter((row) => row.role === "user").length;
+    const assistants = all.filter((row) => row.role === "assistant").length;
+    const lines = [color(`── history: ${title} · ${all.length} messages (${users} user · ${assistants} assistant) ──`, "dim")];
+    for (const row of all) {
       const parts = row.content.split(/\r?\n/);
       if (row.role === "user") {
         lines.push(formatUserLine(parts[0] ?? ""), ...parts.slice(1).map((line) => `  ${line}`));
-      } else {
+      } else if (row.role === "assistant") {
         lines.push(...formatAssistantBlock(row.content));
+      } else {
+        lines.push(...parts.map((line) => color(`  ${line}`, "dim")));
       }
     }
     lines.push(color("── end history ──", "dim"));
@@ -9493,7 +9652,7 @@ async function importCodexThreadByPrefix(prefix: string, args: string[]): Promis
   // A resume is deliberate, so scan wider than the listing default and include
   // subagents: the user may well want to continue a specific delegated thread.
   const flags = readCodexScanFlags(args, 200);
-  const result = await discoverCodexSessions({ ...flags, includeSubagents: true });
+  const result = await discoverCodexSessions({ ...flags, includeSubagents: true, includeExecNoise: true });
   const match = matchCodexThread(result.sessions, prefix);
   if (match.kind === "none") {
     throw new Error(`No Codex session matches "${prefix}". Run: muster codex sessions --limit 50`);
@@ -9515,7 +9674,15 @@ async function importCodexThreadByPrefix(prefix: string, args: string[]): Promis
   }
   const store = openSessionStore();
   try {
-    const imported = await importCodexSession(session, store);
+    // A resume must show the thread's LATEST work: scan the whole rollout,
+    // keep the newest messages when the cap overflows, and reconcile a stale
+    // earlier import window instead of refusing (owner-reported: gigabyte
+    // threads replayed "very old history" and never their last message).
+    const imported = await importCodexSession(session, store, {
+      maxBytes: Number.MAX_SAFE_INTEGER,
+      keepTail: true,
+      reconcileTail: true,
+    });
     return { session, imported, chain: resolveCodexForkChain(result.sessions, session.threadId) };
   } finally {
     store.close();
@@ -9547,7 +9714,7 @@ async function codexResumeCommand(args: string[]): Promise<void> {
   }
 
   const state: ChatState = {
-    sessionName: safeChatSessionName(readFlag(args, "--session") ?? `codex-${session.threadId.slice(0, 8)}`),
+    sessionName: safeChatSessionName(readFlag(args, "--session") ?? `codex-${session.threadId}`),
     scopes: [],
     speedMode: "session",
     startedAt: Date.now(),
@@ -10440,7 +10607,7 @@ function truncate(value: string, length: number): string {
   return value.length <= length ? value : `${value.slice(0, Math.max(0, length - 3))}...`;
 }
 
-type ColorName = "cyan" | "green" | "yellow" | "accent" | "highlight" | "selection" | "red" | "dim";
+type ColorName = "cyan" | "green" | "yellow" | "accent" | "highlight" | "selection" | "red" | "dim" | "periwinkle";
 
 function color(value: string, name: ColorName): string {
   if (process.env.NO_COLOR || !process.stdout.isTTY) return value;
@@ -10455,6 +10622,7 @@ function color(value: string, name: ColorName): string {
     selection: "30;48;2;217;119;87",
     red: "38;2;255;107;122",
     dim: "38;2;148;144;140",
+    periwinkle: "38;2;176;184;248",
   };
   return `\u001b[${codes[name]}m${value}\u001b[0m`;
 }

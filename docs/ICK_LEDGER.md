@@ -44,3 +44,4 @@ fixed in a live session. Severity: ☠ breaks trust/flow · ● daily irritation
 - Gateway Codex threads → 5m env-tunable idle TTL and a counted `muster doctor` check
 - Slash descriptions → concise user outcomes with an automated jargon guard
 - Active inherited plugins → direct cached slash commands with manifest descriptions and prompt engagement
+| 27 | ☠ | Sessions accumulate assistant-only rows ("0 user · 4 assistant" greetings, +1 per use) — a second persistence writer drops user turns; previews and history rot from it | Single-writer transcript persistence; core run.ts writer (:843) reconciled with cli writer; regression test asserts user+assistant pairs |

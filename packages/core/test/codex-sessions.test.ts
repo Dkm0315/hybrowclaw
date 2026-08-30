@@ -10,6 +10,7 @@ import {
   codexSessionsDir,
   discoverCodexSessions,
   importCodexSession,
+  isCodexExecNoise,
   isSyntheticCodexUserText,
   listCodexRolloutFiles,
   matchCodexThread,
@@ -21,6 +22,7 @@ import {
   summarizeCodexPrompt,
   type CodexSessionSummary,
 } from "../src/codex-sessions.js";
+import { sessionPreview } from "../src/session-preview.js";
 import { openSessionStore, type SessionStore } from "../src/sessions.js";
 
 /* ---------- fixtures: the real 0.150.0-alpha.8 rollout shape ---------- */
@@ -40,6 +42,8 @@ interface FixtureOptions {
   readonly parentThreadId?: string;
   readonly threadSource?: string;
   readonly model?: string;
+  readonly originator?: string;
+  readonly source?: string;
   readonly turns: readonly FixtureTurn[];
   /** Extra raw lines appended verbatim (corruption, unknown types, huge lines). */
   readonly extraLines?: readonly string[];
@@ -57,12 +61,12 @@ function metaLine(options: FixtureOptions): string {
       id: options.threadId,
       timestamp: startedAt,
       cwd: options.cwd ?? "/Users/dhairya/Documents/redis-automation",
-      originator: "codex-tui",
+      originator: options.originator ?? "codex-tui",
       cli_version: "0.150.0-alpha.8",
       // Real subagent rollouts carry an OBJECT here, not a string.
       source: subagent
         ? { subagent: { thread_spawn: { parent_thread_id: options.parentThreadId ?? "", depth: 1, agent_nickname: "Sagan" } } }
-        : "vscode",
+        : options.source ?? "vscode",
       model_provider: "openai",
       ...(options.threadSource ? { thread_source: options.threadSource } : {}),
       ...(options.forkedFromId ? { forked_from_id: options.forkedFromId } : {}),
@@ -426,6 +430,40 @@ test("discoverCodexSessions hides multi-agent fan-out unless asked for it", asyn
   });
 });
 
+test("interactive Codex sessions rank above exec noise and noise stays hidden by default", async (t) => {
+  await withCodexHome(t, async (home) => {
+    const now = Date.UTC(2026, 7, 27, 12, 0, 0);
+    await writeRollout(home, "2026-08-27", {
+      threadId: "new-exec",
+      originator: "codex_exec",
+      source: "exec",
+      turns: [{ user: "automated lane prompt", assistant: "done" }],
+      mtimeMs: now,
+    });
+    await writeRollout(home, "2026-08-26", {
+      threadId: "older-interactive",
+      turns: [{ user: "real conversation", assistant: "answer" }],
+      mtimeMs: now - 1000,
+    });
+
+    const visible = await discoverCodexSessions({ codexHome: home, nowMs: now });
+    assert.deepEqual(visible.sessions.map((session) => session.threadId), ["older-interactive"]);
+    assert.equal(visible.execNoiseHidden, 1);
+
+    const all = await discoverCodexSessions({ codexHome: home, nowMs: now, includeExecNoise: true });
+    assert.deepEqual(all.sessions.map((session) => session.threadId), ["older-interactive", "new-exec"]);
+    assert.equal(all.sessions[1]?.execNoise, true);
+  });
+});
+
+test("exec noise recognizes verified origins and Muster-owned lanes", () => {
+  assert.equal(isCodexExecNoise({ originator: "exec", cwd: "/tmp/work" }), true);
+  assert.equal(isCodexExecNoise({ originator: "Codex Desktop", source: "exec", cwd: "/tmp/work" }), true);
+  assert.equal(isCodexExecNoise({ originator: "muster", cwd: "/Users/dhairya/.claude/jobs/abc/wt" }), true);
+  assert.equal(isCodexExecNoise({ originator: "Codex Desktop", cwd: "/tmp/work" }, "Muster repo, main tree."), true);
+  assert.equal(isCodexExecNoise({ originator: "codex-tui", cwd: "/tmp/work" }, "Help me debug this."), false);
+});
+
 test("discoverCodexSessions can scope to a single project directory", async (t) => {
   await withCodexHome(t, async (home) => {
     const now = Date.UTC(2026, 7, 27, 12, 0, 0);
@@ -714,6 +752,25 @@ test("summarizeCodexPrompt strips manifest noise and returns the first human sen
   assert.equal(summarizeCodexPrompt(raw), "Double the redis shards for the staging cluster.");
 });
 
+test("session preview skips injected-context patterns and falls back honestly", () => {
+  const longYaml = `workflow: ${"lane: value ".repeat(16)}`;
+  const bad = [
+    "Recalled context from an earlier run",
+    "[@chrome](plugin://chrome@openai-bundled)",
+    "cluster: name: redis-cluster id: generated",
+    "[reference](https://example.com)",
+    longYaml,
+  ];
+  for (const injected of bad) {
+    assert.equal(sessionPreview([{ role: "user", text: `${injected}\nFix the session picker class. Then run tests.` }]), "Fix the session picker class.");
+  }
+  assert.equal(sessionPreview([
+    { role: "user", text: bad.join("\n") },
+    { role: "assistant", text: "I can recover the useful preview. More follows." },
+  ]), "I can recover the useful preview.");
+  assert.equal(sessionPreview([]), "(no messages)");
+});
+
 test("summarizeCodexPrompt collapses whitespace, drops tags, and clamps width", () => {
   assert.equal(summarizeCodexPrompt("  <ide_context></ide_context>\n\n  fix   the\n  auth bug  "), "fix the auth bug");
   assert.equal(summarizeCodexPrompt(""), "");
@@ -777,4 +834,52 @@ test("orderCodexSessionsByLineage survives a fork cycle without hanging or dropp
 
   assert.equal(rows.length, 2);
   assert.deepEqual([...rows.map((row) => row.session.threadId)].sort(), ["a", "b"]);
+});
+
+test("importCodexSession reconcileTail salvages a stale head-window import with a gap marker", async (t) => {
+  await withCodexHome(t, async (home) => {
+    await withStore(t, async (store) => {
+      const now = Date.UTC(2026, 7, 29, 12, 0, 0);
+      const options = {
+        threadId: "eeee5555-0000-0000-0000-000000000005",
+        cwd: "/Users/dhairya/Documents/muster",
+        turns: [
+          { user: "oldest ask", assistant: "oldest answer" },
+          { user: "middle ask", assistant: "middle answer" },
+          { user: "latest ask", assistant: "latest answer" },
+        ],
+        mtimeMs: now,
+      };
+      await writeRollout(home, "2026-08-28", options);
+      const scan = await discoverCodexSessions({ codexHome: home, nowMs: now });
+      // First import simulates the old head-biased window: only the oldest turn fits.
+      const initial = await importCodexSession(scan.sessions[0], store, { maxMessages: 2 });
+      assert.equal(initial.appended, 3); // provenance + oldest pair
+      assert.equal(store.loadActiveMessages(initial.sessionId).at(-1)?.content.includes("oldest answer"), true);
+
+      // Resume-style re-import whose tail ring EXCLUDES the stored head — the
+      // real gigabyte-thread shape: stored old head, fresh recent tail,
+      // completely disjoint. The reconcile must gap-join, never refuse.
+      const resumed = await importCodexSession(scan.sessions[0], store, {
+        maxBytes: Number.MAX_SAFE_INTEGER,
+        maxMessages: 4,
+        keepTail: true,
+        reconcileTail: true,
+      });
+      assert.equal(resumed.sessionId, initial.sessionId);
+      assert.equal(resumed.appended, 5, "gap marker + middle and latest pairs landed");
+      const contents = store.loadActiveMessages(resumed.sessionId).map((row) => row.content);
+      assert.ok(contents.at(-1)?.includes("latest answer"), "the thread's newest message is last");
+      assert.ok(contents.some((content) => content.includes("history gap")), "the disjoint window is marked honestly");
+
+      // A third resume import is a no-op: the join is stable.
+      const again = await importCodexSession(scan.sessions[0], store, {
+        maxBytes: Number.MAX_SAFE_INTEGER,
+        maxMessages: 4,
+        keepTail: true,
+        reconcileTail: true,
+      });
+      assert.equal(again.appended, 0, "reconciled transcript re-imports cleanly");
+    });
+  });
 });

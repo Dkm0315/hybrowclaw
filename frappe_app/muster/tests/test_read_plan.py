@@ -13,6 +13,7 @@ except ModuleNotFoundError as exc:
 
 class _Meta:
     istable = False
+    issingle = False
 
     def __init__(self):
         self.fields = {
@@ -76,6 +77,31 @@ class TestFrappeReadPlan(FrappeTestCase):
             with self.assertRaises(frappe.PermissionError):
                 execute_read_plan(self.base, "read-test-1", self.user)
         get_list.assert_not_called()
+
+    def test_single_doctype_uses_permission_checked_document_not_a_missing_table(self):
+        meta = _Meta()
+        meta.issingle = True
+        meta.fields["time_zone"] = SimpleNamespace(fieldtype="Data")
+        document = Mock()
+        document.get.side_effect = {"time_zone": "Asia/Kolkata"}.get
+        query = {
+            "doctype": "System Settings", "fields": ["name", "time_zone"],
+            "filters": [], "orderBy": [{"field": "name", "direction": "desc"}], "limit": 1,
+        }
+        plan = {**self.base, "queries": [query]}
+        with (
+            patch("muster.orchestration.read_plan.frappe.db.exists", return_value=True),
+            patch("muster.orchestration.read_plan.frappe.get_meta", return_value=meta),
+            patch("muster.orchestration.read_plan.frappe.has_permission", return_value=True),
+            patch("muster.orchestration.read_plan.get_permitted_fields", return_value=["name", "time_zone"]),
+            patch("muster.orchestration.read_plan.frappe.get_single", return_value=document) as get_single,
+            patch("muster.orchestration.read_plan.frappe.get_list") as get_list,
+        ):
+            evidence = execute_read_plan(plan, "read-test-1", self.user)
+        get_single.assert_called_once_with("System Settings")
+        document.check_permission.assert_called_once_with("read")
+        get_list.assert_not_called()
+        self.assertEqual(evidence["queries"][0]["rows"], [{"name": "System Settings", "time_zone": "Asia/Kolkata"}])
 
     def test_field_permission_secret_child_join_and_scan_escapes_are_denied(self):
         hostile_queries = [

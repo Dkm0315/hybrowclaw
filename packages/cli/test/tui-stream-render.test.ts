@@ -219,7 +219,7 @@ test("a spinner frame appended to the transcript sink lands on the status row in
   const transcript = plain(harness.transcript());
   assert.equal(transcript.some((line) => line.includes("working")), false, "no spinner frame in scrollback");
   assert.ok(transcript.some((line) => line.includes("done streaming the answer")));
-  assert.match(statusDuringTurn, /working/, "the spinner lives on the single status row");
+  assert.match(statusDuringTurn, /Thinking/, "the spinner lives on the single status row");
   assert.equal(harness.status(), "", "and it is cleared when the turn ends");
 });
 

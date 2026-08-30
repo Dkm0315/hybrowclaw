@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import type { BackendEcosystem, InheritedPlugin } from "@musterhq/core";
 import { buildCapabilityOverlayOptions } from "../src/capabilities-overlay.js";
-import { CHAT_COMMANDS, directPluginCommand, dynamicPluginCommands } from "../src/chat-command-catalog.js";
+import { CHAT_COMMANDS, directPluginCommand, dynamicPluginCommands, pickerClassInvocations } from "../src/chat-command-catalog.js";
 import { unknownSlashCommandMessage } from "../src/command-suggestion.js";
 import { threadConflictCure } from "../src/thread-conflict.js";
 
@@ -87,6 +87,21 @@ test("static slash descriptions contain no internal jargon and remain concise", 
     assert.ok(command.description.length <= 60, `${command.name} description is ${command.description.length} chars`);
     for (const phrase of banned) assert.doesNotMatch(command.description.toLowerCase(), new RegExp(phrase));
   }
+});
+
+test("picker-class audit enumerates every bare name/id invocation as choices, never Usage", () => {
+  const idCommands = CHAT_COMMANDS.filter((command) => /<(?:name|id|taskId|cardId|id-prefix)/i.test(command.usage));
+  assert.ok(idCommands.length > 0);
+  assert.ok(idCommands.every((command) => command.bareBehavior === "picker" && command.pickerInvocations?.length));
+  assert.deepEqual(pickerClassInvocations(), [
+    "/provider",
+    "/tasks why",
+    "/tasks assign",
+    "/resume",
+    "/codex",
+    "/name",
+  ]);
+  for (const invocation of pickerClassInvocations()) assert.doesNotMatch(invocation, /Usage:/);
 });
 
 test("help has no banner and reports the package version", async () => {

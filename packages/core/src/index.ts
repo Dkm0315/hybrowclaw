@@ -52,6 +52,7 @@ export * from "./runtime-doctor.js";
 export * from "./scheduler.js";
 export * from "./scoped-runtime.js";
 export * from "./sessions.js";
+export * from "./session-preview.js";
 export * from "./skills.js";
 export * from "./subagents.js";
 export * from "./store.js";

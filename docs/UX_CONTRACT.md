@@ -62,10 +62,13 @@ concepts use the worker's words.
   the transcript as they stream (codex `item/reasoning/summaryTextDelta`;
   claude thinking summaries). If the provider sends none, show nothing —
   never fake it.
-- **History is visible**: opening/resuming any session with prior messages
-  REPLAYS them into the transcript sink (not console.log — engine-line routing
-  swallows that; this was the "codex threads do not print history" bug). Dim
-  separator with counts; the same `> `/`●` grammar.
+- **History replays ONLY when invoked, and then IN FULL** (owner-ratified
+  2026-08-30, superseding the always-replay rule): a plain launch is CLEAN
+  like the reference — no auto-replay. /resume, /codex resume, and /history
+  replay the transcript (into the sink, not console.log — engine-line routing
+  swallows that) — and when they do, EVERY message renders. No "… N earlier"
+  cap, no collapsing, no pruning; flow mode owns native scrollback. Dim
+  separator with true totals; the same `> `/`●` grammar.
 - Nothing internal ever prints raw: run records, memory receipts, stderr —
   chips or the session log, always.
 - **Esc interrupts the running turn** (codex: `turn/interrupt`; claude:
@@ -113,12 +116,17 @@ rendering; every muster surface applies the same semantic layer:
 
 1. THINKING IS A LAYER: reasoning text renders violet-tinted italic with a ✻
    marker — distinguishable from the answer at a glance, before reading.
-2. INLINE SEMANTICS IN PROSE: within assistant sentences, `code spans` get a
-   distinct tint, file paths and branch names and commands are colored as
-   what they are. Meaningful tokens are colored inside sentences.
-3. MARKDOWN RENDERS: bold→bold, italic→italic, bullets with colored markers,
-   headers distinct, fenced code on a subtle background. Raw ** or ` glyphs
-   in painted prose are a bug.
+2. INLINE SEMANTICS IN PROSE (owner-corrected 2026-08-29, FINAL): prose is
+   NEAR-MONOCHROME like the reference, with ONE sanctioned inline color:
+   `code spans` — the important words — render in Claude Code's soft
+   blue-violet (165;180;252), no background. Links underline only. NOTHING
+   else is colored inside sentences — no path/branch/command tinting ever
+   again ("create/update" spray). Color is for state, plus this one identity.
+3. MARKDOWN RENDERS: bold→bold, italic→italic, headers distinct, fenced code
+   on a subtle background with NO language label row, tables as aligned
+   columns (bold header, dim rule, no raw pipes). List markers and the
+   assistant ● are DEFAULT foreground — never accent. Raw ** or ` glyphs in
+   painted prose are a bug.
 4. STATUS BY COLOR ON ACTION BULLETS: ⏺ pending=dim, success=warm green,
    failure=red — readable before the words.
 5. WARNINGS ARE A SYSTEM: ⚠ + yellow + one concrete action. Errors: red +
@@ -126,6 +134,17 @@ rendering; every muster surface applies the same semantic layer:
 6. THE WORKING LINE HAS PERSONALITY: sparkle glyph + verb + elapsed; the
    spinner row is allowed exactly this much whimsy and no more.
 7. USER TURNS SIT ON A SUBTLE BACKGROUND BAND spanning the row — the
-   distinction mechanism, with the naked-prompt composer (no box) below.
+   distinction mechanism. The composer is a THIN DIM-GRAY ROUNDED BOX
+   (owner-corrected 2026-08-28: Claude Code's input HAS a border — subtle,
+   muted, never accent-colored; grows with multiline input; ❯ inside).
+   Neither the loud orange box nor a naked prompt: the quiet middle.
 Applies to: chat transcript, task view, board cards, history replay, chips,
 /status, doctor — every painted surface, one renderer, zero drift.
+
+
+## LAYOUT LAW — FINAL (settled by side-by-side reference frames, 2026-08-28)
+Content anchors at the TOP. The composer is PINNED TO THE BOTTOM of the
+terminal at all times — dim thin rounded box, dim placeholder, effort
+indicator (● Medium · /model) right-aligned on the row above it. The void
+between content and input is correct and calm BECAUSE the input chrome is
+quiet. Flip-flopped twice; never again.

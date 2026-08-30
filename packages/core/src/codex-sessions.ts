@@ -55,10 +55,11 @@
  */
 
 import { createReadStream, realpathSync, type Dirent } from "node:fs";
-import { readdir, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import type { SessionStore } from "./sessions.js";
+import { sessionPreview } from "./session-preview.js";
 
 /* ---------- errors: fail closed, WorkspaceObserverError idiom ---------- */
 
@@ -179,12 +180,18 @@ export interface CodexRollout {
 export interface CodexSessionSummary extends CodexSessionMeta {
   readonly filePath: string;
   readonly model?: string;
+  /** The Codex app's OWN name for this thread (session_index.jsonl) — the name the owner knows it by. */
+  readonly threadName?: string;
   /** User prompts in the transcript — the unit a human calls a "turn". */
   readonly turnCount: number;
   /** False when a byte budget cut the scan short, so `turnCount` is a floor. */
   readonly turnCountExact: boolean;
   readonly messageCount: number;
   readonly firstUserMessage: string;
+  /** Human-readable first real sentence, with assistant fallback. */
+  readonly preview: string;
+  /** True for noninteractive or Muster-owned worker-lane rollouts. */
+  readonly execNoise: boolean;
   /**
    * When the thread was last worked on. Prefers the newest rollout line
    * timestamp when the scan reached EOF, and only falls back to file mtime when
@@ -223,6 +230,8 @@ export interface CodexDiscoveryResult {
   readonly candidates: number;
   /** Threads excluded as multi-agent fan-out (`thread_source: "subagent"`). */
   readonly subagentsHidden: number;
+  /** Noninteractive rollouts excluded unless includeExecNoise is true. */
+  readonly execNoiseHidden: number;
 }
 
 export interface CodexReadLimits {
@@ -230,6 +239,12 @@ export interface CodexReadLimits {
   readonly maxLineBytes?: number;
   readonly maxMessages?: number;
   readonly maxMessageChars?: number;
+  /**
+   * Keep the NEWEST messages when `maxMessages` overflows (ring buffer)
+   * instead of the oldest. A resume must surface the owner's latest work, not
+   * the head of a gigabyte rollout.
+   */
+  readonly keepTail?: boolean;
 }
 
 export interface DiscoverCodexSessionsOptions extends CodexReadLimits {
@@ -240,6 +255,8 @@ export interface DiscoverCodexSessionsOptions extends CodexReadLimits {
   readonly since?: string | number | Date;
   /** Include multi-agent fan-out threads the user never typed into. Default false. */
   readonly includeSubagents?: boolean;
+  /** Include noninteractive Codex exec and Muster worker-lane rollouts. Default false. */
+  readonly includeExecNoise?: boolean;
   /** Only threads whose cwd matches exactly. */
   readonly cwd?: string;
   readonly nowMs?: number;
@@ -247,6 +264,13 @@ export interface DiscoverCodexSessionsOptions extends CodexReadLimits {
 
 export interface ImportCodexSessionOptions extends CodexReadLimits {
   readonly scanLimit?: number;
+  /**
+   * When the stored transcript is not a prefix of the freshly-read rollout
+   * (an earlier import's window ended before the thread's current tail),
+   * salvage instead of refusing: join at the largest stored-tail/desired-head
+   * overlap and append what follows, marking any true gap with a system line.
+   */
+  readonly reconcileTail?: boolean;
 }
 
 export interface CodexImportResult {
@@ -391,7 +415,13 @@ function extractText(content: unknown): string {
     const text = part.text;
     if (typeof text === "string" && text) parts.push(text);
   }
-  return parts.join("\n");
+  // Provider-internal annotation directives (`:codex-annotation{…}`) are
+  // machine plumbing, never transcript content.
+  return parts
+    .join("\n")
+    .split("\n")
+    .filter((line) => !/^:{1,3}codex-annotation\{[^}]*\}\s*$/.test(line.trim()))
+    .join("\n");
 }
 
 export function isSyntheticCodexUserText(text: string): boolean {
@@ -499,7 +529,8 @@ export async function readCodexRollout(filePath: string, limits: CodexReadLimits
     if (!text.trim()) return;
     if (into.length >= maxMessages) {
       droppedMessages += 1;
-      return;
+      if (!limits.keepTail) return;
+      into.shift();
     }
     const clamped = clampText(text, maxMessageChars);
     into.push(at ? { role, text: clamped, at } : { role, text: clamped });
@@ -671,10 +702,28 @@ function summarize(rollout: CodexRollout, file: CodexRolloutFile): CodexSessionS
     turnCountExact: !rollout.stats.truncated,
     messageCount: rollout.messages.length,
     firstUserMessage: userMessages[0]?.text ?? "",
+    preview: sessionPreview(rollout.messages),
+    execNoise: isCodexExecNoise(rollout.meta, userMessages[0]?.text),
     ...resolveCodexLastActivity(rollout, file.mtimeMs),
     sizeBytes: file.sizeBytes,
   };
   return rollout.model ? { ...summary, model: rollout.model } : summary;
+}
+
+export function isCodexExecNoise(
+  meta: Pick<CodexSessionMeta, "originator" | "source" | "cwd">,
+  firstUserMessage = "",
+): boolean {
+  const originator = meta.originator?.trim().toLowerCase();
+  const source = meta.source?.trim().toLowerCase();
+  const cwd = meta.cwd.replace(/\\/g, "/");
+  const prompt = firstUserMessage.trimStart();
+  return originator === "codex_exec"
+    || originator === "exec"
+    || source === "exec"
+    || /^\/Users\/[^/]+\/\.claude\/jobs(?:\/|$)/.test(cwd)
+    || /(?:^|\/)\.muster\/worktrees\//.test(cwd)
+    || /^(?:Muster repo\b|BINDING\b)/i.test(prompt);
 }
 
 /* ---------- prompt preview ---------- */
@@ -713,6 +762,8 @@ function isPromptNoiseLine(line: string): boolean {
  * say "no user message" rather than being handed an invented one.
  */
 export function summarizeCodexPrompt(text: string, maxChars = 200): string {
+  const direct = sessionPreview([{ role: "user", text }], maxChars);
+  if (direct !== "(no messages)") return direct;
   const withoutFences = text.replace(/```[\s\S]*?(?:```|$)/g, " ");
   // `[@chrome](plugin://chrome@openai-bundled)` is a plugin reference the TUI
   // renders as a chip; in a table it is 30 characters of URL for one word.
@@ -794,9 +845,39 @@ export function orderCodexSessionsByLineage(
  * Sessions whose files cannot be parsed land in `skipped` instead of failing the
  * scan (invariant 2).
  */
+/**
+ * The Codex app's thread names, straight from `$CODEX_HOME/session_index.jsonl`
+ * — `{id, thread_name, updated_at}` per line. These are the names the owner
+ * sees in the app's sidebar; muster must never invent its own in their place.
+ * Read-only, tolerant: a missing or partly-corrupt index yields what parsed.
+ */
+export async function readCodexThreadNames(codexHome?: string): Promise<ReadonlyMap<string, string>> {
+  const names = new Map<string, string>();
+  const path = join(codexHome ?? process.env.CODEX_HOME ?? join(homedir(), ".codex"), "session_index.jsonl");
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return names;
+  }
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line) as { id?: unknown; thread_name?: unknown };
+      if (typeof entry.id === "string" && typeof entry.thread_name === "string" && entry.thread_name.trim()) {
+        names.set(entry.id, entry.thread_name.trim());
+      }
+    } catch {
+      // A torn line (the app writes concurrently) skips; later lines still count.
+    }
+  }
+  return names;
+}
+
 export async function discoverCodexSessions(options: DiscoverCodexSessionsOptions = {}): Promise<CodexDiscoveryResult> {
   const root = codexSessionsDir(options.codexHome);
   const files = await listCodexRolloutFiles(options.codexHome);
+  const threadNames = await readCodexThreadNames(options.codexHome);
   const sinceMs = parseCodexSince(options.since, options.nowMs);
   const limit = Math.max(0, options.limit ?? 25);
   const limits: CodexReadLimits = {
@@ -806,11 +887,13 @@ export async function discoverCodexSessions(options: DiscoverCodexSessionsOption
     ...(options.maxMessageChars === undefined ? {} : { maxMessageChars: options.maxMessageChars }),
   };
   const sessions: CodexSessionSummary[] = [];
+  const execNoise: CodexSessionSummary[] = [];
   const skipped: CodexRolloutSkip[] = [];
   let scanned = 0;
   let subagentsHidden = 0;
+  let execNoiseHidden = 0;
   for (const file of files) {
-    if (sessions.length >= limit) break;
+    if (!options.includeExecNoise && sessions.length >= limit) break;
     // Files are mtime-descending, so the first one older than the cutoff ends it.
     if (sinceMs !== undefined && file.mtimeMs < sinceMs) break;
     scanned += 1;
@@ -822,7 +905,15 @@ export async function discoverCodexSessions(options: DiscoverCodexSessionsOption
         continue;
       }
       if (options.cwd !== undefined && normalizeCodexWorkspace(meta.cwd) !== normalizeCodexWorkspace(options.cwd)) continue;
-      sessions.push(summarize(await readCodexRollout(file.filePath, limits), file));
+      let summary = summarize(await readCodexRollout(file.filePath, limits), file);
+      const threadName = threadNames.get(summary.threadId);
+      if (threadName) summary = { ...summary, threadName };
+      if (summary.execNoise) {
+        if (options.includeExecNoise) execNoise.push(summary);
+        else execNoiseHidden += 1;
+        continue;
+      }
+      sessions.push(summary);
     } catch (error) {
       const skip = error instanceof CodexSessionError
         ? { filePath: file.filePath, reason: error.code, detail: error.message }
@@ -830,7 +921,15 @@ export async function discoverCodexSessions(options: DiscoverCodexSessionsOption
       skipped.push(skip);
     }
   }
-  return { root, sessions, skipped, scanned, candidates: files.length, subagentsHidden };
+  return {
+    root,
+    sessions: [...sessions, ...execNoise].slice(0, limit),
+    skipped,
+    scanned,
+    candidates: files.length,
+    subagentsHidden,
+    execNoiseHidden,
+  };
 }
 
 /* ---------- lineage + lookup ---------- */
@@ -932,6 +1031,7 @@ export async function importCodexSession(
     ...(options.maxLineBytes === undefined ? {} : { maxLineBytes: options.maxLineBytes }),
     ...(options.maxMessages === undefined ? {} : { maxMessages: options.maxMessages }),
     ...(options.maxMessageChars === undefined ? {} : { maxMessageChars: options.maxMessageChars }),
+    ...(options.keepTail === undefined ? {} : { keepTail: options.keepTail }),
   };
   const rollout = await readCodexRollout(summary.filePath, limits);
   const threadId = rollout.meta.threadId;
@@ -965,6 +1065,42 @@ export async function importCodexSession(
     for (const message of desired.slice(matched)) {
       store.appendMessage(sessionId, message.role, message.content);
       appended += 1;
+    }
+  } else if (options.reconcileTail) {
+    // An earlier import's window ended before the thread's current tail (or
+    // the read window moved). Refusing here left resumes showing very old
+    // history — salvage chronologically: locate the stored transcript's tail
+    // INSIDE the fresh transcript (latest occurrence, verified backwards),
+    // append everything after it, and mark a truly disjoint window with an
+    // honest gap line. System rows (provenance, prior gap markers) are
+    // excluded from the join on both sides.
+    const key = (row: { role: string; content: string }): string => `${row.role} ${row.content}`;
+    const storedKeys = stored.filter((row) => row.role !== "system").map(key);
+    const fresh = desired.filter((message) => message.role !== "system");
+    const freshKeys = fresh.map(key);
+    let joinAt = -1;
+    const lastKey = storedKeys.at(-1);
+    if (lastKey !== undefined) {
+      for (let j = freshKeys.length - 1; j >= 0; j -= 1) {
+        if (freshKeys[j] !== lastKey) continue;
+        let ok = true;
+        const span = Math.min(j + 1, storedKeys.length);
+        for (let i = 1; i < span; i += 1) {
+          if (freshKeys[j - i] !== storedKeys[storedKeys.length - 1 - i]) { ok = false; break; }
+        }
+        if (ok) { joinAt = j; break; }
+      }
+    }
+    const tail = joinAt >= 0 ? fresh.slice(joinAt + 1) : fresh;
+    if (tail.length) {
+      if (joinAt < 0) {
+        store.appendMessage(sessionId, "system", "… earlier import window ended above; the thread's newer messages continue below (history gap)");
+        appended += 1;
+      }
+      for (const message of tail) {
+        store.appendMessage(sessionId, message.role, message.content);
+        appended += 1;
+      }
     }
   }
   return {

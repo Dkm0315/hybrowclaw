@@ -13,7 +13,7 @@ from frappe import _
 from frappe.model import get_permitted_fields
 
 READ_PLANS_PATH = "/v1/integrations/frappe/read-plans"
-MAX_CATALOG_DOCTYPES = 120
+MAX_CATALOG_DOCTYPES = 24
 MAX_FIELDS = 12
 MAX_FILTERS = 12
 MAX_ROWS = 100
@@ -27,6 +27,13 @@ _AGGREGATES = {"count", "sum", "avg", "min", "max"}
 _STRUCTURAL = {"Button", "Column Break", "Fold", "Heading", "HTML", "Section Break", "Tab Break", "Table", "Table MultiSelect"}
 _NUMERIC = {"Currency", "Float", "Int", "Percent", "Duration"}
 _COUNT_REQUEST = re.compile(r"\b(?:how many|count(?:\s+of)?|number of|total number of)\b", re.I)
+_QUESTION_STOP_WORDS = {
+    "affected", "and", "are", "before", "but", "can", "changed", "check", "continue",
+    "correction", "could", "demo", "fix", "for", "from",
+    "happened", "has", "have", "how", "last", "not", "old", "please", "showing",
+    "records", "still", "that", "the", "this", "was", "week", "what", "when", "where", "which",
+    "why", "with", "would", "you", "your",
+}
 
 
 class FrappeReadPlanError(frappe.ValidationError):
@@ -37,7 +44,10 @@ def build_read_catalog(question: str, scope: dict[str, Any], user: str) -> list[
     """Expose only schema the current user can read; never rows or permission internals."""
     if (frappe.session.user or "").lower() != user.lower():
         raise FrappeReadPlanError(_("Read catalog actor does not match the current session"))
-    words = {word.lower() for word in re.findall(r"[A-Za-z0-9]+", question) if len(word) >= 3}
+    words = {
+        word.lower() for word in re.findall(r"[A-Za-z0-9]+", question)
+        if len(word) >= 3 and word.lower() not in _QUESTION_STOP_WORDS
+    }
     selected = str(scope.get("doctype") or "").strip()
     # Frappe v16's get_user() is deliberately session-bound and accepts no
     # username argument. The explicit equality check above prevents a caller
@@ -47,12 +57,24 @@ def build_read_catalog(question: str, scope: dict[str, Any], user: str) -> list[
     for doctype in readable:
         if not isinstance(doctype, str) or len(doctype) > 140 or not frappe.db.exists("DocType", doctype):
             continue
+        # Harness control records have dedicated commands and dashboards. They
+        # must not crowd business retrieval merely because a customer record
+        # identifier happens to contain the word "Muster".
+        if doctype.startswith("Muster "):
+            continue
         meta = frappe.get_meta(doctype)
         if meta.istable:
             continue
         tokens = {word.lower() for word in re.findall(r"[A-Za-z0-9]+", f"{doctype} {meta.module or ''}") if len(word) >= 3}
-        score = (100 if doctype == selected else 0) + 10 * len(words & tokens)
-        if score or len(candidates) < MAX_CATALOG_DOCTYPES:
+        field_tokens = {
+            word.lower()
+            for field in meta.fields
+            if field.fieldtype not in {"Password", "Code"} and not _SECRET.search(field.fieldname or "")
+            for word in re.findall(r"[A-Za-z0-9]+", f"{field.fieldname or ''} {field.label or ''}")
+            if len(word) >= 3
+        }
+        score = (100 if doctype == selected else 0) + 10 * len(words & tokens) + 3 * len(words & field_tokens)
+        if score:
             candidates.append((score, doctype))
     candidates.sort(key=lambda row: (-row[0], row[1]))
     catalog: list[dict[str, Any]] = []
@@ -217,6 +239,38 @@ def _execute_query(value: Any, user: str) -> dict[str, Any]:
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_ROWS:
         raise FrappeReadPlanError(_("Read row limit is invalid"))
     aggregate = query.get("aggregate")
+    if meta.issingle:
+        if filters:
+            raise FrappeReadPlanError(_("Single-value settings cannot use list filters"))
+        if aggregate is not None:
+            fn, fieldname = _aggregate(aggregate, permitted, meta)
+            if fn != "count" or fieldname:
+                raise FrappeReadPlanError(_("Single-value settings support only a record count"))
+            return {
+                "doctype": doctype,
+                "mode": "aggregate",
+                "aggregate": "count",
+                "value": 1,
+                "returnedRows": 1,
+                "truncated": False,
+            }
+        if not fields:
+            raise FrappeReadPlanError(_("A settings read requires at least one permitted field"))
+        document = frappe.get_single(doctype)
+        document.check_permission("read")
+        row = {
+            field: _scalar(doctype if field == "name" else document.get(field))
+            for field in fields
+            if field == "name" or document.get(field) is not None
+        }
+        return {
+            "doctype": doctype,
+            "mode": "list",
+            "fields": fields,
+            "rows": [row],
+            "returnedRows": 1,
+            "truncated": False,
+        }
     if aggregate is not None:
         estimator = getattr(frappe.db, "estimate_count", None)
         estimated_rows = estimator(doctype) if callable(estimator) else None

@@ -17,6 +17,9 @@ import {
   type SettingsListTheme,
   type Terminal,
 } from "@earendil-works/pi-tui";
+import { appendFileSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { createCoalescer } from "@musterhq/core";
 import type { BoardView, MessageRow } from "@musterhq/core";
 import { effortDisplayLabel, modelDisplayLabel, modelProvider, type ComposerPickerSelection, type ComposerPickerState, type EffortValue } from "./model-catalog.js";
@@ -56,6 +59,7 @@ export interface MusterAutocompleteOptions {
   readonly plugins?: () => readonly PickerOption[] | Promise<readonly PickerOption[]>;
   readonly pluginReuseProviders?: () => readonly PickerOption[] | Promise<readonly PickerOption[]>;
   readonly mcpServers?: () => readonly PickerOption[] | Promise<readonly PickerOption[]>;
+  readonly mcpTargets?: () => readonly PickerOption[] | Promise<readonly PickerOption[]>;
   readonly integrations?: () => readonly PickerOption[] | Promise<readonly PickerOption[]>;
   readonly integrationWorkflows?: () => readonly PickerOption[] | Promise<readonly PickerOption[]>;
   readonly agents: () => readonly string[] | Promise<readonly string[]>;
@@ -76,6 +80,7 @@ export type MusterCompletionKind =
   | "plugin"
   | "plugin-reuse-provider"
   | "mcp"
+  | "mcp-target"
   | "integration"
   | "integration-workflow"
   | "reasoning"
@@ -106,6 +111,8 @@ export interface MusterChatSink {
   clearStatus(): void;
   openPicker(command: string): void;
   selectComposerSetting(state: ComposerPickerState): Promise<ComposerPickerSelection | undefined>;
+  /** Arrow-driven list anchored at the composer; resolves the picked value, undefined on Esc. */
+  selectFromList(title: string, options: readonly PickerOption[]): Promise<string | undefined>;
   /** Replace the Canvas data source at the start of a model turn. */
   setLiveDiffTurn(turn: LiveFileTurnAccumulator): void;
   /** Repaint an open Canvas after an observer patch. */
@@ -157,10 +164,13 @@ export interface MusterChatHarness {
 }
 
 export function formatWorkingIndicator(agentId: string | undefined, frame: number): string {
-  const label = agentId ? `@${agentId} working` : "working";
-  void frame;
-  return `✻ ${label}`;
+  // A verb, alive — never a bare clock. Rotates slowly so long waits breathe.
+  const verb = WORKING_VERBS[Math.floor(Math.abs(frame) / 16) % WORKING_VERBS.length]!;
+  const label = agentId ? `@${agentId} ${verb}` : verb;
+  return `${STATUS_SPINNER_FRAMES[Math.abs(frame) % STATUS_SPINNER_FRAMES.length]} ${label}`;
 }
+
+const WORKING_VERBS = ["Thinking", "Reading", "Weighing", "Connecting", "Shaping", "Composing"] as const;
 
 const RESET = "\x1b[0m";
 // Claude Code-calibre restraint: ONE warm coral accent (Anthropic book-cloth
@@ -171,7 +181,7 @@ const ACCENT_RGB = "217;119;87";
 const HIGHLIGHT_RGB = "224;175;104";
 const MUTED_RGB = "148;144;140";
 const RED_RGB = "255;107;122";
-const SELECTION_BG_RGB = "217;119;87";
+const SELECTION_BG_RGB = "48;45;43";
 
 /**
  * ─────────────────────────────────────────────────────────────────────────────
@@ -235,9 +245,12 @@ export function routeEngineLine(line: string): EngineLineRoute {
   return { kind: "transcript", line };
 }
 
-/** A spinner frame — `⟨frame⟩ working` / `⟨frame⟩ @agent working`. */
+/** A spinner frame — `✻ Verb` / `✻ @agent Verb` (legacy `working` included). */
+const WORKING_STATUS_RE = new RegExp(
+  `^(?:✻|[|/\\\\-])\\s+(?:@[A-Za-z0-9_.:-]+\\s+)?(?:working|${WORKING_VERBS.join("|")})$`,
+);
 export function isWorkingStatusLine(line: string): boolean {
-  return /^(?:✻|[|/\\-])\s+(?:@[A-Za-z0-9_.:-]+\s+)?working$/.test(stripAnsi(line).trim());
+  return WORKING_STATUS_RE.test(stripAnsi(line).trim());
 }
 
 function isRecallReceiptDetailLine(line: string): boolean {
@@ -371,8 +384,10 @@ export function isUserTranscriptLine(line: string): boolean {
  * — deltas paint into the SAME bullet instead of sprouting one per chunk.
  */
 export function formatAssistantBlock(text: string, options: { readonly continued?: boolean } = {}): string[] {
+  // Owner-ruled: the transcript is near-monochrome like the reference —
+  // the assistant marker is DEFAULT foreground, never accent-colored.
   return renderProse(text, {
-    firstPrefix: `${accent(ASSISTANT_BULLET)} `,
+    firstPrefix: `${ASSISTANT_BULLET} `,
     continuationPrefix: "  ",
     continued: options.continued,
   });
@@ -462,6 +477,8 @@ export interface StatusLineInfo {
   readonly elapsedMs?: number;
   /** Routed turn: `@review` rides at the left with the spinner. */
   readonly agentId?: string;
+  /** Live working verb ("Thinking") — shimmered, never `@`-prefixed. */
+  readonly verb?: string;
   /** Present ⇒ working; the spinner paints at the left edge of THIS row. */
   readonly frame?: number;
   /** Extra trailing segments (scopes, tool counts) the header no longer shows. */
@@ -486,8 +503,42 @@ export function formatStatusLine(info: StatusLineInfo): string {
   for (const extra of info.extra ?? []) segments.push(extra);
   const body = segments.join(" · ");
   if (info.frame === undefined) return dim(body);
-  const spinner = STATUS_SPINNER_FRAMES[Math.abs(Math.trunc(info.frame)) % STATUS_SPINNER_FRAMES.length]!;
-  return `${accent(spinner)} ${dim(body)}`;
+  const tick = Math.abs(Math.trunc(info.frame));
+  const spinner = STATUS_SPINNER_FRAMES[tick % STATUS_SPINNER_FRAMES.length]!;
+  const verb = info.verb ? `${shimmerText(info.verb, tick)}${dim(" · ")}` : "";
+  return `${accent(spinner)} ${verb}${dim(body)}`;
+}
+
+/**
+ * THE SHIMMER: a warm 3-char bright window sweeps the verb letter-by-letter,
+ * one position per spinner tick, running off both edges so the glow breathes.
+ */
+export function shimmerText(text: string, tick: number): string {
+  const chars = [...text];
+  if (!chars.length) return text;
+  const span = chars.length + 4;
+  const pos = (((tick % span) + span) % span) - 2;
+  return chars
+    .map((ch, index) => {
+      const distance = Math.abs(index - pos);
+      if (distance === 0) return `\x1b[38;2;255;246;238m${ch}\x1b[0m`;
+      if (distance === 1) return `\x1b[38;2;224;196;178m${ch}\x1b[0m`;
+      return dim(ch);
+    })
+    .join("");
+}
+
+/** Repaint a `✻ Verb` status row with the shimmer for the current tick. */
+export function paintWorkingRow(row: string, tick: number): string {
+  const plain = stripAnsi(row).trim();
+  const match = /^([✻|/\\-])\s+(.*)$/.exec(plain);
+  if (!match) return row;
+  return `${accent(match[1]!)} ${shimmerText(match[2]!, tick)}`;
+}
+
+/** The status row's live verb — rotates every ~4s of spinner frames. */
+export function workingVerbForFrame(frame: number): string {
+  return WORKING_VERBS[Math.floor(Math.abs(frame) / 16) % WORKING_VERBS.length]!;
 }
 
 /** Task statuses collapse to three glyphs: pending, live, ended. */
@@ -782,9 +833,20 @@ export function createMusterAutocompleteProvider(options: MusterAutocompleteOpti
 }
 
 export function createMusterChatEditor(tui: Pick<TUI, "terminal" | "requestRender">): Editor {
-  const editor = new Editor(tui as TUI, musterEditorTheme(), { autocompleteMaxVisible: 16 });
+  const editor = new Editor(tui as TUI, musterEditorTheme(), { autocompleteMaxVisible: 14 });
   editor.setPaddingX(0);
   return editor;
+}
+
+/**
+ * Alt-screen viewport math: the reference scrolls IN-APP (PgUp/PgDn/wheel)
+ * because the alternate screen has no native scrollback. `scrollOffset`
+ * counts rows lifted off the tail; the clamp keeps it inside the content.
+ */
+export function windowTranscript(rows: readonly string[], viewportRows: number, scrollOffset: number): { visible: readonly string[]; clamped: number } {
+  const clamped = Math.max(0, Math.min(scrollOffset, Math.max(0, rows.length - viewportRows)));
+  const end = rows.length - clamped;
+  return { visible: rows.slice(Math.max(0, end - viewportRows), end), clamped };
 }
 
 export function createMusterChatHarness(options: MusterAutocompleteOptions & {
@@ -861,7 +923,6 @@ export function createMusterChatHarness(options: MusterAutocompleteOptions & {
 
 export function renderMusterComposer(editor: Editor, width: number): string[] {
   const frameWidth = Math.max(32, Math.floor(width));
-  const innerWidth = frameWidth - 4;
   const editorWidth = Math.max(8, frameWidth - 2);
   const rawLines = editor.render(editorWidth);
   const borderIndexes = rawLines
@@ -874,37 +935,55 @@ export function renderMusterComposer(editor: Editor, width: number): string[] {
   const completionLines = rawLines.slice(secondBorder + 1);
   const result: string[] = [];
 
-  if (!inputLines.length) {
-    result.push(`${highlight("❯")} `);
-  } else {
-    inputLines.forEach((line, index) => {
-      const prefix = index === 0 ? `${highlight("❯")} ` : "  ";
-      result.push(prefix + line);
-    });
+  if (completionLines.length) {
+    for (const rawLine of completionLines) {
+      const plain = stripAnsi(rawLine).trim();
+      const count = /^\(?(\d+\/\d+)\)?$/.exec(plain)?.[1];
+      if (count) continue; // the reference shows no count row
+      result.push(truncateToWidth(rawLine, frameWidth, ""));
+    }
   }
 
-  if (completionLines.length) {
-    result.push(accent(`╭─ suggestions ${"─".repeat(Math.max(1, frameWidth - 16))}╮`));
-    for (const line of completionLines) {
-      result.push(frameLine(truncateToWidth(line, innerWidth, ""), innerWidth));
-    }
-    result.push(accent(`╰${"─".repeat(frameWidth - 2)}╯`));
+  // The typing area, matched to the reference frame (owner, 2026-08-30):
+  // a full-width dim rule above and below, a PLAIN default-color ❯ inside —
+  // no box, no corners, no accent caret.
+  result.push(dim("─".repeat(frameWidth)));
+  if (!inputLines.length) {
+    result.push("❯ ");
+  } else {
+    inputLines.forEach((line, index) => {
+      result.push((index === 0 ? "❯ " : "  ") + line);
+    });
   }
+  result.push(dim("─".repeat(frameWidth)));
+
   return result.map((line) => padAnsi(line, frameWidth));
+}
+
+// Claude Code's picker palette, MEASURED live from its /model picker
+// (2026-08-29): caret + selected label = palette index 153 (the theme-mapped
+// blue-violet), current-value ✓ = index 114 (soft green), everything else
+// gray. INDEXED codes on purpose — the owner's terminal theme remaps them
+// exactly as it does for Claude Code, so the two are identical by construction.
+function pickerSel(text: string): string {
+  return process.env.NO_COLOR ? text : `\x1b[38;2;176;184;248m${text}${RESET}`;
+}
+export function pickerOk(text: string): string {
+  return process.env.NO_COLOR ? text : `\x1b[38;5;114m${text}${RESET}`;
 }
 
 function composerPickerTheme(): { settings: SettingsListTheme; select: SelectListTheme } {
   return {
     settings: {
-      label: (text, selected) => selected ? accent(text) : text,
-      value: (text, selected) => selected ? accent(text) : dim(text),
+      label: (text, selected) => selected ? pickerSel(text) : text,
+      value: (text, selected) => selected ? pickerSel(text) : dim(text),
       description: dim,
-      cursor: accent("› "),
+      cursor: pickerSel("› "),
       hint: dim,
     },
     select: {
-      selectedPrefix: accent,
-      selectedText: (text) => process.env.NO_COLOR ? text : `\x1b[38;2;${ACCENT_RGB}m${text}${RESET}`,
+      selectedPrefix: pickerSel,
+      selectedText: pickerSel,
       description: dim,
       scrollInfo: dim,
       noMatch: dim,
@@ -924,7 +1003,7 @@ function groupedModelSubmenu(
     previousProvider = model.provider;
     return {
       value: model.value,
-      label: `${startsGroup ? model.provider.padEnd(8) : "".padEnd(8)}${model.label}${model.value === state.activeModel ? "  ✓" : ""}`,
+      label: `${startsGroup ? model.provider.padEnd(8) : "".padEnd(8)}${model.label}${model.value === state.activeModel ? `  ${pickerOk("✓")}` : ""}`,
       description: startsGroup ? `${model.provider} models` : undefined,
     };
   });
@@ -947,16 +1026,31 @@ function selectSubmenu(
 
 class SuspendableProcessTerminal implements Terminal {
   private readonly inner = new ProcessTerminal();
+  private readonly frameLog = process.env.MUSTER_DEBUG_FRAMES === "1" ? new TerminalFrameLog() : undefined;
   private onInput: ((data: string) => void) | undefined;
   private onResize: (() => void) | undefined;
   private suspended = false;
   get columns(): number { return this.inner.columns; }
   get rows(): number { return this.inner.rows; }
   get kittyProtocolActive(): boolean { return this.inner.kittyProtocolActive; }
-  start(onInput: (data: string) => void, onResize: () => void): void { this.onInput = onInput; this.onResize = onResize; this.suspended = false; this.inner.start(onInput, onResize); }
-  stop(): void { this.suspended = false; this.inner.stop(); }
+  start(onInput: (data: string) => void, onResize: () => void): void {
+    this.onInput = onInput;
+    this.onResize = onResize;
+    this.suspended = false;
+    // The reference's page semantics (owner, 2026-08-30): the chat opens on
+    // the terminal's ALTERNATE SCREEN — a fresh page, the shell's prior
+    // commands untouched underneath — and any exit (including Ctrl+C)
+    // restores the shell with only the invocation line remaining.
+    if (process.stdout.isTTY) process.stdout.write("\x1b[?1049h\x1b[H");
+    this.inner.start(onInput, onResize);
+  }
+  stop(): void {
+    this.suspended = false;
+    this.inner.stop();
+    if (process.stdout.isTTY) process.stdout.write("\x1b[?1049l");
+  }
   async drainInput(maxMs?: number, idleMs?: number): Promise<void> { await this.inner.drainInput(maxMs, idleMs); }
-  write(data: string): void { if (!this.suspended) this.inner.write(data); }
+  write(data: string): void { if (!this.suspended) { this.frameLog?.append(data); this.inner.write(data); } }
   moveBy(lines: number): void { if (!this.suspended) this.inner.moveBy(lines); }
   hideCursor(): void { if (!this.suspended) this.inner.hideCursor(); }
   showCursor(): void { if (!this.suspended) this.inner.showCursor(); }
@@ -965,11 +1059,52 @@ class SuspendableProcessTerminal implements Terminal {
   clearScreen(): void { if (!this.suspended) this.inner.clearScreen(); }
   setTitle(title: string): void { if (!this.suspended) this.inner.setTitle(title); }
   setProgress(active: boolean): void { if (!this.suspended) this.inner.setProgress(active); }
-  suspend(): void { if (this.suspended) return; this.inner.stop(); this.suspended = true; }
+  suspend(): void {
+    if (this.suspended) return;
+    this.inner.stop();
+    // External programs (editors) run on the NORMAL screen; re-enter on resume.
+    if (process.stdout.isTTY) process.stdout.write("\x1b[?1049l");
+    this.suspended = true;
+  }
   resume(): void {
     if (!this.suspended || !this.onInput || !this.onResize) return;
     this.suspended = false;
+    if (process.stdout.isTTY) process.stdout.write("\x1b[?1049h\x1b[H");
     this.inner.start(this.onInput, this.onResize);
+  }
+}
+
+export class TerminalFrameLog {
+  static readonly MAX_BYTES = 5 * 1024 * 1024;
+  readonly path: string;
+  constructor(path = join(homedir(), ".muster", "logs", "frames.log")) {
+    this.path = path;
+    mkdirSync(dirname(path), { recursive: true });
+  }
+  append(data: string): void {
+    const encoded = data.split("\n").map((row) => `${JSON.stringify(row)}\n`);
+    let payload = encoded.join("");
+    const payloadBytes = Buffer.byteLength(payload);
+    if (payloadBytes > TerminalFrameLog.MAX_BYTES) {
+      let bytes = 0;
+      const kept: string[] = [];
+      for (let index = encoded.length - 1; index >= 0; index -= 1) {
+        const row = encoded[index]!;
+        const size = Buffer.byteLength(row);
+        if (bytes + size > TerminalFrameLog.MAX_BYTES) break;
+        kept.unshift(row);
+        bytes += size;
+      }
+      payload = kept.join("");
+    }
+    let current = 0;
+    try { current = statSync(this.path).size; } catch { /* first frame */ }
+    if (current + Buffer.byteLength(payload) > TerminalFrameLog.MAX_BYTES) {
+      const rotated = `${this.path}.1`;
+      try { unlinkSync(rotated); } catch { /* no prior rotation */ }
+      try { renameSync(this.path, rotated); } catch { /* no current log */ }
+    }
+    if (payload) appendFileSync(this.path, payload, "utf8");
   }
 }
 
@@ -993,6 +1128,11 @@ export async function runMusterChatTui(options: RunMusterChatTuiOptions): Promis
     if (!stripped) return { consume: true };
     if (stripped !== data) return { data: stripped };
     if (boardMode?.active) return undefined;
+    if (mouse && !mouse.release && (mouse.button === 64 || mouse.button === 65)) {
+      if (screen.scrollTranscript(mouse.button === 64 ? 3 : -3)) return { consume: true };
+    }
+    if (matchesKey(stripped, "pageUp") && screen.scrollPage(1)) return { consume: true };
+    if (matchesKey(stripped, "pageDown") && screen.scrollPage(-1)) return { consume: true };
     if (matchesKey(stripped, "f3")) {
       void screen.openBoard(false);
       return { consume: true };
@@ -1181,6 +1321,7 @@ class BoardModeHost {
 class MusterChatScreen implements Component, MusterChatSink {
   private readonly lines: string[];
   private status = "";
+  private statusTick = 0;
   private stopped = false;
   private turnRunning = false;
   private interruptRequested = false;
@@ -1219,6 +1360,7 @@ class MusterChatScreen implements Component, MusterChatSink {
       this.lines.push(part);
     }
     this.trimTranscript();
+    this.scrollOffset = 0; // new output always snaps the viewport back to live
     this.tui.requestRender();
   }
 
@@ -1240,6 +1382,7 @@ class MusterChatScreen implements Component, MusterChatSink {
   }
 
   setStatus(status: string): void {
+    if (isWorkingStatusLine(status)) status = paintWorkingRow(status, this.statusTick += 1);
     this.status = status;
     this.tui.requestRender();
   }
@@ -1252,6 +1395,43 @@ class MusterChatScreen implements Component, MusterChatSink {
     this.editor.setText("");
     for (const char of command) this.editor.handleInput(char);
     this.tui.requestRender(true);
+  }
+
+  selectFromList(_title: string, options: readonly PickerOption[]): Promise<string | undefined> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let handle: ReturnType<TUI["showOverlay"]> | undefined;
+      const finish = (value?: string): void => {
+        if (settled) return;
+        settled = true;
+        this.pickerOpen = false;
+        handle?.hide();
+        this.tui.setFocus(this.editor);
+        this.tui.requestRender(true);
+        resolve(value);
+      };
+      const theme = composerPickerTheme();
+      this.pickerOpen = true;
+      const list = selectSubmenu(
+        options.map((option) => ({ value: option.value, label: option.label ?? option.value, description: option.description })),
+        0,
+        theme.select,
+        (value) => finish(value),
+        () => finish(),
+      );
+      // The Codex app's placement: flush-left, DIRECTLY above the input box —
+      // never centered in the void, never painting over the composer's frame.
+      handle = this.tui.showOverlay(list, {
+        anchor: "bottom-left",
+        offsetY: -3,
+        // Full width: overlay rows must be OPAQUE across the terminal so the
+        // transcript can never bleed through beside them (owner-reported).
+        width: Math.max(72, this.tui.terminal.columns - 1),
+        maxHeight: 22,
+        margin: { left: 0, right: 1 },
+      });
+      this.tui.requestRender(true);
+    });
   }
 
   selectComposerSetting(state: ComposerPickerState): Promise<ComposerPickerSelection | undefined> {
@@ -1292,7 +1472,7 @@ class MusterChatScreen implements Component, MusterChatSink {
               submenu: () => selectSubmenu(
                 state.catalog.efforts.map((option) => ({
                   value: option.value,
-                  label: `${option.label}${option.value === state.effort ? "  ✓" : ""}`,
+                  label: `${option.label}${option.value === state.effort ? `  ${pickerOk("✓")}` : ""}`,
                   description: option.hint,
                 })),
                 state.catalog.efforts.findIndex((option) => option.value === state.effort),
@@ -1311,19 +1491,15 @@ class MusterChatScreen implements Component, MusterChatSink {
       ], 6, pickerTheme.settings, (id, value) => {
         if (id === "speed") finish({ kind: "speed", value: value as "session" | "fast" });
       }, () => finish());
-      // Anchor AT the composer like the Codex app's picker — never floating in
-      // the void of a tall terminal. The viewport shows the tail of the content,
-      // so the composer's screen row is the content height clamped to the
-      // terminal, minus its own box; the picker opens directly beneath it.
-      const termRows = Math.max(12, this.tui.terminal.rows);
-      const contentRows = this.lastRenderedRows || termRows;
-      const composerRow = Math.min(contentRows, termRows);
+      // The Codex app's placement: flush-left, DIRECTLY above the input box —
+      // never centered in the void, never painting over the composer's frame.
       handle = this.tui.showOverlay(settings, {
-        anchor: "top-center",
-        row: Math.max(2, Math.min(composerRow + 1, termRows - 10)),
-        width: 72,
+        anchor: "bottom-left",
+        offsetY: -3,
+        // Full width for opacity — the transcript must never bleed through.
+        width: Math.max(72, this.tui.terminal.columns - 1),
         maxHeight: 22,
-        margin: { left: 1, right: 1 },
+        margin: { left: 0, right: 1 },
       });
       this.tui.requestRender(true);
     });
@@ -1453,33 +1629,83 @@ class MusterChatScreen implements Component, MusterChatSink {
     // terminals, cells beyond the frame otherwise keep stale glyphs from
     // earlier wide paints (observed as phantom "["/"]" at screen edges).
     const padTo = Math.max(frameWidth, this.tui.terminal.columns || frameWidth);
-    let userBandOpen = false;
-    const transcript = this.lines.flatMap((line) => {
-      const plain = stripAnsi(line);
-      if (isUserTranscriptLine(line)) userBandOpen = true;
-      else if (!plain.startsWith("  ")) userBandOpen = false;
-      return wrapLine(line, frameWidth).map((row) => userBandOpen ? bandUserRow(row, padTo) : row);
-    });
-    // THE LAYOUT LAW, corrected by the owner's eye: content and input travel
-    // TOGETHER — the composer sits directly under the last message, drifting
-    // to the bottom naturally as the screen fills. A filler void between the
-    // reply and the prompt (tried once) reads as broken; never reintroduce it.
-    const rows = [...fittedHeader, ...transcript, ...status, ...composer].map((line) => padAnsi(line, padTo));
+    const transcript = this.wrappedTranscript(frameWidth, padTo);
+    // THE LAYOUT LAW: content and input travel together, composer at the
+    // bottom. On the ALTERNATE SCREEN there is no native scrollback, so the
+    // transcript renders through a viewport window scrolled in-app
+    // (PgUp/PgDn/wheel), exactly like the reference.
+    const termRows = Math.max(8, this.tui.terminal.rows || 24);
+    const statusArea = this.scrollOffset > 0
+      ? [dim(`… ${this.scrollOffset} rows below · PgDn to follow`)]
+      : status;
+    const chromeRows = fittedHeader.length + statusArea.length + composer.length;
+    const viewportRows = Math.max(1, termRows - chromeRows - 1);
+    const windowed = windowTranscript(transcript, viewportRows, this.scrollOffset);
+    this.scrollOffset = windowed.clamped;
+    const filler = Array.from({ length: Math.max(0, termRows - chromeRows - windowed.visible.length - 1) }, () => "");
+    const rows = [...fittedHeader, ...windowed.visible, ...filler, ...statusArea, ...composer].map((line) => padAnsi(line, padTo));
     this.lastRenderedRows = rows.length;
     return rows;
   }
 
   /** Total content rows from the last paint — the composer sits at the tail. */
   private lastRenderedRows = 0;
+  /** Rows lifted off the tail by PgUp/wheel; 0 = following live output. */
+  private scrollOffset = 0;
+
+  /** Returns false when an overlay owns paging keys (canvas, picker). */
+  scrollTranscript(delta: number): boolean {
+    if (this.pickerOpen || this.liveDiffOverlay) return false;
+    const next = Math.max(0, this.scrollOffset + delta);
+    if (next === this.scrollOffset) return delta > 0;
+    this.scrollOffset = next;
+    this.tui.requestRender(true);
+    return true;
+  }
+
+  scrollPage(direction: 1 | -1): boolean {
+    return this.scrollTranscript(direction * Math.max(1, (this.tui.terminal.rows || 24) - 8));
+  }
 
   handleInput(data: string): void {
     this.editor.handleInput(data);
   }
 
+  /**
+   * Incremental wrap cache: transcripts are append-only, so each source line
+   * wraps exactly once per width. This is what makes UNLIMITED scrollback
+   * (owner-ruled 2026-08-30 — no row cap, the entire session reachable)
+   * affordable: a repaint costs O(viewport), not O(session).
+   */
+  private wrapCache = { width: -1, padTo: -1, consumed: 0, rows: [] as string[], bandOpen: false };
+
+  private wrappedTranscript(frameWidth: number, padTo: number): readonly string[] {
+    const cache = this.wrapCache;
+    if (cache.width !== frameWidth || cache.padTo !== padTo || cache.consumed > this.lines.length) {
+      cache.width = frameWidth;
+      cache.padTo = padTo;
+      cache.consumed = 0;
+      cache.rows = [];
+      cache.bandOpen = false;
+    }
+    while (cache.consumed < this.lines.length) {
+      const line = this.lines[cache.consumed]!;
+      const plain = stripAnsi(line);
+      const wasUser = cache.bandOpen;
+      if (isUserTranscriptLine(line)) cache.bandOpen = true;
+      else if (!plain.startsWith("  ")) cache.bandOpen = false;
+      const rows = wrapLine(line, frameWidth).map((row) => cache.bandOpen ? bandUserRow(row, padTo) : row);
+      // THE GAP, enforced at the renderer so no append site can regress it.
+      if (wasUser && !cache.bandOpen && plain.trim() !== "") rows.unshift("");
+      cache.rows.push(...rows);
+      cache.consumed += 1;
+    }
+    return cache.rows;
+  }
+
   private trimTranscript(): void {
-    // Generous: this caps in-process repaint cost, not what the user can read —
-    // everything already flowed into native scrollback stays there regardless.
-    if (this.lines.length > 5000) this.lines.splice(0, this.lines.length - 5000);
+    // Owner-ruled: NO cap — the entire session stays scrollable. The wrap
+    // cache keeps repaints O(viewport) regardless of session length.
   }
 }
 
@@ -1532,6 +1758,10 @@ class HarnessSink implements MusterChatSink {
   }
 
   async selectComposerSetting(_state: ComposerPickerState): Promise<ComposerPickerSelection | undefined> {
+    return undefined;
+  }
+
+  async selectFromList(_title: string, _options: readonly PickerOption[]): Promise<string | undefined> {
     return undefined;
   }
 
@@ -1705,6 +1935,7 @@ function slashCompletionContext(trimmed: string):
   | { kind: "plugin"; fragment: string; prefix: string }
   | { kind: "plugin-reuse-provider"; fragment: string; prefix: string }
   | { kind: "mcp"; fragment: string; prefix: string }
+  | { kind: "mcp-target"; fragment: string; prefix: string }
   | { kind: "integration"; fragment: string; prefix: string }
   | { kind: "integration-workflow"; fragment: string; prefix: string }
   | { kind: "reasoning"; fragment: string; prefix: string }
@@ -1782,6 +2013,8 @@ function slashCompletionContext(trimmed: string):
   if (pluginReuseMatch) return { kind: "plugin-reuse-provider", fragment: pluginReuseMatch[1] ?? "", prefix: trimmed };
   const pluginMatch = trimmed.match(/^\/plugins?\s+([^\s]*)$/i);
   if (pluginMatch) return { kind: "plugin", fragment: pluginMatch[1] ?? "", prefix: trimmed };
+  const mcpTargetMatch = trimmed.match(/^\/mcp\s+(?:login|remove|rm|test|install)\s+([^\s]*)$/i);
+  if (mcpTargetMatch) return { kind: "mcp-target", fragment: mcpTargetMatch[1] ?? "", prefix: trimmed };
   const mcpMatch = trimmed.match(/^\/mcp\s+([^\s]*)$/i);
   if (mcpMatch) return { kind: "mcp", fragment: mcpMatch[1] ?? "", prefix: trimmed };
   const integrationWorkflowMatch = trimmed.match(/^\/integrations?\s+(?:workflow|setup|verify|enable|sample)\s+([^\s]*)$/i);
@@ -1821,7 +2054,7 @@ function pickerOptionsToItems(options: readonly PickerOption[]): AutocompleteIte
   return options.map((option) => ({
     value: option.value,
     label: option.label ?? option.value,
-    description: option.description,
+    description: option.description ? dim(option.description) : undefined,
   }));
 }
 
@@ -1832,7 +2065,7 @@ function createCallbackCompletionCatalog(options: MusterAutocompleteOptions): Mu
         case "command":
           return options.commands
             .filter((command) => command.name.startsWith(request.fragment.toLowerCase()) || command.aliases?.some((alias) => alias.startsWith(request.fragment.toLowerCase())))
-            .map((command) => ({ value: `/${command.name}`, label: command.usage, description: command.description }));
+            .map((command) => ({ value: `/${command.name}`, label: pickerSel(command.usage), description: dim(command.description) }));
         case "toolset":
           return filterPickerOptions(options.toolsets.map((toolset) => ({ value: toolset, label: toolset, description: "toolset" })), request.fragment);
         case "session":
@@ -1876,6 +2109,8 @@ function createCallbackCompletionCatalog(options: MusterAutocompleteOptions): Mu
           return filterPickerOptions(await options.pluginReuseProviders?.() ?? [], request.fragment);
         case "mcp":
           return filterPickerOptions(await options.mcpServers?.() ?? [], request.fragment);
+        case "mcp-target":
+          return filterPickerOptions(await options.mcpTargets?.() ?? await options.mcpServers?.() ?? [], request.fragment);
         case "integration":
           return filterPickerOptions(await options.integrations?.() ?? [], request.fragment);
         case "integration-workflow":
@@ -1963,6 +2198,8 @@ function completionReplacement(beforeCursor: string, item: AutocompleteItem, pre
   if (/^\/skills?\s+/i.test(trimmed)) return `/skills ${item.value}`;
   if (/^\/plugins?\s+reuse(?:\s+.*)?$/i.test(trimmed)) return `/plugins reuse ${item.value}`;
   if (/^\/plugins?\s+/i.test(trimmed)) return `/plugins ${item.value}`;
+  const mcpTarget = trimmed.match(/^\/mcp\s+(login|remove|rm|test|install)\b/i);
+  if (mcpTarget) return `/mcp ${mcpTarget[1]} ${item.value}`;
   if (/^\/mcp\s+/i.test(trimmed)) return `/mcp ${item.value}`;
   const integrationAction = trimmed.match(/^\/integrations?\s+(workflow|setup|verify|enable|sample)\s+/i);
   if (integrationAction) return `/integrations ${integrationAction[1]?.toLowerCase()} ${item.value}`;
@@ -1984,13 +2221,15 @@ export function isExitCommand(text: string): boolean {
 }
 
 function musterEditorTheme(): EditorTheme {
+  // The reference's popup: NO background band — the selected row simply goes
+  // periwinkle; everything structural is dim.
   return {
-    borderColor: accent,
+    borderColor: dim,
     selectList: {
-      selectedPrefix: highlight,
-      selectedText: (text) => `\x1b[48;2;${SELECTION_BG_RGB}m\x1b[30;1m${text}`,
+      selectedPrefix: pickerSel,
+      selectedText: pickerSel,
       description: dim,
-      scrollInfo: accent,
+      scrollInfo: dim,
       noMatch: dim,
     },
   };
@@ -1998,7 +2237,7 @@ function musterEditorTheme(): EditorTheme {
 
 function frameLine(content: string, innerWidth: number): string {
   const padded = padAnsi(content, innerWidth);
-  return `${accent("│ ")}${padded}${RESET}${accent(" │")}`;
+  return `${dim("│ ")}${padded}${RESET}${dim(" │")}`;
 }
 
 /**
