@@ -784,3 +784,49 @@ process.exit(0);
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("runCodexAppServer: forwards raw item events and routes server requests to onRequest", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "muster-codex-app-server-events-"));
+  const fake = join(dir, "codex-fake-events.mjs");
+  await writeFile(fake, `#!/usr/bin/env node
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ id: msg.id, result: { userAgent: "fake" } });
+  else if (msg.method === "thread/start") send({ id: msg.id, result: { thread: { id: "t" } } });
+  else if (msg.method === "turn/start") {
+    send({ id: msg.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
+    send({ method: "item/started", params: { threadId: "t", turnId: "turn-1", item: { type: "fileChange", id: "fc", changes: [{ path: "a.txt" }] } } });
+    send({ method: "item/fileChange/outputDelta", params: { threadId: "t", turnId: "turn-1", itemId: "fc", delta: "*** Begin Patch\\n" } });
+    send({ id: 77, method: "item/commandExecution/requestApproval", params: { threadId: "t", turnId: "turn-1", itemId: "cmd", command: "ls" } });
+  } else if (msg.id === 77) {
+    send({ method: "item/agentMessage/delta", params: { threadId: "t", turnId: "turn-1", itemId: "m", delta: "decision:" + msg.result.decision } });
+    send({ method: "item/completed", params: { item: { type: "agentMessage", id: "m", text: "decision:" + msg.result.decision }, threadId: "t", turnId: "turn-1" } });
+    send({ method: "turn/completed", params: { threadId: "t", turn: { id: "turn-1", status: "completed" } } });
+  }
+});
+`, "utf8");
+  await chmod(fake, 0o755);
+  try {
+    const events: string[] = [];
+    const requests: string[] = [];
+    const result = await runCodexAppServer({
+      prompt: "go",
+      cwd: dir,
+      command: fake,
+      cacheKey: "events",
+      onEvent: (method) => events.push(method),
+      onRequest: async (method) => { requests.push(method); return { decision: "accept" }; },
+    });
+    assert.equal(result.status, "completed");
+    assert.ok(events.includes("item/fileChange/outputDelta"), "streamed patch text is forwarded raw");
+    assert.ok(events.includes("item/started"), "item lifecycle is forwarded");
+    assert.deepEqual(requests, ["item/commandExecution/requestApproval"]);
+    assert.equal(result.finalMessage, "decision:accept", "the handler's answer reached the server");
+  } finally {
+    clearCodexAppServerSessions();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -34,6 +34,19 @@ export interface CodexAppServerRunInput {
   readonly onDelta?: (text: string) => void;
   /** Provider-visible reasoning summary deltas. Raw hidden reasoning is never forwarded. */
   readonly onReasoningDelta?: (text: string) => void;
+  /**
+   * Every `item/*` and `turn/*` notification, raw. This is how an IDE paints
+   * streaming file edits (`item/fileChange/outputDelta` carries the patch text
+   * token by token) and tool activity live, the way the Codex app does.
+   */
+  readonly onEvent?: (method: string, params: Record<string, unknown>) => void;
+  /**
+   * Server→client requests (approvals, MCP elicitations such as Computer Use's
+   * "Allow ChatGPT to use Safari?", user-input prompts). Return the response
+   * to send; return undefined to decline. Without a handler every request is
+   * declined — which is why computer use never worked from muster before.
+   */
+  readonly onRequest?: (method: string, params: Record<string, unknown>) => Promise<Record<string, unknown> | undefined>;
 }
 
 export type CodexAppServerCacheState = "hit" | "miss" | "shared-miss" | "disabled";
@@ -245,6 +258,8 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
         input.onReasoningDelta?.(text);
       },
       onActivity: () => { providerActivity = true; },
+      ...(input.onEvent ? { onEvent: (method: string, params: Record<string, unknown>) => { providerActivity = true; input.onEvent?.(method, params); } } : {}),
+      ...(input.onRequest ? { onRequest: input.onRequest } : {}),
     });
     const requestToFirstDeltaMs = firstDeltaAt === undefined ? undefined : firstDeltaAt - started;
     const result = {
@@ -667,6 +682,8 @@ class CodexAppServerClient {
     readonly onDelta?: (text: string) => void;
     readonly onReasoningDelta?: (text: string) => void;
     readonly onActivity?: () => void;
+    readonly onEvent?: (method: string, params: Record<string, unknown>) => void;
+    readonly onRequest?: (method: string, params: Record<string, unknown>) => Promise<Record<string, unknown> | undefined>;
   }): Promise<{
     readonly finalMessage: string;
     readonly firstDeltaMs?: number;
@@ -716,8 +733,21 @@ class CodexAppServerClient {
         const method = stringValue(message.method) ?? "";
         const params = asRecord(message.params);
         if (method.startsWith("item/")) input.onActivity?.();
-        if (method.endsWith("/request")) {
-          this.respond(message.id, { decision: "decline", action: "decline", content: null, _meta: null });
+        if (method.startsWith("item/") || method.startsWith("turn/")) input.onEvent?.(method, params);
+        // JSON-RPC: a message carrying BOTH an id and a method is a server→client
+        // request awaiting our answer (…/requestApproval, …/requestUserInput,
+        // mcpServer/elicitation/request). Matching only "/request" left the
+        // server waiting on every approval — the silent cause of hung turns.
+        if (message.id !== undefined && message.id !== null && method) {
+          const decline = { decision: "decline", action: "decline", content: null, _meta: null };
+          if (!input.onRequest) {
+            this.respond(message.id, decline);
+            continue;
+          }
+          const id = message.id;
+          void input.onRequest(method, params)
+            .then((response) => this.respond(id, response ?? decline))
+            .catch(() => this.respond(id, decline));
           continue;
         }
         if (method === "item/agentMessage/delta") {
