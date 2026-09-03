@@ -49,6 +49,8 @@ export interface CodexAppServerRunInput {
   readonly onRequest?: (method: string, params: Record<string, unknown>) => Promise<Record<string, unknown> | undefined>;
   /** Per-turn approval policy (turn/start `approvalPolicy`); the thread itself starts with "never". */
   readonly approvalPolicy?: "untrusted" | "on-request" | "never";
+  /** Local image paths attached to the prompt (turn/start `localImage` inputs). */
+  readonly images?: readonly string[];
   /** Codex collaboration mode for the turn: plan mode is `{ mode: "plan", settings: { model, reasoning_effort } }`. */
   readonly collaborationMode?: CodexCollaborationMode;
 }
@@ -275,6 +277,7 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
       prompt: input.prompt,
       applicationContext: input.applicationContext,
       ...(input.approvalPolicy ? { approvalPolicy: input.approvalPolicy } : {}),
+      ...(input.images?.length ? { images: input.images } : {}),
       ...(input.collaborationMode ? { collaborationMode: input.collaborationMode } : {}),
       timeoutMs: input.timeoutMs ?? 180_000,
       onDelta: (text) => {
@@ -719,6 +722,7 @@ class CodexAppServerClient {
     readonly onEvent?: (method: string, params: Record<string, unknown>) => void;
     readonly onRequest?: (method: string, params: Record<string, unknown>) => Promise<Record<string, unknown> | undefined>;
     readonly approvalPolicy?: "untrusted" | "on-request" | "never";
+    readonly images?: readonly string[];
     readonly collaborationMode?: CodexCollaborationMode;
   }): Promise<{
     readonly finalMessage: string;
@@ -732,7 +736,7 @@ class CodexAppServerClient {
     input.onActivity?.();
     const turnStart = await this.request("turn/start", {
       threadId: input.threadId,
-      input: [{ type: "text", text: input.prompt }],
+      input: [{ type: "text", text: input.prompt }, ...(input.images ?? []).map((path) => ({ type: "localImage", path }))],
       ...(input.approvalPolicy ? { approvalPolicy: input.approvalPolicy } : {}),
       ...(input.collaborationMode ? { collaborationMode: input.collaborationMode } : {}),
       ...(input.applicationContext
@@ -771,7 +775,7 @@ class CodexAppServerClient {
         const method = stringValue(message.method) ?? "";
         const params = asRecord(message.params);
         if (method.startsWith("item/")) input.onActivity?.();
-        if (method.startsWith("item/") || method.startsWith("turn/")) input.onEvent?.(method, params);
+        if (method.startsWith("item/") || method.startsWith("turn/") || method.startsWith("account/") || method.startsWith("thread/")) input.onEvent?.(method, params);
         // JSON-RPC: a message carrying BOTH an id and a method is a server→client
         // request awaiting our answer (…/requestApproval, …/requestUserInput,
         // mcpServer/elicitation/request). Matching only "/request" left the
