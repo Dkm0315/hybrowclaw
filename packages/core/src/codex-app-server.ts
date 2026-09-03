@@ -47,6 +47,15 @@ export interface CodexAppServerRunInput {
    * declined — which is why computer use never worked from muster before.
    */
   readonly onRequest?: (method: string, params: Record<string, unknown>) => Promise<Record<string, unknown> | undefined>;
+  /** Per-turn approval policy (turn/start `approvalPolicy`); the thread itself starts with "never". */
+  readonly approvalPolicy?: "untrusted" | "on-request" | "never";
+  /** Codex collaboration mode for the turn: plan mode is `{ mode: "plan", settings: { model, reasoning_effort } }`. */
+  readonly collaborationMode?: CodexCollaborationMode;
+}
+
+export interface CodexCollaborationMode {
+  readonly mode: "plan" | "default";
+  readonly settings: { readonly model: string; readonly reasoning_effort?: string | null; readonly developer_instructions?: string | null };
 }
 
 export type CodexAppServerCacheState = "hit" | "miss" | "shared-miss" | "disabled";
@@ -182,6 +191,24 @@ export async function interruptActiveCodexTurn(transportOwner?: string): Promise
   return (await Promise.allSettled(attempts)).some((result) => result.status === "fulfilled" && result.value);
 }
 
+/**
+ * Ask the app-server one question with a throwaway process — which models,
+ * permission profiles, threads, skills it knows — so hosts never hardcode them.
+ */
+export async function queryCodexAppServer(
+  method: string,
+  params: Record<string, unknown> = {},
+  options: { readonly cwd?: string; readonly command?: string; readonly timeoutMs?: number } = {},
+): Promise<Record<string, unknown>> {
+  const client = new CodexAppServerClient({ command: resolveCodexCommand(options.command), cwd: options.cwd ?? process.cwd() });
+  try {
+    await client.initialize();
+    return await client.call(method, params, options.timeoutMs ?? 15_000);
+  } finally {
+    client.close();
+  }
+}
+
 /** Drop only one conversation's warm process; other chats keep their cache state. */
 export function clearCodexAppServerConversation(conversationKey: string, transportOwner?: string): void {
   for (const [key, session] of SESSION_CACHE) {
@@ -247,6 +274,8 @@ export async function runCodexAppServer(input: CodexAppServerRunInput): Promise<
       threadId: lease.session.threadId,
       prompt: input.prompt,
       applicationContext: input.applicationContext,
+      ...(input.approvalPolicy ? { approvalPolicy: input.approvalPolicy } : {}),
+      ...(input.collaborationMode ? { collaborationMode: input.collaborationMode } : {}),
       timeoutMs: input.timeoutMs ?? 180_000,
       onDelta: (text) => {
         providerActivity = true;
@@ -638,6 +667,11 @@ class CodexAppServerClient {
     this.notify("initialized");
   }
 
+  /** One-shot JSON-RPC call after initialize (model/list, permissionProfile/list, thread/list, …). */
+  call(method: string, params: Record<string, unknown>, timeoutMs = 15_000): Promise<Record<string, unknown>> {
+    return this.request(method, params, timeoutMs);
+  }
+
   async startThread(cwd: string): Promise<string> {
     const result = await this.request("thread/start", {
       cwd,
@@ -684,6 +718,8 @@ class CodexAppServerClient {
     readonly onActivity?: () => void;
     readonly onEvent?: (method: string, params: Record<string, unknown>) => void;
     readonly onRequest?: (method: string, params: Record<string, unknown>) => Promise<Record<string, unknown> | undefined>;
+    readonly approvalPolicy?: "untrusted" | "on-request" | "never";
+    readonly collaborationMode?: CodexCollaborationMode;
   }): Promise<{
     readonly finalMessage: string;
     readonly firstDeltaMs?: number;
@@ -697,6 +733,8 @@ class CodexAppServerClient {
     const turnStart = await this.request("turn/start", {
       threadId: input.threadId,
       input: [{ type: "text", text: input.prompt }],
+      ...(input.approvalPolicy ? { approvalPolicy: input.approvalPolicy } : {}),
+      ...(input.collaborationMode ? { collaborationMode: input.collaborationMode } : {}),
       ...(input.applicationContext
         ? {
             additionalContext: {
