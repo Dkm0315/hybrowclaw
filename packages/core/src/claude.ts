@@ -26,6 +26,8 @@ export interface ClaudeCodeRunInput {
    */
   readonly sessionId?: string;
   readonly resume?: boolean;
+  /** Path to a Claude Code MCP config JSON (`--mcp-config`), e.g. the host's browser tools. */
+  readonly mcpConfig?: string;
 }
 
 export interface ClaudeCodeRunResult {
@@ -94,6 +96,7 @@ export function buildClaudeCodeArgs(input: ClaudeCodeRunInput): string[] {
   if (input.effort) args.push("--effort", input.effort);
   if (input.allowedTools?.length) args.push("--allowedTools", input.allowedTools.join(","));
   for (const pluginDir of input.pluginDirs ?? []) args.push("--plugin-dir", pluginDir);
+  if (input.mcpConfig) args.push("--mcp-config", input.mcpConfig);
   if (input.systemPrompt) args.push("--append-system-prompt", input.systemPrompt);
   args.push(input.prompt);
   return args;
