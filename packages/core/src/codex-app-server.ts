@@ -185,12 +185,45 @@ export function clearCodexAppServerSessions(transportOwner?: string): void {
 }
 
 /** Interrupt the active native Codex turn owned by this host, if there is one. */
-export async function interruptActiveCodexTurn(transportOwner?: string): Promise<boolean> {
+export async function interruptActiveCodexTurn(transportOwner?: string, conversationKey?: string): Promise<boolean> {
   const attempts = [...ACTIVE_CLIENTS]
-    .filter(([, metadata]) => transportOwner === undefined || metadata.transportOwner === transportOwner)
+    .filter(([, metadata]) => (transportOwner === undefined || metadata.transportOwner === transportOwner) && (conversationKey === undefined || metadata.conversationKey === conversationKey))
     .map(([client]) => client.interruptActiveTurn());
   if (!attempts.length) return false;
   return (await Promise.allSettled(attempts)).some((result) => result.status === "fulfilled" && result.value);
+}
+
+/**
+ * Inject a user message into the turn that is running right now (`turn/steer`): the model sees it at its
+ * next step, the way the Codex app and CLI let you type mid-turn. False when no matching turn is active.
+ */
+export async function steerActiveCodexTurn(text: string, transportOwner?: string, conversationKey?: string): Promise<boolean> {
+  for (const [client, metadata] of ACTIVE_CLIENTS) {
+    if (transportOwner !== undefined && metadata.transportOwner !== transportOwner) continue;
+    if (conversationKey !== undefined && metadata.conversationKey !== conversationKey) continue;
+    try { if (await client.steerActiveTurn(text)) return true; } catch { /* try the next client */ }
+  }
+  return false;
+}
+
+/**
+ * Call a method on the warm process that owns a conversation (`thread/rollback`, `thread/name/set`, …);
+ * a thread has one writer, so this must not go through a fresh process while one is warm. Falls back
+ * to a one-shot process when nothing is warm for the conversation.
+ */
+export async function callCodexConversation(
+  conversationKey: string,
+  method: string,
+  params: Record<string, unknown>,
+  options: { readonly transportOwner?: string; readonly cwd?: string; readonly timeoutMs?: number } = {},
+): Promise<Record<string, unknown>> {
+  for (const [client, metadata] of ACTIVE_CLIENTS) {
+    if (metadata.conversationKey !== conversationKey) continue;
+    if (options.transportOwner !== undefined && metadata.transportOwner !== options.transportOwner) continue;
+    if (!client.isAlive()) continue;
+    return client.call(method, params, options.timeoutMs ?? 30_000);
+  }
+  return queryCodexAppServer(method, params, { ...(options.cwd ? { cwd: options.cwd } : {}), ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}) });
 }
 
 /**
@@ -708,6 +741,14 @@ class CodexAppServerClient {
     const active = this.activeTurn;
     if (!active || !this.isAlive()) return false;
     await this.request("turn/interrupt", active, 15_000);
+    return true;
+  }
+
+  /** `turn/steer`: append a user message to the active turn; the request fails if the turn already ended. */
+  async steerActiveTurn(text: string): Promise<boolean> {
+    const active = this.activeTurn;
+    if (!active || !this.isAlive()) return false;
+    await this.request("turn/steer", { threadId: active.threadId, expectedTurnId: active.turnId, input: [{ type: "text", text }] }, 15_000);
     return true;
   }
 
